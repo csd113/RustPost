@@ -37,21 +37,24 @@ pub async fn reset_admin_password(
 }
 
 pub async fn ensure_first_boot_admin_hint(pool: &SqlitePool) -> anyhow::Result<()> {
-    let count: i64 = pool
-        .call(|conn| {
-            Ok(
-                conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |row| {
-                    row.get(0)
-                })?,
-            )
-        })
-        .await?;
+    let count = admin_count(pool).await?;
     if count == 0 {
         tracing::warn!(
-            "no admin account exists; run `rustpost-cli create-admin <username> <password>`"
+            "no admin account exists; run `rustpost-cli create-admin-interactive` or `rustpost-cli create-admin <username> <password>`"
         );
     }
     Ok(())
+}
+
+pub async fn admin_count(pool: &SqlitePool) -> anyhow::Result<i64> {
+    pool.call(|conn| {
+        Ok(
+            conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |row| {
+                row.get(0)
+            })?,
+        )
+    })
+    .await
 }
 
 pub async fn set_user_suspended(

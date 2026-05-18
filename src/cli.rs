@@ -1,5 +1,7 @@
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -27,6 +29,7 @@ enum Command {
         username: String,
         password: String,
     },
+    CreateAdminInteractive,
     ResetAdminPassword {
         username: String,
         password: String,
@@ -77,6 +80,14 @@ pub async fn run() -> anyhow::Result<()> {
             println!("admin account created");
             Ok(())
         }
+        Command::CreateAdminInteractive => {
+            let pool = db::connect(&paths.database_path).await?;
+            db::migrate(&pool).await?;
+            let (username, password) = prompt_admin_credentials()?;
+            admin::create_admin(&pool, &settings, &username, &password).await?;
+            println!("admin account created");
+            Ok(())
+        }
         Command::ResetAdminPassword { username, password } => {
             let pool = db::connect(&paths.database_path).await?;
             db::migrate(&pool).await?;
@@ -109,6 +120,7 @@ pub async fn run() -> anyhow::Result<()> {
 async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyhow::Result<()> {
     let pool = db::connect(&paths.database_path).await?;
     db::migrate(&pool).await?;
+    let admin_count = admin::admin_count(&pool).await?;
     let ffmpeg = crate::ffmpeg::probe(&settings.media).await;
     if !ffmpeg.available {
         warn!("ffmpeg unavailable; uploads will safely fall back to allowed originals");
@@ -132,6 +144,7 @@ async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyh
     if settings.admin.create_admin_on_first_boot {
         admin::ensure_first_boot_admin_hint(&pool).await?;
     }
+    print_startup_summary(&paths, &settings, admin_count);
     let state = server::AppState::new(pool, settings.clone(), paths.clone(), ffmpeg, tor_status);
     let app = server::router(state);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -204,6 +217,88 @@ async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyh
     .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
     clearnet.await?;
     Ok(())
+}
+
+fn print_startup_summary(
+    paths: &runtime::RuntimePaths,
+    settings: &config::Settings,
+    admin_count: i64,
+) {
+    eprintln!("RustPost startup");
+    eprintln!("  data dir: {}", paths.data_dir.display());
+    eprintln!("  settings: {}", paths.settings_path.display());
+    eprintln!("  database: {}", paths.database_path.display());
+    eprintln!("  uploads: {}", paths.uploads_originals.display());
+    eprintln!(
+        "  serving: http://{}:{}",
+        settings.server.host, settings.server.port
+    );
+    if admin_count > 0 {
+        eprintln!("  admin: present");
+    } else {
+        eprintln!("  admin: none found");
+        eprintln!(
+            "  setup: rustpost-cli --data-dir {} create-admin-interactive",
+            paths.data_dir.display()
+        );
+        eprintln!(
+            "  non-interactive: rustpost-cli --data-dir {} create-admin <username> <password>",
+            paths.data_dir.display()
+        );
+    }
+}
+
+fn prompt_admin_credentials() -> anyhow::Result<(String, String)> {
+    print!("Admin username: ");
+    io::stdout().flush()?;
+    let mut username = String::new();
+    io::stdin().read_line(&mut username)?;
+    let username = username.trim().to_owned();
+    let password = read_secret("Admin password: ")?;
+    let confirm = read_secret("Confirm admin password: ")?;
+    if password != confirm {
+        anyhow::bail!("passwords do not match");
+    }
+    Ok((username, password))
+}
+
+#[cfg(unix)]
+fn read_secret(prompt: &str) -> anyhow::Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let _guard = EchoGuard::disable()?;
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    eprintln!();
+    Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+#[cfg(not(unix))]
+fn read_secret(_prompt: &str) -> anyhow::Result<String> {
+    anyhow::bail!(
+        "hidden password prompts are not supported on this platform; use create-admin instead"
+    )
+}
+
+#[cfg(unix)]
+struct EchoGuard;
+
+#[cfg(unix)]
+impl EchoGuard {
+    fn disable() -> anyhow::Result<Self> {
+        let status = ProcessCommand::new("stty").arg("-echo").status()?;
+        if !status.success() {
+            anyhow::bail!("failed to disable terminal echo");
+        }
+        Ok(Self)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        let _ = ProcessCommand::new("stty").arg("echo").status();
+    }
 }
 
 async fn shutdown_signal() {

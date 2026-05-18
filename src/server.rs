@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Form, Multipart, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, Uri, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use rusqlite::{OptionalExtension, params};
@@ -51,6 +51,7 @@ impl AppState {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(local))
+        .route("/assets/rustpost.js", get(client_script))
         .route("/local", get(local))
         .route("/home", get(home))
         .route("/login", get(login_form).post(login))
@@ -99,10 +100,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+async fn client_script() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        render::client_script(),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 struct AuthForm {
     username: String,
     password: String,
+}
+
+#[derive(Deserialize)]
+struct RegisterForm {
+    username: String,
+    password: String,
+    confirm_password: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -148,17 +167,14 @@ async fn local(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppRes
     };
     let body = format!(
         "{}{}{}",
-        render::page_header(
-            "Local timeline",
-            "Public posts from this RustPost instance."
-        ),
+        render::page_header("Local Feed", "Public posts from this RustPost instance."),
         composer,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
     Ok(Html(render::layout_with_csrf(
         user.as_ref(),
         csrf.as_deref(),
-        "Local",
+        "Local Feed",
         &body,
     )))
 }
@@ -169,24 +185,23 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
     let csrf = form_csrf(&state, &headers).await;
     let body = format!(
         "{}{}{}",
-        render::page_header("Home", "Posts from people you follow and your own updates."),
+        render::page_header(
+            "Home Feed",
+            "Posts from people you follow and your own updates."
+        ),
         render::composer(csrf.as_deref(), None),
         render::posts(&posts, Some(&user), csrf.as_deref())
     );
     Ok(Html(render::layout_with_csrf(
         Some(&user),
         csrf.as_deref(),
-        "Home",
+        "Home Feed",
         &body,
     )))
 }
 
 async fn login_form() -> Html<String> {
-    Html(render::layout(
-        None,
-        "Login",
-        r#"<section class="panel auth-panel"><h1>Log in</h1><form method="post"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button type="submit">Log in</button></form></section>"#,
-    ))
+    Html(render::layout(None, "Login", &render::login_form(None)))
 }
 
 async fn login(
@@ -227,17 +242,27 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
     Ok(Html(render::layout(
         None,
         "Register",
-        r#"<section class="panel auth-panel"><h1>Create account</h1><form method="post"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required><button type="submit">Create account</button></form></section>"#,
+        &render::register_form(None),
     )))
 }
 
 async fn register(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Form(form): Form<AuthForm>,
+    Form(form): Form<RegisterForm>,
 ) -> AppResult<Response> {
     if !state.settings.accounts.registration_enabled {
         return Err(AppError::Forbidden);
+    }
+    let Some(confirm_password) = form.confirm_password.as_deref() else {
+        return Err(AppError::BadRequest(
+            "please confirm your password".to_owned(),
+        ));
+    };
+    if form.password != confirm_password {
+        return Err(AppError::BadRequest(
+            "passwords do not match; please enter the same password twice".to_owned(),
+        ));
     }
     rate_limit::check_and_record(
         &state.pool,
@@ -305,6 +330,9 @@ async fn create_post(
         return Err(AppError::Forbidden);
     }
     let form = parse_post_create(&state, user.as_ref().map(|u| u.id), multipart).await?;
+    if let Some(parent_id) = form.parent_post_id {
+        ensure_parent_post_exists(&state.pool, parent_id).await?;
+    }
     if user.is_some() {
         validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
     }
@@ -343,7 +371,10 @@ async fn create_post(
     )
     .await
     .map_err(|err| AppError::BadRequest(err.to_string()))?;
-    Ok(Redirect::to("/local").into_response())
+    let redirect = form
+        .parent_post_id
+        .map_or_else(|| "/local".to_owned(), |id| format!("/posts/{id}"));
+    Ok(Redirect::to(&redirect).into_response())
 }
 
 async fn parse_post_create(
@@ -383,7 +414,17 @@ async fn parse_post_create(
                     .text()
                     .await
                     .map_err(|err| AppError::BadRequest(err.to_string()))?;
-                form.parent_post_id = value.parse::<i64>().ok();
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "reply target is missing; open the post thread and try again".to_owned(),
+                    ));
+                }
+                form.parent_post_id = Some(value.parse::<i64>().map_err(|_| {
+                    AppError::BadRequest(
+                        "reply target is invalid; open the post thread and try again".to_owned(),
+                    )
+                })?);
             }
             "media"
                 if field
@@ -464,7 +505,7 @@ async fn toggle_like(
     } else {
         social::like(&state.pool, user.id, id).await?;
     }
-    Ok(Redirect::to(&format!("/posts/{id}")).into_response())
+    Ok(redirect_back(&headers, "/local").into_response())
 }
 
 async fn toggle_bookmark(
@@ -480,7 +521,7 @@ async fn toggle_bookmark(
     } else {
         social::bookmark(&state.pool, user.id, id).await?;
     }
-    Ok(Redirect::to(&format!("/posts/{id}")).into_response())
+    Ok(redirect_back(&headers, "/local").into_response())
 }
 
 async fn repost(
@@ -824,6 +865,9 @@ async fn parse_profile_update(
                 if !state.settings.accounts.allow_profile_pictures {
                     return Err(AppError::Forbidden);
                 }
+                if field.file_name().is_none_or(|name| name.trim().is_empty()) {
+                    continue;
+                }
                 form.profile_picture_media_id = Some(
                     media::save_upload(
                         &state.pool,
@@ -833,12 +877,19 @@ async fn parse_profile_update(
                         Some(user_id),
                         field,
                     )
-                    .await?,
+                    .await
+                    .map_err(|err| {
+                        tracing::warn!(error = %err, "profile picture upload rejected");
+                        AppError::BadRequest(err.to_string())
+                    })?,
                 );
             }
             "banner" if field.file_name().is_some() => {
                 if !state.settings.accounts.allow_profile_banners {
                     return Err(AppError::Forbidden);
+                }
+                if field.file_name().is_none_or(|name| name.trim().is_empty()) {
+                    continue;
                 }
                 form.banner_media_id = Some(
                     media::save_upload(
@@ -849,13 +900,72 @@ async fn parse_profile_update(
                         Some(user_id),
                         field,
                     )
-                    .await?,
+                    .await
+                    .map_err(|err| {
+                        tracing::warn!(error = %err, "profile banner upload rejected");
+                        AppError::BadRequest(err.to_string())
+                    })?,
                 );
             }
             _ => {}
         }
     }
     Ok(form)
+}
+
+async fn ensure_parent_post_exists(pool: &SqlitePool, parent_id: i64) -> AppResult<()> {
+    let exists = pool
+        .call(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM posts WHERE id = ? AND is_deleted = 0",
+                    [parent_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
+        .await?;
+    if exists {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "reply target was not found; it may have been deleted".to_owned(),
+        ))
+    }
+}
+
+fn redirect_back(headers: &HeaderMap, fallback: &str) -> Redirect {
+    let Some(value) = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Redirect::to(fallback);
+    };
+    let target = if value.starts_with('/') && !value.starts_with("//") {
+        value.to_owned()
+    } else {
+        value
+            .parse::<Uri>()
+            .ok()
+            .and_then(|uri| {
+                uri.path_and_query()
+                    .map(|path| path.as_str().to_owned())
+                    .filter(|path| path.starts_with('/'))
+            })
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    if matches!(
+        target.as_str(),
+        "/local" | "/home" | "/bookmarks" | "/notifications" | "/search"
+    ) || target.starts_with("/posts/")
+        || target.starts_with("/users/")
+        || target.starts_with("/tags/")
+    {
+        Redirect::to(&target)
+    } else {
+        Redirect::to(fallback)
+    }
 }
 
 async fn bookmarks(
@@ -1335,7 +1445,7 @@ mod tests {
             "POST",
             "/register",
             &[("content-type", "application/x-www-form-urlencoded")],
-            b"username=alice&password=very%20secure%20password".to_vec(),
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
         )
         .await;
         assert_eq!(registered.status, 303);
@@ -1398,9 +1508,10 @@ mod tests {
             "POST",
             "/register",
             &[("content-type", "application/x-www-form-urlencoded")],
-            b"username=bob&password=very%20secure%20password".to_vec(),
+            b"username=bob&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
         )
         .await;
+        assert_eq!(registered.status, 303);
         let cookie = session_cookie(&registered);
 
         let missing_csrf = request(
@@ -1470,6 +1581,42 @@ mod tests {
         assert_eq!(too_long.status, 400);
         assert!(too_long.body.contains("post is too long"));
         assert!(!too_long.body.contains("internal server error"));
+    }
+
+    #[tokio::test]
+    async fn registration_requires_matching_password_confirmation() {
+        let server = spawn_test_server().await;
+        let matching = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=carol&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(matching.status, 303);
+
+        let mismatched = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=dave&password=very%20secure%20password&confirm_password=different%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(mismatched.status, 400);
+        assert!(mismatched.body.contains("passwords do not match"));
+
+        let missing = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=erin&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(missing.status, 400);
+        assert!(missing.body.contains("please confirm your password"));
     }
 
     fn multipart_body(

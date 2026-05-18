@@ -19,7 +19,10 @@ test.beforeAll(async () => {
     throw new Error(`rustpost-cli init failed: ${init.stderr || init.stdout}`);
   }
   const settingsPath = join(dataDir, "settings.toml");
-  const settings = readFileSync(settingsPath, "utf8").replace("port = 8080", `port = ${port}`);
+  const settings = readFileSync(settingsPath, "utf8")
+    .replace("port = 8080", `port = ${port}`)
+    .replace("max_image_size = 52428800", "max_image_size = 60")
+    .replace("account_creations_per_ip_per_day = 3", "account_creations_per_ip_per_day = 20");
   writeFileSync(settingsPath, settings);
   server = spawn(binary, ["--data-dir", dataDir, "serve"], {
     stdio: ["ignore", "pipe", "pipe"]
@@ -50,17 +53,23 @@ test("desktop posting and social actions work from the UI", async ({ page }) => 
   await page.goto(`${baseUrl}/local`);
   await expect(page.getByText("Alice desktop post")).toBeVisible();
   const post = page.locator("article.post").filter({ hasText: "Alice desktop post" }).first();
-  await post.getByRole("link", { name: /Thread/ }).click();
+  await post.getByRole("link", { name: /Open thread/ }).click();
   await page.getByLabel("What is happening?").fill("Bob replies from the browser");
   await page.getByRole("button", { name: "Post", exact: true }).click();
   await expect(page.getByText("Bob replies from the browser")).toBeVisible();
+  await page.goto(`${baseUrl}/local`);
+  await expect(page.locator("article.post").filter({ hasText: "Bob replies from the browser" })).toHaveCount(0);
+  await page.goto(`${baseUrl}/posts/1`);
+  await expect(page.locator("article.post").filter({ hasText: "Bob replies from the browser" })).toHaveCount(1);
 
+  await page.goto(`${baseUrl}/local`);
   await page.locator("article.post").filter({ hasText: "Alice desktop post" }).first().getByRole("button", { name: "Like" }).click();
+  await expect(page).toHaveURL(`${baseUrl}/local`);
   await expect(page.getByText("1 likes")).toBeVisible();
   await page.locator("article.post").filter({ hasText: "Alice desktop post" }).first().getByRole("button", { name: "Bookmark" }).click();
   await page.getByRole("link", { name: "Bookmarks" }).click();
   await expect(page.getByText("Alice desktop post")).toBeVisible();
-  await page.getByRole("link", { name: "Thread" }).first().click();
+  await page.getByRole("link", { name: "Open thread" }).first().click();
   await page.locator("article.post").filter({ hasText: "Alice desktop post" }).first().getByRole("button", { name: "Repost" }).click();
   await expect(page).toHaveURL(`${baseUrl}/home`);
   await expect(page.getByText("bob reposted")).toBeVisible();
@@ -108,10 +117,77 @@ test("mobile layout, validation, auth pages, and admin health stay usable", asyn
   await page.screenshot({ path: join("output/playwright", `${testInfo.project.name}-local.png`), fullPage: true });
 });
 
+test("registration confirms passwords and password toggles are accessible", async ({ page }) => {
+  await page.goto(`${baseUrl}/register`);
+  await page.getByLabel("Username").fill("dana");
+  await page.getByLabel("Password", { exact: true }).fill("very secure password");
+  await page.getByLabel("Confirm password").fill("different password");
+  await page.getByRole("button", { name: "Create account" }).click();
+  await expect(page.getByText("passwords do not match")).toBeVisible();
+
+  const missingConfirm = await page.request.post(`${baseUrl}/register`, {
+    form: { username: "erin", password: "very secure password" }
+  });
+  expect(missingConfirm.status()).toBe(400);
+  await expect(missingConfirm.text()).resolves.toContain("please confirm your password");
+
+  await page.goto(`${baseUrl}/register`);
+  await page.getByLabel("Username").fill("frank");
+  await page.getByLabel("Password", { exact: true }).fill("very secure password");
+  await page.getByLabel("Confirm password").fill("very secure password");
+  const passwordInput = page.locator("#password");
+  await expect(passwordInput).toHaveAttribute("type", "password");
+  await page.getByRole("button", { name: "Show password", exact: true }).click();
+  await expect(passwordInput).toHaveAttribute("type", "text");
+  await page.getByRole("button", { name: "Create account" }).click();
+  await expect(page).toHaveURL(`${baseUrl}/home`);
+
+  await page.getByRole("button", { name: "Log out" }).click();
+  await page.goto(`${baseUrl}/login`);
+  await page.getByLabel("Password", { exact: true }).fill("very secure password");
+  const loginPassword = page.locator("#password");
+  await page.getByRole("button", { name: "Show password" }).click();
+  await expect(loginPassword).toHaveAttribute("type", "text");
+});
+
+test("profile picture upload errors are friendly validation failures", async ({ page }) => {
+  await register(page, "grace", "very secure password");
+  await page.getByRole("link", { name: "Settings" }).click();
+
+  await page.setInputFiles("#profile_picture", {
+    name: "avatar.gif",
+    mimeType: "image/gif",
+    buffer: Buffer.from("R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==", "base64")
+  });
+  await page.getByRole("button", { name: "Save settings" }).click();
+  await expect(page).toHaveURL(`${baseUrl}/settings`);
+  await expect(page.locator("img.profile-picture")).toBeVisible();
+
+  await page.setInputFiles("#profile_picture", {
+    name: "avatar.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("not an image")
+  });
+  await page.getByRole("button", { name: "Save settings" }).click();
+  await expect(page.getByText("unsupported media type")).toBeVisible();
+  await expect(page.getByText("500 error")).toHaveCount(0);
+
+  await page.goto(`${baseUrl}/settings`);
+  await page.setInputFiles("#profile_picture", {
+    name: "large.png",
+    mimeType: "image/png",
+    buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=", "base64")
+  });
+  await page.getByRole("button", { name: "Save settings" }).click();
+  await expect(page.getByText("image exceeds maximum size")).toBeVisible();
+  await expect(page.getByText("500 error")).toHaveCount(0);
+});
+
 async function register(page: Page, username: string, password: string) {
   await page.goto(`${baseUrl}/register`);
   await page.getByLabel("Username").fill(username);
-  await page.getByLabel("Password").fill(password);
+  await page.getByLabel("Password", { exact: true }).fill(password);
+  await page.getByLabel("Confirm password").fill(password);
   await page.getByRole("button", { name: "Create account" }).click();
   await expect(page).toHaveURL(`${baseUrl}/home`);
 }
@@ -119,7 +195,7 @@ async function register(page: Page, username: string, password: string) {
 async function login(page: Page, username: string, password: string) {
   await page.goto(`${baseUrl}/login`);
   await page.getByLabel("Username").fill(username);
-  await page.getByLabel("Password").fill(password);
+  await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Log in" }).click();
   await expect(page).toHaveURL(`${baseUrl}/home`);
 }

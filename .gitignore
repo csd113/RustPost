@@ -20,20 +20,27 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Playwright browser artifacts
+# JavaScript dependencies and Playwright artifacts
 node_modules/
 output/
 test-results/
 playwright-report/
+blob-report/
+.playwright/
+playwright/.cache/
 
 # Local runtime data
 app-data/
 rustpost-data/
+rustpost-data/**/*
+!rustpost-data/.gitkeep
 *.sqlite3
 *.sqlite3-*
 *.db
 *.db-*
 *.log
+*.tmp
+*.upload
 uploads/
 
 # macOS

@@ -64,9 +64,18 @@ pub async fn save_upload(
     }
     file.flush().await?;
     let data = tokio::fs::read(&staging).await?;
-    let kind = infer::get(&data).ok_or_else(|| anyhow::anyhow!("unsupported media type"))?;
+    let Some(kind) = infer::get(&data) else {
+        remove_staged_upload(&staging).await;
+        anyhow::bail!("unsupported media type");
+    };
     let mime = kind.mime_type().to_owned();
-    let media_kind = classify(settings, &mime, bytes)?;
+    let media_kind = match classify(settings, &mime, bytes) {
+        Ok(media_kind) => media_kind,
+        Err(error) => {
+            remove_staged_upload(&staging).await;
+            return Err(error);
+        }
+    };
     let ext = safe_extension(&mime, media_kind);
     let original_path = paths.uploads_originals.join(format!("{id}.{ext}"));
     tokio::fs::rename(&staging, &original_path).await?;
@@ -120,6 +129,12 @@ pub async fn save_upload(
         .await?;
     }
     Ok(media_id)
+}
+
+async fn remove_staged_upload(path: &Path) {
+    if let Err(error) = tokio::fs::remove_file(path).await {
+        tracing::debug!(error = %error, "failed to remove rejected staged upload");
+    }
 }
 
 pub async fn set_profile_media(

@@ -25,10 +25,10 @@ pub fn layout_with_csrf(
             )
         });
         format!(
-            r#"<a href="/home">Home</a><a href="/local">Local</a><a href="/search">Search</a><a href="/notifications">Notifications</a><a href="/bookmarks">Bookmarks</a><a href="/settings">Settings</a>{admin}{logout}"#
+            r#"<a href="/home">Home Feed</a><a href="/local">Local Feed</a><a href="/search">Search</a><a href="/notifications">Notifications</a><a href="/bookmarks">Bookmarks</a><a href="/settings">Settings</a>{admin}{logout}"#
         )
     } else {
-        r#"<a href="/local">Local</a><a href="/search">Search</a><a href="/login">Log in</a><a href="/register">Register</a>"#
+        r#"<a href="/local">Local Feed</a><a href="/search">Search</a><a href="/login">Log in</a><a href="/register">Register</a>"#
             .to_owned()
     };
     format!(
@@ -42,10 +42,11 @@ pub fn layout_with_csrf(
 <meta name="referrer" content="same-origin">
 <title>{} - RustPost</title>
 <style>{}</style>
+<script src="/assets/rustpost.js" defer></script>
 </head>
 <body>
 <header class="site-header"><div class="header-inner"><a class="brand" href="/local"><span class="brand-mark">R</span><span>RustPost</span></a><nav>{}</nav></div></header>
-<main><div class="content-shell"><section class="content-column">{} </section><aside class="side-panel"><h2>Alpha status</h2><p>Local-first microblog. Anonymous posting is off by default.</p><a href="/local">Local timeline</a></aside></div></main>
+<main><div class="content-shell"><section class="content-column">{} </section><aside class="side-panel"><h2>Alpha status</h2><p>Local-first microblog. Anonymous posting is off by default.</p><a href="/local">Local Feed</a></aside></div></main>
 <footer class="site-footer">RustPost alpha</footer>
 </body>
 </html>"#,
@@ -56,13 +57,44 @@ pub fn layout_with_csrf(
     )
 }
 
+pub fn login_form(message: Option<&str>) -> String {
+    let notice = message.map_or_else(String::new, |message| notice("error", message));
+    format!(
+        r#"<section class="panel auth-panel"><h1>Log in</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><div class="password-control"><input id="password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><button class="auth-submit" type="submit">Log in</button></form></section>"#
+    )
+}
+
+pub fn register_form(message: Option<&str>) -> String {
+    let notice = message.map_or_else(String::new, |message| notice("error", message));
+    format!(
+        r#"<section class="panel auth-panel"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><div class="password-control"><input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" minlength="10" autocomplete="new-password" required><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div><button class="auth-submit" type="submit">Create account</button></form></section>"#
+    )
+}
+
+pub fn client_script() -> &'static str {
+    r#"document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-password-toggle]");
+  if (!button) {
+    return;
+  }
+  const input = document.getElementById(button.getAttribute("data-password-toggle"));
+  if (!input) {
+    return;
+  }
+  const show = input.type === "password";
+  input.type = show ? "text" : "password";
+  button.textContent = show ? "Hide" : "Show";
+  button.setAttribute("aria-label", show ? "Hide password" : "Show password");
+});"#
+}
+
 pub fn composer(csrf: Option<&str>, parent: Option<i64>) -> String {
     let parent_input = parent.map_or_else(String::new, |id| {
         format!(r#"<input type="hidden" name="parent_post_id" value="{id}">"#)
     });
     let csrf = csrf.unwrap_or_default();
     format!(
-        r#"<section class="composer" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted">280 characters</span></div><form method="post" action="/posts" enctype="multipart/form-data">
+        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted">280 characters</span></div><form method="post" action="/posts" enctype="multipart/form-data">
 <input type="hidden" name="csrf" value="{}">{}
 <label for="text">What is happening?</label>
 <textarea id="text" name="text" maxlength="280" rows="4" placeholder="Write a short update..."></textarea>
@@ -139,8 +171,12 @@ pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>
         } else {
             String::new()
         };
+        let reply_link = format!(
+            r#"<a class="button-link" href="/posts/{}#reply">Reply</a>"#,
+            post.id
+        );
         format!(
-            r#"<div class="actions">{}{}{}{}{}<a class="button-link" href="/posts/{}">Thread</a></div>"#,
+            r#"<div class="actions">{}{}{}{}{}<a class="button-link" href="/posts/{}">Open thread</a></div>"#,
             action_form(
                 &format!("/posts/{}/like", post.id),
                 csrf,
@@ -156,13 +192,13 @@ pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>
                 }
             ),
             action_form(&format!("/posts/{}/repost", post.id), csrf, "Repost"),
-            action_form(&format!("/posts/{}/reply", post.id), csrf, "Reply"),
+            reply_link,
             delete,
             post.id
         )
     } else {
         format!(
-            r#"<div class="actions"><a class="button-link" href="/posts/{}">Thread</a></div>"#,
+            r#"<div class="actions"><a class="button-link" href="/posts/{}">Open thread</a></div>"#,
             post.id
         )
     };
@@ -283,6 +319,7 @@ main{padding:1.25rem}.content-shell{max-width:1120px;margin:0 auto;display:grid;
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:#fff;border:1px solid #dfe4dc;border-radius:8px;margin:0 0 .85rem;padding:1rem;box-shadow:0 1px 2px rgba(20,35,30,.04)}
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.page-header p,.muted,.empty-state p{color:#667064;margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
 label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button{font:inherit}input[type=text],input[type=password],input[type=url],input:not([type]),textarea{width:100%;padding:.72rem .8rem;border:1px solid #b9c2b8;border-radius:7px;background:#fff}textarea{resize:vertical;min-height:7rem}
+input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{background:#fff;color:#24445f;border-color:#cdd7d0;min-width:4.5rem}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}
 input:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:3px solid #93c5fd;outline-offset:2px}button,.primary{border:1px solid #163b2f;background:#163b2f;color:#fff;border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:#235544;text-decoration:none}.actions button{background:#fff;color:#24445f;border-color:#cdd7d0;font-weight:650}.actions button:hover{background:#eef3f0}
 .composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:#24445f;font-weight:700}.file-control input{max-width:15rem}
 .timeline{display:grid;gap:.85rem}.post{overflow:hidden}.post-header{display:flex;justify-content:space-between;gap:.75rem;align-items:flex-start}.author-name{font-weight:800;color:#202124}.username,.post-time,.counts{color:#687068;font-size:.92rem}.text{white-space:pre-wrap;margin:.75rem 0;line-height:1.55;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid #d9ded6;margin-top:.6rem;background:#f6f7f4}

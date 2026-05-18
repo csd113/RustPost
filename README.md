@@ -128,14 +128,36 @@ rustpost-data/
 ```
 
 > **Note:** All runtime paths are derived from `--data-dir` (or the executable location as fallback). RustPost does not rely on the current working directory.
+> Runtime data is local operator state. Databases, uploads, logs, backups, Tor key material, and temporary upload files under `rustpost-data/` should not be committed to git.
 
 ### Create Your First Admin
+
+When `serve` starts, RustPost prints the data directory, settings path, database path, bind address, and whether an admin account exists. If no admin exists, the terminal output includes the bootstrap commands.
+
+The preferred local setup path hides the password while you type:
+
+```sh
+./target/release/rustpost --data-dir ./rustpost-data create-admin-interactive
+```
+
+For scripted deployments, the non-interactive command is still available. Be aware that command-line arguments can be visible to other local processes on some systems:
 
 ```sh
 ./target/release/rustpost --data-dir ./rustpost-data create-admin alice s3cr3tpassword
 ```
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080) and log in.
+
+### Timelines
+
+RustPost uses two feed labels intentionally:
+
+| Label | Meaning |
+|---|---|
+| Home Feed | Your personalized feed: your posts and posts from people you follow |
+| Local Feed | Public top-level posts from this local RustPost instance |
+
+Replies remain attached to their parent thread. They render inside the thread view and are not shown as unrelated top-level Local Feed posts.
 
 ---
 
@@ -145,6 +167,7 @@ Then open [http://127.0.0.1:8080](http://127.0.0.1:8080) and log in.
 rustpost init                                       # Initialize data directory
 rustpost check                                      # Validate config and data directory
 rustpost create-admin <username> <password>         # Create an admin account
+rustpost create-admin-interactive                   # Create an admin with hidden password prompts
 rustpost reset-admin-password <username> <password> # Reset an admin's password
 rustpost serve                                      # Start the HTTP server (default)
 rustpost backup                                     # Create a backup archive

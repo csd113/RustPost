@@ -478,7 +478,10 @@ async fn post_events(
             " AND (p.user_id = ? OR p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?))",
         ),
         "bookmarks" => sql.push_str(" AND p.id IN (SELECT post_id FROM bookmarks WHERE user_id = ?)"),
-        _ => {}
+        _ => sql.push_str(" AND p.parent_post_id IS NULL"),
+    }
+    if matches!(mode, "home" | "bookmarks") {
+        sql.push_str(" AND p.parent_post_id IS NULL");
     }
     append_viewer_filters(&mut sql, "p.user_id", viewer_id);
     if let Some(cursor) = cursor {
@@ -507,7 +510,7 @@ async fn post_events_for_user(
     user_id: i64,
 ) -> anyhow::Result<Vec<PostView>> {
     let mut sql = base_post_query();
-    sql.push_str(" AND p.user_id = ?");
+    sql.push_str(" AND p.user_id = ? AND p.parent_post_id IS NULL");
     append_viewer_filters(&mut sql, "p.user_id", viewer_id);
     sql.push_str(" ORDER BY p.id DESC LIMIT 40");
     let mut bindings = vec![user_id];
@@ -761,6 +764,144 @@ fn create_notification_conn(
         params![user_id, actor_id, post_id, kind, message],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    async fn test_pool() -> (tempfile::TempDir, SqlitePool, Settings) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        crate::db::migrate(&pool).await.expect("migrate");
+        (temp, pool, Settings::default())
+    }
+
+    #[tokio::test]
+    async fn reply_is_linked_to_parent_and_rendered_in_thread() {
+        let (_temp, pool, settings) = test_pool().await;
+        let user_id =
+            crate::auth::register_user(&pool, &settings, "alice", "very secure password", false)
+                .await
+                .expect("user");
+        let parent_id = create_post(&pool, &settings, Some(user_id), "parent post", None, &[])
+            .await
+            .expect("parent");
+
+        let reply_id = create_post(
+            &pool,
+            &settings,
+            Some(user_id),
+            "child reply",
+            Some(parent_id),
+            &[],
+        )
+        .await
+        .expect("reply");
+
+        let parent_row = pool
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT parent_post_id, root_post_id FROM posts WHERE id = ?",
+                    [reply_id],
+                    |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("reply row");
+        assert_eq!(parent_row, (Some(parent_id), Some(parent_id)));
+
+        let thread = post_thread(&pool, Some(user_id), parent_id)
+            .await
+            .expect("thread");
+        assert_eq!(thread.len(), 2);
+        assert_eq!(thread[1].id, reply_id);
+        assert_eq!(thread[1].parent_post_id, Some(parent_id));
+    }
+
+    #[tokio::test]
+    async fn reply_does_not_appear_as_top_level_timeline_post() {
+        let (_temp, pool, settings) = test_pool().await;
+        let user_id =
+            crate::auth::register_user(&pool, &settings, "alice", "very secure password", false)
+                .await
+                .expect("user");
+        let parent_id = create_post(&pool, &settings, Some(user_id), "parent post", None, &[])
+            .await
+            .expect("parent");
+        let reply_id = create_post(
+            &pool,
+            &settings,
+            Some(user_id),
+            "child reply",
+            Some(parent_id),
+            &[],
+        )
+        .await
+        .expect("reply");
+
+        let local = timeline(&pool, Some(user_id), "local", None)
+            .await
+            .expect("local timeline");
+
+        assert!(local.iter().any(|post| post.id == parent_id));
+        assert!(!local.iter().any(|post| post.id == reply_id));
+    }
+
+    #[tokio::test]
+    async fn invalid_parent_post_is_rejected() {
+        let (_temp, pool, settings) = test_pool().await;
+        let user_id =
+            crate::auth::register_user(&pool, &settings, "alice", "very secure password", false)
+                .await
+                .expect("user");
+
+        let result = create_post(
+            &pool,
+            &settings,
+            Some(user_id),
+            "orphan reply",
+            Some(9_999),
+            &[],
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn deleted_parent_does_not_crash_thread_rendering() {
+        let (_temp, pool, settings) = test_pool().await;
+        let user_id =
+            crate::auth::register_user(&pool, &settings, "alice", "very secure password", false)
+                .await
+                .expect("user");
+        let parent_id = create_post(&pool, &settings, Some(user_id), "parent post", None, &[])
+            .await
+            .expect("parent");
+        create_post(
+            &pool,
+            &settings,
+            Some(user_id),
+            "child reply",
+            Some(parent_id),
+            &[],
+        )
+        .await
+        .expect("reply");
+        delete_post(&pool, user_id, parent_id, false)
+            .await
+            .expect("delete parent");
+
+        let thread = post_thread(&pool, Some(user_id), parent_id)
+            .await
+            .expect("thread lookup");
+
+        assert!(thread.is_empty());
+    }
 }
 
 fn create_notification_tx(
