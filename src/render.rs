@@ -103,15 +103,6 @@ pub fn layout_with_context(
 }
 
 fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> String {
-    let tor = context.tor_onion_address.as_deref().map_or_else(
-        || r#"<dt>Tor</dt><dd>Unavailable</dd>"#.to_owned(),
-        |onion| {
-            format!(
-                r#"<dt>Tor</dt><dd><code>{}</code></dd>"#,
-                html_escape::encode_text(onion)
-            )
-        },
-    );
     let posting = if context.anonymous_mode_enabled {
         "Signed-in and anonymous posting"
     } else if user.is_some() {
@@ -123,7 +114,8 @@ fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> Strin
         || r#"<dt>Account</dt><dd>Guest</dd>"#.to_owned(),
         |user| {
             format!(
-                r#"<dt>Account</dt><dd><strong>{}</strong><br><span class="muted">@{}</span></dd>"#,
+                r#"<dt>Account</dt><dd><a class="dashboard-account" href="/users/{}"><strong>{}</strong><br><span class="muted">@{}</span></a></dd>"#,
+                html_escape::encode_double_quoted_attribute(&user.username),
                 html_escape::encode_text(&user.display_name),
                 html_escape::encode_text(&user.username)
             )
@@ -146,8 +138,8 @@ fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> Strin
         ""
     };
     format!(
-        r#"<aside class="side-panel"><h2>Dashboard</h2><dl class="dashboard-list">{}<dt>Posting</dt><dd>{}</dd>{}{}</dl><div class="quick-links"><a class="button-link" href="/home">Home Feed</a><a class="button-link" href="/following">Following</a>{settings}{admin}</div></aside>"#,
-        account, posting, social, tor
+        r#"<aside class="side-panel"><h2>Dashboard</h2><dl class="dashboard-list">{}<dt>Posting</dt><dd>{}</dd>{}</dl><div class="quick-links">{settings}{admin}</div></aside>"#,
+        account, posting, social
     )
 }
 
@@ -599,7 +591,7 @@ const CSS: &str = r#"
 .brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:#172017}.brand-mark{display:inline-grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:#163b2f;color:#fff}
 nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}nav a,nav button,.button-link{display:inline-flex;align-items:center;min-height:2.15rem;border-radius:7px;padding:.42rem .65rem;color:#24445f;border:1px solid transparent;background:transparent}
 nav a:hover,.button-link:hover{background:#eef3f0;text-decoration:none}nav form,.actions form{display:inline}
-main{padding:1.25rem}.content-shell{max-width:1120px;margin:0 auto;display:grid;grid-template-columns:minmax(0,720px) 280px;gap:1.25rem;align-items:start}.content-column{min-width:0}.side-panel{position:sticky;top:5rem;background:#fff;border:1px solid #dfe4dc;border-radius:8px;padding:1rem;color:#59625a}.side-panel h2{margin:.1rem 0 .6rem;font-size:1rem;color:#202124}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:#202124}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.quick-links{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:1120px;margin:0 auto;padding:1rem;color:#687068;font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
+main{padding:1.25rem}.content-shell{max-width:1120px;margin:0 auto;display:grid;grid-template-columns:minmax(0,720px) 280px;gap:1.25rem;align-items:start}.content-column{min-width:0}.side-panel{position:sticky;top:5rem;background:#fff;border:1px solid #dfe4dc;border-radius:8px;padding:1rem;color:#59625a}.side-panel h2{margin:.1rem 0 .6rem;font-size:1rem;color:#202124}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:#202124}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:#202124}.dashboard-account:hover{text-decoration:none}.quick-links{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:1120px;margin:0 auto;padding:1rem;color:#687068;font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:#fff;border:1px solid #dfe4dc;border-radius:8px;margin:0 0 .85rem;padding:1rem;box-shadow:0 1px 2px rgba(20,35,30,.04)}
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.panel h1+table,.panel h1+form,.panel h1+p,.panel h1+dl{margin-top:.85rem}.page-header p,.muted,.empty-state p{color:#667064;margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
 label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button{font:inherit}input[type=text],input[type=password],input[type=url],input:not([type]),textarea{width:100%;padding:.72rem .8rem;border:1px solid #b9c2b8;border-radius:7px;background:#fff}textarea{resize:vertical;min-height:7rem}
@@ -633,6 +625,41 @@ mod tests {
         assert!(body.contains("Login required"));
         assert!(!body.contains("Alpha status"));
         assert!(!body.contains("Self-hosted microblog"));
+    }
+
+    #[test]
+    fn dashboard_uses_account_link_without_duplicate_feed_links_or_onion() {
+        let user = CurrentUser {
+            id: 1,
+            username: "ada".to_owned(),
+            display_name: "Ada Lovelace".to_owned(),
+            is_admin: false,
+            is_suspended: false,
+        };
+        let body = layout_with_context(
+            Some(&user),
+            None,
+            "Home Feed",
+            "<p>body</p>",
+            "My Microblog",
+            &LayoutContext {
+                tor_onion_address: Some("examplehiddenservice.onion".to_owned()),
+                follower_count: Some(2),
+                following_count: Some(3),
+                ..LayoutContext::default()
+            },
+        );
+
+        let dashboard = body
+            .split_once(r#"<aside class="side-panel">"#)
+            .and_then(|(_, rest)| rest.split_once("</aside>"))
+            .map(|(panel, _)| panel)
+            .expect("dashboard panel");
+        assert!(dashboard.contains(r#"href="/users/ada""#));
+        assert!(dashboard.contains("Ada Lovelace"));
+        assert!(!dashboard.contains(r#"href="/home">Home Feed"#));
+        assert!(!dashboard.contains(r#"href="/following">Following"#));
+        assert!(!dashboard.contains("examplehiddenservice.onion"));
     }
 
     #[test]
