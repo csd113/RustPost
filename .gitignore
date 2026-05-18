@@ -37,6 +37,10 @@ playwright/.cache/**/*
 *.trace.zip
 trace.zip
 *.webm
+playwright.config.ts
+package.json
+package-lock.json
+tests/e2e
 
 # Local runtime data
 app-data/
