@@ -22,6 +22,7 @@ pub mod cli;
 pub mod config;
 pub mod csrf;
 pub mod db;
+pub mod demo_seed;
 pub mod errors;
 pub mod ffmpeg;
 pub mod logging;

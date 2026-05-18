@@ -78,6 +78,26 @@ This repository is a **production-oriented MVP** — not a toy, but not overengi
 
 ---
 
+## Platform Preview
+
+RustPost renders as plain server-side HTML with full social interactions, profiles, threads, and media attachments.
+
+| Home feed | Profile |
+|---|---|
+| ![RustPost home feed with reposted media and social actions](docs/screenshots/home-feed.png) | ![RustPost profile page with banner, avatar, bio, and posts](docs/screenshots/profile.png) |
+
+| Threaded replies | Media posts |
+|---|---|
+| ![RustPost post thread with replies from multiple users](docs/screenshots/post-thread.png) | ![RustPost media post thread showing image attachment rendering](docs/screenshots/media-posts.png) |
+
+| Mobile layout |
+|---|
+| ![RustPost mobile home feed layout](docs/screenshots/mobile.png) |
+
+The screenshots above were captured from a local generated demo instance with fictional accounts and local placeholder media only. To inspect the same style of demo locally, see [Demo Preview](docs/demo-preview.md).
+
+---
+
 ## 🚀 Getting Started
 
 ### Prerequisites
@@ -166,6 +186,7 @@ rustpost check                                      # Validate config and data d
 rustpost create-admin <username> <password>         # Create an admin account
 rustpost create-admin-interactive                   # Create an admin with hidden password prompts
 rustpost reset-admin-password <username> <password> # Reset an admin's password
+rustpost seed-demo                                  # Seed a guarded local demo instance under target/debug/rustpost-demo
 rustpost serve                                      # Start the HTTP server (default)
 rustpost backup                                     # Create a backup archive
 rustpost backup --include-tor-keys                  # Backup including Tor private keys

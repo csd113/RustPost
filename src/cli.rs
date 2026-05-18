@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::{admin, backup, config, db, logging, runtime, server, tor};
+use crate::{admin, backup, config, db, demo_seed, logging, runtime, server, tor};
 
 #[derive(Debug, Parser)]
 #[command(about = "Single-binary self-hosted microblog")]
@@ -34,6 +34,7 @@ enum Command {
         username: String,
         password: String,
     },
+    SeedDemo,
     Backup {
         #[arg(long)]
         include_tor_keys: bool,
@@ -50,6 +51,7 @@ enum Command {
 pub async fn run() -> anyhow::Result<()> {
     logging::init();
     let cli = Cli::parse();
+    let explicit_data_dir = cli.data_dir.clone();
     let mut paths = runtime::RuntimePaths::discover(cli.data_dir.as_deref())?;
     paths.ensure()?;
     let settings_path = cli.config.unwrap_or_else(|| paths.settings_path.clone());
@@ -93,6 +95,16 @@ pub async fn run() -> anyhow::Result<()> {
             db::migrate(&pool).await?;
             admin::reset_admin_password(&pool, &settings, &username, &password).await?;
             println!("admin password reset");
+            Ok(())
+        }
+        Command::SeedDemo => {
+            if explicit_data_dir.is_none() {
+                anyhow::bail!("seed-demo requires an explicit --data-dir under target/debug");
+            }
+            let pool = db::connect(&paths.database_path).await?;
+            db::migrate(&pool).await?;
+            let report = demo_seed::seed(&pool, &paths, &settings, &settings_path).await?;
+            println!("{report}");
             Ok(())
         }
         Command::Backup { include_tor_keys } => {

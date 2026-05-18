@@ -134,6 +134,9 @@ pub fn posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option<&str>)
     )
 }
 
+// Rendering a post card stays centralized because the markup, counts, media,
+// and action controls must remain consistent between timelines and threads.
+#[allow(clippy::too_many_lines)]
 pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>) -> String {
     let repost_banner = if post.event_kind == TimelineEventKind::Repost {
         let name = post
@@ -248,15 +251,13 @@ pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>
             delete,
             thread_link
         )
+    } else if post.parent_post_id.is_none() {
+        format!(
+            r#"<div class="actions"><a class="button-link" href="/posts/{}">Open thread</a></div>"#,
+            post.id
+        )
     } else {
-        if post.parent_post_id.is_none() {
-            format!(
-                r#"<div class="actions"><a class="button-link" href="/posts/{}">Open thread</a></div>"#,
-                post.id
-            )
-        } else {
-            String::new()
-        }
+        String::new()
     };
     let post_class = if post.parent_post_id.is_some() {
         "post reply-post"

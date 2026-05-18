@@ -929,6 +929,9 @@ async fn settings_update(
     Ok(Redirect::to("/settings").into_response())
 }
 
+// Multipart parsing is kept in one place so uploaded profile media and text
+// fields share one validation path before any database updates happen.
+#[allow(clippy::too_many_lines)]
 async fn parse_profile_update(
     state: &AppState,
     user_id: i64,

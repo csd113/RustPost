@@ -211,12 +211,7 @@ impl Settings {
         if site_name != self.site.name {
             anyhow::bail!("site.name must not contain surrounding whitespace");
         }
-        if self
-            .site
-            .name
-            .chars()
-            .any(|character| character.is_control())
-        {
+        if self.site.name.chars().any(char::is_control) {
             anyhow::bail!("site.name must not contain control characters");
         }
         if self.accounts.min_password_length < 10 {
