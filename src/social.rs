@@ -543,14 +543,33 @@ pub async fn search(
             Ok(rows)
         })
         .await?;
-    let mut post_sql = base_post_query();
-    post_sql
-        .push_str(" AND p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?) LIMIT 40");
-    let query = query.to_owned();
-    let rows = pool
-        .call(move |conn| query_post_rows(conn, &post_sql, params![query]))
-        .await?;
+    let rows = if let Some(fts_query) = fts_query_from_user_input(query) {
+        let mut post_sql = base_post_query();
+        post_sql.push_str(
+            " AND p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?) LIMIT 40",
+        );
+        pool.call(move |conn| query_post_rows(conn, &post_sql, params![fts_query]))
+            .await?
+    } else {
+        Vec::new()
+    };
     Ok((users, rows_to_posts(pool, rows, viewer_id).await?))
+}
+
+fn fts_query_from_user_input(query: &str) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .flat_map(|word| {
+            word.trim_start_matches(['#', '@'])
+                .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        })
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
 }
 
 pub async fn notifications(
@@ -941,6 +960,15 @@ mod reply_tests {
             .expect("connect");
         crate::db::migrate(&pool).await.expect("migrate");
         (temp, pool, Settings::default())
+    }
+
+    #[test]
+    fn search_fts_query_uses_safe_terms() {
+        assert_eq!(
+            fts_query_from_user_input("#self-hosted @ada"),
+            Some("self hosted ada".to_owned())
+        );
+        assert_eq!(fts_query_from_user_input("#"), None);
     }
 
     #[tokio::test]

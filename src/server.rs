@@ -1383,9 +1383,16 @@ async fn admin_dashboard(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let body = r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/backups">Backups</a></section>"#;
+    let body = format!(
+        "{}{}",
+        render::page_header(
+            "Admin",
+            "Manage site health, users, media jobs, and backups."
+        ),
+        r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/backups">Backups</a></section>"#
+    );
     Ok(Html(
-        page_layout(&state, Some(&user), Some(&csrf), "Admin", body).await?,
+        page_layout(&state, Some(&user), Some(&csrf), "Admin", &body).await?,
     ))
 }
 
@@ -1409,6 +1416,11 @@ async fn admin_health(
         })
         .collect::<Vec<_>>()
         .join("");
+    let jobs = if jobs.is_empty() {
+        r#"<p class="muted">No media jobs yet.</p>"#.to_owned()
+    } else {
+        format!(r#"<ul class="item-list">{jobs}</ul>"#)
+    };
     let onion = state
         .tor
         .onion_address()
@@ -1419,7 +1431,7 @@ async fn admin_health(
         .bootstrap_status()
         .unwrap_or_else(|| "unavailable".to_owned());
     let body = format!(
-        r#"<section class="panel"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2><ul>{}</ul></section>"#,
+        r#"<section class="panel"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
         html_escape::encode_text(&state.paths.database_path.display().to_string()),
         html_escape::encode_text(&state.paths.uploads_originals.display().to_string()),
         html_escape::encode_text(&state.ffmpeg.summary()),
@@ -1466,7 +1478,7 @@ async fn admin_users(
         .collect::<Vec<_>>()
         .join("");
     let body = format!(
-        r#"<section class="panel"><table>{}</table></section>"#,
+        r#"<section class="panel"><h1>Users</h1><table><thead><tr><th>ID</th><th>Username</th><th>Admin</th><th>Suspended</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>"#,
         list
     );
     Ok(Html(
@@ -1528,10 +1540,15 @@ async fn admin_media(
         })
         .collect::<Vec<_>>()
         .join("");
-    let body = format!(
-        r#"<section class="panel"><table>{}</table></section>"#,
-        rows
-    );
+    let body = if rows.is_empty() {
+        r#"<section class="panel"><h1>Media jobs</h1><p class="muted">No media jobs yet.</p></section>"#
+            .to_owned()
+    } else {
+        format!(
+            r#"<section class="panel"><h1>Media jobs</h1><table><thead><tr><th>ID</th><th>Status</th><th>Summary</th></tr></thead><tbody>{}</tbody></table></section>"#,
+            rows
+        )
+    };
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Media jobs", &body).await?,
     ))
@@ -1544,7 +1561,7 @@ async fn admin_backups(
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let body = format!(
-        r#"<section class="panel"><form method="post"><input type="hidden" name="csrf" value="{}"><label><input type="checkbox" name="include_tor_keys" value="true"> Include Tor onion-service keys</label><button>Create backup</button></form></section>"#,
+        r#"<section class="panel"><h1>Backups</h1><form method="post"><input type="hidden" name="csrf" value="{}"><label><input type="checkbox" name="include_tor_keys" value="true"> Include Tor onion-service keys</label><button>Create backup</button></form></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf)
     );
     Ok(Html(
