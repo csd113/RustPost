@@ -18,6 +18,7 @@
 pub mod admin;
 pub mod auth;
 pub mod backup;
+pub mod cli;
 pub mod config;
 pub mod csrf;
 pub mod db;

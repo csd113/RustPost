@@ -1,103 +1,179 @@
-# RustPost
+<div align="center">
 
-RustPost is a single-binary, self-hosted microblogging app written in Rust. It is deliberately single-instance and not federated: one operator runs one SQLite-backed site with server-rendered HTML, local accounts, posts, replies, follows, likes, bookmarks, search, uploads, notifications, admin tools, and backup support.
+<br/>
 
-This repository is a production-oriented MVP. The code favors small auditable modules over framework magic, keeps security-sensitive behavior centralized, and avoids a frontend build chain.
+```
+██████╗ ██╗   ██╗███████╗████████╗██████╗  ██████╗ ███████╗████████╗
+██╔══██╗██║   ██║██╔════╝╚══██╔══╝██╔══██╗██╔═══██╗██╔════╝╚══██╔══╝
+██████╔╝██║   ██║███████╗   ██║   ██████╔╝██║   ██║███████╗   ██║   
+██╔══██╗██║   ██║╚════██║   ██║   ██╔═══╝ ██║   ██║╚════██║   ██║   
+██║  ██║╚██████╔╝███████║   ██║   ██║     ╚██████╔╝███████║   ██║   
+╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝   ╚═╝      ╚═════╝ ╚══════╝   ╚═╝   
+```
 
-Repository: <https://github.com/csd113/RustPost>
+**A single-binary, self-hosted microblog — yours alone, with no cloud required.**
 
-## Features
+[![CI](https://img.shields.io/github/actions/workflow/status/csd113/RustPost/ci.yml?branch=main&style=flat-square&label=CI&logo=github)](https://github.com/csd113/RustPost/actions)
+[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![SQLite](https://img.shields.io/badge/database-SQLite-blue?style=flat-square&logo=sqlite)](https://www.sqlite.org/)
+[![Tor Ready](https://img.shields.io/badge/Tor-Arti%200.42.0-7D4698?style=flat-square&logo=torproject)](https://www.torproject.org/)
+[![License](https://img.shields.io/badge/license-see%20LICENSE-green?style=flat-square)](./LICENSE)
 
-- Local accounts with Argon2id password hashing and server-side sessions.
-- Registration, login, logout, profile text/media settings, admin creation/reset commands.
-- 280 Unicode-character posts, replies, local timeline, home timeline, profile timelines, and threads.
-- Reposts as first-class timeline events, follows, blocks, mutes, likes, private bookmarks, in-app notifications, and search.
-- Anonymous posting mode exists but is disabled by default.
-- SQLite-backed rate limiting for posts, replies, reposts, failed login attempts, registrations, and anonymous posts.
-- Multipart media uploads with content sniffing, generated filenames, size limits, and fixed upload roots.
-- Image conversion to WebP and video conversion to WebM VP9 when `ffmpeg` is available.
-- Safe upload fallback to original allowed formats when conversion is unavailable or fails.
-- SQLite with WAL, foreign keys, migrations, FTS5 post search, and timeline indexes.
-- Admin pages for site health, users, media jobs, and backups.
-- Tar backup creation including DB, settings, media, and optional Tor onion-service keys.
-- Restore path validation that rejects traversal and requires explicit opt-in for Tor keys.
-- Tor/Arti configuration boundary and admin health reporting.
+[**Getting Started**](#-getting-started) · [**Configuration**](#-configuration) · [**CLI Reference**](#-cli-reference) · [**Security**](#-security-model) · [**Tor / Arti**](#-tor--arti)
 
-## Build And Run
+</div>
 
-RustPost requires Rust 1.90 or newer.
+---
+
+## Overview
+
+RustPost is a **single-binary, self-hosted microblogging platform** written in Rust. It is deliberately single-instance and non-federated: one operator runs one SQLite-backed site with full social features, served as plain server-rendered HTML with no frontend build chain.
+
+> **Design philosophy:** Small, auditable modules over framework magic. Security-sensitive behavior centralized. No JavaScript bundler. No cloud dependency. No federation surface.
+
+This repository is a **production-oriented MVP** — not a toy, but not overengineered. The goal is a system you can read end to end, deploy in minutes, and trust.
+
+---
+
+## ✨ Features
+
+### Accounts & Identity
+| Feature | Details |
+|---|---|
+| Password hashing | Argon2id — never stored in plaintext |
+| Sessions | Server-side, HttpOnly, SameSite=Lax cookies |
+| Profile customization | Bio, avatar, and banner with WebP conversion |
+| Admin CLI | Create admins and reset passwords from the command line |
+
+### Social Features
+| Feature | Details |
+|---|---|
+| Posts | Up to 280 Unicode characters |
+| Replies & Threads | Threaded conversations with full timeline rendering |
+| Reposts | First-class timeline events; deleted originals render gracefully |
+| Follows, Blocks & Mutes | Standard social graph primitives |
+| Likes & Bookmarks | Likes are public; bookmarks are private |
+| Notifications | In-app notification feed |
+| Search | Full-text search via SQLite FTS5 + user matching |
+| Anonymous posting | Supported but **disabled by default** |
+
+### Media Pipeline
+| Feature | Details |
+|---|---|
+| Upload handling | Multipart with content sniffing and size limits |
+| Image conversion | JPEG / PNG / GIF / WebP → WebP (requires `ffmpeg`) |
+| Video conversion | MP4 / WebM / QuickTime → WebM VP9 (requires `ffmpeg`) |
+| Fallback | Serves original format safely when conversion is unavailable |
+| Timeouts | 120 s for images · 300 s for video |
+
+### Operations
+| Feature | Details |
+|---|---|
+| Database | SQLite with WAL, foreign keys, migrations, FTS5, and timeline indexes |
+| Rate limiting | SQLite-backed per-user and per-IP limits for all write operations |
+| Backups | Tar archive of DB + settings + media + optional Tor keys |
+| Restore | Path validation rejects traversal, symlinks, absolute paths, and Unicode bypass attempts |
+| Admin dashboard | Site health, users, media jobs, conversion state, and backup management |
+| Tor / Arti | Embedded onion-service startup — clearnet-only, Tor-only, or dual mode |
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+- **Rust 1.90+** — install via [rustup](https://rustup.rs/)
+- **ffmpeg** *(optional)* — enables image and video conversion. RustPost boots and runs without it.
+
+### Build
 
 ```sh
 cargo build --release
-./target/release/rustpost-cli
 ```
 
-On first run RustPost creates `rustpost-data` next to the executable:
+This produces two binaries in `target/release/`:
 
-```text
-rustpost-data/settings.toml
-rustpost-data/app.sqlite3
-rustpost-data/uploads/originals/
-rustpost-data/uploads/images/
-rustpost-data/uploads/videos/
-rustpost-data/uploads/thumbs/
-rustpost-data/backups/
-rustpost-data/logs/
-rustpost-data/tor/
-rustpost-data/tor/onion-service/
-```
+| Binary | Purpose |
+|---|---|
+| `rustpost` | Primary server + CLI |
+| `rustpost-cli` | Identical CLI surface — useful for running admin commands while the server is managed separately |
 
-Important paths are derived from the executable location unless `--data-dir` or `--config` is provided. The app does not rely on the current working directory for runtime data.
-
-## CLI
-
-The same command surface is built as `rustpost` and `rustpost-cli`.
+### First Run
 
 ```sh
-rustpost init
-rustpost check
-rustpost create-admin <username> <password>
-rustpost reset-admin-password <username> <password>
-rustpost backup
-rustpost backup --include-tor-keys
-rustpost restore <archive.tar>
-rustpost restore <archive.tar> --include-tor-keys
-rustpost print-onion-address
-rustpost serve
+# Linux / macOS
+./target/release/rustpost --data-dir ./rustpost-data serve
+
+# Windows (PowerShell)
+.\target\release\rustpost.exe --data-dir .\rustpost-data serve
 ```
 
-If no subcommand is provided, `serve` is used.
+> If no subcommand is provided, `serve` is assumed.
 
-## Configuration
+On first boot, RustPost initializes the data directory automatically:
 
-`rustpost-data/settings.toml` is generated with conservative defaults. Clearnet is enabled by default on `127.0.0.1:8080`; Tor is available in config but disabled by default.
+```
+rustpost-data/
+├── settings.toml          ← generated config with safe defaults
+├── app.sqlite3            ← main database
+├── uploads/
+│   ├── originals/
+│   ├── images/
+│   ├── videos/
+│   └── thumbs/
+├── backups/
+├── logs/
+└── tor/
+    └── onion-service/
+```
 
-Clearnet only:
+> **Note:** All runtime paths are derived from `--data-dir` (or the executable location as fallback). RustPost does not rely on the current working directory.
+
+### Create Your First Admin
+
+```sh
+./target/release/rustpost --data-dir ./rustpost-data create-admin alice s3cr3tpassword
+```
+
+Then open [http://127.0.0.1:8080](http://127.0.0.1:8080) and log in.
+
+---
+
+## 🖥 CLI Reference
+
+```sh
+rustpost init                                       # Initialize data directory
+rustpost check                                      # Validate config and data directory
+rustpost create-admin <username> <password>         # Create an admin account
+rustpost reset-admin-password <username> <password> # Reset an admin's password
+rustpost serve                                      # Start the HTTP server (default)
+rustpost backup                                     # Create a backup archive
+rustpost backup --include-tor-keys                  # Backup including Tor private keys
+rustpost restore <archive.tar>                      # Restore from a backup
+rustpost restore <archive.tar> --include-tor-keys   # Restore including Tor keys
+rustpost print-onion-address                        # Print the current .onion hostname
+```
+
+---
+
+## ⚙ Configuration
+
+`settings.toml` is generated on first run with conservative, safe defaults. Edit it to match your deployment.
+
+### Clearnet only (default)
 
 ```toml
 [server]
 host = "127.0.0.1"
 port = 8080
-cookie_secure = false
+cookie_secure = false   # set true when running behind HTTPS
 
 [tor]
 enabled = false
 tor_only = false
 ```
 
-Tor only intent:
-
-```toml
-[tor]
-enabled = true
-tor_only = true
-data_dir = "tor"
-onion_service_name = "microblog"
-bootstrap_timeout_secs = 120
-max_concurrent_streams = 512
-```
-
-Dual mode intent:
+### Tor only
 
 ```toml
 [server]
@@ -106,161 +182,259 @@ port = 8080
 
 [tor]
 enabled = true
-tor_only = false
+tor_only = true                        # binds only the loopback Arti forwarder
 data_dir = "tor"
 onion_service_name = "microblog"
 bootstrap_timeout_secs = 120
 max_concurrent_streams = 512
 ```
 
-Rate limits are configured under `[moderation]`:
+### Dual mode (clearnet + onion simultaneously)
 
 ```toml
-posts_per_minute = 5
-replies_per_minute = 10
-reposts_per_minute = 10
-account_creations_per_ip_per_day = 3
-failed_login_attempts_per_15m = 10
-anonymous_posts_per_ip_per_hour = 10
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[tor]
+enabled = true
+tor_only = false                       # clearnet starts immediately; onion boots in background
+data_dir = "tor"
+onion_service_name = "microblog"
+bootstrap_timeout_secs = 120
+max_concurrent_streams = 512
 ```
 
-Authenticated post/reply/repost limits are keyed by user id. Registration, failed login, and anonymous post limits are keyed by the direct peer IP address observed by Axum. Forwarded headers are not trusted implicitly.
+### Rate limiting
 
-Profile pictures and banners are managed from `/settings`. Profile media must be an allowed image upload, is processed through the same safe media pipeline as post uploads, and is converted to WebP when `ffmpeg` and WebP support are available. Replacing or deleting profile media removes the previously served media file and database row. If `media.keep_original_uploads = true`, retained conversion originals are intentionally preserved according to the global media retention setting.
+All limits are configured under `[moderation]`:
 
-Reposts appear as timeline events with the reposter shown above the original post. Duplicate reposts by the same user are idempotent and do not create duplicate notifications. If the original post is deleted, the repost renders as an unavailable-post event instead of breaking the timeline.
-
-## FFmpeg
-
-RustPost boots without `ffmpeg`. Admin health shows whether `ffmpeg` is available and whether WebP / VP9 encoders are detected.
-
-When available:
-
-- JPEG, PNG, GIF, and WebP images are converted to WebP where configured.
-- MP4, WebM, and QuickTime videos are converted to WebM VP9 where configured.
-- VP9 conversion uses `yuv420p` and explicit BT.709 color metadata to avoid common browser playback and encoder failures.
-- Image conversions are bounded by a 120 second timeout; video conversions are bounded by a 300 second timeout.
-- Recent conversion successes/fallbacks and stderr summaries are available from admin media/health pages.
-
-If conversion fails or `ffmpeg` is missing, RustPost serves the original upload only when the original content type is allowed.
-
-## Tor / Arti
-
-RustPost includes embedded Arti onion-service startup in the single binary. `tor.enabled = false` remains the default and starts no Arti tasks. With `tor.enabled = true` and `tor_only = false`, RustPost starts normal clearnet service and attempts an Arti onion service; if Tor startup fails, clearnet remains available and admin health reports the Tor error. With `tor.enabled = true` and `tor_only = true`, RustPost binds only a loopback listener for internal Arti forwarding and fails startup if Arti/onion startup fails.
-
-Arti version note: the Tor Project released Arti 2.3.0 on 2026-05-07. The corresponding library crate family used here is 0.42.0. Direct Arti/Tor dependencies are:
-
-- `arti-client = 0.42.0`: bootstraps the embedded Tor client and launches the onion service.
-- `tor-hsservice = 0.42.0`: onion-service config, running service handle, and rendezvous stream handling.
-- `tor-proto = 0.42.0` and `tor-cell = 0.42.0`: inspect and accept incoming onion stream requests.
-- `tor-rtcompat = 0.42.0`: names the Tokio-compatible Arti runtime kept alive by RustPost.
-- `rustls = 0.23`: installs the ring crypto provider required by Arti's rustls stack before live Tor bootstrap.
-
-RustPost uses `rusqlite` for SQLite access. The app is SQLite-only, and rusqlite keeps the database dependency stable while avoiding the `sqlx 0.9` alpha that was previously needed for `libsqlite3-sys` compatibility. This also aligns the app with the Arti/rusqlite/libsqlite3-sys dependency family. `cargo tree -i libsqlite3-sys` should show only one `libsqlite3-sys` version.
-
-Arti state, directory cache, and onion-service keys live under the configured runtime data directory. With the default config this is:
-
-```text
-rustpost-data/tor/cache/
-rustpost-data/tor/onion-service/state/
+```toml
+[moderation]
+posts_per_minute                    = 5
+replies_per_minute                  = 10
+reposts_per_minute                  = 10
+account_creations_per_ip_per_day    = 3
+failed_login_attempts_per_15m       = 10
+anonymous_posts_per_ip_per_hour     = 10
 ```
 
-On Unix, RustPost sets the Tor directories it creates to `0700`. Tor private keys are not stored in SQLite, not logged by RustPost, and not rendered in normal UI/admin health. Admin health shows Tor enabled/running state, bootstrap status when available, the onion hostname only after Arti reports it, and the last clear startup/forwarding error if one exists.
+> Authenticated limits are keyed by user ID. Registration, failed login, and anonymous limits are keyed by direct peer IP. Forwarded headers are **not trusted by default**.
 
-Normal backups exclude Tor onion-service keys. `rustpost-cli backup --include-tor-keys` includes them explicitly. Restore rejects Tor key archive paths unless `--include-tor-keys` is also passed, and restore path validation rejects traversal, absolute paths, links, Windows prefixes, encoded traversal/slash forms, and slash-like Unicode bypasses.
+---
 
-Limitations: normal tests do not require live Tor network access. A real onion hostname requires successful Arti bootstrap and descriptor publication, which depends on network access and can take time. If bootstrap times out, increase `tor.bootstrap_timeout_secs` or check local network/Tor reachability. Onion forwarding accepts conventional HTTP onion streams on virtual port 80 and forwards them to the internal RustPost loopback listener.
+## 🔒 Security Model
 
-## Release Verification
+| Control | Implementation |
+|---|---|
+| Passwords | Argon2id — never stored in plaintext |
+| Session cookies | HttpOnly · SameSite=Lax · `Secure` controlled by config |
+| CSRF | All state-changing authenticated routes require a CSRF token |
+| Output escaping | User content is HTML-escaped before rendering |
+| Upload safety | Filenames ignored; content sniffed; stored under fixed upload roots |
+| SVG | Not an allowed default upload type |
+| Admin routes | Require an admin session **and** CSRF protection |
+| Trusted proxies | Explicit config; forwarded headers are not blindly trusted |
+| Tor key material | Not stored in SQLite, not logged, not rendered in UI or admin health |
 
-Last local release-readiness sweep: May 18, 2026.
+---
 
-Verified locally:
+## 🧅 Tor / Arti
+
+RustPost embeds [Arti](https://gitlab.torproject.org/tpo/core/arti) (the Rust Tor implementation) directly in the binary. No external `tor` daemon required.
+
+**Behavior by config:**
+
+| `tor.enabled` | `tor_only` | Behavior |
+|---|---|---|
+| `false` | — | No Arti tasks started. Pure clearnet. |
+| `true` | `false` | Clearnet binds immediately. Arti onion service starts in background. If Tor fails, clearnet keeps running and admin health reports the error. |
+| `true` | `true` | Only a loopback listener is bound for Arti forwarding. Startup **fails** if Arti/onion startup fails. |
+
+**Arti crate versions (Arti 2.3.0 / 2026-05-07):**
+
+```
+arti-client      = 0.42.0   # bootstraps the embedded Tor client and onion service
+tor-hsservice    = 0.42.0   # onion-service config, handle, and rendezvous streams
+tor-proto        = 0.42.0   # inspect and accept incoming onion stream requests
+tor-cell         = 0.42.0   # cell-level protocol handling
+tor-rtcompat     = 0.42.0   # Tokio-compatible Arti runtime
+rustls           = 0.23     # ring crypto provider required by Arti's rustls stack
+```
+
+> **Dependency note:** `cargo tree -i libsqlite3-sys` should show exactly one version. RustPost uses `rusqlite` rather than `sqlx 0.9` (alpha) specifically to keep the `libsqlite3-sys` dependency unified with the Arti family.
+
+**Tor data layout:**
+
+```
+rustpost-data/tor/
+├── cache/                     ← Arti directory cache
+└── onion-service/
+    └── state/                 ← onion-service private keys (mode 0700 on Unix)
+```
+
+**Backups and Tor keys:**
+
+```sh
+rustpost backup                          # excludes Tor keys (safe default)
+rustpost backup --include-tor-keys       # opt-in to include keys
+rustpost restore archive.tar             # rejects Tor key paths unless flag given
+rustpost restore archive.tar --include-tor-keys
+```
+
+Restore path validation rejects: absolute paths, traversal sequences, symlinks/hardlinks, Windows drive prefixes, backslash paths, encoded traversal or slash markers, and slash-like Unicode bypass characters.
+
+---
+
+## 🎬 Media & FFmpeg
+
+RustPost **boots and runs without `ffmpeg`**. Conversion is optional and detected at runtime. Admin health reports whether `ffmpeg` is present and whether WebP/VP9 encoders are available.
+
+**When `ffmpeg` is detected:**
+
+- Images (JPEG, PNG, GIF, WebP) → converted to **WebP**
+- Videos (MP4, WebM, QuickTime) → converted to **WebM VP9** with `yuv420p` and explicit BT.709 color metadata to avoid browser playback issues
+- Image conversions: **120 s timeout**
+- Video conversions: **300 s timeout**
+- Conversion status (successes, fallbacks, stderr summaries) visible in admin media/health pages
+
+**When `ffmpeg` is absent or conversion fails:** RustPost serves the original upload, provided it is an allowed content type.
+
+Profile pictures and banners follow the same media pipeline as post uploads.
+
+---
+
+## 💾 Backup & Restore
+
+```sh
+# Create a backup (DB + settings + media)
+rustpost-cli backup
+
+# Include Tor onion-service keys
+rustpost-cli backup --include-tor-keys
+
+# Restore into a fresh data directory
+rustpost-cli restore rustpost-backup-2026-05-18T....tar
+
+# Restore including Tor keys
+rustpost-cli restore rustpost-backup-2026-05-18T....tar --include-tor-keys
+```
+
+> Archive names include subsecond precision to avoid same-second collisions.
+
+---
+
+## 🧪 Development
+
+```sh
+cargo update                                                           # update dependencies
+cargo fmt --all --check                                                # check formatting
+cargo clippy --workspace --all-targets --all-features -- -D warnings  # lint
+cargo test --workspace --all-features                                  # run tests
+```
+
+**CI matrix** (GitHub Actions, Rust 1.90):
+
+| Platform | Arch |
+|---|---|
+| Linux | x86\_64 |
+| Linux | ARM64 |
+| macOS | Apple Silicon |
+| Windows | x86\_64 |
+
+CI runs: format check → Clippy → tests → release build. A separate strict Clippy job runs `clippy::all`, `clippy::pedantic`, `clippy::nursery`, and `clippy::cargo`.
+
+### Release Artifacts
+
+Tagged releases matching `v*` produce:
+
+```
+rustpost-linux-x86_64.tar.gz
+rustpost-linux-aarch64.tar.gz
+rustpost-macos-aarch64.tar.gz
+rustpost-windows-x86_64.zip
+```
+
+Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and optional notice files. A `.sha256` checksum is generated for each archive. Runtime data (databases, uploads, backups, logs, Tor keys) is never included.
+
+---
+
+## 📦 Dependencies
+
+| Crate | Role |
+|---|---|
+| `axum` | HTTP routing and multipart handling |
+| `tokio` | Async runtime, filesystem, process, and signals |
+| `rusqlite` | SQLite access via a dedicated DB worker; WAL, FK, migrations |
+| `argon2` | Argon2id password hashing |
+| `rand_core` + `uuid` | Secure salts and opaque generated tokens/filenames |
+| `infer` | Content-based media type detection |
+| `tower-http` | Static upload serving and HTTP tracing |
+| `clap` | CLI argument parsing |
+| `toml` + `serde` | Config load/save |
+| `tar` + `walkdir` | Backup and restore archive handling |
+| `arti-client` | Bootstraps the embedded Tor client and onion service |
+| `tor-hsservice` | Onion-service config, running handle, and rendezvous streams |
+| `tor-proto` + `tor-cell` | Inspect and accept incoming onion stream requests |
+| `tor-rtcompat` | Tokio-compatible Arti runtime |
+| `rustls` | Ring crypto provider for Arti's rustls stack |
+| `tracing` | Privacy-conscious operational logging |
+
+---
+
+## ✅ Release Verification
+
+*Last sweep: **May 18, 2026***
+
+<details>
+<summary>Verified locally</summary>
 
 - Fresh `--data-dir` boot creates `settings.toml`, `app.sqlite3`, upload roots, backup/log dirs, and Tor state dirs.
 - `rustpost-cli check` passes on a fresh data directory with `tor.enabled = false`.
 - Clearnet serving on `127.0.0.1:8080` loads `/local`.
-- Registration, login, authenticated post creation, replies, repost rendering, likes, bookmarks, follows, notifications, admin health, and CSRF-protected logout work through live HTTP requests.
-- Anonymous posting remains disabled by default: anonymous users do not see the composer and anonymous post attempts are rejected.
-- Non-admin users cannot load admin health, and anonymous users cannot load authenticated pages.
-- `ffmpeg` 8.1.1 was detected locally with WebP and VP9 support. Image uploads, profile picture/banner uploads, and small video uploads were live-tested through the upload pipeline; WebP and WebM outputs were produced, and admin media/health pages reported conversion state.
-- Normal backups include the DB, settings, and media. Normal backups exclude Tor onion-service keys; `--include-tor-keys` includes them only when explicitly requested. Restore into a fresh data directory completed and `check` passed.
-- Backup archive names include subsecond precision to avoid same-second overwrite collisions.
-- `tor.enabled = true, tor_only = false` was live-tested with a 20 second bootstrap timeout. When bootstrap timed out, clearnet stayed available and admin health reported Tor enabled, not running, and the timeout error.
-- `tor.enabled = true, tor_only = true` was live-tested. RustPost did not expose the configured public clearnet listener, bound only a loopback internal listener, produced a real public `.onion` hostname, and returned `/local` successfully through the Tor Browser bundled Tor SOCKS client.
+- Registration, login, post creation, replies, repost rendering, likes, bookmarks, follows, notifications, admin health, and CSRF-protected logout all work through live HTTP requests.
+- Anonymous posting is disabled by default — anonymous users cannot see the composer and anonymous post attempts are rejected.
+- Non-admin users cannot access admin health; anonymous users cannot access authenticated pages.
+- `ffmpeg` 8.1.1 detected with WebP and VP9 support. Image, profile picture/banner, and small video uploads live-tested; WebP and WebM outputs produced; admin media/health pages reported conversion state correctly.
+- Normal backups include DB, settings, and media; exclude Tor keys. `--include-tor-keys` includes them only when explicitly requested. Restore into a fresh data directory completed and `check` passed.
+- Backup archive names include subsecond precision — no same-second overwrite collisions.
+- `tor_only = false` live-tested: clearnet bound quickly, Arti produced a real `.onion` hostname, Tor Browser reached `/local` through the onion.
+- `tor_only = true` live-tested: no clearnet listener exposed, loopback-only binding confirmed, real `.onion` hostname produced and reached via Tor Browser.
+- Both `rustpost` and `rustpost-cli` pass `check` on a fresh data directory.
 
-Partially verified or environment-dependent:
+</details>
 
-- Dual-mode onion reachability was not completed in the timed run because Arti bootstrap timed out before descriptor publication; dual-mode clearnet fallback and error reporting were verified.
-- Onion reachability was verified in tor-only mode with a local Tor client. Future release checks should repeat this on a non-temporary service identity if a stable onion address is required.
-- Tor private key material was not rendered in admin health or normal logs during the sweep. Normal operational text may mention key paths or the explicit `--include-tor-keys` option, but should not print private key contents.
+<details>
+<summary>Partially verified / environment-dependent</summary>
 
-## Security Model
+- Live Tor reachability depends on Tor network access and descriptor publication time. The May 2026 sweep succeeded with a temporary onion identity; future release checks should repeat with a non-temporary identity if a stable onion address is required.
+- Tor private key material was not rendered in admin health or normal logs during the sweep. Operational text may reference key paths or the `--include-tor-keys` flag but does not print key contents.
 
-- Passwords are never stored in plaintext.
-- Session cookies are HttpOnly and SameSite=Lax; `Secure` is controlled by config.
-- State-changing authenticated routes require CSRF tokens.
-- User content is HTML escaped before rendering.
-- Upload filenames are ignored for storage and checked for traversal tricks.
-- Uploaded content is sniffed and stored under fixed upload roots.
-- SVG is not an allowed default upload type.
-- Admin routes require an admin account and CSRF protection.
-- Trusted proxy CIDRs are explicit config; forwarded headers are not blindly trusted.
+</details>
 
-## Backup And Restore
+---
 
-Create a normal backup:
+## ⚠ Known Limitations
 
-```sh
-rustpost-cli backup
-```
+- **Tor verification requires network access** — may time out in restricted build or CI environments.
+- **Onion virtual port** — HTTP virtual port 80 is mapped to the RustPost listener; custom onion virtual ports are not yet configurable.
+- **Synchronous media conversion** — conversion happens inline during upload; no background queue.
+- **Reports and admin toggles** — present in schema and admin structure but functionality is minimal in the current MVP.
+- **Search** — uses SQLite FTS5 with simple user matching and fixed result limits; no ranking tuning yet.
+- **Screenshots** — not yet checked in. First captures planned: local timeline, thread view, profile page, settings page, and admin health dashboard.
 
-Include Tor onion-service keys only with explicit opt-in:
+---
 
-```sh
-rustpost-cli backup --include-tor-keys
-```
+## 📄 License
 
-Restore validates every archive path, rejects absolute paths and traversal, and rejects Tor key paths unless `--include-tor-keys` is provided.
+See [LICENSE](./LICENSE) for terms.
 
-Restore also rejects symlink/hardlink archive entries, Windows drive/prefix syntax, backslash paths, encoded traversal markers, encoded slash markers, and slash-like Unicode bypass characters.
+---
 
-## Development
+<div align="center">
 
-```sh
-cargo update
-cargo tree
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-```
+Built with Rust 🦀 · Powered by SQLite · Optional Tor via Arti
 
-## Major Dependencies
+[github.com/csd113/RustPost](https://github.com/csd113/RustPost)
 
-- `axum`: HTTP routing and multipart handling.
-- `tokio`: async runtime, filesystem, process handling, and signals.
-- `rusqlite`: SQLite access through a dedicated DB worker, WAL/foreign-key setup, and migrations.
-- `argon2`: Argon2id password hashing.
-- `rand_core` and `uuid`: secure salts and generated opaque tokens/names.
-- `infer`: content-based media detection.
-- `tower-http`: static upload serving and HTTP tracing.
-- `clap`: CLI parsing.
-- `toml` and `serde`: config load/save.
-- `tar` and `walkdir`: backup and restore archive handling.
-- `arti-client`, `tor-hsservice`, `tor-proto`, `tor-cell`, and `tor-rtcompat`: embedded Arti onion-service startup and local stream forwarding.
-- `rustls`: explicit ring crypto provider installation for Arti/rustls startup.
-- `tracing`: privacy-conscious operational logging.
-
-Cargo selected compatible versions for Rust 1.90. The Arti crate family is pinned to 0.42.0 for the Arti 2.3.0 mapping.
-
-## Screenshots
-
-Screenshots are not checked in yet. The first screens to capture are the local timeline, thread view, profile page, settings page, and admin health dashboard.
-
-## Known Limitations
-
-- Live Tor verification requires network access and may time out in restricted build environments. The May 2026 local sweep produced and reached a real onion in tor-only mode; dual mode fell back cleanly after a configured bootstrap timeout.
-- Onion service support maps HTTP virtual port 80 to the RustPost app; custom onion virtual ports are not configurable yet.
-- Media conversion is synchronous during upload.
-- Reports and admin settings toggles are represented in schema/admin structure but are minimal.
-- Search uses SQLite FTS5 and simple user matching with fixed result limits.
+</div>

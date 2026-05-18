@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -20,7 +21,7 @@ use crate::runtime::RuntimePaths;
 #[derive(Clone)]
 pub struct TorStatus {
     inner: Arc<RwLock<TorStatusSnapshot>>,
-    runtime: Option<Arc<TorRuntime>>,
+    runtime: Arc<RwLock<Option<Arc<TorRuntime>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +51,7 @@ impl fmt::Debug for TorStatus {
         formatter
             .debug_struct("TorStatus")
             .field("inner", &self.snapshot())
-            .field("runtime", &self.runtime.as_ref().map(|_| "running"))
+            .field("runtime", &self.runtime_is_running())
             .finish()
     }
 }
@@ -109,6 +110,18 @@ impl TorStatus {
         })
     }
 
+    #[must_use]
+    pub fn starting() -> Self {
+        Self::new(TorStatusSnapshot {
+            enabled: true,
+            running: false,
+            onion_address: None,
+            state: "starting".to_owned(),
+            bootstrap_status: None,
+            error: None,
+        })
+    }
+
     fn startup_error(message: String, bootstrap_status: Option<String>) -> Self {
         Self::new(TorStatusSnapshot {
             enabled: true,
@@ -123,7 +136,16 @@ impl TorStatus {
     fn new(snapshot: TorStatusSnapshot) -> Self {
         Self {
             inner: Arc::new(RwLock::new(snapshot)),
-            runtime: None,
+            runtime: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub(crate) fn replace_with(&self, other: &Self) {
+        if let (Ok(mut snapshot), Ok(other_snapshot)) = (self.inner.write(), other.inner.read()) {
+            *snapshot = other_snapshot.clone();
+        }
+        if let (Ok(mut runtime), Ok(other_runtime)) = (self.runtime.write(), other.runtime.read()) {
+            runtime.clone_from(&other_runtime);
         }
     }
 
@@ -137,6 +159,12 @@ impl TorStatus {
         self.inner
             .read()
             .map_or_else(|_| TorStatusSnapshot::poisoned(), |guard| guard.clone())
+    }
+
+    fn runtime_is_running(&self) -> bool {
+        self.runtime
+            .read()
+            .is_ok_and(|runtime| runtime.as_ref().is_some())
     }
 }
 
@@ -256,9 +284,10 @@ async fn start_inner(
         bootstrap_status,
         error: None,
     }));
+    let runtime_slot = Arc::new(RwLock::new(None));
     let status = TorStatus {
         inner: Arc::clone(&inner),
-        runtime: None,
+        runtime: Arc::clone(&runtime_slot),
     };
     let task_status = status;
     let mut stream_requests = tor_hsservice::handle_rend_requests(rend_requests);
@@ -279,13 +308,16 @@ async fn start_inner(
         _service: service,
         stream_task,
     });
+    if let Ok(mut slot) = runtime_slot.write() {
+        *slot = Some(runtime);
+    }
     info!(
         onion = onion_address.as_deref().unwrap_or("unavailable"),
         "Arti onion service running"
     );
     Ok(TorStatus {
         inner,
-        runtime: Some(runtime),
+        runtime: runtime_slot,
     })
 }
 
@@ -314,14 +346,26 @@ async fn forward_stream_request(
         .accept(Connected::new_empty())
         .await
         .context("accept onion stream")?;
-    tokio::io::copy_bidirectional(&mut onion, &mut local)
-        .await
-        .context("proxy onion stream to local RustPost listener")?;
+    match tokio::io::copy_bidirectional(&mut onion, &mut local).await {
+        Ok(_) => {}
+        Err(error) if is_clean_stream_close(&error) => {}
+        Err(error) => return Err(error).context("proxy onion stream to local RustPost listener"),
+    }
     Ok(())
 }
 
 fn is_supported_http_begin(request: &IncomingStreamRequest) -> bool {
     matches!(request, IncomingStreamRequest::Begin(begin) if begin.port() == 80)
+}
+
+fn is_clean_stream_close(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 fn create_private_dir(path: &Path) -> anyhow::Result<()> {
@@ -428,5 +472,18 @@ mod tests {
         assert!(!rendered.contains("keystore"));
         assert!(!rendered.contains("private"));
         assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn common_http_stream_close_errors_are_clean() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let error = io::Error::from(kind);
+            assert!(is_clean_stream_close(&error));
+        }
     }
 }
