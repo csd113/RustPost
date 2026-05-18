@@ -2,14 +2,29 @@ use crate::auth::CurrentUser;
 use crate::social::{MediaView, PostView, TimelineEventKind};
 
 pub fn layout(user: Option<&CurrentUser>, title: &str, body: &str) -> String {
+    layout_with_csrf(user, None, title, body)
+}
+
+pub fn layout_with_csrf(
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    title: &str,
+    body: &str,
+) -> String {
     let auth_nav = if let Some(user) = user {
         let admin = if user.is_admin {
             r#"<a href="/admin">Admin</a>"#
         } else {
             ""
         };
+        let logout = csrf.map_or_else(String::new, |token| {
+            format!(
+                r#"<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button>Log out</button></form>"#,
+                html_escape::encode_double_quoted_attribute(token)
+            )
+        });
         format!(
-            r#"<a href="/home">Home</a><a href="/local">Local</a><a href="/notifications">Notifications</a><a href="/bookmarks">Bookmarks</a><a href="/settings">Settings</a>{admin}<form method="post" action="/logout"><button>Log out</button></form>"#
+            r#"<a href="/home">Home</a><a href="/local">Local</a><a href="/notifications">Notifications</a><a href="/bookmarks">Bookmarks</a><a href="/settings">Settings</a>{admin}{logout}"#
         )
     } else {
         r#"<a href="/local">Local</a><a href="/login">Log in</a><a href="/register">Register</a>"#

@@ -11,7 +11,7 @@ pub fn create_backup(paths: &RuntimePaths, include_tor_keys: bool) -> anyhow::Re
     fs::create_dir_all(&paths.backups_dir)?;
     let archive_path = paths.backups_dir.join(format!(
         "rustpost-{}.tar",
-        Utc::now().format("%Y%m%d%H%M%S")
+        Utc::now().format("%Y%m%d%H%M%S%f")
     ));
     let file = File::create(&archive_path)?;
     let mut builder = Builder::new(file);

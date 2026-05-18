@@ -171,6 +171,7 @@ pub async fn start(
     if !settings.enabled {
         return Ok(TorStatus::disabled());
     }
+    ensure_rustls_crypto_provider();
     let Some(onion_target) = onion_target else {
         return tor_startup_error(
             settings,
@@ -327,6 +328,10 @@ fn create_private_dir(path: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(path)?;
     restrict_dir(path)?;
     Ok(())
+}
+
+fn ensure_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 #[cfg(unix)]

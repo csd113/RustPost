@@ -51,17 +51,19 @@ Important paths are derived from the executable location unless `--data-dir` or 
 
 ## CLI
 
+The same command surface is built as `rustpost` and `rustpost-cli`.
+
 ```sh
-rustpost-cli init
-rustpost-cli check
-rustpost-cli create-admin <username> <password>
-rustpost-cli reset-admin-password <username> <password>
-rustpost-cli backup
-rustpost-cli backup --include-tor-keys
-rustpost-cli restore <archive.tar>
-rustpost-cli restore <archive.tar> --include-tor-keys
-rustpost-cli print-onion-address
-rustpost-cli serve
+rustpost init
+rustpost check
+rustpost create-admin <username> <password>
+rustpost reset-admin-password <username> <password>
+rustpost backup
+rustpost backup --include-tor-keys
+rustpost restore <archive.tar>
+rustpost restore <archive.tar> --include-tor-keys
+rustpost print-onion-address
+rustpost serve
 ```
 
 If no subcommand is provided, `serve` is used.
@@ -152,6 +154,7 @@ Arti version note: the Tor Project released Arti 2.3.0 on 2026-05-07. The corres
 - `tor-hsservice = 0.42.0`: onion-service config, running service handle, and rendezvous stream handling.
 - `tor-proto = 0.42.0` and `tor-cell = 0.42.0`: inspect and accept incoming onion stream requests.
 - `tor-rtcompat = 0.42.0`: names the Tokio-compatible Arti runtime kept alive by RustPost.
+- `rustls = 0.23`: installs the ring crypto provider required by Arti's rustls stack before live Tor bootstrap.
 
 RustPost uses `rusqlite` for SQLite access. The app is SQLite-only, and rusqlite keeps the database dependency stable while avoiding the `sqlx 0.9` alpha that was previously needed for `libsqlite3-sys` compatibility. This also aligns the app with the Arti/rusqlite/libsqlite3-sys dependency family. `cargo tree -i libsqlite3-sys` should show only one `libsqlite3-sys` version.
 
@@ -167,6 +170,30 @@ On Unix, RustPost sets the Tor directories it creates to `0700`. Tor private key
 Normal backups exclude Tor onion-service keys. `rustpost-cli backup --include-tor-keys` includes them explicitly. Restore rejects Tor key archive paths unless `--include-tor-keys` is also passed, and restore path validation rejects traversal, absolute paths, links, Windows prefixes, encoded traversal/slash forms, and slash-like Unicode bypasses.
 
 Limitations: normal tests do not require live Tor network access. A real onion hostname requires successful Arti bootstrap and descriptor publication, which depends on network access and can take time. If bootstrap times out, increase `tor.bootstrap_timeout_secs` or check local network/Tor reachability. Onion forwarding accepts conventional HTTP onion streams on virtual port 80 and forwards them to the internal RustPost loopback listener.
+
+## Release Verification
+
+Last local release-readiness sweep: May 18, 2026.
+
+Verified locally:
+
+- Fresh `--data-dir` boot creates `settings.toml`, `app.sqlite3`, upload roots, backup/log dirs, and Tor state dirs.
+- `rustpost-cli check` passes on a fresh data directory with `tor.enabled = false`.
+- Clearnet serving on `127.0.0.1:8080` loads `/local`.
+- Registration, login, authenticated post creation, replies, repost rendering, likes, bookmarks, follows, notifications, admin health, and CSRF-protected logout work through live HTTP requests.
+- Anonymous posting remains disabled by default: anonymous users do not see the composer and anonymous post attempts are rejected.
+- Non-admin users cannot load admin health, and anonymous users cannot load authenticated pages.
+- `ffmpeg` 8.1.1 was detected locally with WebP and VP9 support. Image uploads, profile picture/banner uploads, and small video uploads were live-tested through the upload pipeline; WebP and WebM outputs were produced, and admin media/health pages reported conversion state.
+- Normal backups include the DB, settings, and media. Normal backups exclude Tor onion-service keys; `--include-tor-keys` includes them only when explicitly requested. Restore into a fresh data directory completed and `check` passed.
+- Backup archive names include subsecond precision to avoid same-second overwrite collisions.
+- `tor.enabled = true, tor_only = false` was live-tested with a 20 second bootstrap timeout. When bootstrap timed out, clearnet stayed available and admin health reported Tor enabled, not running, and the timeout error.
+- `tor.enabled = true, tor_only = true` was live-tested. RustPost did not expose the configured public clearnet listener, bound only a loopback internal listener, produced a real public `.onion` hostname, and returned `/local` successfully through the Tor Browser bundled Tor SOCKS client.
+
+Partially verified or environment-dependent:
+
+- Dual-mode onion reachability was not completed in the timed run because Arti bootstrap timed out before descriptor publication; dual-mode clearnet fallback and error reporting were verified.
+- Onion reachability was verified in tor-only mode with a local Tor client. Future release checks should repeat this on a non-temporary service identity if a stable onion address is required.
+- Tor private key material was not rendered in admin health or normal logs during the sweep. Normal operational text may mention key paths or the explicit `--include-tor-keys` option, but should not print private key contents.
 
 ## Security Model
 
@@ -221,6 +248,7 @@ cargo test --workspace --all-features
 - `toml` and `serde`: config load/save.
 - `tar` and `walkdir`: backup and restore archive handling.
 - `arti-client`, `tor-hsservice`, `tor-proto`, `tor-cell`, and `tor-rtcompat`: embedded Arti onion-service startup and local stream forwarding.
+- `rustls`: explicit ring crypto provider installation for Arti/rustls startup.
 - `tracing`: privacy-conscious operational logging.
 
 Cargo selected compatible versions for Rust 1.90. The Arti crate family is pinned to 0.42.0 for the Arti 2.3.0 mapping.
@@ -231,7 +259,7 @@ Screenshots are not checked in yet. The first screens to capture are the local t
 
 ## Known Limitations
 
-- Live Tor verification requires network access and may time out in restricted build environments.
+- Live Tor verification requires network access and may time out in restricted build environments. The May 2026 local sweep produced and reached a real onion in tor-only mode; dual mode fell back cleanly after a configured bootstrap timeout.
 - Onion service support maps HTTP virtual port 80 to the RustPost app; custom onion virtual ports are not configurable yet.
 - Media conversion is synchronous during upload.
 - Reports and admin settings toggles are represented in schema/admin structure but are minimal.

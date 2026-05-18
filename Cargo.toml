@@ -10,6 +10,10 @@ keywords = ["microblog", "self-hosted", "sqlite", "axum"]
 categories = ["web-programming::http-server"]
 
 [[bin]]
+name = "rustpost"
+path = "src/main.rs"
+
+[[bin]]
 name = "rustpost-cli"
 path = "src/main.rs"
 
@@ -29,6 +33,7 @@ safelog = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
 rusqlite = { version = "0.39", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tar = "0.4"
 tempfile = "3.23"
 thiserror = "2.0"

@@ -134,12 +134,22 @@ async fn local(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppRes
     let user = current(&state, &headers).await?;
     let posts = social::timeline(&state.pool, user.as_ref().map(|u| u.id), "local", None).await?;
     let csrf = form_csrf(&state, &headers).await;
+    let composer = if user.is_some() || state.settings.accounts.anonymous_mode_enabled {
+        render::composer(csrf.as_deref(), None)
+    } else {
+        String::new()
+    };
     let body = format!(
         "{}{}",
-        render::composer(csrf.as_deref(), None),
+        composer,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
-    Ok(Html(render::layout(user.as_ref(), "Local", &body)))
+    Ok(Html(render::layout_with_csrf(
+        user.as_ref(),
+        csrf.as_deref(),
+        "Local",
+        &body,
+    )))
 }
 
 async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResult<Html<String>> {
@@ -151,7 +161,12 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
         render::composer(csrf.as_deref(), None),
         render::posts(&posts, Some(&user), csrf.as_deref())
     );
-    Ok(Html(render::layout(Some(&user), "Home", &body)))
+    Ok(Html(render::layout_with_csrf(
+        Some(&user),
+        csrf.as_deref(),
+        "Home",
+        &body,
+    )))
 }
 
 async fn login_form() -> Html<String> {
@@ -242,7 +257,12 @@ async fn register(
     Ok(response)
 }
 
-async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResult<Response> {
+async fn logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    csrf::validate(&state.pool, &headers, &form.csrf).await?;
     if let Some(token) = auth::session_cookie(&headers) {
         auth::revoke_session(&state.pool, &token).await?;
     }
@@ -267,6 +287,9 @@ async fn create_post(
     if let Some(user) = &user
         && user.is_suspended
     {
+        return Err(AppError::Forbidden);
+    }
+    if user.is_none() && !state.settings.accounts.anonymous_mode_enabled {
         return Err(AppError::Forbidden);
     }
     let mut text = String::new();
@@ -367,12 +390,22 @@ async fn thread(
         return Err(AppError::NotFound);
     }
     let csrf = form_csrf(&state, &headers).await;
+    let composer = if user.is_some() || state.settings.accounts.anonymous_mode_enabled {
+        render::composer(csrf.as_deref(), Some(id))
+    } else {
+        String::new()
+    };
     let body = format!(
         "{}{}",
         render::posts(&posts, user.as_ref(), csrf.as_deref()),
-        render::composer(csrf.as_deref(), Some(id))
+        composer
     );
-    Ok(Html(render::layout(user.as_ref(), "Thread", &body)))
+    Ok(Html(render::layout_with_csrf(
+        user.as_ref(),
+        csrf.as_deref(),
+        "Thread",
+        &body,
+    )))
 }
 
 async fn delete_post(
@@ -525,8 +558,9 @@ async fn profile(
         controls,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
-    Ok(Html(render::layout(
+    Ok(Html(render::layout_with_csrf(
         user.as_ref(),
+        csrf.as_deref(),
         &profile_username,
         &body,
     )))
@@ -637,7 +671,12 @@ async fn settings_form(
         picture_input,
         banner_input,
     );
-    Ok(Html(render::layout(Some(&user), "Settings", &body)))
+    Ok(Html(render::layout_with_csrf(
+        Some(&user),
+        Some(&csrf),
+        "Settings",
+        &body,
+    )))
 }
 
 async fn settings_update(
@@ -788,8 +827,9 @@ async fn bookmarks(
     let user = require_user(&state, &headers).await?;
     let posts = social::timeline(&state.pool, Some(user.id), "bookmarks", None).await?;
     let csrf = form_csrf(&state, &headers).await;
-    Ok(Html(render::layout(
+    Ok(Html(render::layout_with_csrf(
         Some(&user),
+        csrf.as_deref(),
         "Bookmarks",
         &render::posts(&posts, Some(&user), csrf.as_deref()),
     )))
@@ -823,7 +863,12 @@ async fn notifications(
         html_escape::encode_double_quoted_attribute(&csrf),
         list
     );
-    Ok(Html(render::layout(Some(&user), "Notifications", &body)))
+    Ok(Html(render::layout_with_csrf(
+        Some(&user),
+        Some(&csrf),
+        "Notifications",
+        &body,
+    )))
 }
 
 async fn mark_notifications_read(
@@ -867,7 +912,12 @@ async fn search(
         user_results,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
-    Ok(Html(render::layout(user.as_ref(), "Search", &body)))
+    Ok(Html(render::layout_with_csrf(
+        user.as_ref(),
+        csrf.as_deref(),
+        "Search",
+        &body,
+    )))
 }
 
 async fn tag(
@@ -890,8 +940,14 @@ async fn admin_dashboard(
     headers: HeaderMap,
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let body = r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/backups">Backups</a></section>"#;
-    Ok(Html(render::layout(Some(&user), "Admin", body)))
+    Ok(Html(render::layout_with_csrf(
+        Some(&user),
+        Some(&csrf),
+        "Admin",
+        body,
+    )))
 }
 
 async fn admin_health(
@@ -899,6 +955,7 @@ async fn admin_health(
     headers: HeaderMap,
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let recent_jobs = admin::recent_media_jobs(&state.pool).await?;
     let jobs = recent_jobs
         .into_iter()
@@ -939,7 +996,12 @@ async fn admin_health(
         state.settings.accounts.registration_enabled,
         jobs
     );
-    Ok(Html(render::layout(Some(&user), "Site health", &body)))
+    Ok(Html(render::layout_with_csrf(
+        Some(&user),
+        Some(&csrf),
+        "Site health",
+        &body,
+    )))
 }
 
 async fn admin_users(
@@ -967,8 +1029,9 @@ async fn admin_users(
         })
         .collect::<Vec<_>>()
         .join("");
-    Ok(Html(render::layout(
+    Ok(Html(render::layout_with_csrf(
         Some(&user),
+        Some(&csrf),
         "Admin users",
         &format!(
             r#"<section class="panel"><table>{}</table></section>"#,
@@ -1017,6 +1080,7 @@ async fn admin_media(
     headers: HeaderMap,
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let jobs = admin::recent_media_jobs(&state.pool).await?;
     let rows = jobs
         .into_iter()
@@ -1030,8 +1094,9 @@ async fn admin_media(
         })
         .collect::<Vec<_>>()
         .join("");
-    Ok(Html(render::layout(
+    Ok(Html(render::layout_with_csrf(
         Some(&user),
+        Some(&csrf),
         "Media jobs",
         &format!(
             r#"<section class="panel"><table>{}</table></section>"#,
@@ -1050,7 +1115,12 @@ async fn admin_backups(
         r#"<section class="panel"><form method="post"><input type="hidden" name="csrf" value="{}"><label><input type="checkbox" name="include_tor_keys" value="true"> Include Tor onion-service keys</label><button>Create backup</button></form></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf)
     );
-    Ok(Html(render::layout(Some(&user), "Backups", &body)))
+    Ok(Html(render::layout_with_csrf(
+        Some(&user),
+        Some(&csrf),
+        "Backups",
+        &body,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -1079,7 +1149,13 @@ async fn admin_create_backup(
         r#"<section class="panel"><p>Backup created: {}</p></section>"#,
         html_escape::encode_text(&archive.display().to_string())
     );
-    Ok(Html(render::layout(Some(&user), "Backup created", &body)))
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    Ok(Html(render::layout_with_csrf(
+        Some(&user),
+        Some(&csrf),
+        "Backup created",
+        &body,
+    )))
 }
 
 fn small_form(action: &str, csrf: &str, label: &str) -> String {
