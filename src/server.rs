@@ -66,10 +66,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/posts/{id}/reply", post(reply_redirect))
         .route("/users/{username}", get(profile))
         .route("/users/{id}/follow", post(follow))
+        .route("/users/{id}/unfollow", post(unfollow))
         .route("/users/{id}/block", post(block))
         .route("/users/{id}/unblock", post(unblock))
         .route("/users/{id}/mute", post(mute))
         .route("/settings", get(settings_form).post(settings_update))
+        .route("/following", get(following))
         .route("/bookmarks", get(bookmarks))
         .route("/notifications", get(notifications))
         .route("/notifications/read", post(mark_notifications_read))
@@ -200,21 +202,56 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
         composer,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
-    Ok(Html(render::layout_with_csrf(
-        user.as_ref(),
-        csrf.as_deref(),
-        "Home Feed",
-        &body,
+    Ok(Html(
+        page_layout(&state, user.as_ref(), csrf.as_deref(), "Home Feed", &body).await?,
+    ))
+}
+
+async fn layout_context(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+) -> AppResult<render::LayoutContext> {
+    let counts = if let Some(user) = user {
+        Some(social::follow_counts(&state.pool, user.id).await?)
+    } else {
+        None
+    };
+    Ok(render::LayoutContext {
+        anonymous_mode_enabled: state.settings.accounts.anonymous_mode_enabled,
+        tor_onion_address: state.tor.onion_address(),
+        follower_count: counts.map(|(followers, _following)| followers),
+        following_count: counts.map(|(_followers, following)| following),
+    })
+}
+
+async fn page_layout(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    title: &str,
+    body: &str,
+) -> AppResult<String> {
+    let context = layout_context(state, user).await?;
+    Ok(render::layout_with_context(
+        user,
+        csrf,
+        title,
+        body,
         &state.settings.site.name,
-    )))
+        &context,
+    ))
 }
 
 async fn login_form(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(render::layout(
+    let body = render::login_form(None);
+    let context = layout_context(&state, None).await.unwrap_or_default();
+    Html(render::layout_with_context(
+        None,
         None,
         "Login",
-        &render::login_form(None),
+        &body,
         &state.settings.site.name,
+        &context,
     ))
 }
 
@@ -253,12 +290,9 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
     if !state.settings.accounts.registration_enabled {
         return Err(AppError::Forbidden);
     }
-    Ok(Html(render::layout(
-        None,
-        "Register",
-        &render::register_form(None),
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(&state, None, None, "Register", &render::register_form(None)).await?,
+    ))
 }
 
 async fn register(
@@ -488,13 +522,9 @@ async fn thread(
         render::posts(&posts, user.as_ref(), csrf.as_deref()),
         composer
     );
-    Ok(Html(render::layout_with_csrf(
-        user.as_ref(),
-        csrf.as_deref(),
-        "Thread",
-        &body,
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(&state, user.as_ref(), csrf.as_deref(), "Thread", &body).await?,
+    ))
 }
 
 async fn delete_confirm(
@@ -525,13 +555,9 @@ async fn delete_confirm(
         html_escape::encode_double_quoted_attribute(&return_to),
         html_escape::encode_double_quoted_attribute(&return_to)
     );
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        Some(&csrf),
-        "Delete post",
-        &body,
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Delete post", &body).await?,
+    ))
 }
 
 async fn delete_post(
@@ -671,21 +697,8 @@ async fn profile(
     let csrf = form_csrf(&state, &headers).await;
     let posts =
         social::profile_timeline(&state.pool, user.as_ref().map(|u| u.id), profile_id).await?;
-    let controls = if let (Some(viewer), Some(csrf)) = (&user, &csrf) {
-        if viewer.id == profile_id {
-            r#"<div class="actions"><a class="button-link" href="/settings">Settings</a></div>"#
-                .to_owned()
-        } else {
-            format!(
-                r#"<div class="actions">{}{}{}</div>"#,
-                small_form(&format!("/users/{profile_id}/follow"), csrf, "Follow"),
-                small_form(&format!("/users/{profile_id}/block"), csrf, "Block"),
-                small_form(&format!("/users/{profile_id}/mute"), csrf, "Mute")
-            )
-        }
-    } else {
-        String::new()
-    };
+    let (followers, following) = social::follow_counts(&state.pool, profile_id).await?;
+    let controls = profile_controls(&state, user.as_ref(), csrf.as_deref(), profile_id).await?;
     let picture = picture_path.map_or_else(
         || r#"<div class="profile-picture" aria-hidden="true"></div>"#.to_owned(),
         |path| {
@@ -705,24 +718,57 @@ async fn profile(
         },
     );
     let body = format!(
-        r#"<section class="panel profile">{}<div class="profile-heading">{}<div><h1>{}</h1><p class="muted">@{}</p><p>{}</p><p><a href="{}">{}</a></p></div></div>{}</section>{}"#,
+        r#"<section class="panel profile">{}<div class="profile-heading">{}<div><h1>{}</h1><p class="muted">@{}</p><p class="counts"><span>{} followers</span><span>{} following</span></p><p>{}</p><p><a href="{}">{}</a></p></div></div>{}</section>{}"#,
         banner,
         picture,
         html_escape::encode_text(display_name.as_str()),
         html_escape::encode_text(profile_username.as_str()),
+        followers,
+        following,
         html_escape::encode_text(bio.as_str()),
         html_escape::encode_double_quoted_attribute(website.as_str()),
         html_escape::encode_text(website.as_str()),
         controls,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
-    Ok(Html(render::layout_with_csrf(
-        user.as_ref(),
-        csrf.as_deref(),
-        &profile_username,
-        &body,
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(
+            &state,
+            user.as_ref(),
+            csrf.as_deref(),
+            &profile_username,
+            &body,
+        )
+        .await?,
+    ))
+}
+
+async fn profile_controls(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    profile_id: i64,
+) -> AppResult<String> {
+    let (Some(viewer), Some(csrf)) = (user, csrf) else {
+        return Ok(String::new());
+    };
+    if viewer.id == profile_id {
+        return Ok(
+            r#"<div class="actions"><a class="button-link" href="/settings">Settings</a></div>"#
+                .to_owned(),
+        );
+    }
+    let follow_action = if social::is_following(&state.pool, viewer.id, profile_id).await? {
+        small_form(&format!("/users/{profile_id}/unfollow"), csrf, "Unfollow")
+    } else {
+        small_form(&format!("/users/{profile_id}/follow"), csrf, "Follow")
+    };
+    Ok(format!(
+        r#"<div class="actions">{}{}{}</div>"#,
+        follow_action,
+        small_form(&format!("/users/{profile_id}/block"), csrf, "Block"),
+        small_form(&format!("/users/{profile_id}/mute"), csrf, "Mute")
+    ))
 }
 
 async fn follow(
@@ -733,8 +779,22 @@ async fn follow(
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
-    social::follow(&state.pool, user.id, id).await?;
+    social::follow(&state.pool, user.id, id)
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
     Ok(Redirect::to("/home").into_response())
+}
+
+async fn unfollow(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    social::unfollow(&state.pool, user.id, id).await?;
+    Ok(Redirect::to("/following").into_response())
 }
 
 async fn block(
@@ -871,13 +931,9 @@ async fn settings_form(
         banner_input,
         blocked_panel,
     );
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        Some(&csrf),
-        "Settings",
-        &body,
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Settings", &body).await?,
+    ))
 }
 
 async fn settings_update(
@@ -1186,17 +1242,31 @@ async fn bookmarks(
     let user = require_user(&state, &headers).await?;
     let posts = social::timeline(&state.pool, Some(user.id), "bookmarks", None).await?;
     let csrf = form_csrf(&state, &headers).await;
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        csrf.as_deref(),
-        "Bookmarks",
-        &format!(
-            "{}{}",
-            render::page_header("Bookmarks", "Posts you saved for later."),
-            render::posts(&posts, Some(&user), csrf.as_deref())
-        ),
-        &state.settings.site.name,
-    )))
+    let body = format!(
+        "{}{}",
+        render::page_header("Bookmarks", "Posts you saved for later."),
+        render::posts(&posts, Some(&user), csrf.as_deref())
+    );
+    Ok(Html(
+        page_layout(&state, Some(&user), csrf.as_deref(), "Bookmarks", &body).await?,
+    ))
+}
+
+async fn following(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> AppResult<Html<String>> {
+    let user = require_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let accounts = social::following_accounts(&state.pool, user.id).await?;
+    let body = format!(
+        "{}{}",
+        render::page_header("Following", "Accounts you follow."),
+        render::accounts(&accounts, &csrf)
+    );
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Following", &body).await?,
+    ))
 }
 
 async fn notifications(
@@ -1235,13 +1305,9 @@ async fn notifications(
         html_escape::encode_double_quoted_attribute(&csrf),
         list
     );
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        Some(&csrf),
-        "Notifications",
-        &body,
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Notifications", &body).await?,
+    ))
 }
 
 async fn mark_notifications_read(
@@ -1291,13 +1357,9 @@ async fn search(
         user_results,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
-    Ok(Html(render::layout_with_csrf(
-        user.as_ref(),
-        csrf.as_deref(),
-        "Search",
-        &body,
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(&state, user.as_ref(), csrf.as_deref(), "Search", &body).await?,
+    ))
 }
 
 async fn tag(
@@ -1322,13 +1384,9 @@ async fn admin_dashboard(
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let body = r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/backups">Backups</a></section>"#;
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        Some(&csrf),
-        "Admin",
-        body,
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Admin", body).await?,
+    ))
 }
 
 async fn admin_health(
@@ -1377,13 +1435,9 @@ async fn admin_health(
         state.settings.accounts.registration_enabled,
         jobs
     );
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        Some(&csrf),
-        "Site health",
-        &body,
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Site health", &body).await?,
+    ))
 }
 
 async fn admin_users(
@@ -1411,16 +1465,13 @@ async fn admin_users(
         })
         .collect::<Vec<_>>()
         .join("");
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        Some(&csrf),
-        "Admin users",
-        &format!(
-            r#"<section class="panel"><table>{}</table></section>"#,
-            list
-        ),
-        &state.settings.site.name,
-    )))
+    let body = format!(
+        r#"<section class="panel"><table>{}</table></section>"#,
+        list
+    );
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Admin users", &body).await?,
+    ))
 }
 
 async fn admin_suspend(
@@ -1477,16 +1528,13 @@ async fn admin_media(
         })
         .collect::<Vec<_>>()
         .join("");
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        Some(&csrf),
-        "Media jobs",
-        &format!(
-            r#"<section class="panel"><table>{}</table></section>"#,
-            rows
-        ),
-        &state.settings.site.name,
-    )))
+    let body = format!(
+        r#"<section class="panel"><table>{}</table></section>"#,
+        rows
+    );
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Media jobs", &body).await?,
+    ))
 }
 
 async fn admin_backups(
@@ -1499,13 +1547,9 @@ async fn admin_backups(
         r#"<section class="panel"><form method="post"><input type="hidden" name="csrf" value="{}"><label><input type="checkbox" name="include_tor_keys" value="true"> Include Tor onion-service keys</label><button>Create backup</button></form></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf)
     );
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        Some(&csrf),
-        "Backups",
-        &body,
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Backups", &body).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1535,13 +1579,9 @@ async fn admin_create_backup(
         html_escape::encode_text(&archive.display().to_string())
     );
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        Some(&csrf),
-        "Backup created",
-        &body,
-        &state.settings.site.name,
-    )))
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Backup created", &body).await?,
+    ))
 }
 
 fn small_form(action: &str, csrf: &str, label: &str) -> String {

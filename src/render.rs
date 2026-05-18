@@ -1,6 +1,14 @@
 use crate::auth::CurrentUser;
-use crate::social::{MediaView, PostView, TimelineEventKind};
+use crate::social::{AccountView, MediaView, PostView, TimelineEventKind};
 use axum::http::StatusCode;
+
+#[derive(Debug, Clone, Default)]
+pub struct LayoutContext {
+    pub anonymous_mode_enabled: bool,
+    pub tor_onion_address: Option<String>,
+    pub follower_count: Option<i64>,
+    pub following_count: Option<i64>,
+}
 
 pub fn layout(user: Option<&CurrentUser>, title: &str, body: &str, site_name: &str) -> String {
     layout_with_csrf(user, None, title, body, site_name)
@@ -12,6 +20,24 @@ pub fn layout_with_csrf(
     title: &str,
     body: &str,
     site_name: &str,
+) -> String {
+    layout_with_context(
+        user,
+        csrf,
+        title,
+        body,
+        site_name,
+        &LayoutContext::default(),
+    )
+}
+
+pub fn layout_with_context(
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    title: &str,
+    body: &str,
+    site_name: &str,
+    context: &LayoutContext,
 ) -> String {
     let auth_nav = if let Some(user) = user {
         let admin = if user.is_admin {
@@ -26,7 +52,7 @@ pub fn layout_with_csrf(
             )
         });
         format!(
-            r#"<a href="/home">Home Feed</a><a href="/search">Search</a><a href="/notifications">Notifications</a><a href="/bookmarks">Bookmarks</a><a href="/users/{}">Profile</a>{admin}{logout}"#,
+            r#"<a href="/home">Home Feed</a><a href="/following">Following</a><a href="/search">Search</a><a href="/notifications">Notifications</a><a href="/bookmarks">Bookmarks</a><a href="/users/{}">Profile</a>{admin}{logout}"#,
             html_escape::encode_double_quoted_attribute(&user.username)
         )
     } else {
@@ -34,6 +60,16 @@ pub fn layout_with_csrf(
             .to_owned()
     };
     let brand_mark = site_name.chars().next().unwrap_or('R');
+    let side_panel = dashboard_panel(user, context);
+    let footer_onion = context
+        .tor_onion_address
+        .as_deref()
+        .map_or_else(String::new, |onion| {
+            format!(
+                r#" <span class="footer-onion">Onion: <code>{}</code></span>"#,
+                html_escape::encode_text(onion)
+            )
+        });
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -49,8 +85,8 @@ pub fn layout_with_csrf(
 </head>
 <body>
 <header class="site-header"><div class="header-inner"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a><nav>{}</nav></div></header>
-<main><div class="content-shell"><section class="content-column">{} </section><aside class="side-panel"><h2>Alpha status</h2><p>Self-hosted microblog. Anonymous posting is off by default.</p><a href="/home">Home Feed</a></aside></div></main>
-<footer class="site-footer">{} alpha</footer>
+<main><div class="content-shell"><section class="content-column">{} </section>{}</div></main>
+<footer class="site-footer">{} alpha{}</footer>
 </body>
 </html>"#,
         html_escape::encode_text(title),
@@ -60,7 +96,58 @@ pub fn layout_with_csrf(
         html_escape::encode_text(site_name),
         auth_nav,
         body,
-        html_escape::encode_text(site_name)
+        side_panel,
+        html_escape::encode_text(site_name),
+        footer_onion
+    )
+}
+
+fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> String {
+    let tor = context.tor_onion_address.as_deref().map_or_else(
+        || r#"<dt>Tor</dt><dd>Unavailable</dd>"#.to_owned(),
+        |onion| {
+            format!(
+                r#"<dt>Tor</dt><dd><code>{}</code></dd>"#,
+                html_escape::encode_text(onion)
+            )
+        },
+    );
+    let posting = if context.anonymous_mode_enabled {
+        "Signed-in and anonymous posting"
+    } else if user.is_some() {
+        "Signed-in posting"
+    } else {
+        "Login required"
+    };
+    let account = user.map_or_else(
+        || r#"<dt>Account</dt><dd>Guest</dd>"#.to_owned(),
+        |user| {
+            format!(
+                r#"<dt>Account</dt><dd><strong>{}</strong><br><span class="muted">@{}</span></dd>"#,
+                html_escape::encode_text(&user.display_name),
+                html_escape::encode_text(&user.username)
+            )
+        },
+    );
+    let social = match (context.follower_count, context.following_count) {
+        (Some(followers), Some(following)) => {
+            format!(r#"<dt>Social</dt><dd>{followers} followers<br>{following} following</dd>"#)
+        }
+        _ => String::new(),
+    };
+    let admin = if user.is_some_and(|user| user.is_admin) {
+        r#"<a class="button-link" href="/admin">Admin</a>"#
+    } else {
+        ""
+    };
+    let settings = if user.is_some() {
+        r#"<a class="button-link" href="/settings">Settings</a>"#
+    } else {
+        r#"<a class="button-link" href="/login">Log in</a>"#
+    };
+    format!(
+        r#"<aside class="side-panel"><h2>Dashboard</h2><dl class="dashboard-list">{}<dt>Posting</dt><dd>{}</dd>{}{}</dl><div class="quick-links"><a class="button-link" href="/home">Home Feed</a><a class="button-link" href="/following">Following</a>{settings}{admin}</div></aside>"#,
+        account, posting, social, tor
     )
 }
 
@@ -92,6 +179,21 @@ pub fn client_script() -> &'static str {
   input.type = show ? "text" : "password";
   button.textContent = show ? "Hide" : "Show";
   button.setAttribute("aria-label", show ? "Hide password" : "Show password");
+});
+
+function updateComposerCount(textarea) {
+  const counter = document.querySelector(`[data-character-counter="${textarea.id}"]`);
+  if (!counter) {
+    return;
+  }
+  const max = Number.parseInt(textarea.getAttribute("maxlength") || "280", 10);
+  const length = Array.from(textarea.value).length;
+  counter.textContent = `${Math.max(0, max - length)} remaining`;
+}
+
+document.querySelectorAll("textarea[data-character-limit]").forEach((textarea) => {
+  updateComposerCount(textarea);
+  textarea.addEventListener("input", () => updateComposerCount(textarea));
 });"#
 }
 
@@ -100,11 +202,12 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>) -> String {
         format!(r#"<input type="hidden" name="parent_post_id" value="{id}">"#)
     });
     let csrf = csrf.unwrap_or_default();
+    let input_id = parent.map_or_else(|| "post-text".to_owned(), |id| format!("reply-text-{id}"));
     format!(
-        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted">280 characters</span></div><form method="post" action="/posts" enctype="multipart/form-data">
+        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted" data-character-counter="{}">280 remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data">
 <input type="hidden" name="csrf" value="{}">{}
-<label for="text">What is happening?</label>
-<textarea id="text" name="text" maxlength="280" rows="4" placeholder="Write a short update..."></textarea>
+<label class="sr-only" for="{}">Post text</label>
+<textarea id="{}" name="text" maxlength="280" rows="4" data-character-limit="280"></textarea>
 <div class="composer-tools"><label class="file-control" for="media">Attach media<input id="media" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime"></label><button class="primary" type="submit">Post</button></div>
 </form></section>"#,
         if parent.is_some() {
@@ -112,8 +215,65 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>) -> String {
         } else {
             "New post"
         },
+        html_escape::encode_double_quoted_attribute(&input_id),
         html_escape::encode_double_quoted_attribute(csrf),
-        parent_input
+        parent_input,
+        html_escape::encode_double_quoted_attribute(&input_id),
+        html_escape::encode_double_quoted_attribute(&input_id)
+    )
+}
+
+pub fn accounts(accounts: &[AccountView], csrf: &str) -> String {
+    if accounts.is_empty() {
+        return empty_state(
+            "You are not following anyone yet.",
+            "Follow accounts to build your home feed.",
+        );
+    }
+    let rows = accounts
+        .iter()
+        .map(|account| {
+            let avatar = account.profile_picture_path.as_ref().map_or_else(
+                || {
+                    let initial = account.display_name.chars().next().unwrap_or('R');
+                    format!(
+                        r#"<span class="post-avatar placeholder" aria-hidden="true">{}</span>"#,
+                        html_escape::encode_text(&initial.to_string())
+                    )
+                },
+                |path| {
+                    format!(
+                        r#"<img class="post-avatar" src="{}" alt="" loading="lazy">"#,
+                        html_escape::encode_double_quoted_attribute(path)
+                    )
+                },
+            );
+            let action = if account.viewer_following {
+                action_form(&format!("/users/{}/unfollow", account.id), csrf, "Unfollow")
+            } else {
+                action_form(&format!("/users/{}/follow", account.id), csrf, "Follow")
+            };
+            format!(
+                r#"<article class="account-row">{}<div><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span><p>{}</p></div><div>{}</div></article>"#,
+                avatar,
+                html_escape::encode_double_quoted_attribute(&account.username),
+                html_escape::encode_text(&account.display_name),
+                html_escape::encode_text(&account.username),
+                html_escape::encode_text(&account.bio),
+                action
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<section class="account-list">{rows}</section>"#)
+}
+
+fn action_form(action: &str, csrf: &str, label: &str) -> String {
+    format!(
+        r#"<form method="post" action="{}"><input type="hidden" name="csrf" value="{}"><button>{}</button></form>"#,
+        html_escape::encode_double_quoted_attribute(action),
+        html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_text(label)
     )
 }
 
@@ -439,7 +599,7 @@ const CSS: &str = r#"
 .brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:#172017}.brand-mark{display:inline-grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:#163b2f;color:#fff}
 nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}nav a,nav button,.button-link{display:inline-flex;align-items:center;min-height:2.15rem;border-radius:7px;padding:.42rem .65rem;color:#24445f;border:1px solid transparent;background:transparent}
 nav a:hover,.button-link:hover{background:#eef3f0;text-decoration:none}nav form,.actions form{display:inline}
-main{padding:1.25rem}.content-shell{max-width:1120px;margin:0 auto;display:grid;grid-template-columns:minmax(0,720px) 280px;gap:1.25rem;align-items:start}.content-column{min-width:0}.side-panel{position:sticky;top:5rem;background:#fff;border:1px solid #dfe4dc;border-radius:8px;padding:1rem;color:#59625a}.side-panel h2{margin:.1rem 0 .35rem;font-size:1rem;color:#202124}.site-footer{max-width:1120px;margin:0 auto;padding:1rem;color:#687068;font-size:.9rem}
+main{padding:1.25rem}.content-shell{max-width:1120px;margin:0 auto;display:grid;grid-template-columns:minmax(0,720px) 280px;gap:1.25rem;align-items:start}.content-column{min-width:0}.side-panel{position:sticky;top:5rem;background:#fff;border:1px solid #dfe4dc;border-radius:8px;padding:1rem;color:#59625a}.side-panel h2{margin:.1rem 0 .6rem;font-size:1rem;color:#202124}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:#202124}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.quick-links{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:1120px;margin:0 auto;padding:1rem;color:#687068;font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:#fff;border:1px solid #dfe4dc;border-radius:8px;margin:0 0 .85rem;padding:1rem;box-shadow:0 1px 2px rgba(20,35,30,.04)}
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.page-header p,.muted,.empty-state p{color:#667064;margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
 label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button{font:inherit}input[type=text],input[type=password],input[type=url],input:not([type]),textarea{width:100%;padding:.72rem .8rem;border:1px solid #b9c2b8;border-radius:7px;background:#fff}textarea{resize:vertical;min-height:7rem}
@@ -448,9 +608,9 @@ input:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:3px soli
 .composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:#24445f;font-weight:700}.file-control input{max-width:15rem}
 .timeline{display:grid;gap:.85rem}.post{overflow:hidden;position:relative}.reply-post{margin-left:1.35rem;border-left:4px solid #c8d8d0;background:#fbfcfa}.reply-post::before{content:"";position:absolute;left:-1.35rem;top:1.4rem;width:1.35rem;border-top:2px solid #c8d8d0}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.75rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid #d0d8d2;background:#eef3f0;flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:#526159;font-weight:800}.author-name{font-weight:800;color:#202124}.username,.post-time,.counts{color:#687068;font-size:.92rem}.text{white-space:pre-wrap;margin:.75rem 0;line-height:1.55;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid #d9ded6;margin-top:.6rem;background:#f6f7f4}.post img.post-avatar{display:block;margin:0;border-radius:999px}
 .counts{display:flex;gap:.8rem;flex-wrap:wrap;margin-top:.4rem}.actions{display:flex;gap:.35rem;flex-wrap:wrap;align-items:center;margin-top:.75rem}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid #cdd7d0;border-radius:7px;background:#fff;color:#24445f;padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:#eef3f0;color:#163b2f;text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:#9aa39d;background:#f4f5f2;border-color:#dfe4dc;cursor:not-allowed}.icon-button.disabled:hover,.icon-button:disabled:hover{background:#f4f5f2;color:#9aa39d}.thread-link{padding:.42rem .65rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:#4b655d;font-size:.9rem;font-weight:800;margin-bottom:.45rem}.unavailable{color:#667064}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:#e6b8a8;background:#fff8f5}.notice.success{border-color:#add7b4;background:#f4fbf5}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:#6d766e;font-size:.78rem}
-.profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#dfe9e1}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#eef3f0;flex:0 0 auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #e3e7e0;text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
+.profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#dfe9e1}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#eef3f0;flex:0 0 auto}.account-list{display:grid;gap:.85rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:#fff;border:1px solid #dfe4dc;border-radius:8px;padding:1rem}.account-row p{margin:.3rem 0 0;color:#59625a;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #e3e7e0;text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
 @media (max-width:900px){.content-shell{grid-template-columns:1fr}.side-panel{position:static;display:none}}
-@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.composer-tools,.post-header,.profile-heading{align-items:stretch;flex-direction:column}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.55rem}.page-header h1,.section-heading h1,.panel h1{font-size:1.25rem}}
+@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.composer-tools,.post-header,.profile-heading,.account-row{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.55rem}.page-header h1,.section-heading h1,.panel h1{font-size:1.25rem}}
 "#;
 
 #[cfg(test)]
@@ -464,5 +624,51 @@ mod tests {
         assert!(body.contains("<span>My Microblog</span>"));
         assert!(body.contains("My Microblog alpha"));
         assert!(!body.contains("<span>RustPost</span>"));
+    }
+
+    #[test]
+    fn layout_replaces_alpha_card_with_dashboard() {
+        let body = layout(None, "Home Feed", "<p>body</p>", "My Microblog");
+        assert!(body.contains("<h2>Dashboard</h2>"));
+        assert!(body.contains("Login required"));
+        assert!(!body.contains("Alpha status"));
+        assert!(!body.contains("Self-hosted microblog"));
+    }
+
+    #[test]
+    fn tor_address_renders_only_when_available() {
+        let without_tor = layout_with_context(
+            None,
+            None,
+            "Home Feed",
+            "<p>body</p>",
+            "My Microblog",
+            &LayoutContext::default(),
+        );
+        assert!(!without_tor.contains("examplehiddenservice.onion"));
+        assert!(!without_tor.contains("Onion: <code>"));
+
+        let with_tor = layout_with_context(
+            None,
+            None,
+            "Home Feed",
+            "<p>body</p>",
+            "My Microblog",
+            &LayoutContext {
+                tor_onion_address: Some("examplehiddenservice.onion".to_owned()),
+                ..LayoutContext::default()
+            },
+        );
+        assert!(with_tor.contains("examplehiddenservice.onion"));
+        assert!(with_tor.contains("footer-onion"));
+    }
+
+    #[test]
+    fn composer_has_live_remaining_counter_without_reply_placeholder() {
+        let body = composer(Some("csrf"), Some(10));
+        assert!(body.contains("280 remaining"));
+        assert!(body.contains("data-character-limit=\"280\""));
+        assert!(!body.contains("What is happening?"));
+        assert!(!body.contains("placeholder="));
     }
 }

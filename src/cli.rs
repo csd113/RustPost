@@ -159,7 +159,15 @@ async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyh
     if settings.admin.create_admin_on_first_boot {
         admin::ensure_first_boot_admin_hint(&pool).await?;
     }
-    print_startup_summary(&paths, &settings, admin_count);
+    print_startup_dashboard(
+        &pool,
+        &paths,
+        &settings,
+        admin_count,
+        &tor_status_for_background,
+        onion_target,
+    )
+    .await?;
     let state = server::AppState::new(pool, settings.clone(), paths.clone(), ffmpeg, tor_status);
     let app = server::router(state);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -182,41 +190,15 @@ async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyh
     }
 
     if let Some(listener) = onion_listener {
-        let task_app = app.clone();
-        let task_paths = paths.clone();
-        let task_tor_settings = settings.tor.clone();
-        let task_tor_status = tor_status_for_background.clone();
-        let task_shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let started = match tor::start(&task_tor_settings, &task_paths, onion_target).await {
-                Ok(status) => status,
-                Err(error) => {
-                    warn!(error = %error, "Tor onion service startup task failed");
-                    return;
-                }
-            };
-            task_tor_status.replace_with(&started);
-            if !started.running() {
-                return;
-            }
-            let addr = match listener.local_addr() {
-                Ok(addr) => addr,
-                Err(error) => {
-                    warn!(error = %error, "Tor onion listener address unavailable");
-                    return;
-                }
-            };
-            info!(%addr, "RustPost listening on loopback for Arti onion forwarding");
-            if let Err(error) = axum::serve(
-                listener,
-                task_app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(wait_for_shutdown(task_shutdown_rx))
-            .await
-            {
-                warn!(error = %error, "Tor onion forwarding listener failed");
-            }
-        });
+        spawn_onion_forwarding(
+            listener,
+            app.clone(),
+            paths.clone(),
+            settings.tor.clone(),
+            tor_status_for_background.clone(),
+            onion_target,
+            shutdown_rx.clone(),
+        );
     }
 
     let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)
@@ -234,12 +216,65 @@ async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyh
     Ok(())
 }
 
-fn print_startup_summary(
+fn spawn_onion_forwarding(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    paths: runtime::RuntimePaths,
+    settings: config::TorSettings,
+    tor_status: tor::TorStatus,
+    onion_target: Option<SocketAddr>,
+    shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let started = match tor::start(&settings, &paths, onion_target).await {
+            Ok(status) => status,
+            Err(error) => {
+                warn!(error = %error, "Tor onion service startup task failed");
+                return;
+            }
+        };
+        tor_status.replace_with(&started);
+        if !started.running() {
+            return;
+        }
+        let addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(error) => {
+                warn!(error = %error, "Tor onion listener address unavailable");
+                return;
+            }
+        };
+        info!(%addr, "RustPost listening on loopback for Arti onion forwarding");
+        if let Err(error) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+        .await
+        {
+            warn!(error = %error, "Tor onion forwarding listener failed");
+        }
+    });
+}
+
+async fn print_startup_dashboard(
+    pool: &db::SqlitePool,
     paths: &runtime::RuntimePaths,
     settings: &config::Settings,
     admin_count: i64,
-) {
-    stderr_line(format_args!("RustPost startup"));
+    tor_status: &tor::TorStatus,
+    onion_target: Option<SocketAddr>,
+) -> anyhow::Result<()> {
+    let (user_count, post_count) = crate::social::instance_counts(pool).await?;
+    stderr_line(format_args!("RustPost dashboard"));
+    stderr_line(format_args!("  server: starting"));
+    stderr_line(format_args!(
+        "  http/local: http://{}:{}",
+        settings.server.host, settings.server.port
+    ));
+    if let Some(addr) = onion_target {
+        stderr_line(format_args!("  onion forward target: http://{addr}"));
+    }
     stderr_line(format_args!("  data dir: {}", paths.data_dir.display()));
     stderr_line(format_args!(
         "  settings: {}",
@@ -254,9 +289,21 @@ fn print_startup_summary(
         paths.uploads_originals.display()
     ));
     stderr_line(format_args!(
-        "  serving: http://{}:{}",
-        settings.server.host, settings.server.port
+        "  anonymous posting: {}",
+        if settings.accounts.anonymous_mode_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
     ));
+    stderr_line(format_args!("  users: {user_count}"));
+    stderr_line(format_args!("  posts: {post_count}"));
+    stderr_line(format_args!("  tor: {}", tor_status.summary()));
+    if let Some(onion) = tor_status.onion_address() {
+        stderr_line(format_args!("  onion address: {onion}"));
+    } else if settings.tor.enabled {
+        stderr_line(format_args!("  onion address: pending"));
+    }
     if admin_count > 0 {
         stderr_line(format_args!("  admin: present"));
     } else {
@@ -270,6 +317,7 @@ fn print_startup_summary(
             paths.data_dir.display()
         ));
     }
+    Ok(())
 }
 
 fn prompt_admin_credentials() -> anyhow::Result<(String, String)> {
