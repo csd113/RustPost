@@ -72,7 +72,7 @@ impl RuntimePaths {
 
 #[cfg(unix)]
 fn restrict_dir(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())

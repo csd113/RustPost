@@ -5,9 +5,9 @@ use axum::Router;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Form, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Uri, header};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse as _, Redirect, Response};
 use axum::routing::{get, post};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension as _, params};
 use serde::Deserialize;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -436,7 +436,7 @@ async fn parse_post_create(
                         "reply target is missing; open the post thread and try again".to_owned(),
                     ));
                 }
-                form.parent_post_id = Some(value.parse::<i64>().map_err(|_| {
+                form.parent_post_id = Some(value.parse::<i64>().map_err(|_parse_err| {
                     AppError::BadRequest(
                         "reply target is invalid; open the post thread and try again".to_owned(),
                     )
@@ -931,7 +931,10 @@ async fn settings_update(
 
 // Multipart parsing is kept in one place so uploaded profile media and text
 // fields share one validation path before any database updates happen.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "multipart profile parsing keeps validation and file handling in one transaction-sized flow"
+)]
 async fn parse_profile_update(
     state: &AppState,
     user_id: i64,
@@ -1169,11 +1172,10 @@ fn referer_target(headers: &HeaderMap) -> Option<String> {
     if value.starts_with('/') && !value.starts_with("//") {
         Some(value.to_owned())
     } else {
-        value.parse::<Uri>().ok().and_then(|uri| {
-            uri.path_and_query()
-                .map(|path| path.as_str().to_owned())
-                .filter(|path| path.starts_with('/'))
-        })
+        let uri = value.parse::<Uri>().ok()?;
+        uri.path_and_query()
+            .map(|path| path.as_str().to_owned())
+            .filter(|path| path.starts_with('/'))
     }
 }
 
@@ -1574,7 +1576,7 @@ async fn require_admin(state: &AppState, headers: &HeaderMap) -> AppResult<Curre
 async fn validate_csrf(pool: &SqlitePool, headers: &HeaderMap, token: &str) -> AppResult<()> {
     csrf::validate(pool, headers, token)
         .await
-        .map_err(|_| AppError::Forbidden)
+        .map_err(|_csrf_err| AppError::Forbidden)
 }
 
 async fn form_csrf(state: &AppState, headers: &HeaderMap) -> Option<String> {
@@ -1642,7 +1644,7 @@ fn user_actor(user_id: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     struct TestServer {
         base_url: String,

@@ -136,7 +136,10 @@ pub fn posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option<&str>)
 
 // Rendering a post card stays centralized because the markup, counts, media,
 // and action controls must remain consistent between timelines and threads.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "post card markup is centralized to keep timeline and thread rendering identical"
+)]
 pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>) -> String {
     let repost_banner = if post.event_kind == TimelineEventKind::Repost {
         let name = post

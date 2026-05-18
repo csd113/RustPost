@@ -1,10 +1,10 @@
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
 use rand_core::OsRng;
-use rusqlite::{OptionalExtension, params};
-use sha2::{Digest, Sha256};
+use rusqlite::{OptionalExtension as _, params};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::config::Settings;
@@ -217,7 +217,9 @@ pub fn hash_token(token: &str) -> String {
 }
 
 pub fn secure_token() -> String {
-    Uuid::new_v4().simple().to_string() + &Uuid::new_v4().simple().to_string()
+    let mut token = Uuid::new_v4().simple().to_string();
+    token.push_str(&Uuid::new_v4().simple().to_string());
+    token
 }
 
 #[cfg(test)]

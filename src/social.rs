@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension as _, Row, params, params_from_iter};
 
 use crate::config::Settings;
 use crate::db::SqlitePool;
@@ -189,8 +189,8 @@ pub async fn post_thread(
         return Ok(Vec::new());
     };
     let root_id = root;
-    let sql =
-        base_post_query() + " AND (p.id = ? OR p.root_post_id = ?) ORDER BY p.id ASC LIMIT 200";
+    let mut sql = base_post_query();
+    sql.push_str(" AND (p.id = ? OR p.root_post_id = ?) ORDER BY p.id ASC LIMIT 200");
     let rows = pool
         .call(move |conn| query_post_rows(conn, &sql, params![root_id, root_id]))
         .await?;
@@ -445,8 +445,9 @@ pub async fn search(
             Ok(rows)
         })
         .await?;
-    let post_sql = base_post_query()
-        + " AND p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?) LIMIT 40";
+    let mut post_sql = base_post_query();
+    post_sql
+        .push_str(" AND p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?) LIMIT 40");
     let query = query.to_owned();
     let rows = pool
         .call(move |conn| query_post_rows(conn, &post_sql, params![query]))

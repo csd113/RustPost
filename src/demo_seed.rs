@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::Context;
+use anyhow::Context as _;
 use chrono::{Duration, Utc};
 use rusqlite::params;
 
@@ -260,7 +260,10 @@ async fn create_social_graph(pool: &SqlitePool, ids: &DemoIds) -> anyhow::Result
 
 // The seed content is intentionally kept in one ordered block so the demo feed
 // reads naturally and post IDs stay easy to map to screenshots.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "demo post fixtures stay ordered so IDs and screenshot content remain stable"
+)]
 async fn create_posts(
     pool: &SqlitePool,
     settings: &Settings,

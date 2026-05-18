@@ -1,9 +1,9 @@
-use std::io::{self, Write};
+use std::io::{self, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
-use anyhow::Context;
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -64,22 +64,22 @@ pub async fn run() -> anyhow::Result<()> {
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Init => {
-            println!("initialized {}", paths.data_dir.display());
+            stdout_line(format_args!("initialized {}", paths.data_dir.display()))?;
             Ok(())
         }
         Command::Check => {
             let ffmpeg = crate::ffmpeg::probe(&settings.media).await;
             let tor_status = tor::validate_startup(&settings.tor);
-            println!("configuration ok");
-            println!("ffmpeg: {}", ffmpeg.summary());
-            println!("tor: {}", tor_status.summary());
+            stdout_line(format_args!("configuration ok"))?;
+            stdout_line(format_args!("ffmpeg: {}", ffmpeg.summary()))?;
+            stdout_line(format_args!("tor: {}", tor_status.summary()))?;
             Ok(())
         }
         Command::CreateAdmin { username, password } => {
             let pool = db::connect(&paths.database_path).await?;
             db::migrate(&pool).await?;
             admin::create_admin(&pool, &settings, &username, &password).await?;
-            println!("admin account created");
+            stdout_line(format_args!("admin account created"))?;
             Ok(())
         }
         Command::CreateAdminInteractive => {
@@ -87,14 +87,14 @@ pub async fn run() -> anyhow::Result<()> {
             db::migrate(&pool).await?;
             let (username, password) = prompt_admin_credentials()?;
             admin::create_admin(&pool, &settings, &username, &password).await?;
-            println!("admin account created");
+            stdout_line(format_args!("admin account created"))?;
             Ok(())
         }
         Command::ResetAdminPassword { username, password } => {
             let pool = db::connect(&paths.database_path).await?;
             db::migrate(&pool).await?;
             admin::reset_admin_password(&pool, &settings, &username, &password).await?;
-            println!("admin password reset");
+            stdout_line(format_args!("admin password reset"))?;
             Ok(())
         }
         Command::SeedDemo => {
@@ -104,12 +104,12 @@ pub async fn run() -> anyhow::Result<()> {
             let pool = db::connect(&paths.database_path).await?;
             db::migrate(&pool).await?;
             let report = demo_seed::seed(&pool, &paths, &settings, &settings_path).await?;
-            println!("{report}");
+            stdout_line(format_args!("{report}"))?;
             Ok(())
         }
         Command::Backup { include_tor_keys } => {
             let archive = backup::create_backup(&paths, include_tor_keys)?;
-            println!("{}", archive.display());
+            stdout_line(format_args!("{}", archive.display()))?;
             Ok(())
         }
         Command::Restore {
@@ -117,12 +117,15 @@ pub async fn run() -> anyhow::Result<()> {
             include_tor_keys,
         } => {
             backup::restore_backup(&paths, &archive, include_tor_keys)?;
-            println!("restore completed");
+            stdout_line(format_args!("restore completed"))?;
             Ok(())
         }
         Command::PrintOnionAddress => {
             let status = tor::validate_startup(&settings.tor);
-            println!("{}", status.onion_address().unwrap_or_default());
+            stdout_line(format_args!(
+                "{}",
+                status.onion_address().unwrap_or_default()
+            ))?;
             Ok(())
         }
         Command::Serve => serve(paths, settings).await,
@@ -236,33 +239,41 @@ fn print_startup_summary(
     settings: &config::Settings,
     admin_count: i64,
 ) {
-    eprintln!("RustPost startup");
-    eprintln!("  data dir: {}", paths.data_dir.display());
-    eprintln!("  settings: {}", paths.settings_path.display());
-    eprintln!("  database: {}", paths.database_path.display());
-    eprintln!("  uploads: {}", paths.uploads_originals.display());
-    eprintln!(
+    stderr_line(format_args!("RustPost startup"));
+    stderr_line(format_args!("  data dir: {}", paths.data_dir.display()));
+    stderr_line(format_args!(
+        "  settings: {}",
+        paths.settings_path.display()
+    ));
+    stderr_line(format_args!(
+        "  database: {}",
+        paths.database_path.display()
+    ));
+    stderr_line(format_args!(
+        "  uploads: {}",
+        paths.uploads_originals.display()
+    ));
+    stderr_line(format_args!(
         "  serving: http://{}:{}",
         settings.server.host, settings.server.port
-    );
+    ));
     if admin_count > 0 {
-        eprintln!("  admin: present");
+        stderr_line(format_args!("  admin: present"));
     } else {
-        eprintln!("  admin: none found");
-        eprintln!(
+        stderr_line(format_args!("  admin: none found"));
+        stderr_line(format_args!(
             "  setup: rustpost-cli --data-dir {} create-admin-interactive",
             paths.data_dir.display()
-        );
-        eprintln!(
+        ));
+        stderr_line(format_args!(
             "  non-interactive: rustpost-cli --data-dir {} create-admin <username> <password>",
             paths.data_dir.display()
-        );
+        ));
     }
 }
 
 fn prompt_admin_credentials() -> anyhow::Result<(String, String)> {
-    print!("Admin username: ");
-    io::stdout().flush()?;
+    stdout_raw(format_args!("Admin username: "))?;
     let mut username = String::new();
     io::stdin().read_line(&mut username)?;
     let username = username.trim().to_owned();
@@ -276,12 +287,11 @@ fn prompt_admin_credentials() -> anyhow::Result<(String, String)> {
 
 #[cfg(unix)]
 fn read_secret(prompt: &str) -> anyhow::Result<String> {
-    print!("{prompt}");
-    io::stdout().flush()?;
+    stdout_raw(format_args!("{prompt}"))?;
     let _guard = EchoGuard::disable()?;
     let mut value = String::new();
     io::stdin().read_line(&mut value)?;
-    eprintln!();
+    stderr_line(format_args!(""));
     Ok(value.trim_end_matches(['\r', '\n']).to_owned())
 }
 
@@ -323,4 +333,24 @@ async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
             break;
         }
     }
+}
+
+fn stdout_line(args: std::fmt::Arguments<'_>) -> anyhow::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_fmt(args)?;
+    stdout.write_all(b"\n")?;
+    Ok(())
+}
+
+fn stdout_raw(args: std::fmt::Arguments<'_>) -> anyhow::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_fmt(args)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn stderr_line(args: std::fmt::Arguments<'_>) {
+    let mut stderr = io::stderr().lock();
+    let _write_result = stderr.write_fmt(args);
+    let _write_newline_result = stderr.write_all(b"\n");
 }

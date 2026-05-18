@@ -118,7 +118,7 @@ async fn run_ffmpeg(path: &str, args: &[String], duration: Duration) -> anyhow::
     let child = command.spawn()?;
     timeout(duration, child.wait_with_output())
         .await
-        .map_err(|_| anyhow::anyhow!("ffmpeg timed out"))?
+        .map_err(|_elapsed| anyhow::anyhow!("ffmpeg timed out"))?
         .map_err(Into::into)
 }
 

@@ -5,10 +5,10 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::Context as _;
 use arti_client::{TorClient, config::TorClientConfigBuilder};
-use futures_util::StreamExt;
-use safelog::DisplayRedacted;
+use futures_util::StreamExt as _;
+use safelog::DisplayRedacted as _;
 use tokio::net::TcpStream;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{HsNickname, RunningOnionService};
@@ -380,7 +380,7 @@ fn ensure_rustls_crypto_provider() {
 
 #[cfg(unix)]
 fn restrict_dir(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     Ok(())

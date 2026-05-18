@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use axum::extract::multipart::Field;
-use rusqlite::{OptionalExtension, params};
-use tokio::io::AsyncWriteExt;
+use rusqlite::{OptionalExtension as _, params};
+use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 
 use crate::config::Settings;

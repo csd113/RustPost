@@ -3,8 +3,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension};
+use anyhow::Context as _;
+use rusqlite::{Connection, OptionalExtension as _};
 
 #[derive(Clone)]
 pub struct Db {
@@ -24,10 +24,10 @@ impl Db {
             .send(Box::new(move |conn| {
                 let _ = result_tx.send(f(conn));
             }))
-            .map_err(|_| anyhow::anyhow!("database worker stopped"))?;
+            .map_err(|_send_err| anyhow::anyhow!("database worker stopped"))?;
         result_rx
             .await
-            .map_err(|_| anyhow::anyhow!("database worker stopped"))?
+            .map_err(|_recv_err| anyhow::anyhow!("database worker stopped"))?
     }
 }
 
@@ -53,7 +53,7 @@ pub async fn connect(path: &Path) -> anyhow::Result<Db> {
         .context("failed to spawn database worker")?;
     ready_rx
         .recv()
-        .map_err(|_| anyhow::anyhow!("database worker stopped during startup"))??;
+        .map_err(|_recv_err| anyhow::anyhow!("database worker stopped during startup"))??;
     Ok(Db {
         sender: Arc::new(job_tx),
     })
