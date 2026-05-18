@@ -331,7 +331,11 @@ cargo update                                                           # update 
 cargo fmt --all --check                                                # check formatting
 cargo clippy --workspace --all-targets --all-features -- -D warnings  # lint
 cargo test --workspace --all-features                                  # run tests
+npm ci                                                                 # install browser test tooling
+npm run test:e2e                                                       # run Playwright browser flows
 ```
+
+Playwright tests are local-only for now. They build the Rust binaries, start `target/debug/rustpost` with a fresh temporary data directory, drive Chromium through registration, posting, replies, reactions, bookmarks, auth rejection, validation, and mobile layout checks, then remove the temporary app data. Browser artifacts are ignored under `test-results/`, `playwright-report/`, and `output/playwright/`.
 
 **CI matrix** (GitHub Actions, Rust 1.90):
 

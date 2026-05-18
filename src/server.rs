@@ -126,6 +126,13 @@ struct ParsedProfileUpdate {
     banner_media_id: Option<i64>,
 }
 
+struct ParsedPostCreate {
+    csrf_token: String,
+    text: String,
+    parent_post_id: Option<i64>,
+    media_ids: Vec<i64>,
+}
+
 async fn current(state: &AppState, headers: &HeaderMap) -> AppResult<Option<CurrentUser>> {
     Ok(auth::current_user(&state.pool, headers).await?)
 }
@@ -140,7 +147,11 @@ async fn local(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppRes
         String::new()
     };
     let body = format!(
-        "{}{}",
+        "{}{}{}",
+        render::page_header(
+            "Local timeline",
+            "Public posts from this RustPost instance."
+        ),
         composer,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
@@ -157,7 +168,8 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
     let posts = social::timeline(&state.pool, Some(user.id), "home", None).await?;
     let csrf = form_csrf(&state, &headers).await;
     let body = format!(
-        "{}{}",
+        "{}{}{}",
+        render::page_header("Home", "Posts from people you follow and your own updates."),
         render::composer(csrf.as_deref(), None),
         render::posts(&posts, Some(&user), csrf.as_deref())
     );
@@ -173,7 +185,7 @@ async fn login_form() -> Html<String> {
     Html(render::layout(
         None,
         "Login",
-        r#"<section class="panel"><form method="post"><label>Username<input name="username" required></label><label>Password<input name="password" type="password" required></label><button>Log in</button></form></section>"#,
+        r#"<section class="panel auth-panel"><h1>Log in</h1><form method="post"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button type="submit">Log in</button></form></section>"#,
     ))
 }
 
@@ -215,7 +227,7 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
     Ok(Html(render::layout(
         None,
         "Register",
-        r#"<section class="panel"><form method="post"><label>Username<input name="username" required></label><label>Password<input name="password" type="password" minlength="10" required></label><button>Create account</button></form></section>"#,
+        r#"<section class="panel auth-panel"><h1>Create account</h1><form method="post"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required><button type="submit">Create account</button></form></section>"#,
     )))
 }
 
@@ -262,7 +274,7 @@ async fn logout(
     headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     if let Some(token) = auth::session_cookie(&headers) {
         auth::revoke_session(&state.pool, &token).await?;
     }
@@ -281,7 +293,7 @@ async fn create_post(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> AppResult<Response> {
     let user = current(&state, &headers).await?;
     if let Some(user) = &user
@@ -292,55 +304,9 @@ async fn create_post(
     if user.is_none() && !state.settings.accounts.anonymous_mode_enabled {
         return Err(AppError::Forbidden);
     }
-    let mut text = String::new();
-    let mut csrf_token = String::new();
-    let mut parent_post_id = None;
-    let mut media_ids = Vec::new();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| AppError::BadRequest(err.to_string()))?
-    {
-        let Some(name) = field.name().map(ToOwned::to_owned) else {
-            continue;
-        };
-        match name.as_str() {
-            "text" => {
-                text = field
-                    .text()
-                    .await
-                    .map_err(|err| AppError::BadRequest(err.to_string()))?
-            }
-            "csrf" => {
-                csrf_token = field
-                    .text()
-                    .await
-                    .map_err(|err| AppError::BadRequest(err.to_string()))?
-            }
-            "parent_post_id" => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
-                parent_post_id = value.parse::<i64>().ok();
-            }
-            "media" if field.file_name().is_some() => {
-                let id = media::save_upload(
-                    &state.pool,
-                    &state.settings,
-                    &state.paths,
-                    &state.ffmpeg,
-                    user.as_ref().map(|u| u.id),
-                    field,
-                )
-                .await?;
-                media_ids.push(id);
-            }
-            _ => {}
-        }
-    }
+    let form = parse_post_create(&state, user.as_ref().map(|u| u.id), multipart).await?;
     if user.is_some() {
-        csrf::validate(&state.pool, &headers, &csrf_token).await?;
+        validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
     }
     let (scope, actor, max_events, window_secs) = if user.is_none() {
         (
@@ -349,7 +315,7 @@ async fn create_post(
             state.settings.moderation.anonymous_posts_per_ip_per_hour,
             60 * 60,
         )
-    } else if parent_post_id.is_some() {
+    } else if form.parent_post_id.is_some() {
         (
             rate_limit::Scope::Reply,
             user_actor(user.as_ref().map(|u| u.id).unwrap_or_default()),
@@ -371,12 +337,76 @@ async fn create_post(
         &state.pool,
         &state.settings,
         user.as_ref().map(|u| u.id),
-        &text,
-        parent_post_id,
-        &media_ids,
+        &form.text,
+        form.parent_post_id,
+        &form.media_ids,
     )
-    .await?;
+    .await
+    .map_err(|err| AppError::BadRequest(err.to_string()))?;
     Ok(Redirect::to("/local").into_response())
+}
+
+async fn parse_post_create(
+    state: &AppState,
+    user_id: Option<i64>,
+    mut multipart: Multipart,
+) -> AppResult<ParsedPostCreate> {
+    let mut form = ParsedPostCreate {
+        csrf_token: String::new(),
+        text: String::new(),
+        parent_post_id: None,
+        media_ids: Vec::new(),
+    };
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?
+    {
+        let Some(name) = field.name().map(ToOwned::to_owned) else {
+            continue;
+        };
+        match name.as_str() {
+            "text" => {
+                form.text = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
+            "csrf" => {
+                form.csrf_token = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
+            "parent_post_id" => {
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+                form.parent_post_id = value.parse::<i64>().ok();
+            }
+            "media"
+                if field
+                    .file_name()
+                    .is_some_and(|name| !name.trim().is_empty()) =>
+            {
+                form.media_ids.push(
+                    media::save_upload(
+                        &state.pool,
+                        &state.settings,
+                        &state.paths,
+                        &state.ffmpeg,
+                        user_id,
+                        field,
+                    )
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(form)
 }
 
 async fn thread(
@@ -396,7 +426,8 @@ async fn thread(
         String::new()
     };
     let body = format!(
-        "{}{}",
+        "{}{}{}",
+        render::page_header("Thread", "Read the conversation and add a reply."),
         render::posts(&posts, user.as_ref(), csrf.as_deref()),
         composer
     );
@@ -415,7 +446,7 @@ async fn delete_post(
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
     let user = require_user(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::delete_post(&state.pool, user.id, id, user.is_admin).await?;
     Ok(Redirect::to("/local").into_response())
 }
@@ -427,7 +458,7 @@ async fn toggle_like(
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     if user_post_relation_exists(&state.pool, "likes", user.id, id).await? {
         social::unlike(&state.pool, user.id, id).await?;
     } else {
@@ -443,7 +474,7 @@ async fn toggle_bookmark(
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     if user_post_relation_exists(&state.pool, "bookmarks", user.id, id).await? {
         social::unbookmark(&state.pool, user.id, id).await?;
     } else {
@@ -459,7 +490,7 @@ async fn repost(
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     rate_limit::check_and_record(
         &state.pool,
         rate_limit::Scope::Repost,
@@ -535,23 +566,30 @@ async fn profile(
     } else {
         String::new()
     };
-    let picture = picture_path.map_or_else(String::new, |path| {
-        format!(
-            r#"<img class="profile-picture" src="{}" alt="">"#,
-            html_escape::encode_double_quoted_attribute(&path)
-        )
-    });
-    let banner = banner_path.map_or_else(String::new, |path| {
-        format!(
-            r#"<img class="profile-banner" src="{}" alt="">"#,
-            html_escape::encode_double_quoted_attribute(&path)
-        )
-    });
+    let picture = picture_path.map_or_else(
+        || r#"<div class="profile-picture" aria-hidden="true"></div>"#.to_owned(),
+        |path| {
+            format!(
+                r#"<img class="profile-picture" src="{}" alt="">"#,
+                html_escape::encode_double_quoted_attribute(&path)
+            )
+        },
+    );
+    let banner = banner_path.map_or_else(
+        || r#"<div class="profile-banner" aria-hidden="true"></div>"#.to_owned(),
+        |path| {
+            format!(
+                r#"<img class="profile-banner" src="{}" alt="">"#,
+                html_escape::encode_double_quoted_attribute(&path)
+            )
+        },
+    );
     let body = format!(
-        r#"<section class="panel profile">{}<div class="profile-heading">{}<div><h1>{}</h1><p>{}</p><p><a href="{}">{}</a></p></div></div>{}</section>{}"#,
+        r#"<section class="panel profile">{}<div class="profile-heading">{}<div><h1>{}</h1><p class="muted">@{}</p><p>{}</p><p><a href="{}">{}</a></p></div></div>{}</section>{}"#,
         banner,
         picture,
         html_escape::encode_text(display_name.as_str()),
+        html_escape::encode_text(profile_username.as_str()),
         html_escape::encode_text(bio.as_str()),
         html_escape::encode_double_quoted_attribute(website.as_str()),
         html_escape::encode_text(website.as_str()),
@@ -573,7 +611,7 @@ async fn follow(
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::follow(&state.pool, user.id, id).await?;
     Ok(Redirect::to("/home").into_response())
 }
@@ -585,7 +623,7 @@ async fn block(
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::block(&state.pool, user.id, id).await?;
     Ok(Redirect::to("/home").into_response())
 }
@@ -597,7 +635,7 @@ async fn mute(
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::mute(&state.pool, user.id, id).await?;
     Ok(Redirect::to("/home").into_response())
 }
@@ -638,32 +676,32 @@ async fn settings_form(
     let (display_name, bio, website, picture_path, banner_path) = profile;
     let picture = picture_path.map_or_else(String::new, |path| {
             format!(
-                r#"<img class="profile-picture" src="{}" alt=""><label><input type="checkbox" name="delete_profile_picture" value="true"> Delete profile picture</label>"#,
+            r#"<img class="profile-picture" src="{}" alt=""><label class="check-row"><input type="checkbox" name="delete_profile_picture" value="true"> Delete profile picture</label>"#,
                 html_escape::encode_double_quoted_attribute(&path)
             )
         });
     let banner = banner_path.map_or_else(String::new, |path| {
             format!(
-                r#"<img class="profile-banner" src="{}" alt=""><label><input type="checkbox" name="delete_banner" value="true"> Delete banner</label>"#,
+                r#"<img class="profile-banner" src="{}" alt=""><label class="check-row"><input type="checkbox" name="delete_banner" value="true"> Delete banner</label>"#,
                 html_escape::encode_double_quoted_attribute(&path)
             )
         });
     let banner_input = if state.settings.accounts.allow_profile_banners {
         format!(
-            r#"{banner}<label>Banner<input name="banner" type="file" accept="image/*"></label>"#
+            r#"{banner}<label for="banner">Banner</label><input id="banner" name="banner" type="file" accept="image/*">"#
         )
     } else {
         r#"<p>Profile banners are disabled.</p>"#.to_owned()
     };
     let picture_input = if state.settings.accounts.allow_profile_pictures {
         format!(
-            r#"{picture}<label>Profile picture<input name="profile_picture" type="file" accept="image/*"></label>"#
+            r#"{picture}<label for="profile_picture">Profile picture</label><input id="profile_picture" name="profile_picture" type="file" accept="image/*">"#
         )
     } else {
         r#"<p>Profile pictures are disabled.</p>"#.to_owned()
     };
     let body = format!(
-        r#"<section class="panel"><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label>Display name<input name="display_name" value="{}"></label><label>Bio<textarea name="bio">{}</textarea></label><label>Website<input type="url" name="website" value="{}"></label>{}{}<button>Save</button></form></section>"#,
+        r#"<section class="panel"><h1>Account settings</h1><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="website">Website</label><input id="website" type="url" name="website" value="{}">{}{}<button type="submit">Save settings</button></form></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         html_escape::encode_double_quoted_attribute(display_name.as_str()),
         html_escape::encode_text(bio.as_str()),
@@ -686,7 +724,7 @@ async fn settings_update(
 ) -> AppResult<Response> {
     let user = require_user(&state, &headers).await?;
     let form = parse_profile_update(&state, user.id, multipart).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf_token).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
     crate::validation::validate_profile_text(&form.display_name, &form.bio, &state.settings)?;
     let display_name = form.display_name.trim().to_owned();
     let bio = form.bio.trim().to_owned();
@@ -831,7 +869,11 @@ async fn bookmarks(
         Some(&user),
         csrf.as_deref(),
         "Bookmarks",
-        &render::posts(&posts, Some(&user), csrf.as_deref()),
+        &format!(
+            "{}{}",
+            render::page_header("Bookmarks", "Posts you saved for later."),
+            render::posts(&posts, Some(&user), csrf.as_deref())
+        ),
     )))
 }
 
@@ -858,8 +900,16 @@ async fn notifications(
         })
         .collect::<Vec<_>>()
         .join("");
+    let list = if list.is_empty() {
+        render::empty_state(
+            "No notifications",
+            "Likes, replies, reposts, and follows will appear here.",
+        )
+    } else {
+        format!(r#"<ul class="item-list">{list}</ul>"#)
+    };
     let body = format!(
-        r#"<section class="panel"><form method="post" action="/notifications/read"><input type="hidden" name="csrf" value="{}"><button>Mark all read</button></form><ul>{}</ul></section>"#,
+        r#"<section class="panel"><div class="section-heading"><h1>Notifications</h1><form method="post" action="/notifications/read"><input type="hidden" name="csrf" value="{}"><button type="submit">Mark all read</button></form></div>{}</section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         list
     );
@@ -877,7 +927,7 @@ async fn mark_notifications_read(
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
     let user = require_user(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::mark_notifications_read(&state.pool, user.id).await?;
     Ok(Redirect::to("/notifications").into_response())
 }
@@ -906,8 +956,13 @@ async fn search(
         .collect::<Vec<_>>()
         .join("");
     let csrf = form_csrf(&state, &headers).await;
+    let user_results = if user_results.is_empty() {
+        render::empty_state("No users found", "Try a username or display name.")
+    } else {
+        format!(r#"<ul class="item-list">{user_results}</ul>"#)
+    };
     let body = format!(
-        r#"<section class="panel"><form method="get"><label>Search<input name="q" value="{}"></label><button>Search</button></form><h2>Users</h2><ul>{}</ul><h2>Posts</h2>{}</section>"#,
+        r#"<section class="panel"><h1>Search</h1><form method="get"><label for="q">Search RustPost</label><input id="q" name="q" value="{}"><button type="submit">Search</button></form></section><section class="panel"><h2>Users</h2>{}</section><section><h2 class="section-title">Posts</h2>{}</section>"#,
         html_escape::encode_double_quoted_attribute(&q),
         user_results,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
@@ -1047,7 +1102,7 @@ async fn admin_suspend(
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
     let user = require_admin(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     let current: i64 = state
         .pool
         .call(move |conn| {
@@ -1069,7 +1124,7 @@ async fn admin_delete_post(
     Form(form): Form<CsrfForm>,
 ) -> AppResult<Response> {
     let user = require_admin(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::delete_post(&state.pool, user.id, id, true).await?;
     admin::audit(&state.pool, user.id, "delete_post", &format!("post:{id}")).await?;
     Ok(Redirect::to("/admin").into_response())
@@ -1135,7 +1190,7 @@ async fn admin_create_backup(
     Form(form): Form<BackupForm>,
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
-    csrf::validate(&state.pool, &headers, &form.csrf).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     let include_tor = form.include_tor_keys.is_some();
     let archive = backup::create_backup(&state.paths, include_tor)?;
     admin::audit(
@@ -1185,6 +1240,12 @@ async fn require_admin(state: &AppState, headers: &HeaderMap) -> AppResult<Curre
         return Err(AppError::Forbidden);
     }
     Ok(user)
+}
+
+async fn validate_csrf(pool: &SqlitePool, headers: &HeaderMap, token: &str) -> AppResult<()> {
+    csrf::validate(pool, headers, token)
+        .await
+        .map_err(|_| AppError::Forbidden)
 }
 
 async fn form_csrf(state: &AppState, headers: &HeaderMap) -> Option<String> {
@@ -1247,4 +1308,294 @@ fn ip_actor(addr: SocketAddr) -> String {
 
 fn user_actor(user_id: i64) -> String {
     format!("user:{user_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct TestServer {
+        base_url: String,
+        _task: tokio::task::JoinHandle<()>,
+        _temp: tempfile::TempDir,
+    }
+
+    struct TestResponse {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    #[tokio::test]
+    async fn logged_in_ui_post_succeeds_with_empty_media_part_and_appears_on_local_timeline() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+        let cookie = session_cookie(&registered);
+
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(home.status, 200);
+        assert!(home.body.contains(r#"action="/posts""#));
+        let csrf = csrf_token(&home.body);
+
+        let body = multipart_body(
+            "post-boundary",
+            &[
+                ("csrf", csrf.as_str()),
+                ("text", "hello from the browser-shaped form"),
+            ],
+            true,
+        );
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let local = request(
+            &server.base_url,
+            "GET",
+            "/local",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(local.status, 200);
+        assert!(local.body.contains("hello from the browser-shaped form"));
+        assert!(local.body.contains(r#"class="post""#));
+    }
+
+    #[tokio::test]
+    async fn post_auth_csrf_anonymous_and_validation_fail_cleanly() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=bob&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let cookie = session_cookie(&registered);
+
+        let missing_csrf = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body("post-boundary", &[("text", "missing csrf")], false),
+        )
+        .await;
+        assert_eq!(missing_csrf.status, 403);
+        assert!(missing_csrf.body.contains("Access denied"));
+        assert!(!missing_csrf.body.contains("missing csrf session"));
+
+        let logged_out = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[(
+                "content-type",
+                "multipart/form-data; boundary=post-boundary",
+            )],
+            multipart_body("post-boundary", &[("text", "logged out")], false),
+        )
+        .await;
+        assert_eq!(logged_out.status, 403);
+        assert!(logged_out.body.contains("Access denied"));
+
+        let anonymous_local = request(&server.base_url, "GET", "/local", &[], Vec::new()).await;
+        assert_eq!(anonymous_local.status, 200);
+        assert!(!anonymous_local.body.contains(r#"action="/posts""#));
+
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&home.body);
+        let too_long = "x".repeat(281);
+        let too_long = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", too_long.as_str())],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(too_long.status, 400);
+        assert!(too_long.body.contains("post is too long"));
+        assert!(!too_long.body.contains("internal server error"));
+    }
+
+    fn multipart_body(
+        boundary: &str,
+        fields: &[(&str, &str)],
+        include_empty_media: bool,
+    ) -> Vec<u8> {
+        let mut body = String::new();
+        for (name, value) in fields {
+            body.push_str(&format!("--{boundary}\r\n"));
+            body.push_str(&format!(
+                "Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        if include_empty_media {
+            body.push_str(&format!("--{boundary}\r\n"));
+            body.push_str("Content-Disposition: form-data; name=\"media\"; filename=\"\"\r\n");
+            body.push_str("Content-Type: application/octet-stream\r\n\r\n\r\n");
+        }
+        body.push_str(&format!("--{boundary}--\r\n"));
+        body.into_bytes()
+    }
+
+    async fn spawn_test_server() -> TestServer {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf());
+        paths.ensure().expect("paths");
+        let pool = crate::db::connect(&paths.database_path)
+            .await
+            .expect("connect");
+        crate::db::migrate(&pool).await.expect("migrate");
+        let settings = Settings::default();
+        let ffmpeg = FfmpegStatus {
+            available: false,
+            version: String::new(),
+            supports_webp: false,
+            supports_vp9: false,
+            error: Some("disabled in tests".to_owned()),
+        };
+        let tor = crate::tor::validate_startup(&settings.tor);
+        let app = router(AppState::new(pool, settings, paths, ffmpeg, tor));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("serve");
+        });
+        TestServer {
+            base_url: format!("127.0.0.1:{}", addr.port()),
+            _task: task,
+            _temp: temp,
+        }
+    }
+
+    async fn request(
+        base_url: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> TestResponse {
+        let mut stream = tokio::net::TcpStream::connect(base_url)
+            .await
+            .expect("connect");
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {base_url}\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            request.push_str(name);
+            request.push_str(": ");
+            request.push_str(value);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write headers");
+        stream.write_all(&body).await.expect("write body");
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.expect("read");
+        parse_response(&bytes)
+    }
+
+    fn parse_response(bytes: &[u8]) -> TestResponse {
+        let raw = String::from_utf8_lossy(bytes);
+        let (head, body) = raw.split_once("\r\n\r\n").expect("response split");
+        let mut lines = head.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u16>().ok())
+            .expect("status");
+        let headers = lines
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.to_ascii_lowercase(), value.trim().to_owned()))
+            })
+            .collect();
+        TestResponse {
+            status,
+            headers,
+            body: body.to_owned(),
+        }
+    }
+
+    fn session_cookie(response: &TestResponse) -> String {
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "set-cookie")
+            .map(|(_, value)| value.split(';').next().unwrap_or_default().to_owned())
+            .expect("session cookie")
+    }
+
+    fn csrf_token(body: &str) -> String {
+        let marker = r#"name="csrf" value=""#;
+        let start = body.find(marker).expect("csrf marker") + marker.len();
+        let end = body[start..].find('"').expect("csrf end") + start;
+        body[start..end].to_owned()
+    }
 }

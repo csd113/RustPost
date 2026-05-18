@@ -1,0 +1,11 @@
+{
+  "name": "rustpost-browser-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:e2e": "env -u RUSTC_WRAPPER cargo build --workspace --all-features && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.57.0"
+  }
+}

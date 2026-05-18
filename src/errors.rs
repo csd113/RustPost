@@ -1,5 +1,5 @@
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -40,18 +40,6 @@ impl IntoResponse for AppError {
                 )
             }
         };
-        (
-            status,
-            crate::render::layout(
-                None,
-                "Error",
-                &format!(
-                    "<h1>{}</h1><p>{}</p>",
-                    status.as_u16(),
-                    html_escape::encode_text(&message)
-                ),
-            ),
-        )
-            .into_response()
+        (status, Html(crate::render::error_page(status, &message))).into_response()
     }
 }
