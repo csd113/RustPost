@@ -12,6 +12,7 @@ pub struct PostView {
     pub user_id: Option<i64>,
     pub username: Option<String>,
     pub display_name: Option<String>,
+    pub profile_picture_path: Option<String>,
     pub anonymous_label: Option<String>,
     pub text: String,
     pub parent_post_id: Option<i64>,
@@ -22,6 +23,8 @@ pub struct PostView {
     pub reply_count: i64,
     pub viewer_liked: bool,
     pub viewer_bookmarked: bool,
+    pub viewer_reposted: bool,
+    pub viewer_can_repost: bool,
     pub original_unavailable: bool,
     pub reposted_by_user_id: Option<i64>,
     pub reposted_by_username: Option<String>,
@@ -58,6 +61,7 @@ struct PostRow {
     user_id: Option<i64>,
     username: Option<String>,
     display_name: Option<String>,
+    profile_picture_path: Option<String>,
     anonymous_label: Option<String>,
     text: String,
     parent_post_id: Option<i64>,
@@ -231,6 +235,17 @@ pub async fn repost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Re
     .await
 }
 
+pub async fn unrepost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<bool> {
+    pool.call(move |conn| {
+        let changed = conn.execute(
+            "DELETE FROM reposts WHERE user_id = ? AND post_id = ?",
+            params![user_id, post_id],
+        )?;
+        Ok(changed > 0)
+    })
+    .await
+}
+
 pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> anyhow::Result<()> {
     if follower_id == followed_id {
         anyhow::bail!("cannot follow yourself");
@@ -280,6 +295,41 @@ pub async fn block(pool: &SqlitePool, blocker_id: i64, blocked_id: i64) -> anyho
         )?;
         tx.commit()?;
         Ok(())
+    })
+    .await
+}
+
+pub async fn unblock(pool: &SqlitePool, blocker_id: i64, blocked_id: i64) -> anyhow::Result<()> {
+    pool.call(move |conn| {
+        conn.execute(
+            "DELETE FROM blocks WHERE blocker_id = ? AND blocked_id = ?",
+            params![blocker_id, blocked_id],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn blocked_users(
+    pool: &SqlitePool,
+    blocker_id: i64,
+) -> anyhow::Result<Vec<(i64, String, String)>> {
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name
+            FROM blocks b
+            JOIN users u ON u.id = b.blocked_id
+            WHERE b.blocker_id = ? AND u.is_deleted = 0
+            ORDER BY lower(u.username)
+            "#,
+        )?;
+        let rows = stmt
+            .query_map([blocker_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     })
     .await
 }
@@ -438,12 +488,14 @@ fn base_post_query() -> String {
     SELECT 'post' AS event_kind, 'p:' || p.id AS event_id, p.created_at AS event_created_at,
       NULL AS repost_user_id, NULL AS repost_username, NULL AS repost_display_name, NULL AS repost_created_at,
       0 AS original_unavailable,
-      p.id, p.user_id, u.username, u.display_name, p.anonymous_label, p.text, p.parent_post_id, p.created_at,
+      p.id, p.user_id, u.username, u.display_name, pic.public_path AS profile_picture_path,
+      p.anonymous_label, p.text, p.parent_post_id, p.created_at,
       (SELECT COUNT(*) FROM likes WHERE post_id = p.id) AS like_count,
       (SELECT COUNT(*) FROM reposts WHERE post_id = p.id) AS repost_count,
       (SELECT COUNT(*) FROM posts r WHERE r.parent_post_id = p.id AND r.is_deleted = 0) AS reply_count
     FROM posts p
     LEFT JOIN users u ON u.id = p.user_id
+    LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
     WHERE p.is_deleted = 0
     "#.to_owned()
 }
@@ -453,7 +505,8 @@ fn base_repost_query() -> String {
     SELECT 'repost' AS event_kind, 'r:' || r.id AS event_id, r.created_at AS event_created_at,
       ru.id AS repost_user_id, ru.username AS repost_username, ru.display_name AS repost_display_name, r.created_at AS repost_created_at,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 1 ELSE 0 END AS original_unavailable,
-      COALESCE(p.id, r.post_id) AS id, p.user_id, u.username, u.display_name, p.anonymous_label,
+      COALESCE(p.id, r.post_id) AS id, p.user_id, u.username, u.display_name,
+      pic.public_path AS profile_picture_path, p.anonymous_label,
       COALESCE(p.text, '') AS text, p.parent_post_id, COALESCE(p.created_at, r.created_at) AS created_at,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM likes WHERE post_id = p.id) END AS like_count,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM reposts WHERE post_id = p.id) END AS repost_count,
@@ -462,6 +515,7 @@ fn base_repost_query() -> String {
     JOIN users ru ON ru.id = r.user_id
     LEFT JOIN posts p ON p.id = r.post_id
     LEFT JOIN users u ON u.id = p.user_id
+    LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
     WHERE ru.is_deleted = 0
     "#.to_owned()
 }
@@ -603,13 +657,14 @@ fn map_post_row(row: &Row<'_>) -> rusqlite::Result<PostRow> {
         user_id: row.get(9)?,
         username: row.get(10)?,
         display_name: row.get(11)?,
-        anonymous_label: row.get(12)?,
-        text: row.get(13)?,
-        parent_post_id: row.get(14)?,
-        created_at: row.get(15)?,
-        like_count: row.get(16)?,
-        repost_count: row.get(17)?,
-        reply_count: row.get(18)?,
+        profile_picture_path: row.get(12)?,
+        anonymous_label: row.get(13)?,
+        text: row.get(14)?,
+        parent_post_id: row.get(15)?,
+        created_at: row.get(16)?,
+        like_count: row.get(17)?,
+        repost_count: row.get(18)?,
+        reply_count: row.get(19)?,
     })
 }
 
@@ -637,6 +692,13 @@ async fn rows_to_posts(
         } else {
             false
         };
+        let viewer_reposted = if let Some(user_id) = viewer_id {
+            !original_unavailable && relation_exists(pool, "reposts", user_id, id).await?
+        } else {
+            false
+        };
+        let viewer_can_repost =
+            viewer_id.is_some_and(|user_id| !original_unavailable && row.user_id != Some(user_id));
         posts.push(PostView {
             event_id: row.event_id,
             event_kind: if row.event_kind == "repost" {
@@ -648,6 +710,7 @@ async fn rows_to_posts(
             user_id: row.user_id,
             username: row.username,
             display_name: row.display_name,
+            profile_picture_path: row.profile_picture_path,
             anonymous_label: row.anonymous_label,
             text: row.text,
             parent_post_id: row.parent_post_id,
@@ -658,6 +721,8 @@ async fn rows_to_posts(
             reply_count: row.reply_count,
             viewer_liked,
             viewer_bookmarked,
+            viewer_reposted,
+            viewer_can_repost,
             original_unavailable,
             reposted_by_user_id: row.repost_user_id,
             reposted_by_username: row.repost_username,
@@ -843,12 +908,12 @@ mod reply_tests {
         .await
         .expect("reply");
 
-        let local = timeline(&pool, Some(user_id), "local", None)
+        let timeline_posts = timeline(&pool, Some(user_id), "local", None)
             .await
-            .expect("local timeline");
+            .expect("timeline");
 
-        assert!(local.iter().any(|post| post.id == parent_id));
-        assert!(!local.iter().any(|post| post.id == reply_id));
+        assert!(timeline_posts.iter().any(|post| post.id == parent_id));
+        assert!(!timeline_posts.iter().any(|post| post.id == reply_id));
     }
 
     #[tokio::test]
@@ -1025,6 +1090,12 @@ mod tests {
         assert_eq!(profile[0].event_kind, TimelineEventKind::Repost);
         assert_eq!(profile[0].id, post);
         assert_eq!(profile[0].reposted_by_user_id, Some(bob));
+        assert!(!profile[0].viewer_can_repost);
+
+        let profile_for_bob = profile_timeline(&pool, Some(bob), bob)
+            .await
+            .expect("profile for bob");
+        assert!(profile_for_bob[0].viewer_can_repost);
     }
 
     #[tokio::test]

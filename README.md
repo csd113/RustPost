@@ -148,16 +148,13 @@ For scripted deployments, the non-interactive command is still available. Be awa
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080) and log in.
 
-### Timelines
-
-RustPost uses two feed labels intentionally:
+### Timeline
 
 | Label | Meaning |
 |---|---|
-| Home Feed | Your personalized feed: your posts and posts from people you follow |
-| Local Feed | Public top-level posts from this local RustPost instance |
+| Home Feed | Public top-level posts from your configured site |
 
-Replies remain attached to their parent thread. They render inside the thread view and are not shown as unrelated top-level Local Feed posts.
+Replies remain attached to their parent thread. They render inside the thread view and are not shown as unrelated top-level Home Feed posts.
 
 ---
 
@@ -182,6 +179,17 @@ rustpost print-onion-address                        # Print the current .onion h
 ## ⚙ Configuration
 
 `settings.toml` is generated on first run with conservative, safe defaults. Edit it to match your deployment.
+
+### Site name
+
+The visible site name is configured in `settings.toml`:
+
+```toml
+[site]
+name = "RustPost"
+```
+
+Changing `site.name` updates the rendered browser title, header brand, footer, and user-facing site copy. Binary names, package names, cookie names, and data paths remain `rustpost` for compatibility.
 
 ### Clearnet only (default)
 
@@ -436,14 +444,14 @@ Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and op
 
 - Fresh `--data-dir` boot creates `settings.toml`, `app.sqlite3`, upload roots, backup/log dirs, and Tor state dirs.
 - `rustpost-cli check` passes on a fresh data directory with `tor.enabled = false`.
-- Clearnet serving on `127.0.0.1:8080` loads `/local`.
+- Clearnet serving on `127.0.0.1:8080` loads `/home`.
 - Registration, login, post creation, replies, repost rendering, likes, bookmarks, follows, notifications, admin health, and CSRF-protected logout all work through live HTTP requests.
 - Anonymous posting is disabled by default — anonymous users cannot see the composer and anonymous post attempts are rejected.
 - Non-admin users cannot access admin health; anonymous users cannot access authenticated pages.
 - `ffmpeg` 8.1.1 detected with WebP and VP9 support. Image, profile picture/banner, and small video uploads live-tested; WebP and WebM outputs produced; admin media/health pages reported conversion state correctly.
 - Normal backups include DB, settings, and media; exclude Tor keys. `--include-tor-keys` includes them only when explicitly requested. Restore into a fresh data directory completed and `check` passed.
 - Backup archive names include subsecond precision — no same-second overwrite collisions.
-- `tor_only = false` live-tested: clearnet bound quickly, Arti produced a real `.onion` hostname, Tor Browser reached `/local` through the onion.
+- `tor_only = false` live-tested: clearnet bound quickly, Arti produced a real `.onion` hostname, Tor Browser reached `/home` through the onion.
 - `tor_only = true` live-tested: no clearnet listener exposed, loopback-only binding confirmed, real `.onion` hostname produced and reached via Tor Browser.
 - Both `rustpost` and `rustpost-cli` pass `check` on a fresh data directory.
 

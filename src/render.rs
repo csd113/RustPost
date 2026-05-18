@@ -2,8 +2,8 @@ use crate::auth::CurrentUser;
 use crate::social::{MediaView, PostView, TimelineEventKind};
 use axum::http::StatusCode;
 
-pub fn layout(user: Option<&CurrentUser>, title: &str, body: &str) -> String {
-    layout_with_csrf(user, None, title, body)
+pub fn layout(user: Option<&CurrentUser>, title: &str, body: &str, site_name: &str) -> String {
+    layout_with_csrf(user, None, title, body, site_name)
 }
 
 pub fn layout_with_csrf(
@@ -11,6 +11,7 @@ pub fn layout_with_csrf(
     csrf: Option<&str>,
     title: &str,
     body: &str,
+    site_name: &str,
 ) -> String {
     let auth_nav = if let Some(user) = user {
         let admin = if user.is_admin {
@@ -25,12 +26,14 @@ pub fn layout_with_csrf(
             )
         });
         format!(
-            r#"<a href="/home">Home Feed</a><a href="/local">Local Feed</a><a href="/search">Search</a><a href="/notifications">Notifications</a><a href="/bookmarks">Bookmarks</a><a href="/settings">Settings</a>{admin}{logout}"#
+            r#"<a href="/home">Home Feed</a><a href="/search">Search</a><a href="/notifications">Notifications</a><a href="/bookmarks">Bookmarks</a><a href="/users/{}">Profile</a>{admin}{logout}"#,
+            html_escape::encode_double_quoted_attribute(&user.username)
         )
     } else {
-        r#"<a href="/local">Local Feed</a><a href="/search">Search</a><a href="/login">Log in</a><a href="/register">Register</a>"#
+        r#"<a href="/home">Home Feed</a><a href="/search">Search</a><a href="/login">Log in</a><a href="/register">Register</a>"#
             .to_owned()
     };
+    let brand_mark = site_name.chars().next().unwrap_or('R');
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -40,20 +43,24 @@ pub fn layout_with_csrf(
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta name="referrer" content="same-origin">
-<title>{} - RustPost</title>
+<title>{} - {}</title>
 <style>{}</style>
 <script src="/assets/rustpost.js" defer></script>
 </head>
 <body>
-<header class="site-header"><div class="header-inner"><a class="brand" href="/local"><span class="brand-mark">R</span><span>RustPost</span></a><nav>{}</nav></div></header>
-<main><div class="content-shell"><section class="content-column">{} </section><aside class="side-panel"><h2>Alpha status</h2><p>Local-first microblog. Anonymous posting is off by default.</p><a href="/local">Local Feed</a></aside></div></main>
-<footer class="site-footer">RustPost alpha</footer>
+<header class="site-header"><div class="header-inner"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a><nav>{}</nav></div></header>
+<main><div class="content-shell"><section class="content-column">{} </section><aside class="side-panel"><h2>Alpha status</h2><p>Self-hosted microblog. Anonymous posting is off by default.</p><a href="/home">Home Feed</a></aside></div></main>
+<footer class="site-footer">{} alpha</footer>
 </body>
 </html>"#,
         html_escape::encode_text(title),
+        html_escape::encode_text(site_name),
         CSS,
+        html_escape::encode_text(&brand_mark.to_string()),
+        html_escape::encode_text(site_name),
         auth_nav,
-        body
+        body,
+        html_escape::encode_text(site_name)
     )
 }
 
@@ -143,7 +150,8 @@ pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>
     };
     if post.original_unavailable {
         return format!(
-            r#"<article class="post unavailable" id="event-{}">{}<div class="text">This post is no longer available.</div></article>"#,
+            r#"<article class="post unavailable" id="post-{}" data-event-id="{}">{}<div class="text">This post is no longer available.</div></article>"#,
+            post.id,
             html_escape::encode_double_quoted_attribute(&post.event_id),
             repost_banner
         );
@@ -158,6 +166,27 @@ pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>
         (None, Some(label)) => html_escape::encode_text(label).to_string(),
         _ => "Deleted user".to_owned(),
     };
+    let avatar = post.profile_picture_path.as_ref().map_or_else(
+        || {
+            let initial = post
+                .display_name
+                .as_deref()
+                .or(post.username.as_deref())
+                .or(post.anonymous_label.as_deref())
+                .and_then(|value| value.chars().next())
+                .unwrap_or('R');
+            format!(
+                r#"<span class="post-avatar placeholder" aria-hidden="true">{}</span>"#,
+                html_escape::encode_text(&initial.to_string())
+            )
+        },
+        |path| {
+            format!(
+                r#"<img class="post-avatar" src="{}" alt="" loading="lazy">"#,
+                html_escape::encode_double_quoted_attribute(path)
+            )
+        },
+    );
     let text = linkify(&post.text);
     let media = post
         .media
@@ -167,45 +196,89 @@ pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>
         .join("");
     let controls = if let (Some(user), Some(csrf)) = (user, csrf) {
         let delete = if post.user_id == Some(user.id) || user.is_admin {
-            action_form(&format!("/posts/{}/delete", post.id), csrf, "Delete")
+            icon_link(&format!("/posts/{}/delete", post.id), "Delete", "trash")
         } else {
             String::new()
         };
-        let reply_link = format!(
-            r#"<a class="button-link" href="/posts/{}#reply">Reply</a>"#,
-            post.id
-        );
+        let reply_link = icon_link(&format!("/posts/{}#reply", post.id), "Reply", "reply");
+        let thread_link = if post.parent_post_id.is_none() {
+            format!(
+                r#"<a class="button-link thread-link" href="/posts/{}">Open thread</a>"#,
+                post.id
+            )
+        } else {
+            String::new()
+        };
         format!(
-            r#"<div class="actions">{}{}{}{}{}<a class="button-link" href="/posts/{}">Open thread</a></div>"#,
-            action_form(
+            r#"<div class="actions">{}{}{}{}{}{}</div>"#,
+            icon_action_form(
                 &format!("/posts/{}/like", post.id),
                 csrf,
-                if post.viewer_liked { "Unlike" } else { "Like" }
+                if post.viewer_liked { "Unlike" } else { "Like" },
+                "heart",
+                post.viewer_liked
             ),
-            action_form(
+            icon_action_form(
                 &format!("/posts/{}/bookmark", post.id),
                 csrf,
                 if post.viewer_bookmarked {
                     "Unbookmark"
                 } else {
                     "Bookmark"
-                }
+                },
+                "bookmark",
+                post.viewer_bookmarked
             ),
-            action_form(&format!("/posts/{}/repost", post.id), csrf, "Repost"),
+            if post.viewer_can_repost {
+                icon_action_form(
+                    &format!("/posts/{}/repost", post.id),
+                    csrf,
+                    if post.viewer_reposted {
+                        "Unrepost"
+                    } else {
+                        "Repost"
+                    },
+                    "repost",
+                    post.viewer_reposted,
+                )
+            } else {
+                disabled_icon_button("Repost unavailable for your own post", "repost")
+            },
             reply_link,
             delete,
+            thread_link
+        )
+    } else {
+        if post.parent_post_id.is_none() {
+            format!(
+                r#"<div class="actions"><a class="button-link" href="/posts/{}">Open thread</a></div>"#,
+                post.id
+            )
+        } else {
+            String::new()
+        }
+    };
+    let post_class = if post.parent_post_id.is_some() {
+        "post reply-post"
+    } else {
+        "post"
+    };
+    let reply_anchor = if post.parent_post_id.is_some() {
+        format!(
+            r#"<span class="anchor-target" id="reply-{}"></span>"#,
             post.id
         )
     } else {
-        format!(
-            r#"<div class="actions"><a class="button-link" href="/posts/{}">Open thread</a></div>"#,
-            post.id
-        )
+        String::new()
     };
     format!(
-        r#"<article class="post" id="event-{}">{}<header class="post-header"><div>{}</div><a class="post-time" href="/posts/{}">#{}</a></header><div class="text">{}</div>{}<div class="counts"><span>{} likes</span><span>{} reposts</span><span>{} replies</span><span>{}</span></div>{}</article>"#,
+        r#"<article class="{}" id="post-{}" data-event-id="{}">{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div><a class="post-time" href="/posts/{}">#{}</a></header><div class="text">{}</div>{}<div class="counts"><span>{} likes</span><span>{} reposts</span><span>{} replies</span><span>{}</span></div>{}</article>"#,
+        post_class,
+        post.id,
         html_escape::encode_double_quoted_attribute(&post.event_id),
+        reply_anchor,
         repost_banner,
+        avatar,
         author,
         post.id,
         post.id,
@@ -219,13 +292,59 @@ pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>
     )
 }
 
-fn action_form(action: &str, csrf: &str, label: &str) -> String {
+fn icon_action_form(action: &str, csrf: &str, label: &str, icon: &str, active: bool) -> String {
     format!(
-        r#"<form method="post" action="{}"><input type="hidden" name="csrf" value="{}"><button type="submit">{}</button></form>"#,
+        r#"<form method="post" action="{}"><input type="hidden" name="csrf" value="{}"><button class="icon-button{}" type="submit" aria-label="{}" title="{}">{}<span class="sr-only">{}</span></button></form>"#,
         html_escape::encode_double_quoted_attribute(action),
         html_escape::encode_double_quoted_attribute(csrf),
+        if active { " active" } else { "" },
+        html_escape::encode_double_quoted_attribute(label),
+        html_escape::encode_double_quoted_attribute(label),
+        icon_svg(icon),
         html_escape::encode_text(label)
     )
+}
+
+fn icon_link(href: &str, label: &str, icon: &str) -> String {
+    format!(
+        r#"<a class="icon-button" href="{}" aria-label="{}" title="{}">{}<span class="sr-only">{}</span></a>"#,
+        html_escape::encode_double_quoted_attribute(href),
+        html_escape::encode_double_quoted_attribute(label),
+        html_escape::encode_double_quoted_attribute(label),
+        icon_svg(icon),
+        html_escape::encode_text(label)
+    )
+}
+
+fn disabled_icon_button(label: &str, icon: &str) -> String {
+    format!(
+        r#"<button class="icon-button disabled" type="button" aria-label="{}" title="{}" disabled>{}<span class="sr-only">{}</span></button>"#,
+        html_escape::encode_double_quoted_attribute(label),
+        html_escape::encode_double_quoted_attribute(label),
+        icon_svg(icon),
+        html_escape::encode_text(label)
+    )
+}
+
+fn icon_svg(icon: &str) -> &'static str {
+    match icon {
+        "heart" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 21s-7-4.4-9.4-8.8C.6 8.5 2.7 4.5 6.7 4.5c2 0 3.5 1.1 4.3 2.4.8-1.3 2.3-2.4 4.3-2.4 4 0 6.1 4 4.1 7.7C19 16.6 12 21 12 21z"/></svg>"#
+        }
+        "reply" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 18.5c-1.9-4.7-5.6-6.2-10.5-6.2V17L3 10.5 9.5 4v4.4c6.2 0 10 3.4 10.5 10.1z"/></svg>"#
+        }
+        "repost" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 7h9.2l-2-2L16 3l5.5 5.5L16 14l-1.8-2 2-2H8v3H5V9c0-1.1.9-2 2-2zm10 10H7.8l2 2L8 21l-5.5-5.5L8 10l1.8 2-2 2H16v-3h3v4c0 1.1-.9 2-2 2z"/></svg>"#
+        }
+        "bookmark" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 3h12c.6 0 1 .4 1 1v17l-7-4-7 4V4c0-.6.4-1 1-1z"/></svg>"#
+        }
+        "trash" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v3H4V5h4l1-2zm-3 7h12l-1 11H7L6 10zm4 2v7h2v-7h-2zm4 0v7h2v-7h-2z"/></svg>"#
+        }
+        _ => r#"<svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg>"#,
+    }
 }
 
 fn render_media(media: &MediaView) -> String {
@@ -299,11 +418,12 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
         None,
         title,
         &format!(
-            r#"<section class="panel error-panel"><p class="eyebrow">{} error</p><h1>{}</h1><p>{}</p><p><a class="button-link" href="/local">Back to local timeline</a></p></section>"#,
+            r#"<section class="panel error-panel"><p class="eyebrow">{} error</p><h1>{}</h1><p>{}</p><p><a class="button-link" href="/home">Back to Home Feed</a></p></section>"#,
             status.as_u16(),
             html_escape::encode_text(title),
             html_escape::encode_text(message)
         ),
+        "RustPost",
     )
 }
 
@@ -320,11 +440,25 @@ main{padding:1.25rem}.content-shell{max-width:1120px;margin:0 auto;display:grid;
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.page-header p,.muted,.empty-state p{color:#667064;margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
 label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button{font:inherit}input[type=text],input[type=password],input[type=url],input:not([type]),textarea{width:100%;padding:.72rem .8rem;border:1px solid #b9c2b8;border-radius:7px;background:#fff}textarea{resize:vertical;min-height:7rem}
 input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{background:#fff;color:#24445f;border-color:#cdd7d0;min-width:4.5rem}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}
-input:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:3px solid #93c5fd;outline-offset:2px}button,.primary{border:1px solid #163b2f;background:#163b2f;color:#fff;border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:#235544;text-decoration:none}.actions button{background:#fff;color:#24445f;border-color:#cdd7d0;font-weight:650}.actions button:hover{background:#eef3f0}
+input:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:3px solid #93c5fd;outline-offset:2px}button,.primary{border:1px solid #163b2f;background:#163b2f;color:#fff;border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:#235544;text-decoration:none}
 .composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:#24445f;font-weight:700}.file-control input{max-width:15rem}
-.timeline{display:grid;gap:.85rem}.post{overflow:hidden}.post-header{display:flex;justify-content:space-between;gap:.75rem;align-items:flex-start}.author-name{font-weight:800;color:#202124}.username,.post-time,.counts{color:#687068;font-size:.92rem}.text{white-space:pre-wrap;margin:.75rem 0;line-height:1.55;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid #d9ded6;margin-top:.6rem;background:#f6f7f4}
-.counts{display:flex;gap:.8rem;flex-wrap:wrap;margin-top:.4rem}.actions{display:flex;gap:.45rem;flex-wrap:wrap;align-items:center;margin-top:.75rem}.repost-banner{color:#4b655d;font-size:.9rem;font-weight:800;margin-bottom:.45rem}.unavailable{color:#667064}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:#e6b8a8;background:#fff8f5}.notice.success{border-color:#add7b4;background:#f4fbf5}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:#6d766e;font-size:.78rem}
+.timeline{display:grid;gap:.85rem}.post{overflow:hidden;position:relative}.reply-post{margin-left:1.35rem;border-left:4px solid #c8d8d0;background:#fbfcfa}.reply-post::before{content:"";position:absolute;left:-1.35rem;top:1.4rem;width:1.35rem;border-top:2px solid #c8d8d0}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.75rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid #d0d8d2;background:#eef3f0;flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:#526159;font-weight:800}.author-name{font-weight:800;color:#202124}.username,.post-time,.counts{color:#687068;font-size:.92rem}.text{white-space:pre-wrap;margin:.75rem 0;line-height:1.55;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid #d9ded6;margin-top:.6rem;background:#f6f7f4}.post img.post-avatar{display:block;margin:0;border-radius:999px}
+.counts{display:flex;gap:.8rem;flex-wrap:wrap;margin-top:.4rem}.actions{display:flex;gap:.35rem;flex-wrap:wrap;align-items:center;margin-top:.75rem}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid #cdd7d0;border-radius:7px;background:#fff;color:#24445f;padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:#eef3f0;color:#163b2f;text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:#9aa39d;background:#f4f5f2;border-color:#dfe4dc;cursor:not-allowed}.icon-button.disabled:hover,.icon-button:disabled:hover{background:#f4f5f2;color:#9aa39d}.thread-link{padding:.42rem .65rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:#4b655d;font-size:.9rem;font-weight:800;margin-bottom:.45rem}.unavailable{color:#667064}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:#e6b8a8;background:#fff8f5}.notice.success{border-color:#add7b4;background:#f4fbf5}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:#6d766e;font-size:.78rem}
 .profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#dfe9e1}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#eef3f0;flex:0 0 auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #e3e7e0;text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
 @media (max-width:900px){.content-shell{grid-template-columns:1fr}.side-panel{position:static;display:none}}
-@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.composer-tools,.post-header,.profile-heading{align-items:stretch;flex-direction:column}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.actions button,.button-link{padding:.42rem .55rem}.counts{gap:.55rem}.page-header h1,.section-heading h1,.panel h1{font-size:1.25rem}}
+@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.composer-tools,.post-header,.profile-heading{align-items:stretch;flex-direction:column}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.55rem}.page-header h1,.section-heading h1,.panel h1{font-size:1.25rem}}
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_uses_configured_site_name() {
+        let body = layout(None, "Home Feed", "<p>body</p>", "My Microblog");
+        assert!(body.contains("<title>Home Feed - My Microblog</title>"));
+        assert!(body.contains("<span>My Microblog</span>"));
+        assert!(body.contains("My Microblog alpha"));
+        assert!(!body.contains("<span>RustPost</span>"));
+    }
+}

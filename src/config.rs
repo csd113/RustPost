@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
+    pub site: SiteSettings,
     pub server: ServerSettings,
     pub accounts: AccountSettings,
     pub posts: PostSettings,
@@ -13,6 +15,19 @@ pub struct Settings {
     pub moderation: ModerationSettings,
     pub admin: AdminSettings,
     pub backup: BackupSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteSettings {
+    pub name: String,
+}
+
+impl Default for SiteSettings {
+    fn default() -> Self {
+        Self {
+            name: "RustPost".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +116,7 @@ pub struct BackupSettings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            site: SiteSettings::default(),
             server: ServerSettings {
                 host: "127.0.0.1".to_owned(),
                 port: 8080,
@@ -188,6 +204,21 @@ impl Settings {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        let site_name = self.site.name.trim();
+        if site_name.is_empty() || site_name.len() > 80 {
+            anyhow::bail!("site.name must be between 1 and 80 bytes");
+        }
+        if site_name != self.site.name {
+            anyhow::bail!("site.name must not contain surrounding whitespace");
+        }
+        if self
+            .site
+            .name
+            .chars()
+            .any(|character| character.is_control())
+        {
+            anyhow::bail!("site.name must not contain control characters");
+        }
         if self.accounts.min_password_length < 10 {
             anyhow::bail!("accounts.min_password_length must be at least 10");
         }
@@ -325,6 +356,86 @@ mod tests {
 
         let mut settings = Settings::default();
         settings.tor.max_concurrent_streams = 0;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn site_name_is_validated_and_defaults_when_missing() {
+        let settings: Settings = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            public_url = ""
+            cookie_secure = false
+            trusted_proxy_cidrs = ["127.0.0.1/32"]
+
+            [accounts]
+            registration_enabled = true
+            anonymous_mode_enabled = false
+            min_password_length = 10
+            max_username_len = 32
+            max_display_name_len = 64
+            max_bio_len = 240
+            allow_profile_banners = true
+            allow_profile_pictures = true
+
+            [posts]
+            max_text_chars = 280
+            max_images_per_post = 4
+            max_videos_per_post = 1
+            max_media_per_post = 4
+            allow_reposts = true
+            allow_replies = true
+            allow_likes = true
+            allow_bookmarks = true
+            allow_hashtags = true
+            allow_mentions = true
+
+            [media]
+            ffmpeg_path = "ffmpeg"
+            convert_images_to_webp = true
+            convert_videos_to_webm = true
+            keep_original_uploads = false
+            max_image_size = 52428800
+            max_video_size = 157286400
+            generate_video_thumbnails = true
+            allowed_image_mime_types = ["image/png"]
+            allowed_video_mime_types = ["video/webm"]
+            webp_quality = 82
+            vp9_crf = 32
+            vp9_deadline = "good"
+
+            [tor]
+            enabled = false
+            tor_only = false
+            data_dir = "tor"
+            onion_service_name = "microblog"
+            bootstrap_timeout_secs = 120
+            max_concurrent_streams = 512
+            include_tor_keys_in_backups_by_default = false
+
+            [moderation]
+            posts_per_minute = 5
+            replies_per_minute = 10
+            reposts_per_minute = 10
+            account_creations_per_ip_per_day = 3
+            failed_login_attempts_per_15m = 10
+            anonymous_posts_per_ip_per_hour = 10
+
+            [admin]
+            create_admin_on_first_boot = true
+
+            [backup]
+            enabled = true
+            backup_dir = "backups"
+            "#,
+        )
+        .expect("settings without site");
+        assert_eq!(settings.site.name, "RustPost");
+
+        let mut settings = Settings::default();
+        settings.site.name = " Custom".to_owned();
         assert!(settings.validate().is_err());
     }
 }

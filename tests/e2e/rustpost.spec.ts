@@ -20,6 +20,7 @@ test.beforeAll(async () => {
   }
   const settingsPath = join(dataDir, "settings.toml");
   const settings = readFileSync(settingsPath, "utf8")
+    .replace('name = "RustPost"', 'name = "RustPost Test"')
     .replace("port = 8080", `port = ${port}`)
     .replace("max_image_size = 52428800", "max_image_size = 60")
     .replace("account_creations_per_ip_per_day = 3", "account_creations_per_ip_per_day = 20");
@@ -39,42 +40,53 @@ test.afterAll(() => {
 
 test("desktop posting and social actions work from the UI", async ({ page }) => {
   await register(page, "alice", "very secure password");
+  await expect(page).toHaveTitle(/RustPost Test/);
+  await expect(page.getByRole("link", { name: "RustPost Test" })).toBeVisible();
   await page.getByRole("button", { name: "Post", exact: true }).click();
   await expect(page.getByText("post text or media is required")).toBeVisible();
   await page.goto(`${baseUrl}/home`);
   await page.getByLabel("What is happening?").fill("Alice desktop post");
   await page.getByRole("button", { name: "Post", exact: true }).click();
-  await expect(page).toHaveURL(`${baseUrl}/local`);
+  await expect(page).toHaveURL(`${baseUrl}/home#post-1`);
   await expect(page.getByText("Alice desktop post")).toBeVisible();
+  await expect(page.locator("article.post").filter({ hasText: "Alice desktop post" }).first().getByRole("button", { name: "Repost unavailable for your own post" })).toBeDisabled();
   await page.getByRole("button", { name: "Log out" }).click();
 
   await register(page, "bob", "very secure password");
   await login(page, "bob", "very secure password");
-  await page.goto(`${baseUrl}/local`);
+  await page.goto(`${baseUrl}/home`);
   await expect(page.getByText("Alice desktop post")).toBeVisible();
   const post = page.locator("article.post").filter({ hasText: "Alice desktop post" }).first();
   await post.getByRole("link", { name: /Open thread/ }).click();
   await page.getByLabel("What is happening?").fill("Bob replies from the browser");
   await page.getByRole("button", { name: "Post", exact: true }).click();
   await expect(page.getByText("Bob replies from the browser")).toBeVisible();
-  await page.goto(`${baseUrl}/local`);
+  await page.goto(`${baseUrl}/home`);
   await expect(page.locator("article.post").filter({ hasText: "Bob replies from the browser" })).toHaveCount(0);
   await page.goto(`${baseUrl}/posts/1`);
-  await expect(page.locator("article.post").filter({ hasText: "Bob replies from the browser" })).toHaveCount(1);
+  const reply = page.locator("article.post").filter({ hasText: "Bob replies from the browser" });
+  await expect(reply).toHaveCount(1);
+  await expect(reply.getByRole("link", { name: /Open thread/ })).toHaveCount(0);
 
-  await page.goto(`${baseUrl}/local`);
+  await page.goto(`${baseUrl}/home`);
   await page.locator("article.post").filter({ hasText: "Alice desktop post" }).first().getByRole("button", { name: "Like" }).click();
-  await expect(page).toHaveURL(`${baseUrl}/local`);
+  await expect(page).toHaveURL(`${baseUrl}/home#post-1`);
   await expect(page.getByText("1 likes")).toBeVisible();
   await page.locator("article.post").filter({ hasText: "Alice desktop post" }).first().getByRole("button", { name: "Bookmark" }).click();
   await page.getByRole("link", { name: "Bookmarks" }).click();
   await expect(page.getByText("Alice desktop post")).toBeVisible();
   await page.getByRole("link", { name: "Open thread" }).first().click();
   await page.locator("article.post").filter({ hasText: "Alice desktop post" }).first().getByRole("button", { name: "Repost" }).click();
-  await expect(page).toHaveURL(`${baseUrl}/home`);
+  await expect(page).toHaveURL(`${baseUrl}/posts/1#post-1`);
+  await page.goto(`${baseUrl}/home`);
   await expect(page.getByText("bob reposted")).toBeVisible();
 
   await page.getByRole("button", { name: "Log out" }).click();
+  await login(page, "alice", "very secure password");
+  const repostOfOwnPost = page.locator("article.post").filter({ hasText: "bob reposted" }).filter({ hasText: "Alice desktop post" }).first();
+  await expect(repostOfOwnPost.getByRole("button", { name: "Repost unavailable for your own post" })).toBeDisabled();
+  await page.getByRole("button", { name: "Log out" }).click();
+
   await expect(page.getByRole("link", { name: "Log in" })).toBeVisible();
   await expect(page.locator(".composer")).toHaveCount(0);
   const rejected = await page.request.post(`${baseUrl}/posts`, {
@@ -85,7 +97,7 @@ test("desktop posting and social actions work from the UI", async ({ page }) => 
 });
 
 test("mobile layout, validation, auth pages, and admin health stay usable", async ({ page }, testInfo) => {
-  await page.goto(`${baseUrl}/local`);
+  await page.goto(`${baseUrl}/home`);
   const dimensions = await page.evaluate(() => ({
     clientWidth: document.documentElement.clientWidth,
     scrollWidth: document.documentElement.scrollWidth
@@ -102,13 +114,15 @@ test("mobile layout, validation, auth pages, and admin health stay usable", asyn
   await page.getByRole("button", { name: "Post", exact: true }).click();
   await expect(page.getByText("post is too long")).toBeVisible();
 
-  await page.goto(`${baseUrl}/local`);
+  await page.goto(`${baseUrl}/home`);
   await page.getByLabel("What is happening?").fill("Mobile layout post");
   await page.getByRole("button", { name: "Post", exact: true }).click();
   await expect(page.getByText("Mobile layout post")).toBeVisible();
   await expect(page.locator("article.post").first()).toBeVisible();
-  await expect(page.getByRole("link", { name: "Settings" })).toBeVisible();
-  await page.getByRole("link", { name: "Settings" }).click();
+  await expect(page.getByRole("link", { name: "Profile" })).toBeVisible();
+  await page.getByRole("link", { name: "Profile" }).click();
+  await expect(page).toHaveURL(`${baseUrl}/users/carol`);
+  await page.locator("section.profile").getByRole("link", { name: "Settings" }).click();
   await expect(page.getByRole("heading", { name: "Account settings" })).toBeVisible();
   await page.goto(`${baseUrl}/search`);
   await expect(page.getByRole("heading", { name: "Search" })).toBeVisible();
@@ -152,7 +166,8 @@ test("registration confirms passwords and password toggles are accessible", asyn
 
 test("profile picture upload errors are friendly validation failures", async ({ page }) => {
   await register(page, "grace", "very secure password");
-  await page.getByRole("link", { name: "Settings" }).click();
+  await page.getByRole("link", { name: "Profile" }).click();
+  await page.locator("section.profile").getByRole("link", { name: "Settings" }).click();
 
   await page.setInputFiles("#profile_picture", {
     name: "avatar.gif",
@@ -183,6 +198,29 @@ test("profile picture upload errors are friendly validation failures", async ({ 
   await expect(page.getByText("500 error")).toHaveCount(0);
 });
 
+test("blocked users can be reviewed and unblocked, and mute does not error", async ({ page }) => {
+  await register(page, "heidi", "very secure password");
+  await page.getByRole("button", { name: "Log out" }).click();
+
+  await register(page, "ivan", "very secure password");
+  await page.goto(`${baseUrl}/users/heidi`);
+  await page.getByRole("button", { name: "Block" }).click();
+  await expect(page).toHaveURL(`${baseUrl}/home`);
+
+  await page.getByRole("link", { name: "Profile" }).click();
+  await page.locator("section.profile").getByRole("link", { name: "Settings" }).click();
+  await expect(page.getByRole("heading", { name: "Blocked users" })).toBeVisible();
+  await expect(page.getByText("@heidi")).toBeVisible();
+  await page.getByRole("button", { name: "Unblock" }).click();
+  await expect(page).toHaveURL(`${baseUrl}/settings`);
+  await expect(page.getByText("No blocked users")).toBeVisible();
+
+  await page.goto(`${baseUrl}/users/heidi`);
+  await page.getByRole("button", { name: "Mute" }).click();
+  await expect(page).toHaveURL(`${baseUrl}/home`);
+  await expect(page.getByText("500 error")).toHaveCount(0);
+});
+
 async function register(page: Page, username: string, password: string) {
   await page.goto(`${baseUrl}/register`);
   await page.getByLabel("Username").fill(username);
@@ -204,7 +242,7 @@ async function waitForServer(url: string) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`${url}/local`);
+      const response = await fetch(`${url}/home`);
       if (response.ok) {
         return;
       }

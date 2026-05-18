@@ -23,11 +23,20 @@ target
 # JavaScript dependencies and Playwright artifacts
 node_modules/
 output/
+output/**/*
 test-results/
+test-results/**/*
 playwright-report/
+playwright-report/**/*
 blob-report/
+blob-report/**/*
 .playwright/
+.playwright/**/*
 playwright/.cache/
+playwright/.cache/**/*
+*.trace.zip
+trace.zip
+*.webm
 
 # Local runtime data
 app-data/
@@ -45,3 +54,4 @@ uploads/
 
 # macOS
 .DS_Store
+**/.DS_Store

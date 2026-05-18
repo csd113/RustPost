@@ -50,16 +50,16 @@ impl AppState {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/", get(local))
+        .route("/", get(home))
         .route("/assets/rustpost.js", get(client_script))
-        .route("/local", get(local))
+        .route("/local", get(local_redirect))
         .route("/home", get(home))
         .route("/login", get(login_form).post(login))
         .route("/register", get(register_form).post(register))
         .route("/logout", post(logout))
         .route("/posts", post(create_post))
         .route("/posts/{id}", get(thread))
-        .route("/posts/{id}/delete", post(delete_post))
+        .route("/posts/{id}/delete", get(delete_confirm).post(delete_post))
         .route("/posts/{id}/like", post(toggle_like))
         .route("/posts/{id}/bookmark", post(toggle_bookmark))
         .route("/posts/{id}/repost", post(repost))
@@ -67,6 +67,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/users/{username}", get(profile))
         .route("/users/{id}/follow", post(follow))
         .route("/users/{id}/block", post(block))
+        .route("/users/{id}/unblock", post(unblock))
         .route("/users/{id}/mute", post(mute))
         .route("/settings", get(settings_form).post(settings_update))
         .route("/bookmarks", get(bookmarks))
@@ -130,6 +131,17 @@ struct CsrfForm {
 }
 
 #[derive(Deserialize)]
+struct DeleteForm {
+    csrf: String,
+    return_to: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteQuery {
+    return_to: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SearchQuery {
     q: Option<String>,
 }
@@ -152,11 +164,22 @@ struct ParsedPostCreate {
     media_ids: Vec<i64>,
 }
 
+struct DeletePreview {
+    text: String,
+    username: Option<String>,
+    display_name: Option<String>,
+    parent_post_id: Option<i64>,
+}
+
 async fn current(state: &AppState, headers: &HeaderMap) -> AppResult<Option<CurrentUser>> {
     Ok(auth::current_user(&state.pool, headers).await?)
 }
 
-async fn local(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResult<Html<String>> {
+async fn local_redirect() -> Redirect {
+    Redirect::to("/home")
+}
+
+async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
     let posts = social::timeline(&state.pool, user.as_ref().map(|u| u.id), "local", None).await?;
     let csrf = form_csrf(&state, &headers).await;
@@ -167,41 +190,32 @@ async fn local(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppRes
     };
     let body = format!(
         "{}{}{}",
-        render::page_header("Local Feed", "Public posts from this RustPost instance."),
+        render::page_header(
+            "Home Feed",
+            &format!(
+                "Top-level posts from your {} instance.",
+                state.settings.site.name
+            ),
+        ),
         composer,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
     Ok(Html(render::layout_with_csrf(
         user.as_ref(),
         csrf.as_deref(),
-        "Local Feed",
-        &body,
-    )))
-}
-
-async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResult<Html<String>> {
-    let user = require_user(&state, &headers).await?;
-    let posts = social::timeline(&state.pool, Some(user.id), "home", None).await?;
-    let csrf = form_csrf(&state, &headers).await;
-    let body = format!(
-        "{}{}{}",
-        render::page_header(
-            "Home Feed",
-            "Posts from people you follow and your own updates."
-        ),
-        render::composer(csrf.as_deref(), None),
-        render::posts(&posts, Some(&user), csrf.as_deref())
-    );
-    Ok(Html(render::layout_with_csrf(
-        Some(&user),
-        csrf.as_deref(),
         "Home Feed",
         &body,
+        &state.settings.site.name,
     )))
 }
 
-async fn login_form() -> Html<String> {
-    Html(render::layout(None, "Login", &render::login_form(None)))
+async fn login_form(State(state): State<Arc<AppState>>) -> Html<String> {
+    Html(render::layout(
+        None,
+        "Login",
+        &render::login_form(None),
+        &state.settings.site.name,
+    ))
 }
 
 async fn login(
@@ -243,6 +257,7 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
         None,
         "Register",
         &render::register_form(None),
+        &state.settings.site.name,
     )))
 }
 
@@ -303,7 +318,7 @@ async fn logout(
     if let Some(token) = auth::session_cookie(&headers) {
         auth::revoke_session(&state.pool, &token).await?;
     }
-    let mut response = Redirect::to("/local").into_response();
+    let mut response = Redirect::to("/home").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&auth::clear_session_cookie(
@@ -361,7 +376,7 @@ async fn create_post(
     rate_limit::check_and_record(&state.pool, scope, &actor, max_events, window_secs)
         .await
         .map_err(|err| AppError::RateLimited(err.to_string()))?;
-    social::create_post(
+    let post_id = social::create_post(
         &state.pool,
         &state.settings,
         user.as_ref().map(|u| u.id),
@@ -371,9 +386,10 @@ async fn create_post(
     )
     .await
     .map_err(|err| AppError::BadRequest(err.to_string()))?;
-    let redirect = form
-        .parent_post_id
-        .map_or_else(|| "/local".to_owned(), |id| format!("/posts/{id}"));
+    let redirect = form.parent_post_id.map_or_else(
+        || format!("/home#post-{post_id}"),
+        |_| format!("/posts/{post_id}#reply-{post_id}"),
+    );
     Ok(Redirect::to(&redirect).into_response())
 }
 
@@ -477,6 +493,44 @@ async fn thread(
         csrf.as_deref(),
         "Thread",
         &body,
+        &state.settings.site.name,
+    )))
+}
+
+async fn delete_confirm(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(query): Query<DeleteQuery>,
+) -> AppResult<Html<String>> {
+    let user = require_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let preview = delete_preview(&state.pool, user.id, user.is_admin, id).await?;
+    let fallback = anchored_return(&headers, id, preview.parent_post_id.is_some(), "/home");
+    let return_to = query
+        .return_to
+        .as_deref()
+        .and_then(safe_return_target)
+        .unwrap_or(fallback);
+    let author = preview
+        .display_name
+        .as_deref()
+        .or(preview.username.as_deref())
+        .unwrap_or("Deleted user");
+    let body = format!(
+        r#"<section class="panel"><h1>Delete post?</h1><p class="muted">This will remove the post from timelines and threads.</p><blockquote>{}</blockquote><p class="muted">By {}</p><div class="actions"><form method="post"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="return_to" value="{}"><button class="danger" type="submit">Confirm delete</button></form><a class="button-link" href="{}">Cancel</a></div></section>"#,
+        html_escape::encode_text(&preview.text),
+        html_escape::encode_text(author),
+        html_escape::encode_double_quoted_attribute(&csrf),
+        html_escape::encode_double_quoted_attribute(&return_to),
+        html_escape::encode_double_quoted_attribute(&return_to)
+    );
+    Ok(Html(render::layout_with_csrf(
+        Some(&user),
+        Some(&csrf),
+        "Delete post",
+        &body,
+        &state.settings.site.name,
     )))
 }
 
@@ -484,12 +538,19 @@ async fn delete_post(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<DeleteForm>,
 ) -> AppResult<Response> {
     let user = require_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let preview = delete_preview(&state.pool, user.id, user.is_admin, id).await?;
     social::delete_post(&state.pool, user.id, id, user.is_admin).await?;
-    Ok(Redirect::to("/local").into_response())
+    let fallback = if let Some(parent_id) = preview.parent_post_id {
+        format!("/posts/{parent_id}#post-{parent_id}")
+    } else {
+        "/home".to_owned()
+    };
+    let target = safe_return_target(&form.return_to).unwrap_or(fallback);
+    Ok(Redirect::to(&target).into_response())
 }
 
 async fn toggle_like(
@@ -500,12 +561,13 @@ async fn toggle_like(
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let is_reply = post_is_reply(&state.pool, id).await?;
     if user_post_relation_exists(&state.pool, "likes", user.id, id).await? {
         social::unlike(&state.pool, user.id, id).await?;
     } else {
         social::like(&state.pool, user.id, id).await?;
     }
-    Ok(redirect_back(&headers, "/local").into_response())
+    Ok(redirect_to_post_anchor(&headers, id, is_reply).into_response())
 }
 
 async fn toggle_bookmark(
@@ -516,12 +578,13 @@ async fn toggle_bookmark(
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let is_reply = post_is_reply(&state.pool, id).await?;
     if user_post_relation_exists(&state.pool, "bookmarks", user.id, id).await? {
         social::unbookmark(&state.pool, user.id, id).await?;
     } else {
         social::bookmark(&state.pool, user.id, id).await?;
     }
-    Ok(redirect_back(&headers, "/local").into_response())
+    Ok(redirect_to_post_anchor(&headers, id, is_reply).into_response())
 }
 
 async fn repost(
@@ -532,6 +595,7 @@ async fn repost(
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let is_reply = post_is_reply(&state.pool, id).await?;
     rate_limit::check_and_record(
         &state.pool,
         rate_limit::Scope::Repost,
@@ -541,8 +605,22 @@ async fn repost(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
-    social::repost(&state.pool, user.id, id).await?;
-    Ok(Redirect::to("/home").into_response())
+    if user_post_relation_exists(&state.pool, "reposts", user.id, id).await? {
+        social::unrepost(&state.pool, user.id, id)
+            .await
+            .map_err(|err| {
+                tracing::warn!(post_id = id, user_id = user.id, error = %err, "unrepost failed");
+                AppError::BadRequest(err.to_string())
+            })?;
+    } else {
+        social::repost(&state.pool, user.id, id)
+            .await
+            .map_err(|err| {
+                tracing::warn!(post_id = id, user_id = user.id, error = %err, "repost rejected");
+                AppError::BadRequest(err.to_string())
+            })?;
+    }
+    Ok(redirect_to_post_anchor(&headers, id, is_reply).into_response())
 }
 
 async fn reply_redirect(Path(id): Path<i64>) -> Redirect {
@@ -595,7 +673,8 @@ async fn profile(
         social::profile_timeline(&state.pool, user.as_ref().map(|u| u.id), profile_id).await?;
     let controls = if let (Some(viewer), Some(csrf)) = (&user, &csrf) {
         if viewer.id == profile_id {
-            String::new()
+            r#"<div class="actions"><a class="button-link" href="/settings">Settings</a></div>"#
+                .to_owned()
         } else {
             format!(
                 r#"<div class="actions">{}{}{}</div>"#,
@@ -642,6 +721,7 @@ async fn profile(
         csrf.as_deref(),
         &profile_username,
         &body,
+        &state.settings.site.name,
     )))
 }
 
@@ -665,8 +745,25 @@ async fn block(
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
-    social::block(&state.pool, user.id, id).await?;
+    social::block(&state.pool, user.id, id)
+        .await
+        .map_err(|err| {
+            tracing::warn!(blocker_id = user.id, blocked_id = id, error = %err, "block rejected");
+            AppError::BadRequest(err.to_string())
+        })?;
     Ok(Redirect::to("/home").into_response())
+}
+
+async fn unblock(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    social::unblock(&state.pool, user.id, id).await?;
+    Ok(Redirect::to("/settings").into_response())
 }
 
 async fn mute(
@@ -677,7 +774,12 @@ async fn mute(
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
-    social::mute(&state.pool, user.id, id).await?;
+    social::mute(&state.pool, user.id, id)
+        .await
+        .map_err(|err| {
+            tracing::warn!(muter_id = user.id, muted_id = id, error = %err, "mute rejected");
+            AppError::BadRequest(err.to_string())
+        })?;
     Ok(Redirect::to("/home").into_response())
 }
 
@@ -741,20 +843,40 @@ async fn settings_form(
     } else {
         r#"<p>Profile pictures are disabled.</p>"#.to_owned()
     };
+    let blocked = social::blocked_users(&state.pool, user.id).await?;
+    let blocked_rows = blocked
+        .into_iter()
+        .map(|(id, username, display_name)| {
+            format!(
+                r#"<li><span><strong>{}</strong> <span class="muted">@{}</span></span>{}</li>"#,
+                html_escape::encode_text(&display_name),
+                html_escape::encode_text(&username),
+                small_form(&format!("/users/{id}/unblock"), &csrf, "Unblock")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let blocked_panel = if blocked_rows.is_empty() {
+        render::empty_state("No blocked users", "Blocked accounts will appear here.")
+    } else {
+        format!(r#"<ul class="item-list">{blocked_rows}</ul>"#)
+    };
     let body = format!(
-        r#"<section class="panel"><h1>Account settings</h1><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="website">Website</label><input id="website" type="url" name="website" value="{}">{}{}<button type="submit">Save settings</button></form></section>"#,
+        r#"<section class="panel"><h1>Account settings</h1><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="website">Website</label><input id="website" type="url" name="website" value="{}">{}{}<button type="submit">Save settings</button></form></section><section class="panel"><h2>Blocked users</h2>{}</section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         html_escape::encode_double_quoted_attribute(display_name.as_str()),
         html_escape::encode_text(bio.as_str()),
         html_escape::encode_double_quoted_attribute(website.as_str()),
         picture_input,
         banner_input,
+        blocked_panel,
     );
     Ok(Html(render::layout_with_csrf(
         Some(&user),
         Some(&csrf),
         "Settings",
         &body,
+        &state.settings.site.name,
     )))
 }
 
@@ -935,36 +1057,120 @@ async fn ensure_parent_post_exists(pool: &SqlitePool, parent_id: i64) -> AppResu
     }
 }
 
-fn redirect_back(headers: &HeaderMap, fallback: &str) -> Redirect {
-    let Some(value) = headers
-        .get(header::REFERER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Redirect::to(fallback);
+async fn delete_preview(
+    pool: &SqlitePool,
+    actor_id: i64,
+    is_admin: bool,
+    post_id: i64,
+) -> AppResult<DeletePreview> {
+    let preview = pool
+        .call(move |conn| {
+            conn.query_row(
+                r#"
+                SELECT p.user_id, p.text, u.username, u.display_name, p.parent_post_id
+                FROM posts p
+                LEFT JOIN users u ON u.id = p.user_id
+                WHERE p.id = ? AND p.is_deleted = 0
+                "#,
+                [post_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?;
+    let Some((owner, text, username, display_name, parent_post_id)) = preview else {
+        return Err(AppError::NotFound);
     };
+    if !is_admin && owner != Some(actor_id) {
+        return Err(AppError::Forbidden);
+    }
+    Ok(DeletePreview {
+        text,
+        username,
+        display_name,
+        parent_post_id,
+    })
+}
+
+async fn post_is_reply(pool: &SqlitePool, post_id: i64) -> AppResult<bool> {
+    Ok(pool
+        .call(move |conn| {
+            conn.query_row(
+                "SELECT parent_post_id IS NOT NULL FROM posts WHERE id = ? AND is_deleted = 0",
+                [post_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(0) != 0)
+            .map_err(Into::into)
+        })
+        .await?)
+}
+
+fn redirect_to_post_anchor(headers: &HeaderMap, post_id: i64, is_reply: bool) -> Redirect {
+    let target = anchored_return(headers, post_id, is_reply, "/home");
+    Redirect::to(&target)
+}
+
+fn anchored_return(headers: &HeaderMap, post_id: i64, is_reply: bool, fallback: &str) -> String {
+    let anchor = if is_reply {
+        format!("reply-{post_id}")
+    } else {
+        format!("post-{post_id}")
+    };
+    let base = referer_target(headers)
+        .as_deref()
+        .and_then(safe_return_target)
+        .unwrap_or_else(|| fallback.to_owned());
+    let base = base.split('#').next().unwrap_or(fallback);
+    format!("{base}#{anchor}")
+}
+
+fn safe_return_target(value: &str) -> Option<String> {
     let target = if value.starts_with('/') && !value.starts_with("//") {
         value.to_owned()
     } else {
-        value
-            .parse::<Uri>()
-            .ok()
-            .and_then(|uri| {
-                uri.path_and_query()
-                    .map(|path| path.as_str().to_owned())
-                    .filter(|path| path.starts_with('/'))
-            })
-            .unwrap_or_else(|| fallback.to_owned())
+        value.parse::<Uri>().ok().and_then(|uri| {
+            uri.path_and_query()
+                .map(|path| path.as_str().to_owned())
+                .filter(|path| path.starts_with('/'))
+        })?
     };
+    let path = target.split('#').next().unwrap_or_default();
     if matches!(
-        target.as_str(),
-        "/local" | "/home" | "/bookmarks" | "/notifications" | "/search"
-    ) || target.starts_with("/posts/")
-        || target.starts_with("/users/")
-        || target.starts_with("/tags/")
+        path,
+        "/home" | "/bookmarks" | "/notifications" | "/search" | "/"
+    ) || path.starts_with("/posts/")
+        || path.starts_with("/users/")
+        || path.starts_with("/tags/")
     {
-        Redirect::to(&target)
+        Some(target)
     } else {
-        Redirect::to(fallback)
+        None
+    }
+}
+
+fn referer_target(headers: &HeaderMap) -> Option<String> {
+    let value = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())?;
+    if value.starts_with('/') && !value.starts_with("//") {
+        Some(value.to_owned())
+    } else {
+        value.parse::<Uri>().ok().and_then(|uri| {
+            uri.path_and_query()
+                .map(|path| path.as_str().to_owned())
+                .filter(|path| path.starts_with('/'))
+        })
     }
 }
 
@@ -984,6 +1190,7 @@ async fn bookmarks(
             render::page_header("Bookmarks", "Posts you saved for later."),
             render::posts(&posts, Some(&user), csrf.as_deref())
         ),
+        &state.settings.site.name,
     )))
 }
 
@@ -1028,6 +1235,7 @@ async fn notifications(
         Some(&csrf),
         "Notifications",
         &body,
+        &state.settings.site.name,
     )))
 }
 
@@ -1072,7 +1280,8 @@ async fn search(
         format!(r#"<ul class="item-list">{user_results}</ul>"#)
     };
     let body = format!(
-        r#"<section class="panel"><h1>Search</h1><form method="get"><label for="q">Search RustPost</label><input id="q" name="q" value="{}"><button type="submit">Search</button></form></section><section class="panel"><h2>Users</h2>{}</section><section><h2 class="section-title">Posts</h2>{}</section>"#,
+        r#"<section class="panel"><h1>Search</h1><form method="get"><label for="q">Search {}</label><input id="q" name="q" value="{}"><button type="submit">Search</button></form></section><section class="panel"><h2>Users</h2>{}</section><section><h2 class="section-title">Posts</h2>{}</section>"#,
+        html_escape::encode_text(&state.settings.site.name),
         html_escape::encode_double_quoted_attribute(&q),
         user_results,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
@@ -1082,6 +1291,7 @@ async fn search(
         csrf.as_deref(),
         "Search",
         &body,
+        &state.settings.site.name,
     )))
 }
 
@@ -1112,6 +1322,7 @@ async fn admin_dashboard(
         Some(&csrf),
         "Admin",
         body,
+        &state.settings.site.name,
     )))
 }
 
@@ -1166,6 +1377,7 @@ async fn admin_health(
         Some(&csrf),
         "Site health",
         &body,
+        &state.settings.site.name,
     )))
 }
 
@@ -1202,6 +1414,7 @@ async fn admin_users(
             r#"<section class="panel"><table>{}</table></section>"#,
             list
         ),
+        &state.settings.site.name,
     )))
 }
 
@@ -1267,6 +1480,7 @@ async fn admin_media(
             r#"<section class="panel"><table>{}</table></section>"#,
             rows
         ),
+        &state.settings.site.name,
     )))
 }
 
@@ -1285,6 +1499,7 @@ async fn admin_backups(
         Some(&csrf),
         "Backups",
         &body,
+        &state.settings.site.name,
     )))
 }
 
@@ -1320,6 +1535,7 @@ async fn admin_create_backup(
         Some(&csrf),
         "Backup created",
         &body,
+        &state.settings.site.name,
     )))
 }
 
@@ -1438,7 +1654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logged_in_ui_post_succeeds_with_empty_media_part_and_appears_on_local_timeline() {
+    async fn logged_in_ui_post_succeeds_with_empty_media_part_and_appears_on_home_feed() {
         let server = spawn_test_server().await;
         let registered = request(
             &server.base_url,
@@ -1487,17 +1703,17 @@ mod tests {
         .await;
         assert_eq!(posted.status, 303);
 
-        let local = request(
+        let home = request(
             &server.base_url,
             "GET",
-            "/local",
+            "/home",
             &[("cookie", &cookie)],
             Vec::new(),
         )
         .await;
-        assert_eq!(local.status, 200);
-        assert!(local.body.contains("hello from the browser-shaped form"));
-        assert!(local.body.contains(r#"class="post""#));
+        assert_eq!(home.status, 200);
+        assert!(home.body.contains("hello from the browser-shaped form"));
+        assert!(home.body.contains(r#"class="post""#));
     }
 
     #[tokio::test]
@@ -1546,9 +1762,9 @@ mod tests {
         assert_eq!(logged_out.status, 403);
         assert!(logged_out.body.contains("Access denied"));
 
-        let anonymous_local = request(&server.base_url, "GET", "/local", &[], Vec::new()).await;
-        assert_eq!(anonymous_local.status, 200);
-        assert!(!anonymous_local.body.contains(r#"action="/posts""#));
+        let anonymous_home = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert_eq!(anonymous_home.status, 200);
+        assert!(!anonymous_home.body.contains(r#"action="/posts""#));
 
         let home = request(
             &server.base_url,
@@ -1617,6 +1833,160 @@ mod tests {
         .await;
         assert_eq!(missing.status, 400);
         assert!(missing.body.contains("please confirm your password"));
+    }
+
+    #[tokio::test]
+    async fn post_actions_redirect_to_anchored_context_and_repost_errors_are_validation_failures() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+        let cookie = session_cookie(&registered);
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "anchored post")],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+        assert_eq!(location(&posted), "/home#post-1");
+
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert!(home.body.contains(r#"id="post-1""#));
+        let csrf = csrf_token(&home.body);
+        let liked = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/like",
+            &[
+                ("cookie", &cookie),
+                ("referer", "/home"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(liked.status, 303);
+        assert_eq!(location(&liked), "/home#post-1");
+
+        let self_repost = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/repost",
+            &[
+                ("cookie", &cookie),
+                ("referer", "/home"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(self_repost.status, 400);
+        assert!(self_repost.body.contains("cannot repost your own post"));
+        assert!(!self_repost.body.contains("internal server error"));
+    }
+
+    #[tokio::test]
+    async fn delete_requires_confirmation_and_preserves_cancel_target() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let cookie = session_cookie(&registered);
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "delete me")],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let confirm = request(
+            &server.base_url,
+            "GET",
+            "/posts/1/delete",
+            &[("cookie", &cookie), ("referer", "/home")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(confirm.status, 200);
+        assert!(confirm.body.contains("Delete post?"));
+        assert!(confirm.body.contains("Confirm delete"));
+        assert!(confirm.body.contains(r#"href="/home#post-1""#));
+        let csrf = csrf_token(&confirm.body);
+        let deleted = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/delete",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&return_to=/home%23post-1").into_bytes(),
+        )
+        .await;
+        assert_eq!(deleted.status, 303);
+        assert_eq!(location(&deleted), "/home#post-1");
     }
 
     fn multipart_body(
@@ -1737,6 +2107,15 @@ mod tests {
             .find(|(name, _)| name == "set-cookie")
             .map(|(_, value)| value.split(';').next().unwrap_or_default().to_owned())
             .expect("session cookie")
+    }
+
+    fn location(response: &TestResponse) -> &str {
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "location")
+            .map(|(_, value)| value.as_str())
+            .expect("location")
     }
 
     fn csrf_token(body: &str) -> String {
