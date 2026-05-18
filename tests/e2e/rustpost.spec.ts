@@ -13,10 +13,10 @@ test.beforeAll(async () => {
   const port = await freePort();
   baseUrl = `http://127.0.0.1:${port}`;
   dataDir = mkdtempSync(join(tmpdir(), "rustpost-e2e-"));
-  const binary = resolve("target/debug/rustpost");
+  const binary = resolve("target/debug/rustpost-cli");
   const init = spawnSync(binary, ["--data-dir", dataDir, "init"], { encoding: "utf8" });
   if (init.status !== 0) {
-    throw new Error(`rustpost init failed: ${init.stderr || init.stdout}`);
+    throw new Error(`rustpost-cli init failed: ${init.stderr || init.stdout}`);
   }
   const settingsPath = join(dataDir, "settings.toml");
   const settings = readFileSync(settingsPath, "utf8").replace("port = 8080", `port = ${port}`);

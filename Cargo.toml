@@ -8,10 +8,11 @@ repository = "https://github.com/csd113/RustPost"
 rust-version = "1.90"
 keywords = ["microblog", "self-hosted", "sqlite", "axum"]
 categories = ["web-programming::http-server"]
+autobins = false
 
 [[bin]]
-name = "rustpost"
-path = "src/main.rs"
+name = "rustpost-cli"
+path = "src/bin/rustpost-cli.rs"
 
 [dependencies]
 anyhow = "1.0"

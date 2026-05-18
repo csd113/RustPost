@@ -45,14 +45,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - name: Build release binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} --bins
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin rustpost-cli
       - name: Package archive
         run: |
           set -euo pipefail
           staging="dist/${{ matrix.name }}/rustpost"
           mkdir -p "$staging"
-          cp "target/${{ matrix.target }}/release/rustpost" "$staging/"
           cp "target/${{ matrix.target }}/release/rustpost-cli" "$staging/"
           cp README.md "$staging/"
           if [ -f LICENSE ]; then cp LICENSE "$staging/"; fi
@@ -81,15 +80,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - name: Build release binaries
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc --bins
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --bin rustpost-cli
       - name: Package archive
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $staging = "dist/windows-x86_64/rustpost"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "target/x86_64-pc-windows-msvc/release/rustpost.exe" $staging
           Copy-Item "target/x86_64-pc-windows-msvc/release/rustpost-cli.exe" $staging
           Copy-Item "README.md" $staging
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" $staging }

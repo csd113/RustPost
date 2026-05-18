@@ -335,7 +335,25 @@ npm ci                                                                 # install
 npm run test:e2e                                                       # run Playwright browser flows
 ```
 
-Playwright tests are local-only for now. They build the Rust binaries, start `target/debug/rustpost` with a fresh temporary data directory, drive Chromium through registration, posting, replies, reactions, bookmarks, auth rejection, validation, and mobile layout checks, then remove the temporary app data. Browser artifacts are ignored under `test-results/`, `playwright-report/`, and `output/playwright/`.
+### Local UI Regression Pass
+
+Run the app locally with a disposable data directory:
+
+```sh
+cargo build --workspace --all-features
+./target/debug/rustpost --data-dir /tmp/rustpost-alpha serve
+```
+
+Then open [http://127.0.0.1:8080](http://127.0.0.1:8080). The server initializes the data directory on first boot.
+
+Run the browser regression tests with:
+
+```sh
+npm ci
+npm run test:e2e
+```
+
+Playwright tests are local-only unless CI integration is intentionally added later. They build the Rust binaries, start `target/debug/rustpost` with a fresh temporary data directory, drive Chromium through registration, login, posting, replies, reactions, bookmarks, auth rejection, validation, and mobile layout checks, then remove the temporary app data. Intentional regression screenshots are written to `output/playwright/`; Playwright traces, failure screenshots, videos, and reports are ignored under `test-results/`, `playwright-report/`, and `output/`.
 
 **CI matrix** (GitHub Actions, Rust 1.90):
 
@@ -425,7 +443,7 @@ Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and op
 - **Synchronous media conversion** — conversion happens inline during upload; no background queue.
 - **Reports and admin toggles** — present in schema and admin structure but functionality is minimal in the current MVP.
 - **Search** — uses SQLite FTS5 with simple user matching and fixed result limits; no ranking tuning yet.
-- **Screenshots** — not yet checked in. First captures planned: local timeline, thread view, profile page, settings page, and admin health dashboard.
+- **UI polish** — server-rendered HTML/CSS has been brought to alpha quality, but final visual design and broader accessibility review are still future work.
 
 ---
 

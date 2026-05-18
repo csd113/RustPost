@@ -22,7 +22,19 @@ target
 
 # Playwright browser artifacts
 node_modules/
+output/
 test-results/
 playwright-report/
-output/playwright/
+
+# Local runtime data
+app-data/
+rustpost-data/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+uploads/
+
+# macOS
 .DS_Store

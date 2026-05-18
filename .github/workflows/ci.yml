@@ -93,5 +93,5 @@ jobs:
           cache-bin: false
       - name: Run tests
         run: cargo test --workspace --all-features
-      - name: Build
-        run: cargo build --workspace --all-features
+      - name: Build CLI
+        run: cargo build --workspace --all-features --bin rustpost-cli
