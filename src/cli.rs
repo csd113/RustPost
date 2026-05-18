@@ -140,21 +140,9 @@ async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyh
     if !ffmpeg.available {
         warn!("ffmpeg unavailable; uploads will safely fall back to allowed originals");
     }
-    let onion_listener = if settings.tor.enabled {
-        Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
-    } else {
-        None
-    };
-    let onion_target = onion_listener
-        .as_ref()
-        .and_then(|listener| listener.local_addr().ok());
-    let tor_status = if settings.tor.tor_only {
-        tor::start(&settings.tor, &paths, onion_target).await?
-    } else if settings.tor.enabled {
-        tor::TorStatus::starting()
-    } else {
-        tor::validate_startup(&settings.tor)
-    };
+    let onion_listener = bind_onion_listener(&settings.tor).await?;
+    let onion_target = onion_listener_target(onion_listener.as_ref());
+    let tor_status = initial_tor_status(&settings.tor, &paths, onion_target).await?;
     let tor_status_for_background = tor_status.clone();
     if settings.admin.create_admin_on_first_boot {
         admin::ensure_first_boot_admin_hint(&pool).await?;
@@ -170,23 +158,10 @@ async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyh
     .await?;
     let state = server::AppState::new(pool, settings.clone(), paths.clone(), ffmpeg, tor_status);
     let app = server::router(state);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = shutdown_tx.send(true);
-    });
+    let shutdown_rx = shutdown_receiver();
 
     if settings.tor.tor_only {
-        let listener = onion_listener.context("tor_only requires an internal onion listener")?;
-        let addr = listener.local_addr()?;
-        info!(%addr, "RustPost listening on loopback for Arti onion forwarding");
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
-        .await?;
-        return Ok(());
+        return serve_tor_only(onion_listener, app, shutdown_rx).await;
     }
 
     if let Some(listener) = onion_listener {
@@ -201,7 +176,68 @@ async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyh
         );
     }
 
-    let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)
+    serve_clearnet(app, &settings.server, shutdown_rx).await
+}
+
+async fn bind_onion_listener(
+    settings: &config::TorSettings,
+) -> anyhow::Result<Option<tokio::net::TcpListener>> {
+    if !settings.enabled {
+        return Ok(None);
+    }
+    Ok(Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?))
+}
+
+fn onion_listener_target(listener: Option<&tokio::net::TcpListener>) -> Option<SocketAddr> {
+    listener.and_then(|listener| listener.local_addr().ok())
+}
+
+async fn initial_tor_status(
+    settings: &config::TorSettings,
+    paths: &runtime::RuntimePaths,
+    onion_target: Option<SocketAddr>,
+) -> anyhow::Result<tor::TorStatus> {
+    if settings.tor_only {
+        return tor::start(settings, paths, onion_target).await;
+    }
+    if settings.enabled {
+        return Ok(tor::TorStatus::starting());
+    }
+    Ok(tor::validate_startup(settings))
+}
+
+fn shutdown_receiver() -> watch::Receiver<bool> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+    shutdown_rx
+}
+
+async fn serve_tor_only(
+    onion_listener: Option<tokio::net::TcpListener>,
+    app: axum::Router,
+    shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let listener = onion_listener.context("tor_only requires an internal onion listener")?;
+    let addr = listener.local_addr()?;
+    info!(%addr, "RustPost listening on loopback for Arti onion forwarding");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+    .await?;
+    Ok(())
+}
+
+async fn serve_clearnet(
+    app: axum::Router,
+    settings: &config::ServerSettings,
+    shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let addr: SocketAddr = format!("{}:{}", settings.host, settings.port)
         .parse()
         .with_context(|| "invalid server bind address")?;
     let clearnet_listener = tokio::net::TcpListener::bind(addr).await?;
