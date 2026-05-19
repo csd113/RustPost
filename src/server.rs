@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::Router;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Form, Multipart, Path, Query, State};
@@ -8,7 +9,7 @@ use axum::http::{HeaderMap, HeaderValue, Uri, header};
 use axum::response::{Html, IntoResponse as _, Redirect, Response};
 use axum::routing::{get, post};
 use rusqlite::{OptionalExtension as _, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -171,6 +172,37 @@ struct DeletePreview {
     username: Option<String>,
     display_name: Option<String>,
     parent_post_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct FollowActionResponse {
+    kind: &'static str,
+    user_id: i64,
+    following: bool,
+    followers: i64,
+    following_count: i64,
+    action: String,
+}
+
+#[derive(Serialize)]
+struct PostActionResponse {
+    kind: &'static str,
+    post_id: i64,
+    likes: i64,
+    reposts: i64,
+    replies: i64,
+    liked: bool,
+    bookmarked: bool,
+    reposted: bool,
+}
+
+#[derive(Serialize)]
+struct PostCreateResponse {
+    kind: &'static str,
+    post_id: i64,
+    parent_post_id: Option<i64>,
+    redirect: String,
+    html: String,
 }
 
 async fn current(state: &AppState, headers: &HeaderMap) -> AppResult<Option<CurrentUser>> {
@@ -424,6 +456,25 @@ async fn create_post(
         || format!("/home#post-{post_id}"),
         |_| format!("/posts/{post_id}#reply-{post_id}"),
     );
+    if enhanced_request(&headers) {
+        let posts = social::post_thread(&state.pool, user.as_ref().map(|u| u.id), post_id).await?;
+        let post = posts
+            .iter()
+            .find(|post| post.id == post_id)
+            .ok_or(AppError::NotFound)?;
+        return Ok(Json(PostCreateResponse {
+            kind: "post-created",
+            post_id,
+            parent_post_id: form.parent_post_id,
+            redirect,
+            html: render::post_card(
+                post,
+                user.as_ref(),
+                form_csrf(&state, &headers).await.as_deref(),
+            ),
+        })
+        .into_response());
+    }
     Ok(Redirect::to(&redirect).into_response())
 }
 
@@ -593,6 +644,9 @@ async fn toggle_like(
     } else {
         social::like(&state.pool, user.id, id).await?;
     }
+    if enhanced_request(&headers) {
+        return Ok(Json(post_action_response(&state.pool, user.id, id).await?).into_response());
+    }
     Ok(redirect_to_post_anchor(&headers, id, is_reply).into_response())
 }
 
@@ -609,6 +663,9 @@ async fn toggle_bookmark(
         social::unbookmark(&state.pool, user.id, id).await?;
     } else {
         social::bookmark(&state.pool, user.id, id).await?;
+    }
+    if enhanced_request(&headers) {
+        return Ok(Json(post_action_response(&state.pool, user.id, id).await?).into_response());
     }
     Ok(redirect_to_post_anchor(&headers, id, is_reply).into_response())
 }
@@ -645,6 +702,9 @@ async fn repost(
                 tracing::warn!(post_id = id, user_id = user.id, error = %err, "repost rejected");
                 AppError::BadRequest(err.to_string())
             })?;
+    }
+    if enhanced_request(&headers) {
+        return Ok(Json(post_action_response(&state.pool, user.id, id).await?).into_response());
     }
     Ok(redirect_to_post_anchor(&headers, id, is_reply).into_response())
 }
@@ -717,18 +777,28 @@ async fn profile(
             )
         },
     );
+    let website_link = if website.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p><a href="{}">{}</a></p>"#,
+            html_escape::encode_double_quoted_attribute(website.as_str()),
+            html_escape::encode_text(website.as_str())
+        )
+    };
     let body = format!(
-        r#"<section class="panel profile">{}<div class="profile-heading">{}<div><h1>{}</h1><p class="muted">@{}</p><p class="counts"><span>{} followers</span><span>{} following</span></p><p>{}</p><p><a href="{}">{}</a></p></div></div>{}</section>{}"#,
+        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p><p>{}</p>{}</div></div></section>{}"#,
         banner,
         picture,
         html_escape::encode_text(display_name.as_str()),
         html_escape::encode_text(profile_username.as_str()),
+        controls,
+        profile_id,
         followers,
+        profile_id,
         following,
         html_escape::encode_text(bio.as_str()),
-        html_escape::encode_double_quoted_attribute(website.as_str()),
-        html_escape::encode_text(website.as_str()),
-        controls,
+        website_link,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
     Ok(Html(
@@ -754,20 +824,30 @@ async fn profile_controls(
     };
     if viewer.id == profile_id {
         return Ok(
-            r#"<div class="actions"><a class="button-link" href="/settings">Settings</a></div>"#
+            r#"<div class="actions profile-actions"><a class="button-link" href="/settings">Settings</a></div>"#
                 .to_owned(),
         );
     }
-    let follow_action = if social::is_following(&state.pool, viewer.id, profile_id).await? {
-        small_form(&format!("/users/{profile_id}/unfollow"), csrf, "Unfollow")
-    } else {
-        small_form(&format!("/users/{profile_id}/follow"), csrf, "Follow")
-    };
+    let follow_action = render::follow_form(
+        profile_id,
+        csrf,
+        social::is_following(&state.pool, viewer.id, profile_id).await?,
+    );
     Ok(format!(
-        r#"<div class="actions">{}{}{}</div>"#,
+        r#"<div class="actions profile-actions">{}<span class="actions profile-secondary">{}{}</span></div>"#,
         follow_action,
-        small_form(&format!("/users/{profile_id}/block"), csrf, "Block"),
-        small_form(&format!("/users/{profile_id}/mute"), csrf, "Mute")
+        small_form(
+            &format!("/users/{profile_id}/block"),
+            csrf,
+            "Block",
+            "Block this account"
+        ),
+        small_form(
+            &format!("/users/{profile_id}/mute"),
+            csrf,
+            "Mute",
+            "Mute this account"
+        )
     ))
 }
 
@@ -782,7 +862,10 @@ async fn follow(
     social::follow(&state.pool, user.id, id)
         .await
         .map_err(|err| AppError::BadRequest(err.to_string()))?;
-    Ok(Redirect::to("/home").into_response())
+    if enhanced_request(&headers) {
+        return Ok(Json(follow_action_response(&state.pool, user.id, id).await?).into_response());
+    }
+    Ok(Redirect::to(&account_action_return(&state.pool, &headers, id).await?).into_response())
 }
 
 async fn unfollow(
@@ -794,7 +877,10 @@ async fn unfollow(
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::unfollow(&state.pool, user.id, id).await?;
-    Ok(Redirect::to("/following").into_response())
+    if enhanced_request(&headers) {
+        return Ok(Json(follow_action_response(&state.pool, user.id, id).await?).into_response());
+    }
+    Ok(Redirect::to(&account_action_return(&state.pool, &headers, id).await?).into_response())
 }
 
 async fn block(
@@ -811,7 +897,7 @@ async fn block(
             tracing::warn!(blocker_id = user.id, blocked_id = id, error = %err, "block rejected");
             AppError::BadRequest(err.to_string())
         })?;
-    Ok(Redirect::to("/home").into_response())
+    Ok(Redirect::to(&account_action_return(&state.pool, &headers, id).await?).into_response())
 }
 
 async fn unblock(
@@ -840,7 +926,7 @@ async fn mute(
             tracing::warn!(muter_id = user.id, muted_id = id, error = %err, "mute rejected");
             AppError::BadRequest(err.to_string())
         })?;
-    Ok(Redirect::to("/home").into_response())
+    Ok(Redirect::to(&account_action_return(&state.pool, &headers, id).await?).into_response())
 }
 
 async fn settings_form(
@@ -911,7 +997,12 @@ async fn settings_form(
                 r#"<li><span><strong>{}</strong> <span class="muted">@{}</span></span>{}</li>"#,
                 html_escape::encode_text(&display_name),
                 html_escape::encode_text(&username),
-                small_form(&format!("/users/{id}/unblock"), &csrf, "Unblock")
+                small_form(
+                    &format!("/users/{id}/unblock"),
+                    &csrf,
+                    "Unblock",
+                    "Unblock this account",
+                )
             )
         })
         .collect::<Vec<_>>()
@@ -1181,6 +1272,105 @@ async fn post_is_reply(pool: &SqlitePool, post_id: i64) -> AppResult<bool> {
 fn redirect_to_post_anchor(headers: &HeaderMap, post_id: i64, is_reply: bool) -> Redirect {
     let target = anchored_return(headers, post_id, is_reply, "/home");
     Redirect::to(&target)
+}
+
+fn enhanced_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-rustpost-enhance")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "1")
+}
+
+async fn follow_action_response(
+    pool: &SqlitePool,
+    viewer_id: i64,
+    profile_id: i64,
+) -> AppResult<FollowActionResponse> {
+    let following = social::is_following(pool, viewer_id, profile_id).await?;
+    let (followers, following_count) = social::follow_counts(pool, profile_id).await?;
+    Ok(FollowActionResponse {
+        kind: "follow",
+        user_id: profile_id,
+        following,
+        followers,
+        following_count,
+        action: if following {
+            format!("/users/{profile_id}/unfollow")
+        } else {
+            format!("/users/{profile_id}/follow")
+        },
+    })
+}
+
+async fn post_action_response(
+    pool: &SqlitePool,
+    viewer_id: i64,
+    post_id: i64,
+) -> AppResult<PostActionResponse> {
+    let state = pool
+        .call(move |conn| {
+            conn.query_row(
+                r#"
+                SELECT
+                  (SELECT COUNT(*) FROM likes WHERE post_id = p.id),
+                  (SELECT COUNT(*) FROM reposts WHERE post_id = p.id),
+                  (SELECT COUNT(*) FROM posts replies WHERE replies.parent_post_id = p.id AND replies.is_deleted = 0),
+                  EXISTS(SELECT 1 FROM likes WHERE user_id = ? AND post_id = p.id),
+                  EXISTS(SELECT 1 FROM bookmarks WHERE user_id = ? AND post_id = p.id),
+                  EXISTS(SELECT 1 FROM reposts WHERE user_id = ? AND post_id = p.id)
+                FROM posts p
+                WHERE p.id = ? AND p.is_deleted = 0
+                "#,
+                params![viewer_id, viewer_id, viewer_id, post_id],
+                |row| {
+                    Ok(PostActionResponse {
+                        kind: "post-action",
+                        post_id,
+                        likes: row.get(0)?,
+                        reposts: row.get(1)?,
+                        replies: row.get(2)?,
+                        liked: row.get::<_, i64>(3)? != 0,
+                        bookmarked: row.get::<_, i64>(4)? != 0,
+                        reposted: row.get::<_, i64>(5)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?;
+    state.ok_or(AppError::NotFound)
+}
+
+async fn account_action_return(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+    profile_id: i64,
+) -> AppResult<String> {
+    if let Some(target) = referer_target(headers)
+        .as_deref()
+        .and_then(safe_return_target)
+    {
+        return Ok(target);
+    }
+    Ok(user_profile_path(pool, profile_id)
+        .await?
+        .unwrap_or_else(|| "/home".to_owned()))
+}
+
+async fn user_profile_path(pool: &SqlitePool, user_id: i64) -> AppResult<Option<String>> {
+    Ok(pool
+        .call(move |conn| {
+            conn.query_row(
+                "SELECT username FROM users WHERE id = ? AND is_deleted = 0",
+                [user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?
+        .map(|username| format!("/users/{username}")))
 }
 
 fn anchored_return(headers: &HeaderMap, post_id: i64, is_reply: bool, fallback: &str) -> String {
@@ -1471,7 +1661,12 @@ async fn admin_users(
                 small_form(
                     &format!("/admin/users/{id}/suspend"),
                     &csrf,
-                    if suspended { "Unsuspend" } else { "Suspend" }
+                    if suspended { "Unsuspend" } else { "Suspend" },
+                    if suspended {
+                        "Unsuspend this account"
+                    } else {
+                        "Suspend this account"
+                    },
                 )
             )
         })
@@ -1601,11 +1796,13 @@ async fn admin_create_backup(
     ))
 }
 
-fn small_form(action: &str, csrf: &str, label: &str) -> String {
+fn small_form(action: &str, csrf: &str, label: &str, title: &str) -> String {
     format!(
-        r#"<form method="post" action="{}"><input type="hidden" name="csrf" value="{}"><button>{}</button></form>"#,
+        r#"<form method="post" action="{}"><input type="hidden" name="csrf" value="{}"><button type="submit" aria-label="{}" title="{}">{}</button></form>"#,
         html_escape::encode_double_quoted_attribute(action),
         html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_double_quoted_attribute(title),
+        html_escape::encode_double_quoted_attribute(title),
         html_escape::encode_text(label)
     )
 }
@@ -1980,6 +2177,304 @@ mod tests {
         assert_eq!(self_repost.status, 400);
         assert!(self_repost.body.contains("cannot repost your own post"));
         assert!(!self_repost.body.contains("internal server error"));
+    }
+
+    #[tokio::test]
+    async fn enhanced_like_updates_in_place_with_stable_action_markup() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let cookie = session_cookie(&registered);
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "enhanced like")],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert!(home.body.contains(r#"data-enhance="post-action""#));
+        assert!(home.body.contains(r#"data-count="likes""#));
+        assert!(home.body.contains(r#"data-action-kind="like""#));
+        let csrf = csrf_token(&home.body);
+        let liked = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/like",
+            &[
+                ("cookie", &cookie),
+                ("referer", "/home"),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("x-rustpost-enhance", "1"),
+                ("accept", "application/json"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(liked.status, 200);
+        assert!(liked.body.contains(r#""kind":"post-action""#));
+        assert!(liked.body.contains(r#""post_id":1"#));
+        assert!(liked.body.contains(r#""liked":true"#));
+        assert!(liked.body.contains(r#""likes":1"#));
+    }
+
+    #[tokio::test]
+    async fn enhanced_post_and_reply_return_rendered_cards_without_redirects() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let cookie = session_cookie(&registered);
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert!(home.body.contains(r#"data-enhance="post-create""#));
+        let csrf = csrf_token(&home.body);
+
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+                ("x-rustpost-enhance", "1"),
+                ("accept", "application/json"),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "enhanced post")],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 200);
+        assert!(posted.body.contains(r#""kind":"post-created""#));
+        assert!(posted.body.contains(r#""post_id":1"#));
+        assert!(posted.body.contains(r#""parent_post_id":null"#));
+        assert!(posted.body.contains("enhanced post"));
+        assert!(posted.body.contains(r#"id=\"post-1\""#));
+
+        let thread = request(
+            &server.base_url,
+            "GET",
+            "/posts/1",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&thread.body);
+        let replied = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+                ("x-rustpost-enhance", "1"),
+                ("accept", "application/json"),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("parent_post_id", "1"),
+                    ("text", "enhanced reply"),
+                ],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(replied.status, 200);
+        assert!(replied.body.contains(r#""post_id":2"#));
+        assert!(replied.body.contains(r#""parent_post_id":1"#));
+        assert!(replied.body.contains("enhanced reply"));
+        assert!(replied.body.contains(r#"reply-post"#));
+    }
+
+    #[tokio::test]
+    async fn follow_profile_stays_on_profile_and_renders_following_state() {
+        let server = spawn_test_server().await;
+        let bob = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=bob&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(bob.status, 303);
+        let alice = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(alice.status, 303);
+        let alice_cookie = session_cookie(&alice);
+
+        let profile = request(
+            &server.base_url,
+            "GET",
+            "/users/bob",
+            &[("cookie", &alice_cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(profile.status, 200);
+        assert!(profile.body.contains(r#"class="actions profile-actions""#));
+        assert!(profile.body.contains(r#"class="follow-button""#));
+        assert!(profile.body.contains(r#">Follow</button>"#));
+        assert!(
+            profile
+                .body
+                .contains(r#"data-profile-followers="1">0 followers"#)
+        );
+        assert!(
+            profile
+                .body
+                .contains(r#"class="actions profile-secondary""#)
+        );
+        let csrf = csrf_token(&profile.body);
+
+        let followed = request(
+            &server.base_url,
+            "POST",
+            "/users/1/follow",
+            &[
+                ("cookie", &alice_cookie),
+                ("referer", "/users/bob"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(followed.status, 303);
+        assert_eq!(location(&followed), "/users/bob");
+
+        let profile = request(
+            &server.base_url,
+            "GET",
+            "/users/bob",
+            &[("cookie", &alice_cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(profile.status, 200);
+        assert!(profile.body.contains(r#"class="follow-button active""#));
+        assert!(profile.body.contains(r#">Following</button>"#));
+        assert!(
+            profile
+                .body
+                .contains(r#"data-profile-followers="1">1 followers"#)
+        );
+        assert!(!profile.body.contains(">Unfollow</button>"));
+    }
+
+    #[tokio::test]
+    async fn enhanced_follow_returns_button_and_count_state() {
+        let server = spawn_test_server().await;
+        let bob = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=bob&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(bob.status, 303);
+        let alice = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let alice_cookie = session_cookie(&alice);
+        let profile = request(
+            &server.base_url,
+            "GET",
+            "/users/bob",
+            &[("cookie", &alice_cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&profile.body);
+
+        let followed = request(
+            &server.base_url,
+            "POST",
+            "/users/1/follow",
+            &[
+                ("cookie", &alice_cookie),
+                ("referer", "/users/bob"),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("x-rustpost-enhance", "1"),
+                ("accept", "application/json"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(followed.status, 200);
+        assert!(followed.body.contains(r#""kind":"follow""#));
+        assert!(followed.body.contains(r#""user_id":1"#));
+        assert!(followed.body.contains(r#""following":true"#));
+        assert!(followed.body.contains(r#""followers":1"#));
+        assert!(followed.body.contains(r#""action":"/users/1/unfollow""#));
     }
 
     #[tokio::test]
