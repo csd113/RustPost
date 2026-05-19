@@ -8,43 +8,84 @@ use clap::{Parser, Subcommand};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::{admin, backup, config, db, demo_seed, logging, runtime, server, tor};
+use crate::{admin, backup, config, db, demo_seed, logging, runtime, server, terminal, tor};
 
 #[derive(Debug, Parser)]
-#[command(about = "Single-binary self-hosted microblog")]
+#[command(
+    about = "Single-binary self-hosted microblog",
+    after_help = "Common first run:\n  rustpost-cli init\n  rustpost-cli create-admin-interactive\n  rustpost-cli serve"
+)]
 struct Cli {
-    #[arg(long)]
+    /// Path to settings.toml. Defaults to <data-dir>/settings.toml.
+    #[arg(long, help = "Path to settings.toml")]
     config: Option<PathBuf>,
-    #[arg(long)]
+
+    /// Runtime data directory. Defaults to rustpost-data beside the binary.
+    #[arg(long, help = "Runtime data directory")]
     data_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create the data directory and default settings file.
+    #[command(about = "Create the data directory and default settings file")]
     Init,
+
+    /// Validate settings and report optional service readiness.
+    #[command(about = "Validate settings and optional service readiness")]
     Check,
+
+    /// Create an administrator account with arguments from the command line.
+    #[command(about = "Create an administrator account")]
     CreateAdmin {
+        #[arg(help = "Administrator username")]
         username: String,
+        #[arg(help = "Administrator password")]
         password: String,
     },
+
+    /// Create an administrator account with hidden password prompts.
+    #[command(about = "Create an administrator account with hidden password prompts")]
     CreateAdminInteractive,
+
+    /// Reset an administrator password.
+    #[command(about = "Reset an administrator password")]
     ResetAdminPassword {
+        #[arg(help = "Administrator username")]
         username: String,
+        #[arg(help = "New administrator password")]
         password: String,
     },
+
+    /// Seed demo data into an explicit target/debug data directory.
+    #[command(about = "Seed demo data into an explicit data directory")]
     SeedDemo,
+
+    /// Write a tar backup under the runtime backup directory.
+    #[command(about = "Write a tar backup under the backup directory")]
     Backup {
-        #[arg(long)]
+        #[arg(long, help = "Include Tor onion service keys in the backup")]
         include_tor_keys: bool,
     },
+
+    /// Restore a backup tar archive into the runtime data directory.
+    #[command(about = "Restore a backup tar archive into the data directory")]
     Restore {
+        #[arg(help = "Backup archive to restore")]
         archive: PathBuf,
-        #[arg(long)]
+        #[arg(long, help = "Allow restoring Tor onion service keys")]
         include_tor_keys: bool,
     },
+
+    /// Print only the configured onion address when one is available.
+    #[command(about = "Print the onion address when one is available")]
     PrintOnionAddress,
+
+    /// Start the `RustPost` web server.
+    #[command(about = "Start the RustPost web server")]
     Serve,
 }
 
@@ -62,43 +103,56 @@ pub async fn run() -> anyhow::Result<()> {
     paths.ensure()?;
     info!(data_dir = %paths.data_dir.display(), settings = %settings_path.display(), "runtime paths ready");
 
-    match cli.command.unwrap_or(Command::Serve) {
+    run_command(
+        cli.command.unwrap_or(Command::Serve),
+        paths,
+        settings_path,
+        settings,
+        explicit_data_dir.is_some(),
+    )
+    .await
+}
+
+async fn run_command(
+    command: Command,
+    paths: runtime::RuntimePaths,
+    settings_path: PathBuf,
+    settings: config::Settings,
+    has_explicit_data_dir: bool,
+) -> anyhow::Result<()> {
+    let database = AdminDatabase {
+        paths: &paths,
+        settings: &settings,
+    };
+    match command {
         Command::Init => {
-            stdout_line(format_args!("initialized {}", paths.data_dir.display()))?;
+            stdout_raw(format_args!(
+                "{}",
+                terminal::render_init(&paths, &settings_path)
+            ))?;
             Ok(())
         }
         Command::Check => {
             let ffmpeg = crate::ffmpeg::probe(&settings.media).await;
             let tor_status = tor::validate_startup(&settings.tor);
-            stdout_line(format_args!("configuration ok"))?;
-            stdout_line(format_args!("ffmpeg: {}", ffmpeg.summary()))?;
-            stdout_line(format_args!("tor: {}", tor_status.summary()))?;
+            stdout_raw(format_args!(
+                "{}",
+                terminal::render_check(&settings, &ffmpeg, &tor_status)
+            ))?;
             Ok(())
         }
         Command::CreateAdmin { username, password } => {
-            let pool = db::connect(&paths.database_path).await?;
-            db::migrate(&pool).await?;
-            admin::create_admin(&pool, &settings, &username, &password).await?;
-            stdout_line(format_args!("admin account created"))?;
-            Ok(())
+            create_admin_command(&database, username, password).await
         }
         Command::CreateAdminInteractive => {
-            let pool = db::connect(&paths.database_path).await?;
-            db::migrate(&pool).await?;
             let (username, password) = prompt_admin_credentials()?;
-            admin::create_admin(&pool, &settings, &username, &password).await?;
-            stdout_line(format_args!("admin account created"))?;
-            Ok(())
+            create_admin_command(&database, username, password).await
         }
         Command::ResetAdminPassword { username, password } => {
-            let pool = db::connect(&paths.database_path).await?;
-            db::migrate(&pool).await?;
-            admin::reset_admin_password(&pool, &settings, &username, &password).await?;
-            stdout_line(format_args!("admin password reset"))?;
-            Ok(())
+            reset_admin_password_command(&database, username, password).await
         }
         Command::SeedDemo => {
-            if explicit_data_dir.is_none() {
+            if !has_explicit_data_dir {
                 anyhow::bail!("seed-demo requires an explicit --data-dir under target/debug");
             }
             let pool = db::connect(&paths.database_path).await?;
@@ -107,19 +161,11 @@ pub async fn run() -> anyhow::Result<()> {
             stdout_line(format_args!("{report}"))?;
             Ok(())
         }
-        Command::Backup { include_tor_keys } => {
-            let archive = backup::create_backup(&paths, include_tor_keys)?;
-            stdout_line(format_args!("{}", archive.display()))?;
-            Ok(())
-        }
+        Command::Backup { include_tor_keys } => backup_command(&paths, include_tor_keys),
         Command::Restore {
             archive,
             include_tor_keys,
-        } => {
-            backup::restore_backup(&paths, &archive, include_tor_keys)?;
-            stdout_line(format_args!("restore completed"))?;
-            Ok(())
-        }
+        } => restore_command(&paths, &archive, include_tor_keys),
         Command::PrintOnionAddress => {
             let status = tor::validate_startup(&settings.tor);
             stdout_line(format_args!(
@@ -128,11 +174,109 @@ pub async fn run() -> anyhow::Result<()> {
             ))?;
             Ok(())
         }
-        Command::Serve => serve(paths, settings).await,
+        Command::Serve => serve(paths, settings_path, settings).await,
     }
 }
 
-async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyhow::Result<()> {
+struct AdminDatabase<'a> {
+    paths: &'a runtime::RuntimePaths,
+    settings: &'a config::Settings,
+}
+
+async fn create_admin_command(
+    database: &AdminDatabase<'_>,
+    username: String,
+    password: String,
+) -> anyhow::Result<()> {
+    let pool = db::connect(&database.paths.database_path).await?;
+    db::migrate(&pool).await?;
+    admin::create_admin(&pool, database.settings, &username, &password).await?;
+    stdout_raw(format_args!(
+        "{}",
+        terminal::render_command_success(
+            "RustPost admin created",
+            &[
+                terminal::row("Username", username),
+                terminal::row(
+                    "Next command",
+                    format!(
+                        "rustpost-cli --data-dir {} serve",
+                        database.paths.data_dir.display()
+                    ),
+                ),
+            ],
+        )
+    ))?;
+    Ok(())
+}
+
+async fn reset_admin_password_command(
+    database: &AdminDatabase<'_>,
+    username: String,
+    password: String,
+) -> anyhow::Result<()> {
+    let pool = db::connect(&database.paths.database_path).await?;
+    db::migrate(&pool).await?;
+    admin::reset_admin_password(&pool, database.settings, &username, &password).await?;
+    stdout_raw(format_args!(
+        "{}",
+        terminal::render_command_success(
+            "RustPost admin password reset",
+            &[
+                terminal::row("Username", username),
+                terminal::row("Next command", "sign in with the new password"),
+            ],
+        )
+    ))?;
+    Ok(())
+}
+
+fn backup_command(paths: &runtime::RuntimePaths, include_tor_keys: bool) -> anyhow::Result<()> {
+    let archive = backup::create_backup(paths, include_tor_keys)?;
+    stdout_raw(format_args!(
+        "{}",
+        terminal::render_command_success(
+            "RustPost backup created",
+            &[
+                terminal::row("Archive", archive.display().to_string()),
+                terminal::row(
+                    "Tor keys",
+                    if include_tor_keys {
+                        "included"
+                    } else {
+                        "excluded"
+                    },
+                ),
+            ],
+        )
+    ))?;
+    Ok(())
+}
+
+fn restore_command(
+    paths: &runtime::RuntimePaths,
+    archive: &std::path::Path,
+    include_tor_keys: bool,
+) -> anyhow::Result<()> {
+    backup::restore_backup(paths, archive, include_tor_keys)?;
+    stdout_raw(format_args!(
+        "{}",
+        terminal::render_command_success(
+            "RustPost restore completed",
+            &[
+                terminal::row("Archive", archive.display().to_string()),
+                terminal::row("Data directory", paths.data_dir.display().to_string()),
+            ],
+        )
+    ))?;
+    Ok(())
+}
+
+async fn serve(
+    paths: runtime::RuntimePaths,
+    settings_path: PathBuf,
+    settings: config::Settings,
+) -> anyhow::Result<()> {
     let pool = db::connect(&paths.database_path).await?;
     db::migrate(&pool).await?;
     let admin_count = admin::admin_count(&pool).await?;
@@ -140,89 +284,113 @@ async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyh
     if !ffmpeg.available {
         warn!("ffmpeg unavailable; uploads will safely fall back to allowed originals");
     }
-    let onion_listener = if settings.tor.enabled {
-        Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
-    } else {
-        None
-    };
-    let onion_target = onion_listener
-        .as_ref()
-        .and_then(|listener| listener.local_addr().ok());
-    let tor_status = if settings.tor.tor_only {
-        tor::start(&settings.tor, &paths, onion_target).await?
-    } else if settings.tor.enabled {
-        tor::TorStatus::starting()
-    } else {
-        tor::validate_startup(&settings.tor)
-    };
+    let onion_listener = bind_onion_listener(&settings.tor).await?;
+    let onion_target = onion_listener_target(onion_listener.as_ref());
+    let tor_status = initial_tor_status(&settings.tor, &paths, onion_target).await?;
     let tor_status_for_background = tor_status.clone();
     if settings.admin.create_admin_on_first_boot {
         admin::ensure_first_boot_admin_hint(&pool).await?;
     }
-    print_startup_summary(&paths, &settings, admin_count);
+    print_startup_dashboard(
+        &pool,
+        StartupPrintContext {
+            paths: &paths,
+            settings_path: &settings_path,
+            settings: &settings,
+            admin_count,
+            ffmpeg: &ffmpeg,
+            tor_status: &tor_status_for_background,
+            onion_target,
+        },
+    )
+    .await?;
     let state = server::AppState::new(pool, settings.clone(), paths.clone(), ffmpeg, tor_status);
     let app = server::router(state);
+    let shutdown_rx = shutdown_receiver();
+
+    if settings.tor.tor_only {
+        return serve_tor_only(onion_listener, app, shutdown_rx).await;
+    }
+
+    if let Some(listener) = onion_listener {
+        spawn_onion_forwarding(
+            listener,
+            app.clone(),
+            paths.clone(),
+            settings.tor.clone(),
+            tor_status_for_background.clone(),
+            onion_target,
+            shutdown_rx.clone(),
+        );
+    }
+
+    serve_clearnet(app, &settings.server, shutdown_rx).await
+}
+
+async fn bind_onion_listener(
+    settings: &config::TorSettings,
+) -> anyhow::Result<Option<tokio::net::TcpListener>> {
+    if !settings.enabled {
+        return Ok(None);
+    }
+    Ok(Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?))
+}
+
+fn onion_listener_target(listener: Option<&tokio::net::TcpListener>) -> Option<SocketAddr> {
+    listener.and_then(|listener| listener.local_addr().ok())
+}
+
+async fn initial_tor_status(
+    settings: &config::TorSettings,
+    paths: &runtime::RuntimePaths,
+    onion_target: Option<SocketAddr>,
+) -> anyhow::Result<tor::TorStatus> {
+    if settings.tor_only {
+        return tor::start(settings, paths, onion_target).await;
+    }
+    if settings.enabled {
+        return Ok(tor::TorStatus::starting());
+    }
+    Ok(tor::validate_startup(settings))
+}
+
+fn shutdown_receiver() -> watch::Receiver<bool> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     });
+    shutdown_rx
+}
 
-    if settings.tor.tor_only {
-        let listener = onion_listener.context("tor_only requires an internal onion listener")?;
-        let addr = listener.local_addr()?;
-        info!(%addr, "RustPost listening on loopback for Arti onion forwarding");
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
-        .await?;
-        return Ok(());
-    }
+async fn serve_tor_only(
+    onion_listener: Option<tokio::net::TcpListener>,
+    app: axum::Router,
+    shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let listener = onion_listener.context("tor_only requires an internal onion listener")?;
+    let addr = listener.local_addr()?;
+    info!(%addr, "RustPost listening on loopback for Arti onion forwarding");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+    .await?;
+    Ok(())
+}
 
-    if let Some(listener) = onion_listener {
-        let task_app = app.clone();
-        let task_paths = paths.clone();
-        let task_tor_settings = settings.tor.clone();
-        let task_tor_status = tor_status_for_background.clone();
-        let task_shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let started = match tor::start(&task_tor_settings, &task_paths, onion_target).await {
-                Ok(status) => status,
-                Err(error) => {
-                    warn!(error = %error, "Tor onion service startup task failed");
-                    return;
-                }
-            };
-            task_tor_status.replace_with(&started);
-            if !started.running() {
-                return;
-            }
-            let addr = match listener.local_addr() {
-                Ok(addr) => addr,
-                Err(error) => {
-                    warn!(error = %error, "Tor onion listener address unavailable");
-                    return;
-                }
-            };
-            info!(%addr, "RustPost listening on loopback for Arti onion forwarding");
-            if let Err(error) = axum::serve(
-                listener,
-                task_app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(wait_for_shutdown(task_shutdown_rx))
-            .await
-            {
-                warn!(error = %error, "Tor onion forwarding listener failed");
-            }
-        });
-    }
-
-    let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)
+async fn serve_clearnet(
+    app: axum::Router,
+    settings: &config::ServerSettings,
+    shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let addr: SocketAddr = format!("{}:{}", settings.host, settings.port)
         .parse()
         .with_context(|| "invalid server bind address")?;
-    let clearnet_listener = tokio::net::TcpListener::bind(addr).await?;
+    let clearnet_listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind RustPost server at {addr}"))?;
     info!(%addr, "RustPost listening");
     let clearnet = axum::serve(
         clearnet_listener,
@@ -234,42 +402,77 @@ async fn serve(paths: runtime::RuntimePaths, settings: config::Settings) -> anyh
     Ok(())
 }
 
-fn print_startup_summary(
-    paths: &runtime::RuntimePaths,
-    settings: &config::Settings,
-    admin_count: i64,
+fn spawn_onion_forwarding(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    paths: runtime::RuntimePaths,
+    settings: config::TorSettings,
+    tor_status: tor::TorStatus,
+    onion_target: Option<SocketAddr>,
+    shutdown_rx: watch::Receiver<bool>,
 ) {
-    stderr_line(format_args!("RustPost startup"));
-    stderr_line(format_args!("  data dir: {}", paths.data_dir.display()));
-    stderr_line(format_args!(
-        "  settings: {}",
-        paths.settings_path.display()
+    tokio::spawn(async move {
+        let started = match tor::start(&settings, &paths, onion_target).await {
+            Ok(status) => status,
+            Err(error) => {
+                warn!(error = %error, "Tor onion service startup task failed");
+                return;
+            }
+        };
+        tor_status.replace_with(&started);
+        if !started.running() {
+            return;
+        }
+        let addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(error) => {
+                warn!(error = %error, "Tor onion listener address unavailable");
+                return;
+            }
+        };
+        info!(%addr, "RustPost listening on loopback for Arti onion forwarding");
+        if let Err(error) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+        .await
+        {
+            warn!(error = %error, "Tor onion forwarding listener failed");
+        }
+    });
+}
+
+struct StartupPrintContext<'a> {
+    paths: &'a runtime::RuntimePaths,
+    settings_path: &'a std::path::Path,
+    settings: &'a config::Settings,
+    admin_count: i64,
+    ffmpeg: &'a crate::ffmpeg::FfmpegStatus,
+    tor_status: &'a tor::TorStatus,
+    onion_target: Option<SocketAddr>,
+}
+
+async fn print_startup_dashboard(
+    pool: &db::SqlitePool,
+    context: StartupPrintContext<'_>,
+) -> anyhow::Result<()> {
+    let (user_count, post_count) = crate::social::instance_counts(pool).await?;
+    stderr_raw(format_args!(
+        "{}",
+        terminal::render_startup_dashboard(&terminal::StartupDashboard {
+            paths: context.paths,
+            settings_path: context.settings_path,
+            settings: context.settings,
+            admin_count: context.admin_count,
+            user_count,
+            post_count,
+            ffmpeg: context.ffmpeg,
+            tor_status: context.tor_status,
+            onion_target: context.onion_target,
+        })
     ));
-    stderr_line(format_args!(
-        "  database: {}",
-        paths.database_path.display()
-    ));
-    stderr_line(format_args!(
-        "  uploads: {}",
-        paths.uploads_originals.display()
-    ));
-    stderr_line(format_args!(
-        "  serving: http://{}:{}",
-        settings.server.host, settings.server.port
-    ));
-    if admin_count > 0 {
-        stderr_line(format_args!("  admin: present"));
-    } else {
-        stderr_line(format_args!("  admin: none found"));
-        stderr_line(format_args!(
-            "  setup: rustpost-cli --data-dir {} create-admin-interactive",
-            paths.data_dir.display()
-        ));
-        stderr_line(format_args!(
-            "  non-interactive: rustpost-cli --data-dir {} create-admin <username> <password>",
-            paths.data_dir.display()
-        ));
-    }
+    Ok(())
 }
 
 fn prompt_admin_credentials() -> anyhow::Result<(String, String)> {
@@ -353,4 +556,9 @@ fn stderr_line(args: std::fmt::Arguments<'_>) {
     let mut stderr = io::stderr().lock();
     let _write_result = stderr.write_fmt(args);
     let _write_newline_result = stderr.write_all(b"\n");
+}
+
+fn stderr_raw(args: std::fmt::Arguments<'_>) {
+    let mut stderr = io::stderr().lock();
+    let _write_result = stderr.write_fmt(args);
 }

@@ -383,8 +383,6 @@ cargo update                                                           # update 
 cargo fmt --all --check                                                # check formatting
 cargo clippy --workspace --all-targets --all-features -- -D warnings  # lint
 cargo test --workspace --all-features                                  # run tests
-npm ci                                                                 # install browser test tooling
-npm run test:e2e                                                       # run Playwright browser flows
 ```
 
 ### Local UI Regression Pass
@@ -397,15 +395,6 @@ cargo build --workspace --all-features
 ```
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080). The server initializes the data directory on first boot.
-
-Run the browser regression tests with:
-
-```sh
-npm ci
-npm run test:e2e
-```
-
-Playwright tests are local-only unless CI integration is intentionally added later. They build the Rust binaries, start `target/debug/rustpost` with a fresh temporary data directory, drive Chromium through registration, login, posting, replies, reactions, bookmarks, auth rejection, validation, and mobile layout checks, then remove the temporary app data. Intentional regression screenshots are written to `output/playwright/`; Playwright traces, failure screenshots, videos, and reports are ignored under `test-results/`, `playwright-report/`, and `output/`.
 
 **CI matrix** (GitHub Actions, Rust 1.90):
 

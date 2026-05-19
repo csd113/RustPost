@@ -5,6 +5,16 @@ use crate::db::SqlitePool;
 use crate::validation::clean_post_text;
 
 #[derive(Debug, Clone)]
+pub struct AccountView {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub bio: String,
+    pub profile_picture_path: Option<String>,
+    pub viewer_following: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct PostView {
     pub event_id: String,
     pub event_kind: TimelineEventKind,
@@ -246,35 +256,123 @@ pub async fn unrepost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::
     .await
 }
 
-pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> anyhow::Result<()> {
+pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> anyhow::Result<bool> {
     if follower_id == followed_id {
         anyhow::bail!("cannot follow yourself");
     }
     pool.call(move |conn| {
-        conn.execute(
+        let changed = conn.execute(
             "INSERT OR IGNORE INTO follows (follower_id, followed_id) VALUES (?, ?)",
             params![follower_id, followed_id],
         )?;
-        create_notification_conn(
-            conn,
-            followed_id,
-            Some(follower_id),
-            None,
-            "follow",
-            "followed you",
-        )?;
-        Ok(())
+        if changed > 0 {
+            create_notification_conn(
+                conn,
+                followed_id,
+                Some(follower_id),
+                None,
+                "follow",
+                "followed you",
+            )?;
+        }
+        Ok(changed > 0)
     })
     .await
 }
 
-pub async fn unfollow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> anyhow::Result<()> {
+pub async fn unfollow(
+    pool: &SqlitePool,
+    follower_id: i64,
+    followed_id: i64,
+) -> anyhow::Result<bool> {
     pool.call(move |conn| {
-        conn.execute(
+        let changed = conn.execute(
             "DELETE FROM follows WHERE follower_id = ? AND followed_id = ?",
             params![follower_id, followed_id],
         )?;
-        Ok(())
+        Ok(changed > 0)
+    })
+    .await
+}
+
+pub async fn is_following(
+    pool: &SqlitePool,
+    follower_id: i64,
+    followed_id: i64,
+) -> anyhow::Result<bool> {
+    pool.call(move |conn| {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM follows WHERE follower_id = ? AND followed_id = ?",
+            params![follower_id, followed_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    })
+    .await
+}
+
+pub async fn follow_counts(pool: &SqlitePool, user_id: i64) -> anyhow::Result<(i64, i64)> {
+    pool.call(move |conn| {
+        let followers = conn.query_row(
+            "SELECT COUNT(*) FROM follows f JOIN users u ON u.id = f.follower_id WHERE f.followed_id = ? AND u.is_deleted = 0",
+            [user_id],
+            |row| row.get(0),
+        )?;
+        let following = conn.query_row(
+            "SELECT COUNT(*) FROM follows f JOIN users u ON u.id = f.followed_id WHERE f.follower_id = ? AND u.is_deleted = 0",
+            [user_id],
+            |row| row.get(0),
+        )?;
+        Ok((followers, following))
+    })
+    .await
+}
+
+pub async fn instance_counts(pool: &SqlitePool) -> anyhow::Result<(i64, i64)> {
+    pool.call(|conn| {
+        let users = conn.query_row(
+            "SELECT COUNT(*) FROM users WHERE is_deleted = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let posts = conn.query_row(
+            "SELECT COUNT(*) FROM posts WHERE is_deleted = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((users, posts))
+    })
+    .await
+}
+
+pub async fn following_accounts(
+    pool: &SqlitePool,
+    viewer_id: i64,
+) -> anyhow::Result<Vec<AccountView>> {
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name, u.bio, pic.public_path
+            FROM follows f
+            JOIN users u ON u.id = f.followed_id
+            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+            WHERE f.follower_id = ? AND u.is_deleted = 0
+            ORDER BY lower(u.username)
+            "#,
+        )?;
+        let rows = stmt
+            .query_map([viewer_id], |row| {
+                Ok(AccountView {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    display_name: row.get(2)?,
+                    bio: row.get(3)?,
+                    profile_picture_path: row.get(4)?,
+                    viewer_following: true,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     })
     .await
 }
@@ -445,14 +543,33 @@ pub async fn search(
             Ok(rows)
         })
         .await?;
-    let mut post_sql = base_post_query();
-    post_sql
-        .push_str(" AND p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?) LIMIT 40");
-    let query = query.to_owned();
-    let rows = pool
-        .call(move |conn| query_post_rows(conn, &post_sql, params![query]))
-        .await?;
+    let rows = if let Some(fts_query) = fts_query_from_user_input(query) {
+        let mut post_sql = base_post_query();
+        post_sql.push_str(
+            " AND p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?) LIMIT 40",
+        );
+        pool.call(move |conn| query_post_rows(conn, &post_sql, params![fts_query]))
+            .await?
+    } else {
+        Vec::new()
+    };
     Ok((users, rows_to_posts(pool, rows, viewer_id).await?))
+}
+
+fn fts_query_from_user_input(query: &str) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .flat_map(|word| {
+            word.trim_start_matches(['#', '@'])
+                .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        })
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
 }
 
 pub async fn notifications(
@@ -845,6 +962,15 @@ mod reply_tests {
         (temp, pool, Settings::default())
     }
 
+    #[test]
+    fn search_fts_query_uses_safe_terms() {
+        assert_eq!(
+            fts_query_from_user_input("#self-hosted @ada"),
+            Some("self hosted ada".to_owned())
+        );
+        assert_eq!(fts_query_from_user_input("#"), None);
+    }
+
     #[tokio::test]
     async fn reply_is_linked_to_parent_and_rendered_in_thread() {
         let (_temp, pool, settings) = test_pool().await;
@@ -1175,5 +1301,64 @@ mod tests {
 
         assert_eq!(likes, 1);
         assert_eq!(bookmarks, 1);
+    }
+
+    #[tokio::test]
+    async fn follow_unfollow_is_idempotent_and_counts_once() {
+        let (pool, _settings, alice, bob) = fixture().await;
+
+        assert!(follow(&pool, bob, alice).await.expect("first follow"));
+        assert!(!follow(&pool, bob, alice).await.expect("duplicate follow"));
+        assert!(is_following(&pool, bob, alice).await.expect("is following"));
+        assert_eq!(
+            follow_counts(&pool, alice).await.expect("alice counts"),
+            (1, 0)
+        );
+        assert_eq!(follow_counts(&pool, bob).await.expect("bob counts"), (0, 1));
+
+        let notifications: i64 = pool
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND actor_user_id = ? AND kind = 'follow'",
+                    params![alice, bob],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("notification count");
+        assert_eq!(notifications, 1);
+
+        assert!(unfollow(&pool, bob, alice).await.expect("unfollow"));
+        assert!(
+            !unfollow(&pool, bob, alice)
+                .await
+                .expect("duplicate unfollow")
+        );
+        assert!(
+            !is_following(&pool, bob, alice)
+                .await
+                .expect("not following")
+        );
+    }
+
+    #[tokio::test]
+    async fn following_accounts_returns_only_viewer_follows() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+
+        follow(&pool, alice, bob).await.expect("alice follows bob");
+        follow(&pool, carol, alice)
+            .await
+            .expect("carol follows alice");
+
+        let accounts = following_accounts(&pool, alice)
+            .await
+            .expect("following accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, bob);
+        assert_eq!(accounts[0].username, "bob");
+        assert!(accounts[0].viewer_following);
     }
 }
