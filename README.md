@@ -135,12 +135,17 @@ On first boot, RustPost initializes the data directory automatically:
 ```
 rustpost-data/
 ├── settings.toml          ← generated config with safe defaults
-├── app.sqlite3            ← main database
+├── db/
+│   ├── rustpost.sqlite3   ← main database
+│   ├── rustpost.sqlite3-wal
+│   └── rustpost.sqlite3-shm
 ├── uploads/
 │   ├── originals/
 │   ├── images/
 │   ├── videos/
 │   └── thumbs/
+├── tmp/
+│   └── uploads/           ← interrupted upload staging only
 ├── backups/
 ├── logs/
 └── tor/
@@ -149,10 +154,11 @@ rustpost-data/
 
 > **Note:** All runtime paths are derived from `--data-dir` (or the executable location as fallback). RustPost does not rely on the current working directory.
 > Runtime data is local operator state. Databases, uploads, logs, backups, Tor key material, and temporary upload files under `rustpost-data/` should not be committed to git.
+> Existing data directories that still contain `app.sqlite3` at the data-dir root are migrated to `db/rustpost.sqlite3` on startup. If both old and new database files exist, RustPost stops with a conflict error and does not overwrite either file.
 
 ### Create Your First Admin
 
-When `serve` starts, RustPost prints the data directory, settings path, database path, bind address, and whether an admin account exists. If no admin exists, the terminal output includes the bootstrap commands.
+When `serve` starts, RustPost prints the data directory, settings path, database path, upload/media paths, log path, backup path, bind address, and whether an admin account exists. If no admin exists, the terminal output includes the bootstrap commands.
 
 The preferred local setup path hides the password while you type:
 
@@ -452,7 +458,7 @@ Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and op
 <details>
 <summary>Verified locally</summary>
 
-- Fresh `--data-dir` boot creates `settings.toml`, `app.sqlite3`, upload roots, backup/log dirs, and Tor state dirs.
+- Fresh `--data-dir` boot creates `settings.toml`, `db/rustpost.sqlite3`, upload roots, temp upload staging, backup/log dirs, and Tor state dirs.
 - `rustpost-cli check` passes on a fresh data directory with `tor.enabled = false`.
 - Clearnet serving on `127.0.0.1:8080` loads `/home`.
 - Registration, login, post creation, replies, repost rendering, likes, bookmarks, follows, notifications, admin health, and CSRF-protected logout all work through live HTTP requests.

@@ -42,14 +42,25 @@ rustpost-data/**/*
 !rustpost-data/.gitkeep
 tmp/
 tmp/**/*
+db/
+db/**/*
+backups/
+logs/
+media/
+media/**/*
 *.sqlite3
 *.sqlite3-*
+*.sqlite
+*.sqlite-*
 *.db
 *.db-*
+rustpost.sqlite3*
+app.sqlite3*
 *.log
 *.tmp
 *.upload
 uploads/
+uploads/**/*
 
 # macOS
 .DS_Store

@@ -86,6 +86,8 @@ pub fn render_startup_dashboard(input: &StartupDashboard<'_>) -> String {
             row("Settings", display(input.settings_path)),
             row("Database", display(input.paths.database_path.as_path())),
             row("Uploads", display(input.paths.uploads_originals.as_path())),
+            row("Media", display(input.paths.uploads_images.as_path())),
+            row("Logs", display(input.paths.logs_dir.as_path())),
             row("Backups", display(input.paths.backups_dir.as_path())),
         ],
     );
@@ -151,6 +153,9 @@ pub fn render_init(paths: &runtime::RuntimePaths, settings_path: &Path) -> Strin
             row("Data directory", display(paths.data_dir.as_path())),
             row("Settings", display(settings_path)),
             row("Database", display(paths.database_path.as_path())),
+            row("Uploads", display(paths.uploads_originals.as_path())),
+            row("Logs", display(paths.logs_dir.as_path())),
+            row("Backups", display(paths.backups_dir.as_path())),
         ],
     );
     push_section(
@@ -420,6 +425,10 @@ mod tests {
         assert!(output.contains("http://127.0.0.1:8080"));
         assert!(output.contains("Data directory"));
         assert!(output.contains("/tmp/rustpost-data"));
+        assert!(output.contains("/tmp/rustpost-data/db/rustpost.sqlite3"));
+        assert!(output.contains("/tmp/rustpost-data/uploads/originals"));
+        assert!(output.contains("/tmp/rustpost-data/logs"));
+        assert!(output.contains("/tmp/rustpost-data/backups"));
         assert!(
             output.contains("rustpost-cli --data-dir /tmp/rustpost-data create-admin-interactive")
         );

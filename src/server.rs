@@ -1697,9 +1697,12 @@ async fn admin_health(
         .bootstrap_status()
         .unwrap_or_else(|| "unavailable".to_owned());
     let body = format!(
-        r#"<section class="panel"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
+        r#"<section class="panel"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
         html_escape::encode_text(&state.paths.database_path.display().to_string()),
         html_escape::encode_text(&state.paths.uploads_originals.display().to_string()),
+        html_escape::encode_text(&state.paths.uploads_images.display().to_string()),
+        html_escape::encode_text(&state.paths.logs_dir.display().to_string()),
+        html_escape::encode_text(&state.paths.backups_dir.display().to_string()),
         html_escape::encode_text(&state.ffmpeg.summary()),
         state.ffmpeg.supports_webp,
         state.ffmpeg.supports_vp9,
