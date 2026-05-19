@@ -98,7 +98,7 @@ pub fn layout_with_context(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta name="referrer" content="same-origin">
 <title>{} - {}</title>
@@ -266,7 +266,7 @@ document.addEventListener("submit", async (event) => {
       credentials: "same-origin"
     });
     if (!response.ok) {
-      window.location.assign(response.url || window.location.href);
+      HTMLFormElement.prototype.submit.call(form);
       return;
     }
     const data = await response.json();

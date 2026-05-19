@@ -355,7 +355,8 @@ async fn register(
         &form.password,
         false,
     )
-    .await?;
+    .await
+    .map_err(|err| AppError::BadRequest(err.to_string()))?;
     let session = auth::create_session(&state.pool, user_id).await?;
     let mut response = Redirect::to("/home").into_response();
     response.headers_mut().insert(

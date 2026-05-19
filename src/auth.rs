@@ -38,6 +38,17 @@ pub async fn register_user(
     let hash = hash_password(password)?;
     let username = username.trim().to_owned();
     pool.call(move |conn| {
+        let existing = conn
+            .query_row(
+                "SELECT 1 FROM users WHERE normalized_username = ?",
+                [&normalized],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if existing {
+            anyhow::bail!("username is already taken");
+        }
         conn.execute(
             "INSERT INTO users (username, normalized_username, password_hash, display_name, is_admin) VALUES (?, ?, ?, ?, ?)",
             params![username, normalized, hash, username, i64::from(is_admin)],
