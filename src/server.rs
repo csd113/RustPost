@@ -21,6 +21,8 @@ use crate::ffmpeg::FfmpegStatus;
 use crate::runtime::RuntimePaths;
 use crate::{admin, backup, csrf, media, rate_limit, render, social};
 
+const CSRF_TOKEN_HISTORY_LIMIT: usize = 32;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -1871,15 +1873,15 @@ async fn validate_csrf(pool: &SqlitePool, headers: &HeaderMap, token: &str) -> A
 async fn form_csrf(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let token = auth::session_cookie(headers)?;
     let token_hash = auth::hash_token(&token);
-    let stored_hash: String = state
+    let (stored_hash, previous_hashes): (String, Option<String>) = state
         .pool
         .call({
             let token_hash = token_hash.clone();
             move |conn| {
                 conn.query_row(
-                    "SELECT csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
+                    "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
                     [token_hash],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
                 .map_err(Into::into)
@@ -1887,22 +1889,34 @@ async fn form_csrf(state: &AppState, headers: &HeaderMap) -> Option<String> {
         })
         .await
         .ok()??;
-    // Keep the last rendered token valid for browser back/forward-cache restores.
+    let previous_hashes = csrf_history_with(&stored_hash, previous_hashes.as_deref());
     let plain = auth::secure_token();
     let new_hash = auth::hash_token(&plain);
-    state
+    let updated = state
         .pool
         .call(move |conn| {
-            let previous_hash = stored_hash.clone();
-            conn.execute(
+            let changed = conn.execute(
                 "UPDATE sessions SET csrf_token_hash = ?, previous_csrf_token_hash = ? WHERE token_hash = ? AND csrf_token_hash = ?",
-                params![new_hash, previous_hash, token_hash, stored_hash],
+                params![new_hash, previous_hashes, token_hash, stored_hash],
             )?;
-            Ok(())
+            Ok(changed == 1)
         })
         .await
         .ok()?;
-    Some(plain)
+    updated.then_some(plain)
+}
+
+fn csrf_history_with(current_hash: &str, previous_hashes: Option<&str>) -> String {
+    std::iter::once(current_hash)
+        .chain(
+            previous_hashes
+                .into_iter()
+                .flat_map(str::lines)
+                .filter(|hash| !hash.is_empty() && *hash != current_hash),
+        )
+        .take(CSRF_TOKEN_HISTORY_LIMIT.saturating_sub(1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn user_post_relation_exists(
@@ -1945,6 +1959,22 @@ mod tests {
         status: u16,
         headers: Vec<(String, String)>,
         body: String,
+    }
+
+    #[test]
+    fn csrf_history_is_bounded_and_keeps_recent_hashes() {
+        let prior = (1..CSRF_TOKEN_HISTORY_LIMIT + 3)
+            .map(|idx| format!("token-{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let history = csrf_history_with("current", Some(&prior));
+        let hashes = history.lines().collect::<Vec<_>>();
+
+        assert_eq!(hashes.len(), CSRF_TOKEN_HISTORY_LIMIT - 1);
+        assert_eq!(hashes[0], "current");
+        assert_eq!(hashes[1], "token-1");
+        assert_eq!(hashes[CSRF_TOKEN_HISTORY_LIMIT - 2], "token-30");
     }
 
     #[tokio::test]
@@ -2248,7 +2278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_actions_accept_token_from_previous_page_render() {
+    async fn post_actions_accept_token_from_recent_page_render_history() {
         let server = spawn_test_server().await;
         let registered = request(
             &server.base_url,
@@ -2298,15 +2328,17 @@ mod tests {
         )
         .await;
         let home_csrf = csrf_token(&home.body);
-        let thread = request(
-            &server.base_url,
-            "GET",
-            "/posts/1",
-            &[("cookie", &cookie)],
-            Vec::new(),
-        )
-        .await;
-        assert_eq!(thread.status, 200);
+        for _ in 0..5 {
+            let thread = request(
+                &server.base_url,
+                "GET",
+                "/posts/1",
+                &[("cookie", &cookie)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(thread.status, 200);
+        }
 
         let liked = request(
             &server.base_url,

@@ -11,11 +11,11 @@ pub async fn validate(
     let Some(token) = session_cookie(headers) else {
         anyhow::bail!("missing session");
     };
-    let Some((current, previous)) = csrf_hashes_for_cookie(pool, &token).await? else {
+    let Some(accepted_hashes) = csrf_hashes_for_cookie(pool, &token).await? else {
         anyhow::bail!("missing csrf session");
     };
     let submitted = hash_token(submitted);
-    if submitted != current && previous.as_deref() != Some(submitted.as_str()) {
+    if !accepted_hashes.iter().any(|hash| hash == &submitted) {
         anyhow::bail!("invalid csrf token");
     }
     Ok(())

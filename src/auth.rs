@@ -160,13 +160,27 @@ pub async fn current_user(
 pub async fn csrf_hashes_for_cookie(
     pool: &SqlitePool,
     token: &str,
-) -> anyhow::Result<Option<(String, Option<String>)>> {
+) -> anyhow::Result<Option<Vec<String>>> {
     let token_hash = hash_token(token);
     pool.call(move |conn| {
         conn.query_row(
             "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
             [token_hash],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                let current = row.get::<_, String>(0)?;
+                let previous = row.get::<_, Option<String>>(1)?;
+                let mut hashes = Vec::with_capacity(8);
+                hashes.push(current);
+                if let Some(previous) = previous {
+                    hashes.extend(
+                        previous
+                            .lines()
+                            .filter(|hash| !hash.is_empty())
+                            .map(ToOwned::to_owned),
+                    );
+                }
+                Ok(hashes)
+            },
         )
         .optional()
         .map_err(Into::into)
