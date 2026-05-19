@@ -32,5 +32,6 @@ pub mod render;
 pub mod runtime;
 pub mod server;
 pub mod social;
+pub mod terminal;
 pub mod tor;
 pub mod validation;
