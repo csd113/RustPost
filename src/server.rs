@@ -624,11 +624,11 @@ async fn delete_confirm(
     let user = require_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let preview = delete_preview(&state.pool, user.id, user.is_admin, id).await?;
-    let fallback = anchored_return(&headers, id, preview.parent_post_id.is_some(), "/home");
+    let fallback = delete_return_fallback(&headers, id, preview.parent_post_id);
     let return_to = query
         .return_to
         .as_deref()
-        .and_then(safe_return_target)
+        .and_then(|target| safe_delete_return_target(target, id))
         .unwrap_or(fallback);
     let author = preview
         .display_name
@@ -663,7 +663,7 @@ async fn delete_post(
     } else {
         "/home".to_owned()
     };
-    let target = safe_return_target(&form.return_to).unwrap_or(fallback);
+    let target = safe_delete_return_target(&form.return_to, id).unwrap_or(fallback);
     Ok(Redirect::to(&target).into_response())
 }
 
@@ -1424,6 +1424,36 @@ fn anchored_return(headers: &HeaderMap, post_id: i64, is_reply: bool, fallback: 
     format!("{base}#{anchor}")
 }
 
+fn delete_return_fallback(
+    headers: &HeaderMap,
+    post_id: i64,
+    parent_post_id: Option<i64>,
+) -> String {
+    let fallback = anchored_return(headers, post_id, parent_post_id.is_some(), "/home");
+    let self_path = format!("/posts/{post_id}/delete");
+    if path_without_query_or_fragment(&fallback) != self_path {
+        return fallback;
+    }
+    parent_post_id.map_or_else(
+        || format!("/home#post-{post_id}"),
+        |parent_id| format!("/posts/{parent_id}#reply-{post_id}"),
+    )
+}
+
+fn safe_delete_return_target(value: &str, post_id: i64) -> Option<String> {
+    let target = safe_return_target(value)?;
+    let self_path = format!("/posts/{post_id}/delete");
+    if path_without_query_or_fragment(&target) == self_path {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+fn path_without_query_or_fragment(target: &str) -> &str {
+    target.split(['?', '#']).next().unwrap_or_default()
+}
+
 fn safe_return_target(value: &str) -> Option<String> {
     let target = if value.starts_with('/') && !value.starts_with("//") {
         value.to_owned()
@@ -1975,6 +2005,27 @@ mod tests {
         assert_eq!(hashes[0], "current");
         assert_eq!(hashes[1], "token-1");
         assert_eq!(hashes[CSRF_TOKEN_HISTORY_LIMIT - 2], "token-30");
+    }
+
+    #[test]
+    fn delete_return_target_rejects_self_referential_confirmation_paths() {
+        assert_eq!(safe_delete_return_target("/posts/42/delete", 42), None);
+        assert_eq!(
+            safe_delete_return_target("/posts/42/delete#post-42", 42),
+            None
+        );
+        assert_eq!(
+            safe_delete_return_target("http://127.0.0.1:18080/posts/42/delete?return_to=/home", 42),
+            None
+        );
+        assert_eq!(
+            safe_delete_return_target("/posts/42#post-42", 42),
+            Some("/posts/42#post-42".to_owned())
+        );
+        assert_eq!(
+            safe_delete_return_target("/home#post-42", 42),
+            Some("/home#post-42".to_owned())
+        );
     }
 
     #[tokio::test]

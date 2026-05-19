@@ -21,6 +21,39 @@ export function fixturePath(name: string): string {
   return file;
 }
 
+export function uniqueName(prefix: string): string {
+  return `${prefix}${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export async function expectAppShell(page: Page): Promise<void> {
+  await expect(page.locator('header.site-header')).toBeVisible();
+  await expect(page.locator('main .content-shell')).toBeVisible();
+  await expect(page.locator('nav')).toBeVisible();
+}
+
+export async function expectNotErrorPage(page: Page): Promise<void> {
+  await page.waitForLoadState('domcontentloaded');
+  await expectAppShell(page);
+  await expect(page.locator('.error-panel')).toHaveCount(0);
+  await expect(page.getByText(/csrf error|invalid csrf|missing csrf|400 error|403 error|404 error|405 error|access denied|page not found|something went wrong/i)).toHaveCount(0);
+}
+
+export async function goBackToHealthyPage(page: Page): Promise<void> {
+  await page.goBack({ waitUntil: 'domcontentloaded' });
+  await expectNotErrorPage(page);
+}
+
+export async function goForwardToHealthyPage(page: Page): Promise<void> {
+  await page.goForward({ waitUntil: 'domcontentloaded' });
+  await expectNotErrorPage(page);
+}
+
+export async function openPostThread(page: Page, postId: string): Promise<void> {
+  await page.goto(`/posts/${postId}`);
+  await expect(page.getByRole('heading', { name: 'Thread' })).toBeVisible();
+  await expectNotErrorPage(page);
+}
+
 export async function installQaGuards(page: Page, testInfo: TestInfo): Promise<void> {
   const failures: string[] = [];
 
@@ -108,16 +141,13 @@ export async function createPost(page: Page, text: string, media?: string): Prom
     await page.locator('input[type="file"][name="media"]').setInputFiles(media);
   }
   await page.getByRole('button', { name: 'Post', exact: true }).click();
-  await expect(page.getByText(text)).toBeVisible();
+  const article = page.locator('article[data-post-id]').filter({ hasText: text }).first();
+  await expect(article).toBeVisible();
   const hashId = new URL(page.url()).hash.replace('#post-', '');
   if (hashId) {
     return hashId;
   }
-  const postId = await page
-    .locator('article[data-post-id]')
-    .filter({ hasText: text })
-    .first()
-    .getAttribute('data-post-id');
+  const postId = await article.getAttribute('data-post-id');
   expect(postId, `post id for "${text}"`).not.toBeNull();
   return postId!;
 }

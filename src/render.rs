@@ -237,6 +237,14 @@ document.querySelectorAll("textarea[data-character-limit]").forEach((textarea) =
   textarea.addEventListener("input", () => updateComposerCount(textarea));
 });
 
+window.addEventListener("pageshow", (event) => {
+  const nav = performance.getEntriesByType("navigation")[0];
+  const restored = event.persisted || (nav && nav.type === "back_forward");
+  if (restored && document.querySelector('form[method="post"] input[name="csrf"]')) {
+    window.location.reload();
+  }
+});
+
 function setButtonState(button, active, label) {
   button.classList.toggle("active", active);
   button.setAttribute("aria-pressed", active ? "true" : "false");
@@ -259,9 +267,11 @@ document.addEventListener("submit", async (event) => {
     submitter.disabled = true;
   }
   try {
+    const formData = new FormData(form);
+    const body = form.enctype === "multipart/form-data" ? formData : new URLSearchParams(formData);
     const response = await fetch(form.action, {
       method: form.method || "POST",
-      body: new FormData(form),
+      body,
       headers: { "Accept": "application/json", "X-RustPost-Enhance": "1" },
       credentials: "same-origin"
     });
