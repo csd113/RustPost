@@ -277,9 +277,289 @@ pub fn write_default_if_missing(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let settings = toml::to_string_pretty(&Settings::default())?;
+    let settings = default_settings_toml();
     fs::write(path, settings)?;
     Ok(())
+}
+
+fn default_settings_toml() -> String {
+    let settings = Settings::default();
+
+    format!(
+        r#"# RustPost settings
+# Generated with conservative defaults. Edit values as needed, keep key names intact,
+# and restart RustPost after changing this file.
+
+# Site identity
+
+[site]
+# Display name shown in the page title, header, footer, and user-facing copy.
+name = {site_name}
+
+
+# HTTP listener and public access
+
+[server]
+# Address RustPost listens on. 127.0.0.1 is safest behind a reverse proxy.
+host = {server_host}
+
+# HTTP port for the RustPost listener.
+port = {server_port}
+
+# Public base URL used for absolute links. Leave empty for local or proxy-only setups.
+public_url = {public_url}
+
+# SECURITY: Set true only when users always reach RustPost over HTTPS.
+# This marks session cookies as Secure.
+cookie_secure = {cookie_secure}
+
+# SECURITY: Reverse-proxy CIDRs allowed to provide forwarded client IP headers.
+# Keep this list narrow; do not add public networks.
+trusted_proxy_cidrs = {trusted_proxy_cidrs}
+
+
+# Accounts and profiles
+
+[accounts]
+# Allow visitors to create accounts from the web UI.
+registration_enabled = {registration_enabled}
+
+# Allow posting without accounts. Rate limits are keyed by client IP.
+anonymous_mode_enabled = {anonymous_mode_enabled}
+
+# Minimum account password length. Values below 10 are rejected.
+min_password_length = {min_password_length}
+
+# Maximum username length in bytes. Usernames are also format-validated.
+max_username_len = {max_username_len}
+
+# Maximum display-name length in bytes.
+max_display_name_len = {max_display_name_len}
+
+# Maximum profile bio length in bytes.
+max_bio_len = {max_bio_len}
+
+# Allow users to upload profile banner images.
+allow_profile_banners = {allow_profile_banners}
+
+# Allow users to upload profile picture images.
+allow_profile_pictures = {allow_profile_pictures}
+
+
+# Posts and interactions
+
+[posts]
+# Maximum post text length in characters.
+max_text_chars = {max_text_chars}
+
+# Maximum image attachments allowed on one post.
+max_images_per_post = {max_images_per_post}
+
+# Maximum video attachments allowed on one post.
+max_videos_per_post = {max_videos_per_post}
+
+# Maximum total media attachments allowed on one post.
+max_media_per_post = {max_media_per_post}
+
+# Allow users to repost posts.
+allow_reposts = {allow_reposts}
+
+# Allow replies to posts.
+allow_replies = {allow_replies}
+
+# Allow likes on posts.
+allow_likes = {allow_likes}
+
+# Allow users to bookmark posts.
+allow_bookmarks = {allow_bookmarks}
+
+# Link hashtag text to hashtag feeds.
+allow_hashtags = {allow_hashtags}
+
+# Link @mentions to user profiles.
+allow_mentions = {allow_mentions}
+
+
+# Uploads and media processing
+
+[media]
+# ffmpeg executable name or path used for media conversion and thumbnails.
+ffmpeg_path = {ffmpeg_path}
+
+# Convert uploaded images to WebP when ffmpeg supports the input.
+convert_images_to_webp = {convert_images_to_webp}
+
+# Convert uploaded videos to WebM/VP9 when ffmpeg supports the input.
+convert_videos_to_webm = {convert_videos_to_webm}
+
+# SECURITY: Keep original uploaded files after conversion.
+# false reduces stored untrusted file formats.
+keep_original_uploads = {keep_original_uploads}
+
+# SECURITY: Maximum accepted image upload size in bytes. Default is 50 MiB.
+max_image_size = {max_image_size}
+
+# SECURITY: Maximum accepted video upload size in bytes. Default is 150 MiB.
+max_video_size = {max_video_size}
+
+# Generate thumbnail images for uploaded videos.
+generate_video_thumbnails = {generate_video_thumbnails}
+
+# SECURITY: Accepted image MIME types after content sniffing.
+# Do not add wildcard or scriptable formats.
+allowed_image_mime_types = {allowed_image_mime_types}
+
+# SECURITY: Accepted video MIME types after content sniffing.
+allowed_video_mime_types = {allowed_video_mime_types}
+
+# WebP image quality, 0 to 100. Higher means larger files.
+webp_quality = {webp_quality}
+
+# VP9 quality, 0 to 63. Lower means higher quality and larger files.
+vp9_crf = {vp9_crf}
+
+# VP9 encoder deadline. Typical values are "good", "best", or "realtime".
+vp9_deadline = {vp9_deadline}
+
+
+# Tor onion service
+
+[tor]
+# SECURITY: Start the embedded Arti onion service.
+enabled = {tor_enabled}
+
+# SECURITY: Serve only through Tor. Requires tor.enabled = true.
+tor_only = {tor_only}
+
+# Relative directory for Tor state under the RustPost data directory.
+data_dir = {tor_data_dir}
+
+# Local name for the onion service state directory.
+onion_service_name = {onion_service_name}
+
+# Seconds to wait for Tor bootstrap during Tor-only startup.
+bootstrap_timeout_secs = {bootstrap_timeout_secs}
+
+# Maximum concurrent onion streams accepted by the service.
+max_concurrent_streams = {max_concurrent_streams}
+
+# SECURITY: Include onion service keys when backups are created by default.
+# Keep false unless backups are encrypted and access-controlled.
+include_tor_keys_in_backups_by_default = {include_tor_keys_in_backups_by_default}
+
+
+# Rate limits
+
+[moderation]
+# Posts allowed per authenticated user per minute.
+posts_per_minute = {posts_per_minute}
+
+# Replies allowed per authenticated user per minute.
+replies_per_minute = {replies_per_minute}
+
+# Reposts allowed per authenticated user per minute.
+reposts_per_minute = {reposts_per_minute}
+
+# Account creations allowed per client IP per day.
+account_creations_per_ip_per_day = {account_creations_per_ip_per_day}
+
+# Failed login attempts allowed per client IP per 15 minutes.
+failed_login_attempts_per_15m = {failed_login_attempts_per_15m}
+
+# Anonymous posts allowed per client IP per hour.
+anonymous_posts_per_ip_per_hour = {anonymous_posts_per_ip_per_hour}
+
+
+# Administration
+
+[admin]
+# SECURITY: Create the first admin account during first boot.
+# Disable after initial setup if you want manual admin provisioning only.
+create_admin_on_first_boot = {create_admin_on_first_boot}
+
+
+# Backups
+
+[backup]
+# Enable the built-in tar backup command.
+enabled = {backup_enabled}
+
+# SECURITY: Relative directory for backup archives under the RustPost data directory.
+backup_dir = {backup_dir}
+"#,
+        site_name = toml_string(&settings.site.name),
+        server_host = toml_string(&settings.server.host),
+        server_port = settings.server.port,
+        public_url = toml_string(&settings.server.public_url),
+        cookie_secure = settings.server.cookie_secure,
+        trusted_proxy_cidrs = toml_string_array(&settings.server.trusted_proxy_cidrs),
+        registration_enabled = settings.accounts.registration_enabled,
+        anonymous_mode_enabled = settings.accounts.anonymous_mode_enabled,
+        min_password_length = settings.accounts.min_password_length,
+        max_username_len = settings.accounts.max_username_len,
+        max_display_name_len = settings.accounts.max_display_name_len,
+        max_bio_len = settings.accounts.max_bio_len,
+        allow_profile_banners = settings.accounts.allow_profile_banners,
+        allow_profile_pictures = settings.accounts.allow_profile_pictures,
+        max_text_chars = settings.posts.max_text_chars,
+        max_images_per_post = settings.posts.max_images_per_post,
+        max_videos_per_post = settings.posts.max_videos_per_post,
+        max_media_per_post = settings.posts.max_media_per_post,
+        allow_reposts = settings.posts.allow_reposts,
+        allow_replies = settings.posts.allow_replies,
+        allow_likes = settings.posts.allow_likes,
+        allow_bookmarks = settings.posts.allow_bookmarks,
+        allow_hashtags = settings.posts.allow_hashtags,
+        allow_mentions = settings.posts.allow_mentions,
+        ffmpeg_path = toml_string(&settings.media.ffmpeg_path),
+        convert_images_to_webp = settings.media.convert_images_to_webp,
+        convert_videos_to_webm = settings.media.convert_videos_to_webm,
+        keep_original_uploads = settings.media.keep_original_uploads,
+        max_image_size = settings.media.max_image_size,
+        max_video_size = settings.media.max_video_size,
+        generate_video_thumbnails = settings.media.generate_video_thumbnails,
+        allowed_image_mime_types = toml_string_array(&settings.media.allowed_image_mime_types),
+        allowed_video_mime_types = toml_string_array(&settings.media.allowed_video_mime_types),
+        webp_quality = settings.media.webp_quality,
+        vp9_crf = settings.media.vp9_crf,
+        vp9_deadline = toml_string(&settings.media.vp9_deadline),
+        tor_enabled = settings.tor.enabled,
+        tor_only = settings.tor.tor_only,
+        tor_data_dir = toml_string(&settings.tor.data_dir),
+        onion_service_name = toml_string(&settings.tor.onion_service_name),
+        bootstrap_timeout_secs = settings.tor.bootstrap_timeout_secs,
+        max_concurrent_streams = settings.tor.max_concurrent_streams,
+        include_tor_keys_in_backups_by_default =
+            settings.tor.include_tor_keys_in_backups_by_default,
+        posts_per_minute = settings.moderation.posts_per_minute,
+        replies_per_minute = settings.moderation.replies_per_minute,
+        reposts_per_minute = settings.moderation.reposts_per_minute,
+        account_creations_per_ip_per_day = settings.moderation.account_creations_per_ip_per_day,
+        failed_login_attempts_per_15m = settings.moderation.failed_login_attempts_per_15m,
+        anonymous_posts_per_ip_per_hour = settings.moderation.anonymous_posts_per_ip_per_hour,
+        create_admin_on_first_boot = settings.admin.create_admin_on_first_boot,
+        backup_enabled = settings.backup.enabled,
+        backup_dir = toml_string(&settings.backup.backup_dir),
+    )
+}
+
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
+}
+
+fn toml_string_array(values: &[String]) -> String {
+    if values.is_empty() {
+        return "[]".to_owned();
+    }
+
+    let mut output = "[\n".to_owned();
+    for value in values {
+        output.push_str("    ");
+        output.push_str(&toml_string(value));
+        output.push_str(",\n");
+    }
+    output.push(']');
+    output
 }
 
 pub fn validate_relative_path(value: &str, field: &str) -> anyhow::Result<()> {
@@ -322,6 +602,18 @@ mod tests {
     #[test]
     fn default_settings_validate() {
         Settings::default().validate().expect("default config");
+    }
+
+    #[test]
+    fn generated_default_settings_toml_parses_and_preserves_defaults() {
+        let generated = default_settings_toml();
+        let parsed: Settings = toml::from_str(&generated).expect("generated config parses");
+
+        assert_eq!(
+            toml::to_string(&parsed).expect("parsed settings serialize"),
+            toml::to_string(&Settings::default()).expect("default settings serialize")
+        );
+        parsed.validate().expect("generated config validates");
     }
 
     #[test]
