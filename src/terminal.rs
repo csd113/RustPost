@@ -194,6 +194,55 @@ pub fn render_command_success(title: &str, rows: &[Row]) -> String {
 }
 
 #[must_use]
+pub fn render_first_admin_setup(paths: &runtime::RuntimePaths) -> String {
+    let mut out = String::with_capacity(512);
+    push_header(&mut out, "Create admin account");
+    push_section(
+        &mut out,
+        "Setup",
+        &[
+            row("Why", "no admin account exists"),
+            row("Data directory", display(paths.data_dir.as_path())),
+            row("Password input", "hidden where supported"),
+        ],
+    );
+    out.push_str(RULE);
+    out.push('\n');
+    out
+}
+
+#[must_use]
+pub fn render_first_admin_non_interactive(paths: &runtime::RuntimePaths) -> String {
+    let mut out = String::with_capacity(640);
+    push_header(&mut out, "RustPost first admin required");
+    push_section(
+        &mut out,
+        "Setup",
+        &[
+            row("Status", "no admin account exists"),
+            row("Input", "stdin is not interactive, so setup was skipped"),
+            row(
+                "Create admin",
+                format!(
+                    "rustpost-cli --data-dir {} create-admin-interactive",
+                    display(paths.data_dir.as_path())
+                ),
+            ),
+            row(
+                "Alternative",
+                format!(
+                    "rustpost-cli --data-dir {} create-admin <username> <password>",
+                    display(paths.data_dir.as_path())
+                ),
+            ),
+        ],
+    );
+    out.push_str(RULE);
+    out.push('\n');
+    out
+}
+
+#[must_use]
 pub fn render_error(error: &Error) -> String {
     let mut out = String::with_capacity(512);
     push_header(&mut out, error_title(error));

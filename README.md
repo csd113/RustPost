@@ -158,9 +158,9 @@ rustpost-data/
 
 ### Create Your First Admin
 
-When `serve` starts, RustPost prints the data directory, settings path, database path, upload/media paths, log path, backup path, bind address, and whether an admin account exists. If no admin exists, the terminal output includes the bootstrap commands.
+When `serve` starts, RustPost prints the data directory, settings path, database path, upload/media paths, log path, backup path, bind address, and whether an admin account exists. If `admin.create_admin_on_first_boot` is enabled and no admin exists, interactive startup enters a `Create admin account` step before the server begins accepting requests. If stdin is not interactive, RustPost prints the bootstrap commands instead of waiting for input.
 
-The preferred local setup path hides the password while you type:
+You can also create the first admin explicitly. The preferred local setup path hides the password while you type:
 
 ```sh
 ./target/release/rustpost --data-dir ./rustpost-data create-admin-interactive

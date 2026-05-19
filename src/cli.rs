@@ -1,4 +1,4 @@
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
@@ -279,7 +279,7 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let pool = db::connect(&paths.database_path).await?;
     db::migrate(&pool).await?;
-    let admin_count = admin::admin_count(&pool).await?;
+    let admin_count = ensure_first_admin_interactive(&pool, &settings, &paths).await?;
     let ffmpeg = crate::ffmpeg::probe(&settings.media).await;
     if !ffmpeg.available {
         warn!("ffmpeg unavailable; uploads will safely fall back to allowed originals");
@@ -288,9 +288,6 @@ async fn serve(
     let onion_target = onion_listener_target(onion_listener.as_ref());
     let tor_status = initial_tor_status(&settings.tor, &paths, onion_target).await?;
     let tor_status_for_background = tor_status.clone();
-    if settings.admin.create_admin_on_first_boot {
-        admin::ensure_first_boot_admin_hint(&pool).await?;
-    }
     print_startup_dashboard(
         &pool,
         StartupPrintContext {
@@ -325,6 +322,60 @@ async fn serve(
     }
 
     serve_clearnet(app, &settings.server, shutdown_rx).await
+}
+
+async fn ensure_first_admin_interactive(
+    pool: &db::SqlitePool,
+    settings: &config::Settings,
+    paths: &runtime::RuntimePaths,
+) -> anyhow::Result<i64> {
+    let count = admin::admin_count(pool).await?;
+    if count > 0 || !settings.admin.create_admin_on_first_boot {
+        return Ok(count);
+    }
+    if !stdin_is_interactive() {
+        stderr_raw(format_args!(
+            "{}",
+            terminal::render_first_admin_non_interactive(paths)
+        ));
+        admin::ensure_first_boot_admin_hint(pool).await?;
+        return Ok(count);
+    }
+    stderr_raw(format_args!(
+        "{}",
+        terminal::render_first_admin_setup(paths)
+    ));
+    let credentials = prompt_first_admin_credentials(settings)?;
+    admin::create_admin_with_display_name(
+        pool,
+        settings,
+        &credentials.username,
+        &credentials.password,
+        credentials.display_name.as_deref(),
+    )
+    .await?;
+    stdout_raw(format_args!(
+        "{}",
+        terminal::render_command_success(
+            "RustPost admin created",
+            &[
+                terminal::row("Username", credentials.username),
+                terminal::row(
+                    "Display name",
+                    credentials
+                        .display_name
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| "(same as username)".to_owned()),
+                ),
+                terminal::row("Next step", "starting RustPost"),
+            ],
+        )
+    ))?;
+    admin::admin_count(pool).await
+}
+
+fn stdin_is_interactive() -> bool {
+    io::stdin().is_terminal()
 }
 
 async fn bind_onion_listener(
@@ -488,6 +539,55 @@ fn prompt_admin_credentials() -> anyhow::Result<(String, String)> {
     Ok((username, password))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct FirstAdminCredentials {
+    username: String,
+    display_name: Option<String>,
+    password: String,
+}
+
+fn prompt_first_admin_credentials(
+    settings: &config::Settings,
+) -> anyhow::Result<FirstAdminCredentials> {
+    stdout_raw(format_args!("Admin username: "))?;
+    let mut username = String::new();
+    io::stdin().read_line(&mut username)?;
+    stdout_raw(format_args!("Admin display name (optional): "))?;
+    let mut display_name = String::new();
+    io::stdin().read_line(&mut display_name)?;
+    let password = read_secret("Admin password: ")?;
+    let confirm = read_secret("Confirm admin password: ")?;
+    validate_first_admin_credentials(settings, &username, &display_name, password, &confirm)
+}
+
+fn validate_first_admin_credentials(
+    settings: &config::Settings,
+    username: &str,
+    display_name: &str,
+    password: String,
+    confirm: &str,
+) -> anyhow::Result<FirstAdminCredentials> {
+    let username = username.trim().to_owned();
+    if username.is_empty() {
+        anyhow::bail!("username cannot be empty");
+    }
+    if password.is_empty() {
+        anyhow::bail!("password cannot be empty");
+    }
+    if password != confirm {
+        anyhow::bail!("passwords do not match");
+    }
+    let display_name = display_name.trim().to_owned();
+    if !display_name.is_empty() {
+        crate::validation::validate_profile_text(&display_name, "", settings)?;
+    }
+    Ok(FirstAdminCredentials {
+        username,
+        display_name: (!display_name.is_empty()).then_some(display_name),
+        password,
+    })
+}
+
 #[cfg(unix)]
 fn read_secret(prompt: &str) -> anyhow::Result<String> {
     stdout_raw(format_args!("{prompt}"))?;
@@ -561,4 +661,120 @@ fn stderr_line(args: std::fmt::Arguments<'_>) {
 fn stderr_raw(args: std::fmt::Arguments<'_>) {
     let mut stderr = io::stderr().lock();
     let _write_result = stderr.write_fmt(args);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_admin_credentials_reject_empty_username() {
+        let result = validate_first_admin_credentials(
+            &config::Settings::default(),
+            "   ",
+            "",
+            "very secure password".to_owned(),
+            "very secure password",
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.expect_err("empty username").to_string(),
+            "username cannot be empty"
+        );
+    }
+
+    #[test]
+    fn first_admin_credentials_reject_empty_password() {
+        let result = validate_first_admin_credentials(
+            &config::Settings::default(),
+            "admin-user",
+            "",
+            String::new(),
+            "",
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.expect_err("empty password").to_string(),
+            "password cannot be empty"
+        );
+    }
+
+    #[test]
+    fn first_admin_credentials_reject_password_mismatch() {
+        let result = validate_first_admin_credentials(
+            &config::Settings::default(),
+            "admin-user",
+            "",
+            "very secure password".to_owned(),
+            "very different password",
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.expect_err("mismatch").to_string(),
+            "passwords do not match"
+        );
+    }
+
+    #[test]
+    fn first_admin_credentials_accept_optional_display_name() {
+        let credentials = validate_first_admin_credentials(
+            &config::Settings::default(),
+            " Admin-User ",
+            " Ada Admin ",
+            "very secure password".to_owned(),
+            "very secure password",
+        )
+        .expect("valid credentials");
+
+        assert_eq!(
+            credentials,
+            FirstAdminCredentials {
+                username: "Admin-User".to_owned(),
+                display_name: Some("Ada Admin".to_owned()),
+                password: "very secure password".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn first_admin_creation_sets_optional_display_name() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = db::connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        db::migrate(&pool).await.expect("migrate");
+        let settings = config::Settings::default();
+
+        let user_id = admin::create_admin_with_display_name(
+            &pool,
+            &settings,
+            "admin-user",
+            "very secure password",
+            Some("Ada Admin"),
+        )
+        .await
+        .expect("create admin");
+
+        let row: (String, bool, String) = pool
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT username, is_admin, display_name FROM users WHERE id = ?",
+                    [user_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)? != 0,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?)
+            })
+            .await
+            .expect("load admin");
+
+        assert_eq!(row, ("admin-user".to_owned(), true, "Ada Admin".to_owned()));
+    }
 }

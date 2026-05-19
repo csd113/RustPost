@@ -13,6 +13,32 @@ pub async fn create_admin(
     auth::register_user(pool, settings, username, password, true).await
 }
 
+pub async fn create_admin_with_display_name(
+    pool: &SqlitePool,
+    settings: &Settings,
+    username: &str,
+    password: &str,
+    display_name: Option<&str>,
+) -> anyhow::Result<i64> {
+    let display_name = display_name.map(str::trim).filter(|name| !name.is_empty());
+    if let Some(display_name) = display_name {
+        crate::validation::validate_profile_text(display_name, "", settings)?;
+    }
+    let user_id = create_admin(pool, settings, username, password).await?;
+    if let Some(display_name) = display_name {
+        let display_name = display_name.to_owned();
+        pool.call(move |conn| {
+            conn.execute(
+                "UPDATE users SET display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                params![display_name, user_id],
+            )?;
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(user_id)
+}
+
 pub async fn reset_admin_password(
     pool: &SqlitePool,
     settings: &Settings,
