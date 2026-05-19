@@ -51,7 +51,7 @@ pub async fn save_upload(
     let original_filename = field.file_name().unwrap_or("upload").to_owned();
     reject_path_tricks(&original_filename)?;
     let id = Uuid::new_v4().simple().to_string();
-    let staging = paths.uploads_originals.join(format!("{id}.upload"));
+    let staging = paths.staged_upload_path(&id);
     let mut file = tokio::fs::File::create(&staging).await?;
     let mut bytes = 0_u64;
     while let Some(chunk) = field.chunk().await? {

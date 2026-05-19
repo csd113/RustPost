@@ -38,6 +38,17 @@ pub async fn register_user(
     let hash = hash_password(password)?;
     let username = username.trim().to_owned();
     pool.call(move |conn| {
+        let existing = conn
+            .query_row(
+                "SELECT 1 FROM users WHERE normalized_username = ?",
+                [&normalized],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if existing {
+            anyhow::bail!("username is already taken");
+        }
         conn.execute(
             "INSERT INTO users (username, normalized_username, password_hash, display_name, is_admin) VALUES (?, ?, ?, ?, ?)",
             params![username, normalized, hash, username, i64::from(is_admin)],
@@ -146,13 +157,30 @@ pub async fn current_user(
     .await
 }
 
-pub async fn csrf_for_cookie(pool: &SqlitePool, token: &str) -> anyhow::Result<Option<String>> {
+pub async fn csrf_hashes_for_cookie(
+    pool: &SqlitePool,
+    token: &str,
+) -> anyhow::Result<Option<Vec<String>>> {
     let token_hash = hash_token(token);
     pool.call(move |conn| {
         conn.query_row(
-            "SELECT csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
+            "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
             [token_hash],
-            |row| row.get(0),
+            |row| {
+                let current = row.get::<_, String>(0)?;
+                let previous = row.get::<_, Option<String>>(1)?;
+                let mut hashes = Vec::with_capacity(8);
+                hashes.push(current);
+                if let Some(previous) = previous {
+                    hashes.extend(
+                        previous
+                            .lines()
+                            .filter(|hash| !hash.is_empty())
+                            .map(ToOwned::to_owned),
+                    );
+                }
+                Ok(hashes)
+            },
         )
         .optional()
         .map_err(Into::into)

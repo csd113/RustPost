@@ -42,4 +42,4 @@ rustpost demo password
 | Tess Vale | `tess` | Video creator |
 | Omar Stone | `omar` | Infrastructure/admin focused |
 
-The generated runtime database and uploads stay under `target/debug/rustpost-demo/` and should not be committed.
+The generated runtime database, uploads, temp upload staging, logs, and backups stay under `target/debug/rustpost-demo/` and should not be committed.

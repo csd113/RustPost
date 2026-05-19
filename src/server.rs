@@ -4,8 +4,8 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::extract::connect_info::ConnectInfo;
-use axum::extract::{Form, Multipart, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Uri, header};
+use axum::extract::{DefaultBodyLimit, Form, Multipart, Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse as _, Redirect, Response};
 use axum::routing::{get, post};
 use rusqlite::{OptionalExtension as _, params};
@@ -20,6 +20,8 @@ use crate::errors::{AppError, AppResult};
 use crate::ffmpeg::FfmpegStatus;
 use crate::runtime::RuntimePaths;
 use crate::{admin, backup, csrf, media, rate_limit, render, social};
+
+const CSRF_TOKEN_HISTORY_LIMIT: usize = 32;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -50,6 +52,7 @@ impl AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    let upload_body_limit = upload_body_limit(&state.settings);
     Router::new()
         .route("/", get(home))
         .route("/assets/rustpost.js", get(client_script))
@@ -100,8 +103,17 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/uploads/videos",
             ServeDir::new(state.paths.uploads_videos.clone()),
         )
+        .layer(DefaultBodyLimit::max(upload_body_limit))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+fn upload_body_limit(settings: &Settings) -> usize {
+    let limit = settings.media.max_video_size.saturating_add(1024 * 1024);
+    match usize::try_from(limit) {
+        Ok(limit) => limit,
+        Err(_overflow) => usize::MAX,
+    }
 }
 
 async fn client_script() -> Response {
@@ -355,7 +367,8 @@ async fn register(
         &form.password,
         false,
     )
-    .await?;
+    .await
+    .map_err(|err| AppError::BadRequest(err.to_string()))?;
     let session = auth::create_session(&state.pool, user_id).await?;
     let mut response = Redirect::to("/home").into_response();
     response.headers_mut().insert(
@@ -404,7 +417,13 @@ async fn create_post(
     if user.is_none() && !state.settings.accounts.anonymous_mode_enabled {
         return Err(AppError::Forbidden);
     }
-    let form = parse_post_create(&state, user.as_ref().map(|u| u.id), multipart).await?;
+    let form = match parse_post_create(&state, user.as_ref().map(|u| u.id), multipart).await {
+        Ok(form) => form,
+        Err(AppError::BadRequest(message)) => {
+            return bad_request_page(&state, user.as_ref(), &message).await;
+        }
+        Err(err) => return Err(err),
+    };
     if let Some(parent_id) = form.parent_post_id {
         ensure_parent_post_exists(&state.pool, parent_id).await?;
     }
@@ -553,6 +572,22 @@ async fn parse_post_create(
     Ok(form)
 }
 
+async fn bad_request_page(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    message: &str,
+) -> AppResult<Response> {
+    let body = format!(
+        r#"<section class="panel error-panel"><p class="eyebrow">400 error</p><h1>Check the form</h1><p>{}</p><p><a class="button-link" href="/home">Back to Home Feed</a></p></section>"#,
+        html_escape::encode_text(message)
+    );
+    Ok((
+        StatusCode::BAD_REQUEST,
+        Html(page_layout(state, user, None, "Check the form", &body).await?),
+    )
+        .into_response())
+}
+
 async fn thread(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -589,11 +624,11 @@ async fn delete_confirm(
     let user = require_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let preview = delete_preview(&state.pool, user.id, user.is_admin, id).await?;
-    let fallback = anchored_return(&headers, id, preview.parent_post_id.is_some(), "/home");
+    let fallback = delete_return_fallback(&headers, id, preview.parent_post_id);
     let return_to = query
         .return_to
         .as_deref()
-        .and_then(safe_return_target)
+        .and_then(|target| safe_delete_return_target(target, id))
         .unwrap_or(fallback);
     let author = preview
         .display_name
@@ -621,14 +656,22 @@ async fn delete_post(
 ) -> AppResult<Response> {
     let user = require_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
-    let preview = delete_preview(&state.pool, user.id, user.is_admin, id).await?;
+    let preview = match delete_preview(&state.pool, user.id, user.is_admin, id).await {
+        Ok(preview) => preview,
+        Err(AppError::NotFound) => {
+            let target = safe_delete_return_target(&form.return_to, id)
+                .unwrap_or_else(|| "/home".to_owned());
+            return Ok(Redirect::to(&target).into_response());
+        }
+        Err(err) => return Err(err),
+    };
     social::delete_post(&state.pool, user.id, id, user.is_admin).await?;
     let fallback = if let Some(parent_id) = preview.parent_post_id {
         format!("/posts/{parent_id}#post-{parent_id}")
     } else {
         "/home".to_owned()
     };
-    let target = safe_return_target(&form.return_to).unwrap_or(fallback);
+    let target = safe_delete_return_target(&form.return_to, id).unwrap_or(fallback);
     Ok(Redirect::to(&target).into_response())
 }
 
@@ -1389,6 +1432,37 @@ fn anchored_return(headers: &HeaderMap, post_id: i64, is_reply: bool, fallback: 
     format!("{base}#{anchor}")
 }
 
+fn delete_return_fallback(
+    headers: &HeaderMap,
+    post_id: i64,
+    parent_post_id: Option<i64>,
+) -> String {
+    let fallback = anchored_return(headers, post_id, parent_post_id.is_some(), "/home");
+    if safe_delete_return_target(&fallback, post_id).is_some() {
+        return fallback;
+    }
+    parent_post_id.map_or_else(
+        || format!("/home#post-{post_id}"),
+        |parent_id| format!("/posts/{parent_id}#post-{parent_id}"),
+    )
+}
+
+fn safe_delete_return_target(value: &str, post_id: i64) -> Option<String> {
+    let target = safe_return_target(value)?;
+    let self_path = format!("/posts/{post_id}/delete");
+    let thread_path = format!("/posts/{post_id}");
+    let path = path_without_query_or_fragment(&target);
+    if path == self_path || path == thread_path {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+fn path_without_query_or_fragment(target: &str) -> &str {
+    target.split(['?', '#']).next().unwrap_or_default()
+}
+
 fn safe_return_target(value: &str) -> Option<String> {
     let target = if value.starts_with('/') && !value.starts_with("//") {
         value.to_owned()
@@ -1623,9 +1697,12 @@ async fn admin_health(
         .bootstrap_status()
         .unwrap_or_else(|| "unavailable".to_owned());
     let body = format!(
-        r#"<section class="panel"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
+        r#"<section class="panel"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
         html_escape::encode_text(&state.paths.database_path.display().to_string()),
         html_escape::encode_text(&state.paths.uploads_originals.display().to_string()),
+        html_escape::encode_text(&state.paths.uploads_images.display().to_string()),
+        html_escape::encode_text(&state.paths.logs_dir.display().to_string()),
+        html_escape::encode_text(&state.paths.backups_dir.display().to_string()),
         html_escape::encode_text(&state.ffmpeg.summary()),
         state.ffmpeg.supports_webp,
         state.ffmpeg.supports_vp9,
@@ -1838,15 +1915,15 @@ async fn validate_csrf(pool: &SqlitePool, headers: &HeaderMap, token: &str) -> A
 async fn form_csrf(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let token = auth::session_cookie(headers)?;
     let token_hash = auth::hash_token(&token);
-    let stored_hash: String = state
+    let (stored_hash, previous_hashes): (String, Option<String>) = state
         .pool
         .call({
             let token_hash = token_hash.clone();
             move |conn| {
                 conn.query_row(
-                    "SELECT csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
+                    "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
                     [token_hash],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
                 .map_err(Into::into)
@@ -1854,22 +1931,34 @@ async fn form_csrf(state: &AppState, headers: &HeaderMap) -> Option<String> {
         })
         .await
         .ok()??;
-    // CSRF tokens are only shown immediately after login in memory through the cookie session.
-    // For persisted sessions we rotate a new token and update its hash before rendering forms.
+    let previous_hashes = csrf_history_with(&stored_hash, previous_hashes.as_deref());
     let plain = auth::secure_token();
     let new_hash = auth::hash_token(&plain);
-    state
+    let updated = state
         .pool
         .call(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET csrf_token_hash = ? WHERE token_hash = ? AND csrf_token_hash = ?",
-                params![new_hash, token_hash, stored_hash],
+            let changed = conn.execute(
+                "UPDATE sessions SET csrf_token_hash = ?, previous_csrf_token_hash = ? WHERE token_hash = ? AND csrf_token_hash = ?",
+                params![new_hash, previous_hashes, token_hash, stored_hash],
             )?;
-            Ok(())
+            Ok(changed == 1)
         })
         .await
         .ok()?;
-    Some(plain)
+    updated.then_some(plain)
+}
+
+fn csrf_history_with(current_hash: &str, previous_hashes: Option<&str>) -> String {
+    std::iter::once(current_hash)
+        .chain(
+            previous_hashes
+                .into_iter()
+                .flat_map(str::lines)
+                .filter(|hash| !hash.is_empty() && *hash != current_hash),
+        )
+        .take(CSRF_TOKEN_HISTORY_LIMIT.saturating_sub(1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn user_post_relation_exists(
@@ -1912,6 +2001,40 @@ mod tests {
         status: u16,
         headers: Vec<(String, String)>,
         body: String,
+    }
+
+    #[test]
+    fn csrf_history_is_bounded_and_keeps_recent_hashes() {
+        let prior = (1..CSRF_TOKEN_HISTORY_LIMIT + 3)
+            .map(|idx| format!("token-{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let history = csrf_history_with("current", Some(&prior));
+        let hashes = history.lines().collect::<Vec<_>>();
+
+        assert_eq!(hashes.len(), CSRF_TOKEN_HISTORY_LIMIT - 1);
+        assert_eq!(hashes[0], "current");
+        assert_eq!(hashes[1], "token-1");
+        assert_eq!(hashes[CSRF_TOKEN_HISTORY_LIMIT - 2], "token-30");
+    }
+
+    #[test]
+    fn delete_return_target_rejects_self_referential_confirmation_paths() {
+        assert_eq!(safe_delete_return_target("/posts/42/delete", 42), None);
+        assert_eq!(
+            safe_delete_return_target("/posts/42/delete#post-42", 42),
+            None
+        );
+        assert_eq!(
+            safe_delete_return_target("http://127.0.0.1:18080/posts/42/delete?return_to=/home", 42),
+            None
+        );
+        assert_eq!(safe_delete_return_target("/posts/42#post-42", 42), None);
+        assert_eq!(
+            safe_delete_return_target("/home#post-42", 42),
+            Some("/home#post-42".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -1978,7 +2101,8 @@ mod tests {
         assert!(home.body.contains("hello from the browser-shaped form"));
         assert!(home.body.contains(r#"class="post""#));
         assert!(home.body.contains(r#"data-card-href="/posts/1""#));
-        assert!(home.body.contains(r#"href="/posts/1">Open post</a>"#));
+        assert!(!home.body.contains(r#">Open post</a>"#));
+        assert!(!home.body.contains("Open thread"));
         assert!(!home.body.contains(r#"class="post-time""#));
 
         let thread = request(
@@ -2211,6 +2335,168 @@ mod tests {
         assert_eq!(self_repost.status, 400);
         assert!(self_repost.body.contains("cannot repost your own post"));
         assert!(!self_repost.body.contains("internal server error"));
+    }
+
+    #[tokio::test]
+    async fn post_actions_accept_token_from_recent_page_render_history() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let cookie = session_cookie(&registered);
+
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "liked after back")],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let home_csrf = csrf_token(&home.body);
+        for _ in 0..5 {
+            let thread = request(
+                &server.base_url,
+                "GET",
+                "/posts/1",
+                &[("cookie", &cookie)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(thread.status, 200);
+        }
+
+        let liked = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/like",
+            &[
+                ("cookie", &cookie),
+                ("referer", "/home"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={home_csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(liked.status, 303);
+        assert_eq!(location(&liked), "/home#post-1");
+    }
+
+    #[tokio::test]
+    async fn image_uploads_over_default_body_limit_are_accepted() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let cookie = session_cookie(&registered);
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&home.body);
+
+        let mut image = tiny_png_bytes();
+        image.resize((2 * 1024 * 1024) + 1, 0);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "large image")],
+                "media",
+                "large.png",
+                "image/png",
+                &image,
+            ),
+        )
+        .await;
+
+        assert_eq!(posted.status, 303);
+        assert_eq!(location(&posted), "/home#post-1");
+    }
+
+    #[tokio::test]
+    async fn post_multipart_errors_keep_authenticated_layout() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let cookie = session_cookie(&registered);
+        let failed = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            b"--post-boundary\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\nunterminated"
+                .to_vec(),
+        )
+        .await;
+
+        assert_eq!(failed.status, 400);
+        assert!(failed.body.contains("Check the form"));
+        assert!(failed.body.contains(r#"href="/users/alice""#));
     }
 
     #[tokio::test]
@@ -2618,6 +2904,50 @@ mod tests {
         }
         body.push_str(&format!("--{boundary}--\r\n"));
         body.into_bytes()
+    }
+
+    fn multipart_body_with_file(
+        boundary: &str,
+        fields: &[(&str, &str)],
+        file_field: &str,
+        filename: &str,
+        content_type: &str,
+        file: &[u8],
+    ) -> Vec<u8> {
+        let mut body = multipart_body_without_close(boundary, fields);
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        body.extend_from_slice(file);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    fn multipart_body_without_close(boundary: &str, fields: &[(&str, &str)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                    .as_bytes(),
+            );
+        }
+        body
+    }
+
+    fn tiny_png_bytes() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x04, 0x00, 0x01, 0xfe, 0xa7, 0x69, 0x9d,
+            0x16, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ]
     }
 
     async fn spawn_test_server() -> TestServer {

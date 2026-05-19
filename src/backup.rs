@@ -15,7 +15,17 @@ pub fn create_backup(paths: &RuntimePaths, include_tor_keys: bool) -> anyhow::Re
     ));
     let file = File::create(&archive_path)?;
     let mut builder = Builder::new(file);
-    append_file(&mut builder, &paths.database_path, "app.sqlite3")?;
+    append_file(&mut builder, &paths.database_path, "db/rustpost.sqlite3")?;
+    append_file(
+        &mut builder,
+        &paths.database_sidecar_path("wal"),
+        "db/rustpost.sqlite3-wal",
+    )?;
+    append_file(
+        &mut builder,
+        &paths.database_sidecar_path("shm"),
+        "db/rustpost.sqlite3-shm",
+    )?;
     append_file(&mut builder, &paths.settings_path, "settings.toml")?;
     append_dir(&mut builder, &paths.uploads_originals, "uploads/originals")?;
     append_dir(&mut builder, &paths.uploads_images, "uploads/images")?;
@@ -128,10 +138,13 @@ mod tests {
         let paths = RuntimePaths::from_data_dir(temp.path().join("data"));
         paths.ensure().expect("ensure");
         fs::write(&paths.database_path, "db").expect("db");
+        fs::write(paths.database_sidecar_path("wal"), "wal").expect("wal");
         fs::write(&paths.settings_path, "settings").expect("settings");
         fs::write(paths.tor_onion_service_dir.join("secret"), "key").expect("key");
         let no_tor = create_backup(&paths, false).expect("backup");
         let names = archive_names(&no_tor);
+        assert!(names.iter().any(|name| name == "db/rustpost.sqlite3"));
+        assert!(names.iter().any(|name| name == "db/rustpost.sqlite3-wal"));
         assert!(!names.iter().any(|name| name.contains("tor/onion-service")));
         let with_tor = create_backup(&paths, true).expect("backup");
         let names = archive_names(&with_tor);

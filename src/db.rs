@@ -88,6 +88,10 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_1)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (1)", [])?;
         }
+        if applied.unwrap_or(0) < 2 {
+            tx.execute_batch(MIGRATION_2)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (2)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -271,6 +275,10 @@ CREATE INDEX idx_bookmarks_post ON bookmarks(post_id, user_id);
 CREATE INDEX idx_rate_limit_scope_actor_created ON rate_limit_events(scope, actor, created_at);
 "#;
 
+const MIGRATION_2: &str = r#"
+ALTER TABLE sessions ADD COLUMN previous_csrf_token_hash TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,7 +320,7 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 1);
+        assert_eq!(versions, 2);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);
