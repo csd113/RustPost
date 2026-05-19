@@ -282,6 +282,10 @@ pub fn write_default_if_missing(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the generated settings template is intentionally kept in one readable TOML block"
+)]
 fn default_settings_toml() -> String {
     let settings = Settings::default();
 
