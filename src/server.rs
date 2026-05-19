@@ -4,8 +4,8 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::extract::connect_info::ConnectInfo;
-use axum::extract::{Form, Multipart, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Uri, header};
+use axum::extract::{DefaultBodyLimit, Form, Multipart, Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse as _, Redirect, Response};
 use axum::routing::{get, post};
 use rusqlite::{OptionalExtension as _, params};
@@ -50,6 +50,7 @@ impl AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    let upload_body_limit = upload_body_limit(&state.settings);
     Router::new()
         .route("/", get(home))
         .route("/assets/rustpost.js", get(client_script))
@@ -100,8 +101,17 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/uploads/videos",
             ServeDir::new(state.paths.uploads_videos.clone()),
         )
+        .layer(DefaultBodyLimit::max(upload_body_limit))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+fn upload_body_limit(settings: &Settings) -> usize {
+    let limit = settings.media.max_video_size.saturating_add(1024 * 1024);
+    match usize::try_from(limit) {
+        Ok(limit) => limit,
+        Err(_overflow) => usize::MAX,
+    }
 }
 
 async fn client_script() -> Response {
@@ -405,7 +415,13 @@ async fn create_post(
     if user.is_none() && !state.settings.accounts.anonymous_mode_enabled {
         return Err(AppError::Forbidden);
     }
-    let form = parse_post_create(&state, user.as_ref().map(|u| u.id), multipart).await?;
+    let form = match parse_post_create(&state, user.as_ref().map(|u| u.id), multipart).await {
+        Ok(form) => form,
+        Err(AppError::BadRequest(message)) => {
+            return bad_request_page(&state, user.as_ref(), &message).await;
+        }
+        Err(err) => return Err(err),
+    };
     if let Some(parent_id) = form.parent_post_id {
         ensure_parent_post_exists(&state.pool, parent_id).await?;
     }
@@ -552,6 +568,22 @@ async fn parse_post_create(
         }
     }
     Ok(form)
+}
+
+async fn bad_request_page(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    message: &str,
+) -> AppResult<Response> {
+    let body = format!(
+        r#"<section class="panel error-panel"><p class="eyebrow">400 error</p><h1>Check the form</h1><p>{}</p><p><a class="button-link" href="/home">Back to Home Feed</a></p></section>"#,
+        html_escape::encode_text(message)
+    );
+    Ok((
+        StatusCode::BAD_REQUEST,
+        Html(page_layout(state, user, None, "Check the form", &body).await?),
+    )
+        .into_response())
 }
 
 async fn thread(
@@ -1855,16 +1887,16 @@ async fn form_csrf(state: &AppState, headers: &HeaderMap) -> Option<String> {
         })
         .await
         .ok()??;
-    // CSRF tokens are only shown immediately after login in memory through the cookie session.
-    // For persisted sessions we rotate a new token and update its hash before rendering forms.
+    // Keep the last rendered token valid for browser back/forward-cache restores.
     let plain = auth::secure_token();
     let new_hash = auth::hash_token(&plain);
     state
         .pool
         .call(move |conn| {
+            let previous_hash = stored_hash.clone();
             conn.execute(
-                "UPDATE sessions SET csrf_token_hash = ? WHERE token_hash = ? AND csrf_token_hash = ?",
-                params![new_hash, token_hash, stored_hash],
+                "UPDATE sessions SET csrf_token_hash = ?, previous_csrf_token_hash = ? WHERE token_hash = ? AND csrf_token_hash = ?",
+                params![new_hash, previous_hash, token_hash, stored_hash],
             )?;
             Ok(())
         })
@@ -1979,7 +2011,8 @@ mod tests {
         assert!(home.body.contains("hello from the browser-shaped form"));
         assert!(home.body.contains(r#"class="post""#));
         assert!(home.body.contains(r#"data-card-href="/posts/1""#));
-        assert!(home.body.contains(r#"href="/posts/1">Open post</a>"#));
+        assert!(!home.body.contains(r#">Open post</a>"#));
+        assert!(!home.body.contains("Open thread"));
         assert!(!home.body.contains(r#"class="post-time""#));
 
         let thread = request(
@@ -2212,6 +2245,166 @@ mod tests {
         assert_eq!(self_repost.status, 400);
         assert!(self_repost.body.contains("cannot repost your own post"));
         assert!(!self_repost.body.contains("internal server error"));
+    }
+
+    #[tokio::test]
+    async fn post_actions_accept_token_from_previous_page_render() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let cookie = session_cookie(&registered);
+
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "liked after back")],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let home_csrf = csrf_token(&home.body);
+        let thread = request(
+            &server.base_url,
+            "GET",
+            "/posts/1",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(thread.status, 200);
+
+        let liked = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/like",
+            &[
+                ("cookie", &cookie),
+                ("referer", "/home"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={home_csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(liked.status, 303);
+        assert_eq!(location(&liked), "/home#post-1");
+    }
+
+    #[tokio::test]
+    async fn image_uploads_over_default_body_limit_are_accepted() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let cookie = session_cookie(&registered);
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&home.body);
+
+        let mut image = tiny_png_bytes();
+        image.resize((2 * 1024 * 1024) + 1, 0);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "large image")],
+                "media",
+                "large.png",
+                "image/png",
+                &image,
+            ),
+        )
+        .await;
+
+        assert_eq!(posted.status, 303);
+        assert_eq!(location(&posted), "/home#post-1");
+    }
+
+    #[tokio::test]
+    async fn post_multipart_errors_keep_authenticated_layout() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let cookie = session_cookie(&registered);
+        let failed = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            b"--post-boundary\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\nunterminated"
+                .to_vec(),
+        )
+        .await;
+
+        assert_eq!(failed.status, 400);
+        assert!(failed.body.contains("Check the form"));
+        assert!(failed.body.contains(r#"href="/users/alice""#));
     }
 
     #[tokio::test]
@@ -2619,6 +2812,50 @@ mod tests {
         }
         body.push_str(&format!("--{boundary}--\r\n"));
         body.into_bytes()
+    }
+
+    fn multipart_body_with_file(
+        boundary: &str,
+        fields: &[(&str, &str)],
+        file_field: &str,
+        filename: &str,
+        content_type: &str,
+        file: &[u8],
+    ) -> Vec<u8> {
+        let mut body = multipart_body_without_close(boundary, fields);
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        body.extend_from_slice(file);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    fn multipart_body_without_close(boundary: &str, fields: &[(&str, &str)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                    .as_bytes(),
+            );
+        }
+        body
+    }
+
+    fn tiny_png_bytes() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x04, 0x00, 0x01, 0xfe, 0xa7, 0x69, 0x9d,
+            0x16, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ]
     }
 
     async fn spawn_test_server() -> TestServer {

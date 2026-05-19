@@ -1,6 +1,6 @@
 use axum::http::HeaderMap;
 
-use crate::auth::{csrf_for_cookie, hash_token, session_cookie};
+use crate::auth::{csrf_hashes_for_cookie, hash_token, session_cookie};
 use crate::db::SqlitePool;
 
 pub async fn validate(
@@ -11,10 +11,11 @@ pub async fn validate(
     let Some(token) = session_cookie(headers) else {
         anyhow::bail!("missing session");
     };
-    let Some(expected) = csrf_for_cookie(pool, &token).await? else {
+    let Some((current, previous)) = csrf_hashes_for_cookie(pool, &token).await? else {
         anyhow::bail!("missing csrf session");
     };
-    if expected != hash_token(submitted) {
+    let submitted = hash_token(submitted);
+    if submitted != current && previous.as_deref() != Some(submitted.as_str()) {
         anyhow::bail!("invalid csrf token");
     }
     Ok(())

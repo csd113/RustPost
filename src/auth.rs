@@ -157,13 +157,16 @@ pub async fn current_user(
     .await
 }
 
-pub async fn csrf_for_cookie(pool: &SqlitePool, token: &str) -> anyhow::Result<Option<String>> {
+pub async fn csrf_hashes_for_cookie(
+    pool: &SqlitePool,
+    token: &str,
+) -> anyhow::Result<Option<(String, Option<String>)>> {
     let token_hash = hash_token(token);
     pool.call(move |conn| {
         conn.query_row(
-            "SELECT csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
+            "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
             [token_hash],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(Into::into)
