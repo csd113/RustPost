@@ -47,7 +47,8 @@ test('logged-out navigation, registration validation, and public links are healt
     page.getByRole('button', { name: 'Log in' }).click(),
   ]).then(([response]) => response);
   expect(badLogin.status()).toBe(401);
-  await expect(page.getByRole('heading', { name: 'Authentication required' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Log in' })).toBeVisible();
+  await expect(page.getByText('No account with that username.')).toBeVisible();
 
   await page.goto('/home');
   await crawlVisibleInternalLinks(page);
@@ -176,7 +177,8 @@ test('normal UI forms post to real routes and forbidden duplicates are intention
     page.getByRole('button', { name: 'Create account' }).click(),
   ]).then(([response]) => response);
   expect(duplicate.status()).toBe(400);
-  await expect(page.getByRole('heading', { name: 'Check the form' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Create account' })).toBeVisible();
+  await expect(page.getByText('That username is already taken.')).toBeVisible();
 
   await login(page, user, password);
   await page.goto('/home');

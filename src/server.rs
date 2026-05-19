@@ -308,9 +308,17 @@ async fn login(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
-    let Some(session) = auth::login(&state.pool, &form.username, &form.password).await? else {
-        rate_limit::record(&state.pool, rate_limit::Scope::FailedLogin, &actor).await?;
-        return Err(AppError::Unauthorized);
+    let session = match auth::login(&state.pool, &form.username, &form.password).await? {
+        Ok(session) => session,
+        Err(failure) => {
+            let message = match failure {
+                auth::LoginFailure::NoAccount => "No account with that username.",
+                auth::LoginFailure::InvalidPassword => "The password is incorrect.",
+                auth::LoginFailure::UnavailableAccount => "This account cannot log in.",
+            };
+            rate_limit::record(&state.pool, rate_limit::Scope::FailedLogin, &actor).await?;
+            return auth_form_response(&state, StatusCode::UNAUTHORIZED, message).await;
+        }
     };
     let mut response = Redirect::to("/home").into_response();
     response.headers_mut().insert(
@@ -360,7 +368,7 @@ async fn register(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
-    let user_id = auth::register_user(
+    let user_id = match auth::register_user(
         &state.pool,
         &state.settings,
         &form.username,
@@ -368,7 +376,21 @@ async fn register(
         false,
     )
     .await
-    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    {
+        Ok(user_id) => user_id,
+        Err(err) => {
+            let message = err.to_string();
+            if message == auth::USERNAME_TAKEN_MESSAGE {
+                return register_form_response(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    "That username is already taken.",
+                )
+                .await;
+            }
+            return Err(AppError::BadRequest(message));
+        }
+    };
     let session = auth::create_session(&state.pool, user_id).await?;
     let mut response = Redirect::to("/home").into_response();
     response.headers_mut().insert(
@@ -380,6 +402,32 @@ async fn register(
         .map_err(|err| AppError::BadRequest(err.to_string()))?,
     );
     Ok(response)
+}
+
+async fn auth_form_response(
+    state: &AppState,
+    status: StatusCode,
+    message: &str,
+) -> AppResult<Response> {
+    let body = render::login_form(Some(message));
+    Ok((
+        status,
+        Html(page_layout(state, None, None, "Login", &body).await?),
+    )
+        .into_response())
+}
+
+async fn register_form_response(
+    state: &AppState,
+    status: StatusCode,
+    message: &str,
+) -> AppResult<Response> {
+    let body = render::register_form(Some(message));
+    Ok((
+        status,
+        Html(page_layout(state, None, None, "Register", &body).await?),
+    )
+        .into_response())
 }
 
 async fn logout(
@@ -2035,6 +2083,63 @@ mod tests {
             safe_delete_return_target("/home#post-42", 42),
             Some("/home#post-42".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn missing_login_account_renders_login_form_message() {
+        let server = spawn_test_server().await;
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=missing-user&password=not%20the%20password".to_vec(),
+        )
+        .await;
+
+        assert_eq!(response.status, 401);
+        assert!(response.body.contains("<h1>Log in</h1>"));
+        assert!(response.body.contains("No account with that username."));
+        assert!(
+            response
+                .body
+                .contains(r#"<button class="auth-submit" type="submit">Log in</button>"#)
+        );
+        assert!(!response.body.contains("Authentication required"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_renders_register_form_message() {
+        let server = spawn_test_server().await;
+        let first = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(first.status, 303);
+
+        let duplicate = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=Alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+
+        assert_eq!(duplicate.status, 400);
+        assert!(duplicate.body.contains("<h1>Create account</h1>"));
+        assert!(duplicate.body.contains("That username is already taken."));
+        assert!(
+            duplicate
+                .body
+                .contains(r#"<button class="auth-submit" type="submit">Create account</button>"#)
+        );
+        assert!(!duplicate.body.contains("Check the form"));
     }
 
     #[tokio::test]
