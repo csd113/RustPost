@@ -34,8 +34,10 @@ export async function expectAppShell(page: Page): Promise<void> {
 export async function expectNotErrorPage(page: Page): Promise<void> {
   await page.waitForLoadState('domcontentloaded');
   await expectAppShell(page);
+  await expect(page).not.toHaveURL(/\/(?:posts\/\d+\/(?:like|bookmark|repost|reply)|users\/\d+\/(?:follow|unfollow|block|unblock|mute)|logout|notifications\/read|admin\/users\/\d+\/suspend|admin\/posts\/\d+\/delete)(?:$|[?#])/);
   await expect(page.locator('.error-panel')).toHaveCount(0);
-  await expect(page.getByText(/csrf error|invalid csrf|missing csrf|400 error|403 error|404 error|405 error|access denied|page not found|something went wrong/i)).toHaveCount(0);
+  await expect(page.getByText(/csrf error|invalid csrf|missing csrf|400 error|403 error|404 error|405 error|415 error|500 error|access denied|page not found|method not allowed|unsupported media type|something went wrong/i)).toHaveCount(0);
+  await expect(page.locator('body')).not.toHaveText(/^\s*(bad request|forbidden|not found|method not allowed|unsupported media type|internal server error)\s*$/i);
 }
 
 export async function goBackToHealthyPage(page: Page): Promise<void> {
@@ -159,6 +161,18 @@ export async function submitFirstPostAction(page: Page, label: string): Promise<
     page.waitForLoadState('networkidle'),
     button.click(),
   ]);
+}
+
+export async function expectHealthyRedirect(
+  page: Page,
+  action: () => Promise<void>,
+  expectedUrl: RegExp | string,
+): Promise<void> {
+  await Promise.all([
+    page.waitForURL(expectedUrl),
+    action(),
+  ]);
+  await expectNotErrorPage(page);
 }
 
 export async function crawlVisibleInternalLinks(page: Page): Promise<void> {

@@ -656,7 +656,15 @@ async fn delete_post(
 ) -> AppResult<Response> {
     let user = require_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
-    let preview = delete_preview(&state.pool, user.id, user.is_admin, id).await?;
+    let preview = match delete_preview(&state.pool, user.id, user.is_admin, id).await {
+        Ok(preview) => preview,
+        Err(AppError::NotFound) => {
+            let target = safe_delete_return_target(&form.return_to, id)
+                .unwrap_or_else(|| "/home".to_owned());
+            return Ok(Redirect::to(&target).into_response());
+        }
+        Err(err) => return Err(err),
+    };
     social::delete_post(&state.pool, user.id, id, user.is_admin).await?;
     let fallback = if let Some(parent_id) = preview.parent_post_id {
         format!("/posts/{parent_id}#post-{parent_id}")
@@ -1430,20 +1438,21 @@ fn delete_return_fallback(
     parent_post_id: Option<i64>,
 ) -> String {
     let fallback = anchored_return(headers, post_id, parent_post_id.is_some(), "/home");
-    let self_path = format!("/posts/{post_id}/delete");
-    if path_without_query_or_fragment(&fallback) != self_path {
+    if safe_delete_return_target(&fallback, post_id).is_some() {
         return fallback;
     }
     parent_post_id.map_or_else(
         || format!("/home#post-{post_id}"),
-        |parent_id| format!("/posts/{parent_id}#reply-{post_id}"),
+        |parent_id| format!("/posts/{parent_id}#post-{parent_id}"),
     )
 }
 
 fn safe_delete_return_target(value: &str, post_id: i64) -> Option<String> {
     let target = safe_return_target(value)?;
     let self_path = format!("/posts/{post_id}/delete");
-    if path_without_query_or_fragment(&target) == self_path {
+    let thread_path = format!("/posts/{post_id}");
+    let path = path_without_query_or_fragment(&target);
+    if path == self_path || path == thread_path {
         None
     } else {
         Some(target)
@@ -2018,10 +2027,7 @@ mod tests {
             safe_delete_return_target("http://127.0.0.1:18080/posts/42/delete?return_to=/home", 42),
             None
         );
-        assert_eq!(
-            safe_delete_return_target("/posts/42#post-42", 42),
-            Some("/posts/42#post-42".to_owned())
-        );
+        assert_eq!(safe_delete_return_target("/posts/42#post-42", 42), None);
         assert_eq!(
             safe_delete_return_target("/home#post-42", 42),
             Some("/home#post-42".to_owned())

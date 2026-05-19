@@ -237,9 +237,21 @@ document.querySelectorAll("textarea[data-character-limit]").forEach((textarea) =
   textarea.addEventListener("input", () => updateComposerCount(textarea));
 });
 
+function resetSubmittingForms() {
+  document.querySelectorAll('form[data-submitting="true"]').forEach((form) => {
+    delete form.dataset.submitting;
+    form.querySelectorAll("button:disabled").forEach((button) => {
+      button.disabled = false;
+    });
+  });
+}
+
 window.addEventListener("pageshow", (event) => {
   const nav = performance.getEntriesByType("navigation")[0];
   const restored = event.persisted || (nav && nav.type === "back_forward");
+  if (restored) {
+    resetSubmittingForms();
+  }
   if (restored && document.querySelector('form[method="post"] input[name="csrf"]')) {
     window.location.reload();
   }
@@ -262,6 +274,10 @@ document.addEventListener("submit", async (event) => {
     return;
   }
   event.preventDefault();
+  if (form.dataset.submitting === "true") {
+    return;
+  }
+  form.dataset.submitting = "true";
   const submitter = event.submitter || form.querySelector("button[type=submit]");
   if (submitter) {
     submitter.disabled = true;
@@ -334,10 +350,20 @@ document.addEventListener("submit", async (event) => {
         return;
       }
       timeline.insertAdjacentHTML(data.parent_post_id === null ? "afterbegin" : "beforeend", data.html);
+      if (data.parent_post_id !== null) {
+        document.querySelectorAll(`[data-post-id="${data.parent_post_id}"] [data-count="replies"]`).forEach((node) => {
+          const current = Number.parseInt(node.textContent || "0", 10);
+          const next = Number.isFinite(current) ? current + 1 : 1;
+          node.textContent = `${next} replies`;
+        });
+      }
       const created = document.getElementById(`post-${data.post_id}`);
       if (created) {
         created.setAttribute("tabindex", "-1");
         created.focus({ preventScroll: true });
+      }
+      if (window.history && data.redirect) {
+        window.history.pushState(null, "", data.redirect);
       }
       form.reset();
       form.querySelectorAll("textarea[data-character-limit]").forEach(updateComposerCount);
@@ -345,9 +371,29 @@ document.addEventListener("submit", async (event) => {
   } catch (_err) {
     form.submit();
   } finally {
+    delete form.dataset.submitting;
     if (submitter) {
       submitter.disabled = false;
     }
+  }
+});
+
+document.addEventListener("submit", (event) => {
+  const form = event.target.closest("form");
+  if (!form || form.dataset.enhance) {
+    return;
+  }
+  if ((form.method || "GET").toUpperCase() !== "POST") {
+    return;
+  }
+  if (form.dataset.submitting === "true") {
+    event.preventDefault();
+    return;
+  }
+  form.dataset.submitting = "true";
+  const submitter = event.submitter || form.querySelector("button[type=submit]");
+  if (submitter) {
+    submitter.disabled = true;
   }
 });"#;
 
