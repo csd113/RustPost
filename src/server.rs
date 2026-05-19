@@ -224,13 +224,7 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
     };
     let body = format!(
         "{}{}{}",
-        render::page_header(
-            "Home Feed",
-            &format!(
-                "Top-level posts from your {} instance.",
-                state.settings.site.name
-            ),
-        ),
+        render::page_header("Home Feed", "All posts"),
         composer,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
     );
@@ -467,11 +461,19 @@ async fn create_post(
             post_id,
             parent_post_id: form.parent_post_id,
             redirect,
-            html: render::post_card(
-                post,
-                user.as_ref(),
-                form_csrf(&state, &headers).await.as_deref(),
-            ),
+            html: if form.parent_post_id.is_some() {
+                render::thread_post_card(
+                    post,
+                    user.as_ref(),
+                    form_csrf(&state, &headers).await.as_deref(),
+                )
+            } else {
+                render::post_card(
+                    post,
+                    user.as_ref(),
+                    form_csrf(&state, &headers).await.as_deref(),
+                )
+            },
         })
         .into_response());
     }
@@ -570,7 +572,7 @@ async fn thread(
     let body = format!(
         "{}{}{}",
         render::page_header("Thread", "Read the conversation and add a reply."),
-        render::posts(&posts, user.as_ref(), csrf.as_deref()),
+        render::thread_posts(&posts, user.as_ref(), csrf.as_deref()),
         composer
     );
     Ok(Html(
@@ -1935,6 +1937,8 @@ mod tests {
         )
         .await;
         assert_eq!(home.status, 200);
+        assert!(home.body.contains("<p>All posts</p>"));
+        assert!(!home.body.contains("Top-level posts from your"));
         assert!(home.body.contains(r#"action="/posts""#));
         let csrf = csrf_token(&home.body);
 
@@ -1973,6 +1977,21 @@ mod tests {
         assert_eq!(home.status, 200);
         assert!(home.body.contains("hello from the browser-shaped form"));
         assert!(home.body.contains(r#"class="post""#));
+        assert!(home.body.contains(r#"data-card-href="/posts/1""#));
+        assert!(home.body.contains(r#"href="/posts/1">Open post</a>"#));
+        assert!(!home.body.contains(r#"class="post-time""#));
+
+        let thread = request(
+            &server.base_url,
+            "GET",
+            "/posts/1",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(thread.status, 200);
+        assert!(thread.body.contains(r#"class="post-time""#));
+        assert!(!thread.body.contains(r#"href="/posts/1">Open post</a>"#));
     }
 
     #[tokio::test]
@@ -2162,6 +2181,21 @@ mod tests {
         assert_eq!(liked.status, 303);
         assert_eq!(location(&liked), "/home#post-1");
 
+        let bookmarked = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/bookmark",
+            &[
+                ("cookie", &cookie),
+                ("referer", "/home"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(bookmarked.status, 303);
+        assert_eq!(location(&bookmarked), "/home#post-1");
+
         let self_repost = request(
             &server.base_url,
             "POST",
@@ -2251,6 +2285,25 @@ mod tests {
         assert!(liked.body.contains(r#""post_id":1"#));
         assert!(liked.body.contains(r#""liked":true"#));
         assert!(liked.body.contains(r#""likes":1"#));
+
+        let bookmarked = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/bookmark",
+            &[
+                ("cookie", &cookie),
+                ("referer", "/home"),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("x-rustpost-enhance", "1"),
+                ("accept", "application/json"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(bookmarked.status, 200);
+        assert!(bookmarked.body.contains(r#""kind":"post-action""#));
+        assert!(bookmarked.body.contains(r#""post_id":1"#));
+        assert!(bookmarked.body.contains(r#""bookmarked":true"#));
     }
 
     #[tokio::test]
