@@ -96,6 +96,10 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_3)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (3)", [])?;
         }
+        if applied.unwrap_or(0) < 4 {
+            tx.execute_batch(MIGRATION_4)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (4)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -288,6 +292,10 @@ ALTER TABLE media ADD COLUMN thumbnail_path TEXT;
 ALTER TABLE media ADD COLUMN thumbnail_public_path TEXT;
 "#;
 
+const MIGRATION_4: &str = r#"
+ALTER TABLE users ADD COLUMN theme TEXT NOT NULL DEFAULT 'light' CHECK (theme IN ('light', 'dark'));
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,9 +337,31 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 3);
+        assert_eq!(versions, 4);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);
+    }
+
+    #[tokio::test]
+    async fn users_get_light_theme_by_default() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        let theme: String = pool
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO users (username, normalized_username, password_hash, display_name) VALUES ('Alice', 'alice', 'hash', 'Alice')",
+                    [],
+                )?;
+                Ok(conn.query_row("SELECT theme FROM users WHERE normalized_username = 'alice'", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("theme");
+
+        assert_eq!(theme, "light");
     }
 }

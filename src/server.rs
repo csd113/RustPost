@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
-use crate::auth::{self, CurrentUser};
+use crate::auth::{self, CurrentUser, Theme};
 use crate::config::Settings;
 use crate::db::SqlitePool;
 use crate::errors::{AppError, AppResult};
@@ -178,6 +178,7 @@ struct ParsedProfileUpdate {
     display_name: String,
     bio: String,
     website: String,
+    theme: Theme,
     delete_profile_picture: bool,
     delete_banner: bool,
     profile_picture_media_id: Option<i64>,
@@ -1050,7 +1051,7 @@ async fn settings_form(
         .call(move |conn| {
             conn.query_row(
                 r#"
-        SELECT u.display_name, u.bio, u.website,
+        SELECT u.display_name, u.bio, u.website, u.theme,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path
         FROM users u
@@ -1064,15 +1065,16 @@ async fn settings_form(
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
             .map_err(Into::into)
         })
         .await?;
-    let (display_name, bio, website, picture_path, banner_path) = profile;
+    let (display_name, bio, website, theme, picture_path, banner_path) = profile;
     let picture = picture_path.map_or_else(String::new, |path| {
             format!(
             r#"<img class="profile-picture" src="{}" alt=""><label class="check-row"><input type="checkbox" name="delete_profile_picture" value="true"> Delete profile picture</label>"#,
@@ -1122,9 +1124,15 @@ async fn settings_form(
     } else {
         format!(r#"<ul class="item-list">{blocked_rows}</ul>"#)
     };
+    let dark_checked = if Theme::from(theme.as_str()) == Theme::Dark {
+        " checked"
+    } else {
+        ""
+    };
     let body = format!(
-        r#"<section class="panel"><h1>Account settings</h1><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="website">Website</label><input id="website" type="url" name="website" value="{}">{}{}<button type="submit">Save settings</button></form></section><section class="panel"><h2>Blocked users</h2>{}</section>"#,
+        r#"<section class="panel"><h1>Account settings</h1><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="website">Website</label><input id="website" type="url" name="website" value="{}">{}{}<button type="submit">Save settings</button></form></section><section class="panel"><h2>Blocked users</h2>{}</section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
+        dark_checked,
         html_escape::encode_double_quoted_attribute(display_name.as_str()),
         html_escape::encode_text(bio.as_str()),
         html_escape::encode_double_quoted_attribute(website.as_str()),
@@ -1149,12 +1157,13 @@ async fn settings_update(
     let display_name = form.display_name.trim().to_owned();
     let bio = form.bio.trim().to_owned();
     let website = form.website.trim().to_owned();
+    let theme = form.theme.as_str().to_owned();
     state
         .pool
         .call(move |conn| {
             conn.execute(
-                "UPDATE users SET display_name = ?, bio = ?, website = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                params![display_name, bio, website, user.id],
+                "UPDATE users SET display_name = ?, bio = ?, website = ?, theme = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                params![display_name, bio, website, theme, user.id],
             )?;
             Ok(())
         })
@@ -1202,6 +1211,7 @@ async fn parse_profile_update(
         display_name: String::new(),
         bio: String::new(),
         website: String::new(),
+        theme: Theme::Light,
         delete_profile_picture: false,
         delete_banner: false,
         profile_picture_media_id: None,
@@ -1239,6 +1249,9 @@ async fn parse_profile_update(
                     .text()
                     .await
                     .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
+            "dark_mode" => {
+                form.theme = Theme::Dark;
             }
             "delete_profile_picture" => {
                 form.delete_profile_picture = true;

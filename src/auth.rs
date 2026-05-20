@@ -11,6 +11,31 @@ use crate::config::Settings;
 use crate::db::SqlitePool;
 use crate::validation::{normalize_username, validate_password};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+impl From<&str> for Theme {
+    fn from(value: &str) -> Self {
+        match value {
+            "dark" => Self::Dark,
+            _ => Self::Light,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CurrentUser {
     pub id: i64,
@@ -18,6 +43,7 @@ pub struct CurrentUser {
     pub display_name: String,
     pub is_admin: bool,
     pub is_suspended: bool,
+    pub theme: Theme,
 }
 
 #[derive(Debug, Clone)]
@@ -144,7 +170,7 @@ pub async fn current_user(
     pool.call(move |conn| {
         conn.query_row(
             r#"
-        SELECT u.id, u.username, u.display_name, u.is_admin, u.is_suspended
+        SELECT u.id, u.username, u.display_name, u.is_admin, u.is_suspended, u.theme
         FROM sessions s
         JOIN users u ON u.id = s.user_id
         WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP AND u.is_deleted = 0
@@ -157,6 +183,7 @@ pub async fn current_user(
                     display_name: row.get(2)?,
                     is_admin: row.get::<_, i64>(3)? != 0,
                     is_suspended: row.get::<_, i64>(4)? != 0,
+                    theme: Theme::from(row.get::<_, String>(5)?.as_str()),
                 })
             },
         )
