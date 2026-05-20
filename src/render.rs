@@ -2,12 +2,25 @@ use crate::auth::CurrentUser;
 use crate::social::{AccountView, MediaView, PostView, TimelineEventKind};
 use axum::http::StatusCode;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LayoutContext {
     pub anonymous_mode_enabled: bool,
     pub tor_onion_address: Option<String>,
     pub follower_count: Option<i64>,
     pub following_count: Option<i64>,
+    pub favicon_content_type: &'static str,
+}
+
+impl Default for LayoutContext {
+    fn default() -> Self {
+        Self {
+            anonymous_mode_enabled: false,
+            tor_onion_address: None,
+            follower_count: None,
+            following_count: None,
+            favicon_content_type: "image/x-icon",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +114,7 @@ pub fn layout_with_context(
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta name="referrer" content="same-origin">
+<link rel="icon" href="/favicon.ico" type="{}">
 <title>{} - {}</title>
 <style>{}</style>
 <script src="/assets/rustpost.js" defer></script>
@@ -111,6 +125,7 @@ pub fn layout_with_context(
 <footer class="site-footer">{} alpha{}</footer>
 </body>
 </html>"#,
+        html_escape::encode_double_quoted_attribute(context.favicon_content_type),
         html_escape::encode_text(title),
         html_escape::encode_text(site_name),
         CSS,
@@ -871,7 +886,7 @@ input:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:3px soli
 .composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:#24445f;font-weight:700}.file-control input{max-width:15rem}
 .timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.post[data-card-href]{cursor:pointer}.post[data-card-href]:hover{border-color:#c7d2ca}.post[data-card-href]:focus-visible{outline:3px solid #93c5fd;outline-offset:2px}.reply-post{margin-left:1.1rem;border-left:4px solid #c8d8d0;background:#fbfcfa}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid #c8d8d0}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid #d0d8d2;background:#eef3f0;flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:#526159;font-weight:800}.author-name{font-weight:800;color:#202124}.username,.post-time,.counts{color:#687068;font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid #d9ded6;margin-top:.5rem;background:#f6f7f4}.post img.post-avatar{display:block;margin:0;border-radius:999px}
 .counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.actions{display:flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid #cdd7d0;border-radius:7px;background:#fff;color:#24445f;padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:#eef3f0;color:#163b2f;text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:#9aa39d;background:#f4f5f2;border-color:#dfe4dc;cursor:not-allowed}.icon-button.disabled:hover,.icon-button:disabled:hover{background:#f4f5f2;color:#9aa39d}.follow-button{min-width:6.6rem}.follow-button.active{background:#eef3f0;color:#163b2f;border-color:#9fb9ad}.profile-actions{margin-top:0}.profile-secondary button{background:#fff;color:#8a3d2d;border-color:#e0c4bb;padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:#fff8f5;color:#6f2f22}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:#4b655d;font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:#667064}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:#e6b8a8;background:#fff8f5}.notice.success{border-color:#add7b4;background:#f4fbf5}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:#6d766e;font-size:.78rem}
-.profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#dfe9e1}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#eef3f0;flex:0 0 auto}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:#fff;border:1px solid #dfe4dc;border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:#59625a;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #e3e7e0;text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
+.profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#dfe9e1}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#eef3f0;flex:0 0 auto}.favicon-preview{width:32px;height:32px;object-fit:contain;border:1px solid #d9ded6;border-radius:6px;background:#fff}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:#fff;border:1px solid #dfe4dc;border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:#59625a;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #e3e7e0;text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
 @media (max-width:900px){.content-shell{grid-template-columns:1fr}.side-panel{position:static;display:none}}
 @media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1{font-size:1.25rem}}
 "#;
@@ -989,6 +1004,29 @@ mod tests {
         let body = thread_post_card(&post, None, None);
 
         assert!(body.contains(r#"class="post-time" href="/posts/42">2026-05-18 10:30</a>"#));
+    }
+
+    #[test]
+    fn compact_post_avatar_uses_profile_picture_path() {
+        let mut post = test_post();
+        post.profile_picture_path = Some("/uploads/thumbs/ada-profile.webp".to_owned());
+
+        let body = post_card(&post, None, None);
+
+        assert!(
+            body.contains(r#"<img class="post-avatar" src="/uploads/thumbs/ada-profile.webp""#)
+        );
+        assert!(!body.contains(r#"post-avatar placeholder"#));
+    }
+
+    #[test]
+    fn compact_post_avatar_uses_placeholder_without_profile_picture() {
+        let post = test_post();
+        let body = post_card(&post, None, None);
+
+        assert!(
+            body.contains(r#"<span class="post-avatar placeholder" aria-hidden="true">A</span>"#)
+        );
     }
 
     #[test]

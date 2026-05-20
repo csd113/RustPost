@@ -180,6 +180,18 @@ test('normal UI forms post to real routes and forbidden duplicates are intention
   await expect(page.getByRole('heading', { name: 'Create account' })).toBeVisible();
   await expect(page.getByText('That username is already taken.')).toBeVisible();
 
+  await page.goto('/login');
+  await page.getByLabel('Username').fill(user);
+  await page.getByLabel('Password', { exact: true }).fill('not the password');
+  const badPassword = await Promise.all([
+    page.waitForResponse((response) => response.url().includes('/login') && response.request().method() === 'POST'),
+    page.getByRole('button', { name: 'Log in' }).click(),
+  ]).then(([response]) => response);
+  expect(badPassword.status()).toBe(401);
+  await expect(page.getByRole('heading', { name: 'Log in' })).toBeVisible();
+  await expect(page.getByText('The password is incorrect.')).toBeVisible();
+  await expect(page.getByText('No account with that username.')).not.toBeVisible();
+
   await login(page, user, password);
   await page.goto('/home');
   await expect(firstFormWithAction(page, '/posts')).toBeVisible();

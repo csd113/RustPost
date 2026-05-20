@@ -352,7 +352,8 @@ pub async fn following_accounts(
     pool.call(move |conn| {
         let mut stmt = conn.prepare(
             r#"
-            SELECT u.id, u.username, u.display_name, u.bio, pic.public_path
+            SELECT u.id, u.username, u.display_name, u.bio,
+              COALESCE(pic.thumbnail_public_path, pic.public_path)
             FROM follows f
             JOIN users u ON u.id = f.followed_id
             LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
@@ -606,7 +607,8 @@ fn base_post_query() -> String {
     SELECT 'post' AS event_kind, 'p:' || p.id AS event_id, p.created_at AS event_created_at,
       NULL AS repost_user_id, NULL AS repost_username, NULL AS repost_display_name, NULL AS repost_created_at,
       0 AS original_unavailable,
-      p.id, p.user_id, u.username, u.display_name, pic.public_path AS profile_picture_path,
+      p.id, p.user_id, u.username, u.display_name,
+      COALESCE(pic.thumbnail_public_path, pic.public_path) AS profile_picture_path,
       p.anonymous_label, p.text, p.parent_post_id, p.created_at,
       (SELECT COUNT(*) FROM likes WHERE post_id = p.id) AS like_count,
       (SELECT COUNT(*) FROM reposts WHERE post_id = p.id) AS repost_count,
@@ -624,7 +626,7 @@ fn base_repost_query() -> String {
       ru.id AS repost_user_id, ru.username AS repost_username, ru.display_name AS repost_display_name, r.created_at AS repost_created_at,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 1 ELSE 0 END AS original_unavailable,
       COALESCE(p.id, r.post_id) AS id, p.user_id, u.username, u.display_name,
-      pic.public_path AS profile_picture_path, p.anonymous_label,
+      COALESCE(pic.thumbnail_public_path, pic.public_path) AS profile_picture_path, p.anonymous_label,
       COALESCE(p.text, '') AS text, p.parent_post_id, COALESCE(p.created_at, r.created_at) AS created_at,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM likes WHERE post_id = p.id) END AS like_count,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM reposts WHERE post_id = p.id) END AS repost_count,
@@ -1203,6 +1205,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_post_avatar_prefers_profile_thumbnail() {
+        let (pool, settings, alice, _) = fixture().await;
+        set_profile_picture(
+            &pool,
+            alice,
+            "/uploads/images/alice.webp",
+            Some("/uploads/thumbs/alice-profile.webp"),
+        )
+        .await;
+        let post = create_post(&pool, &settings, Some(alice), "hello", None, &[])
+            .await
+            .expect("post");
+
+        let local = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("timeline");
+        let original = local
+            .iter()
+            .find(|event| event.event_kind == TimelineEventKind::Post && event.id == post)
+            .expect("original post");
+
+        assert_eq!(
+            original.profile_picture_path.as_deref(),
+            Some("/uploads/thumbs/alice-profile.webp")
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_post_avatar_falls_back_to_original_without_thumbnail() {
+        let (pool, settings, alice, _) = fixture().await;
+        set_profile_picture(&pool, alice, "/uploads/images/alice.webp", None).await;
+        let post = create_post(&pool, &settings, Some(alice), "hello", None, &[])
+            .await
+            .expect("post");
+
+        let local = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("timeline");
+        let original = local
+            .iter()
+            .find(|event| event.event_kind == TimelineEventKind::Post && event.id == post)
+            .expect("original post");
+
+        assert_eq!(
+            original.profile_picture_path.as_deref(),
+            Some("/uploads/images/alice.webp")
+        );
+    }
+
+    #[tokio::test]
+    async fn following_accounts_keep_default_avatar_when_no_profile_picture() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        follow(&pool, bob, alice).await.expect("follow");
+
+        let accounts = following_accounts(&pool, bob).await.expect("accounts");
+
+        assert_eq!(accounts.len(), 1);
+        assert!(accounts[0].profile_picture_path.is_none());
+    }
+
+    #[tokio::test]
     async fn profile_timeline_includes_user_reposts() {
         let (pool, settings, alice, bob) = fixture().await;
         let post = create_post(&pool, &settings, Some(alice), "hello", None, &[])
@@ -1245,6 +1308,30 @@ mod tests {
             .expect("repost event");
         assert!(repost_event.original_unavailable);
         assert!(repost_event.media.is_empty());
+    }
+
+    async fn set_profile_picture(
+        pool: &SqlitePool,
+        user_id: i64,
+        public_path: &str,
+        thumbnail_public_path: Option<&str>,
+    ) {
+        let public_path = public_path.to_owned();
+        let thumbnail_public_path = thumbnail_public_path.map(ToOwned::to_owned);
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, thumbnail_public_path) VALUES (?, 'avatar.webp', '/tmp/avatar.webp', ?, 'image/webp', 'image', 1, ?)",
+                params![user_id, public_path, thumbnail_public_path],
+            )?;
+            let media_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE users SET profile_picture_media_id = ? WHERE id = ?",
+                params![media_id, user_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("profile picture");
     }
 
     #[tokio::test]

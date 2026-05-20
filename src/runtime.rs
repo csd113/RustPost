@@ -15,6 +15,7 @@ pub struct RuntimePaths {
     pub uploads_images: PathBuf,
     pub uploads_videos: PathBuf,
     pub uploads_thumbs: PathBuf,
+    pub assets_dir: PathBuf,
     pub tmp_dir: PathBuf,
     pub tmp_uploads: PathBuf,
     pub backups_dir: PathBuf,
@@ -36,6 +37,7 @@ impl RuntimePaths {
     pub fn from_data_dir(data_dir: PathBuf) -> Self {
         let db_dir = data_dir.join("db");
         let uploads_dir = data_dir.join("uploads");
+        let assets_dir = data_dir.join("assets");
         let tmp_dir = data_dir.join("tmp");
         Self {
             settings_path: data_dir.join("settings.toml"),
@@ -45,6 +47,7 @@ impl RuntimePaths {
             uploads_images: uploads_dir.join("images"),
             uploads_videos: uploads_dir.join("videos"),
             uploads_thumbs: uploads_dir.join("thumbs"),
+            assets_dir,
             tmp_uploads: tmp_dir.join("uploads"),
             tmp_dir,
             backups_dir: data_dir.join("backups"),
@@ -70,6 +73,7 @@ impl RuntimePaths {
             &self.uploads_images,
             &self.uploads_videos,
             &self.uploads_thumbs,
+            &self.assets_dir,
             &self.tmp_dir,
             &self.tmp_uploads,
             &self.backups_dir,
@@ -236,6 +240,7 @@ mod tests {
             paths.staged_upload_path("abc"),
             PathBuf::from("/tmp/rustpost-data/tmp/uploads/abc.upload")
         );
+        assert_eq!(paths.assets_dir, PathBuf::from("/tmp/rustpost-data/assets"));
     }
 
     #[test]

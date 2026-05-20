@@ -92,6 +92,21 @@ pub async fn convert_image_to_webp(
     }
 }
 
+pub async fn convert_image_to_webp_thumbnail(
+    settings: &MediaSettings,
+    input: &Path,
+    output: &Path,
+    size: u16,
+) -> anyhow::Result<String> {
+    let args = image_webp_thumbnail_args(settings, input, output, size);
+    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_secs(120)).await?;
+    if result.status.success() {
+        Ok(stderr_summary(&result.stderr))
+    } else {
+        anyhow::bail!(stderr_summary(&result.stderr));
+    }
+}
+
 pub async fn convert_video_to_webm(
     settings: &MediaSettings,
     input: &Path,
@@ -129,6 +144,27 @@ fn image_webp_args(settings: &MediaSettings, input: &Path, output: &Path) -> Vec
         input.display().to_string(),
         "-vf".to_owned(),
         "scale='min(1600,iw)':-2".to_owned(),
+        "-c:v".to_owned(),
+        "libwebp".to_owned(),
+        "-quality".to_owned(),
+        settings.webp_quality.to_string(),
+        output.display().to_string(),
+    ]
+}
+
+fn image_webp_thumbnail_args(
+    settings: &MediaSettings,
+    input: &Path,
+    output: &Path,
+    size: u16,
+) -> Vec<String> {
+    let size = size.to_string();
+    vec![
+        "-y".to_owned(),
+        "-i".to_owned(),
+        input.display().to_string(),
+        "-vf".to_owned(),
+        format!("scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}"),
         "-c:v".to_owned(),
         "libwebp".to_owned(),
         "-quality".to_owned(),
@@ -206,6 +242,37 @@ mod tests {
         );
         assert!(args.iter().any(|arg| arg == "yuv420p"));
         assert!(args.iter().filter(|arg| arg.as_str() == "bt709").count() >= 3);
+    }
+
+    #[test]
+    fn image_thumbnail_args_crop_square_webp() {
+        let args = super::image_webp_thumbnail_args(
+            &MediaSettings {
+                ffmpeg_path: "ffmpeg".to_owned(),
+                convert_images_to_webp: true,
+                convert_videos_to_webm: true,
+                keep_original_uploads: false,
+                max_image_size: 1,
+                max_video_size: 1,
+                generate_video_thumbnails: false,
+                allowed_image_mime_types: Vec::new(),
+                allowed_video_mime_types: Vec::new(),
+                webp_quality: 82,
+                vp9_crf: 32,
+                vp9_deadline: "good".to_owned(),
+            },
+            Path::new("in.png"),
+            Path::new("out.webp"),
+            96,
+        );
+
+        assert!(args.iter().any(|arg| arg == "libwebp"));
+        assert!(args.iter().any(|arg| arg == "-quality"));
+        assert!(args.iter().any(|arg| arg.contains("crop=96:96")));
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains("force_original_aspect_ratio=increase"))
+        );
     }
 
     #[tokio::test]

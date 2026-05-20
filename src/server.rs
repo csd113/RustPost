@@ -19,7 +19,7 @@ use crate::db::SqlitePool;
 use crate::errors::{AppError, AppResult};
 use crate::ffmpeg::FfmpegStatus;
 use crate::runtime::RuntimePaths;
-use crate::{admin, backup, csrf, media, rate_limit, render, social};
+use crate::{admin, backup, csrf, favicon, media, rate_limit, render, social};
 
 const CSRF_TOKEN_HISTORY_LIMIT: usize = 32;
 
@@ -56,6 +56,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(home))
         .route("/assets/rustpost.js", get(client_script))
+        .route("/favicon.ico", get(site_favicon))
         .route("/local", get(local_redirect))
         .route("/home", get(home))
         .route("/login", get(login_form).post(login))
@@ -87,6 +88,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/posts/{id}/delete", post(admin_delete_post))
         .route("/admin/health", get(admin_health))
         .route("/admin/media", get(admin_media))
+        .route("/admin/favicon", post(admin_favicon_upload))
+        .route("/admin/favicon/remove", post(admin_favicon_remove))
         .route(
             "/admin/backups",
             get(admin_backups).post(admin_create_backup),
@@ -125,6 +128,10 @@ async fn client_script() -> Response {
         render::client_script(),
     )
         .into_response()
+}
+
+async fn site_favicon(State(state): State<Arc<AppState>>) -> Response {
+    favicon::response(&state.paths).await
 }
 
 #[derive(Deserialize)]
@@ -170,6 +177,10 @@ struct ParsedProfileUpdate {
     delete_banner: bool,
     profile_picture_media_id: Option<i64>,
     banner_media_id: Option<i64>,
+}
+
+struct ParsedFaviconUpload {
+    uploaded: bool,
 }
 
 struct ParsedPostCreate {
@@ -259,6 +270,7 @@ async fn layout_context(
         tor_onion_address: state.tor.onion_address(),
         follower_count: counts.map(|(followers, _following)| followers),
         following_count: counts.map(|(_followers, following)| following),
+        favicon_content_type: favicon::current(&state.paths).content_type(),
     })
 }
 
@@ -1237,12 +1249,12 @@ async fn parse_profile_update(
                     continue;
                 }
                 form.profile_picture_media_id = Some(
-                    media::save_upload(
+                    media::save_profile_picture_upload(
                         &state.pool,
                         &state.settings,
                         &state.paths,
                         &state.ffmpeg,
-                        Some(user_id),
+                        user_id,
                         field,
                     )
                     .await
@@ -1697,17 +1709,109 @@ async fn admin_dashboard(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let favicon_asset = favicon::current(&state.paths);
+    let remove_form = if favicon_asset.is_custom() {
+        small_form(
+            "/admin/favicon/remove",
+            &csrf,
+            "Remove favicon",
+            "Reset to the built-in favicon",
+        )
+    } else {
+        String::new()
+    };
+    let favicon_panel = format!(
+        r#"<section class="panel"><h2>Favicon</h2><p class="muted">{}</p><p><img class="favicon-preview" src="/favicon.ico" alt="Current favicon"></p><form method="post" action="/admin/favicon" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="favicon">Upload favicon</label><input id="favicon" name="favicon" type="file" accept=".ico,image/png,image/svg+xml"><p class="muted">Accepted: .ico, .png, .svg. Maximum size: 256 KiB.</p><button type="submit">Save favicon</button></form><div class="actions">{}</div></section>"#,
+        html_escape::encode_text(favicon_asset.state_label()),
+        html_escape::encode_double_quoted_attribute(&csrf),
+        remove_form
+    );
     let body = format!(
-        "{}{}",
+        "{}{}{}",
         render::page_header(
             "Admin",
             "Manage site health, users, media jobs, and backups."
         ),
-        r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/backups">Backups</a></section>"#
+        r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/backups">Backups</a></section>"#,
+        favicon_panel
     );
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Admin", &body).await?,
     ))
+}
+
+async fn admin_favicon_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> AppResult<Response> {
+    require_admin(&state, &headers).await?;
+    let parsed = parse_favicon_upload(&state, &headers, multipart).await?;
+    if !parsed.uploaded {
+        return Err(AppError::BadRequest(
+            "choose a .ico, .png, or .svg favicon to upload".to_owned(),
+        ));
+    }
+    Ok(Redirect::to("/admin").into_response())
+}
+
+async fn admin_favicon_remove(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    favicon::reset(&state.paths).await?;
+    Ok(Redirect::to("/admin").into_response())
+}
+
+async fn parse_favicon_upload(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut multipart: Multipart,
+) -> AppResult<ParsedFaviconUpload> {
+    let mut parsed = ParsedFaviconUpload { uploaded: false };
+    let mut csrf_validated = false;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?
+    {
+        let Some(name) = field.name().map(ToOwned::to_owned) else {
+            continue;
+        };
+        match name.as_str() {
+            "csrf" => {
+                let token = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+                validate_csrf(&state.pool, headers, &token).await?;
+                csrf_validated = true;
+            }
+            "favicon" if field.file_name().is_some() => {
+                if field.file_name().is_none_or(|name| name.trim().is_empty()) {
+                    continue;
+                }
+                if !csrf_validated {
+                    return Err(AppError::Forbidden);
+                }
+                favicon::save_upload(&state.paths, field)
+                    .await
+                    .map_err(|err| {
+                        tracing::warn!(error = %err, "favicon upload rejected");
+                        AppError::BadRequest(err.to_string())
+                    })?;
+                parsed.uploaded = true;
+            }
+            _ => {}
+        }
+    }
+    if !csrf_validated {
+        return Err(AppError::Forbidden);
+    }
+    Ok(parsed)
 }
 
 async fn admin_health(
@@ -2037,10 +2141,12 @@ fn user_actor(user_id: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     struct TestServer {
         base_url: String,
+        data_dir: PathBuf,
         _task: tokio::task::JoinHandle<()>,
         _temp: tempfile::TempDir,
     }
@@ -2922,6 +3028,219 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_favicon_route_and_html_link_are_present() {
+        let server = spawn_test_server().await;
+
+        let favicon = request(&server.base_url, "GET", "/favicon.ico", &[], Vec::new()).await;
+        assert_eq!(favicon.status, 200);
+        assert_header(&favicon, "content-type", "image/x-icon");
+        assert_header(&favicon, "cache-control", "public, max-age=3600");
+
+        let home = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert_eq!(home.status, 200);
+        assert!(
+            home.body
+                .contains(r#"<link rel="icon" href="/favicon.ico" type="image/x-icon">"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_can_upload_replace_and_remove_png_favicon() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let admin = request(
+            &server.base_url,
+            "GET",
+            "/admin",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(admin.status, 200);
+        assert!(admin.body.contains("Using built-in default favicon"));
+        let csrf = csrf_token(&admin.body);
+
+        let uploaded = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=favicon-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "favicon-boundary",
+                &[("csrf", csrf.as_str())],
+                "favicon",
+                "site.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(uploaded.status, 303);
+        assert_eq!(location(&uploaded), "/admin");
+        assert!(server.data_dir.join("assets/favicon.png").is_file());
+
+        let favicon = request(&server.base_url, "GET", "/favicon.ico", &[], Vec::new()).await;
+        assert_eq!(favicon.status, 200);
+        assert_header(&favicon, "content-type", "image/png");
+
+        let admin = request(
+            &server.base_url,
+            "GET",
+            "/admin",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert!(admin.body.contains("Custom favicon configured"));
+        assert!(admin.body.contains("Remove favicon"));
+        let csrf = csrf_token(&admin.body);
+
+        let replacement = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=favicon-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "favicon-boundary",
+                &[("csrf", csrf.as_str())],
+                "favicon",
+                "site.ico",
+                "image/x-icon",
+                &[0, 0, 1, 0, 1, 0],
+            ),
+        )
+        .await;
+        assert_eq!(replacement.status, 303);
+        assert!(server.data_dir.join("assets/favicon.ico").is_file());
+        assert!(!server.data_dir.join("assets/favicon.png").exists());
+
+        let admin = request(
+            &server.base_url,
+            "GET",
+            "/admin",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&admin.body);
+        let removed = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon/remove",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(removed.status, 303);
+        assert!(!server.data_dir.join("assets/favicon.ico").exists());
+    }
+
+    #[tokio::test]
+    async fn favicon_upload_rejects_unsupported_content_and_unsafe_names() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let admin = request(
+            &server.base_url,
+            "GET",
+            "/admin",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&admin.body);
+
+        let unsupported = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=favicon-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "favicon-boundary",
+                &[("csrf", csrf.as_str())],
+                "favicon",
+                "favicon.gif",
+                "image/gif",
+                b"GIF89a",
+            ),
+        )
+        .await;
+        assert_eq!(unsupported.status, 400);
+        assert!(unsupported.body.contains("unsupported favicon type"));
+        assert!(!server.data_dir.join("assets/favicon.gif").exists());
+
+        let invalid_png = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=favicon-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "favicon-boundary",
+                &[("csrf", csrf.as_str())],
+                "favicon",
+                "favicon.png",
+                "image/png",
+                b"<html></html>",
+            ),
+        )
+        .await;
+        assert_eq!(invalid_png.status, 400);
+        assert!(invalid_png.body.contains("invalid file signature"));
+        assert!(!server.data_dir.join("assets/favicon.png").exists());
+
+        let traversal = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=favicon-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "favicon-boundary",
+                &[("csrf", csrf.as_str())],
+                "favicon",
+                "../favicon.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(traversal.status, 400);
+        assert!(traversal.body.contains("unsafe upload filename"));
+        assert!(!server.data_dir.join("assets/favicon.png").exists());
+    }
+
+    #[tokio::test]
     async fn delete_requires_confirmation_and_preserves_cancel_target() {
         let server = spawn_test_server().await;
         let registered = request(
@@ -3056,14 +3375,28 @@ mod tests {
     }
 
     async fn spawn_test_server() -> TestServer {
+        spawn_test_server_inner(false).await
+    }
+
+    async fn spawn_test_server_with_admin() -> TestServer {
+        spawn_test_server_inner(true).await
+    }
+
+    async fn spawn_test_server_inner(create_admin: bool) -> TestServer {
         let temp = tempfile::tempdir().expect("temp dir");
         let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf());
         paths.ensure().expect("paths");
+        let data_dir = paths.data_dir.clone();
         let pool = crate::db::connect(&paths.database_path)
             .await
             .expect("connect");
         crate::db::migrate(&pool).await.expect("migrate");
         let settings = Settings::default();
+        if create_admin {
+            crate::admin::create_admin(&pool, &settings, "siteowner", "very secure password")
+                .await
+                .expect("admin");
+        }
         let ffmpeg = FfmpegStatus {
             available: false,
             version: String::new(),
@@ -3087,9 +3420,23 @@ mod tests {
         });
         TestServer {
             base_url: format!("127.0.0.1:{}", addr.port()),
+            data_dir,
             _task: task,
             _temp: temp,
         }
+    }
+
+    async fn admin_session_cookie(server: &TestServer) -> String {
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=siteowner&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(login.status, 303);
+        session_cookie(&login)
     }
 
     async fn request(
@@ -3161,6 +3508,17 @@ mod tests {
             .find(|(name, _)| name == "location")
             .map(|(_, value)| value.as_str())
             .expect("location")
+    }
+
+    fn assert_header(response: &TestResponse, name: &str, expected: &str) {
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(header_name, _)| header_name == name)
+                .map(|(_, value)| value.as_str()),
+            Some(expected)
+        );
     }
 
     fn csrf_token(body: &str) -> String {
