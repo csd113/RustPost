@@ -20,7 +20,7 @@ use crate::db::SqlitePool;
 use crate::errors::{AppError, AppResult};
 use crate::ffmpeg::FfmpegStatus;
 use crate::runtime::RuntimePaths;
-use crate::{admin, backup, csrf, favicon, media, rate_limit, render, social};
+use crate::{account, admin, backup, csrf, favicon, media, rate_limit, render, social};
 
 const CSRF_TOKEN_HISTORY_LIMIT: usize = 32;
 
@@ -76,7 +76,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/users/{id}/block", post(block))
         .route("/users/{id}/unblock", post(unblock))
         .route("/users/{id}/mute", post(mute))
+        .route("/users/{id}/unmute", post(unmute))
         .route("/settings", get(settings_form).post(settings_update))
+        .route("/settings/muted-words", post(add_muted_word))
+        .route("/settings/muted-words/{id}/remove", post(remove_muted_word))
+        .route("/settings/password", post(change_password))
+        .route("/settings/delete", get(delete_account_warning))
+        .route(
+            "/settings/delete/confirm",
+            get(delete_account_final_warning).post(delete_account_final),
+        )
+        .route("/account-deleted", get(account_deleted))
         .route("/following", get(following))
         .route("/bookmarks", get(bookmarks))
         .route("/notifications", get(notifications))
@@ -173,10 +183,36 @@ struct SearchQuery {
     q: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SettingsQuery {
+    saved: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MutedWordForm {
+    csrf: String,
+    term: String,
+}
+
+#[derive(Deserialize)]
+struct PasswordChangeForm {
+    csrf: String,
+    current_password: String,
+    new_password: String,
+    confirm_new_password: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteAccountPasswordForm {
+    csrf: String,
+    password: String,
+}
+
 struct ParsedProfileUpdate {
     csrf_token: String,
     display_name: String,
     bio: String,
+    location: String,
     website: String,
     theme: Theme,
     delete_profile_picture: bool,
@@ -835,7 +871,7 @@ async fn profile(
         .call(move |conn| {
             conn.query_row(
                 r#"
-        SELECT u.id, u.username, u.display_name, u.bio, u.website,
+        SELECT u.id, u.username, u.display_name, u.bio, u.location, u.website,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path
         FROM users u
@@ -851,8 +887,9 @@ async fn profile(
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
@@ -860,8 +897,16 @@ async fn profile(
             .map_err(Into::into)
         })
         .await?;
-    let Some((profile_id, profile_username, display_name, bio, website, picture_path, banner_path)) =
-        profile
+    let Some((
+        profile_id,
+        profile_username,
+        display_name,
+        bio,
+        location,
+        website,
+        picture_path,
+        banner_path,
+    )) = profile
     else {
         return Err(AppError::NotFound);
     };
@@ -897,8 +942,16 @@ async fn profile(
             html_escape::encode_text(website.as_str())
         )
     };
+    let location_line = if location.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="profile-meta">{}</p>"#,
+            html_escape::encode_text(location.as_str())
+        )
+    };
     let body = format!(
-        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p><p>{}</p>{}</div></div></section>{}"#,
+        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p>{}<p>{}</p>{}</div></div></section>{}"#,
         banner,
         picture,
         html_escape::encode_text(display_name.as_str()),
@@ -908,6 +961,7 @@ async fn profile(
         followers,
         profile_id,
         following,
+        location_line,
         html_escape::encode_text(bio.as_str()),
         website_link,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
@@ -1020,7 +1074,146 @@ async fn unblock(
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::unblock(&state.pool, user.id, id).await?;
-    Ok(Redirect::to("/settings").into_response())
+    Ok(Redirect::to("/settings?saved=profile").into_response())
+}
+
+fn settings_query_notice(saved: Option<&str>) -> Option<(&'static str, &'static str)> {
+    match saved {
+        Some("profile") => Some(("success", "Profile settings saved.")),
+        Some("muted-word") => Some(("success", "Muted word saved.")),
+        Some("muted-word-removed") => Some(("success", "Muted word removed.")),
+        Some("password") => Some(("success", "Password changed.")),
+        _ => None,
+    }
+}
+
+fn settings_profile_media(
+    picture_path: Option<&str>,
+    banner_path: Option<&str>,
+    allow_profile_pictures: bool,
+    allow_profile_banners: bool,
+) -> String {
+    let banner = banner_path.map_or_else(
+        || {
+            r#"<div class="settings-banner-preview placeholder" aria-hidden="true"></div>"#
+                .to_owned()
+        },
+        |path| {
+            format!(
+                r#"<img class="settings-banner-preview" src="{}" alt="">"#,
+                html_escape::encode_double_quoted_attribute(path)
+            )
+        },
+    );
+    let picture = picture_path.map_or_else(
+        || {
+            r#"<div class="settings-picture-preview placeholder" aria-hidden="true"></div>"#
+                .to_owned()
+        },
+        |path| {
+            format!(
+                r#"<img class="settings-picture-preview" src="{}" alt="">"#,
+                html_escape::encode_double_quoted_attribute(path)
+            )
+        },
+    );
+    let banner_control = if allow_profile_banners {
+        let delete = banner_path.map_or_else(String::new, |_| {
+            r#"<label class="check-row"><input type="checkbox" name="delete_banner" value="true"> Remove banner</label>"#
+                .to_owned()
+        });
+        format!(
+            r#"<div class="media-control-row"><label class="file-control" for="banner">Change banner<input id="banner" name="banner" type="file" accept="image/*"></label>{delete}</div>"#
+        )
+    } else {
+        r#"<p class="muted">Profile banners are disabled.</p>"#.to_owned()
+    };
+    let picture_control = if allow_profile_pictures {
+        let delete = picture_path.map_or_else(String::new, |_| {
+            r#"<label class="check-row"><input type="checkbox" name="delete_profile_picture" value="true"> Remove profile picture</label>"#
+                .to_owned()
+        });
+        format!(
+            r#"<div class="media-control-row"><label class="file-control" for="profile_picture">Change profile picture<input id="profile_picture" name="profile_picture" type="file" accept="image/*"></label>{delete}</div>"#
+        )
+    } else {
+        r#"<p class="muted">Profile pictures are disabled.</p>"#.to_owned()
+    };
+    format!(
+        r#"<div class="settings-profile-media"><div class="settings-banner-wrap">{banner}</div><div class="settings-picture-row">{picture}<div class="settings-media-controls">{banner_control}{picture_control}</div></div></div>"#
+    )
+}
+
+fn settings_user_list(
+    users: &[(i64, String, String)],
+    action_suffix: &str,
+    csrf: &str,
+    label: &str,
+    empty_title: &str,
+    empty_message: &str,
+) -> String {
+    if users.is_empty() {
+        return compact_empty_state(empty_title, empty_message);
+    }
+    let rows = users
+        .iter()
+        .map(|(id, username, display_name)| {
+            format!(
+                r#"<li><span><strong>{}</strong> <span class="muted">@{}</span></span>{}</li>"#,
+                html_escape::encode_text(display_name),
+                html_escape::encode_text(username),
+                small_form(&format!("/users/{id}{action_suffix}"), csrf, label, label,)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<ul class="settings-item-list">{rows}</ul>"#)
+}
+
+fn settings_muted_word_list(words: &[social::MutedWord], csrf: &str) -> String {
+    if words.is_empty() {
+        return compact_empty_state(
+            "No muted words",
+            "Posts containing muted words will be hidden.",
+        );
+    }
+    let rows = words
+        .iter()
+        .map(|word| {
+            format!(
+                r#"<li><span>{}</span>{}</li>"#,
+                html_escape::encode_text(&word.term),
+                small_form(
+                    &format!("/settings/muted-words/{}/remove", word.id),
+                    csrf,
+                    "Remove",
+                    "Remove muted word",
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<ul class="settings-item-list">{rows}</ul>"#)
+}
+
+fn compact_empty_state(title: &str, message: &str) -> String {
+    format!(
+        r#"<div class="compact-empty"><strong>{}</strong><p>{}</p></div>"#,
+        html_escape::encode_text(title),
+        html_escape::encode_text(message)
+    )
+}
+
+fn validate_profile_location(location: &str) -> AppResult<()> {
+    if location.chars().count() > 100 {
+        return Err(AppError::BadRequest("location is too long".to_owned()));
+    }
+    if location.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "location contains unsupported control characters".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn mute(
@@ -1040,18 +1233,42 @@ async fn mute(
     Ok(Redirect::to(&account_action_return(&state.pool, &headers, id).await?).into_response())
 }
 
+async fn unmute(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    social::unmute(&state.pool, user.id, id).await?;
+    Ok(Redirect::to("/settings").into_response())
+}
+
 async fn settings_form(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<SettingsQuery>,
 ) -> AppResult<Html<String>> {
     let user = require_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let notice = settings_query_notice(query.saved.as_deref());
+    Ok(Html(settings_page(&state, &user, &csrf, notice).await?))
+}
+
+async fn settings_page(
+    state: &AppState,
+    user: &CurrentUser,
+    csrf: &str,
+    notice: Option<(&str, &str)>,
+) -> AppResult<String> {
+    let user_id = user.id;
     let profile = state
         .pool
         .call(move |conn| {
             conn.query_row(
                 r#"
-        SELECT u.display_name, u.bio, u.website, u.theme,
+        SELECT u.display_name, u.bio, u.location, u.website, u.theme,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path
         FROM users u
@@ -1059,90 +1276,71 @@ async fn settings_form(
         LEFT JOIN media banner ON banner.id = u.banner_media_id
         WHERE u.id = ?
         "#,
-                [user.id],
+                [user_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .map_err(Into::into)
         })
         .await?;
-    let (display_name, bio, website, theme, picture_path, banner_path) = profile;
-    let picture = picture_path.map_or_else(String::new, |path| {
-            format!(
-            r#"<img class="profile-picture" src="{}" alt=""><label class="check-row"><input type="checkbox" name="delete_profile_picture" value="true"> Delete profile picture</label>"#,
-                html_escape::encode_double_quoted_attribute(&path)
-            )
-        });
-    let banner = banner_path.map_or_else(String::new, |path| {
-            format!(
-                r#"<img class="profile-banner" src="{}" alt=""><label class="check-row"><input type="checkbox" name="delete_banner" value="true"> Delete banner</label>"#,
-                html_escape::encode_double_quoted_attribute(&path)
-            )
-        });
-    let banner_input = if state.settings.accounts.allow_profile_banners {
-        format!(
-            r#"{banner}<label for="banner">Banner</label><input id="banner" name="banner" type="file" accept="image/*">"#
-        )
-    } else {
-        r#"<p>Profile banners are disabled.</p>"#.to_owned()
-    };
-    let picture_input = if state.settings.accounts.allow_profile_pictures {
-        format!(
-            r#"{picture}<label for="profile_picture">Profile picture</label><input id="profile_picture" name="profile_picture" type="file" accept="image/*">"#
-        )
-    } else {
-        r#"<p>Profile pictures are disabled.</p>"#.to_owned()
-    };
+    let (display_name, bio, location, website, theme, picture_path, banner_path) = profile;
     let blocked = social::blocked_users(&state.pool, user.id).await?;
-    let blocked_rows = blocked
-        .into_iter()
-        .map(|(id, username, display_name)| {
-            format!(
-                r#"<li><span><strong>{}</strong> <span class="muted">@{}</span></span>{}</li>"#,
-                html_escape::encode_text(&display_name),
-                html_escape::encode_text(&username),
-                small_form(
-                    &format!("/users/{id}/unblock"),
-                    &csrf,
-                    "Unblock",
-                    "Unblock this account",
-                )
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let blocked_panel = if blocked_rows.is_empty() {
-        render::empty_state("No blocked users", "Blocked accounts will appear here.")
-    } else {
-        format!(r#"<ul class="item-list">{blocked_rows}</ul>"#)
-    };
+    let muted = social::muted_users(&state.pool, user.id).await?;
+    let muted_words = social::muted_words(&state.pool, user.id).await?;
     let dark_checked = if Theme::from(theme.as_str()) == Theme::Dark {
         " checked"
     } else {
         ""
     };
+    let notice_html =
+        notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
+    let profile_media = settings_profile_media(
+        picture_path.as_deref(),
+        banner_path.as_deref(),
+        state.settings.accounts.allow_profile_pictures,
+        state.settings.accounts.allow_profile_banners,
+    );
     let body = format!(
-        r#"<section class="panel"><h1>Account settings</h1><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="website">Website</label><input id="website" type="url" name="website" value="{}">{}{}<button type="submit">Save settings</button></form></section><section class="panel"><h2>Blocked users</h2>{}</section>"#,
+        r#"{notice_html}<section class="panel settings-profile-editor"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel compact-panel"><h2>Blocked users</h2>{}</section><section class="panel compact-panel"><h2>Muted users</h2>{}</section></div><section class="panel compact-panel"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel compact-panel"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password" minlength="{}" required><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password" minlength="{}" required><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel danger-panel"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
+        profile_media,
         dark_checked,
         html_escape::encode_double_quoted_attribute(display_name.as_str()),
         html_escape::encode_text(bio.as_str()),
+        html_escape::encode_double_quoted_attribute(location.as_str()),
         html_escape::encode_double_quoted_attribute(website.as_str()),
-        picture_input,
-        banner_input,
-        blocked_panel,
+        settings_user_list(
+            &blocked,
+            "/unblock",
+            csrf,
+            "Unblock",
+            "No blocked users",
+            "Blocked accounts will appear here."
+        ),
+        settings_user_list(
+            &muted,
+            "/unmute",
+            csrf,
+            "Unmute",
+            "No muted users",
+            "Muted accounts will appear here."
+        ),
+        html_escape::encode_double_quoted_attribute(&csrf),
+        settings_muted_word_list(&muted_words, csrf),
+        html_escape::encode_double_quoted_attribute(&csrf),
+        state.settings.accounts.min_password_length,
+        state.settings.accounts.min_password_length,
     );
-    Ok(Html(
-        page_layout(&state, Some(&user), Some(&csrf), "Settings", &body).await?,
-    ))
+    page_layout(state, Some(user), Some(csrf), "Settings", &body).await
 }
 
 async fn settings_update(
@@ -1154,16 +1352,18 @@ async fn settings_update(
     let form = parse_profile_update(&state, user.id, multipart).await?;
     validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
     crate::validation::validate_profile_text(&form.display_name, &form.bio, &state.settings)?;
+    validate_profile_location(&form.location)?;
     let display_name = form.display_name.trim().to_owned();
     let bio = form.bio.trim().to_owned();
+    let location = form.location.trim().to_owned();
     let website = form.website.trim().to_owned();
     let theme = form.theme.as_str().to_owned();
     state
         .pool
         .call(move |conn| {
             conn.execute(
-                "UPDATE users SET display_name = ?, bio = ?, website = ?, theme = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                params![display_name, bio, website, theme, user.id],
+                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                params![display_name, bio, location, website, theme, user.id],
             )?;
             Ok(())
         })
@@ -1192,7 +1392,209 @@ async fn settings_update(
         )
         .await?;
     }
-    Ok(Redirect::to("/settings").into_response())
+    Ok(Redirect::to("/settings?saved=profile").into_response())
+}
+
+async fn add_muted_word(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<MutedWordForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    match social::add_muted_word(&state.pool, user.id, &form.term).await {
+        Ok(()) => Ok(Redirect::to("/settings?saved=muted-word").into_response()),
+        Err(err) => {
+            settings_response(
+                &state,
+                &user,
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "error",
+                &err.to_string(),
+            )
+            .await
+        }
+    }
+}
+
+async fn remove_muted_word(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    social::remove_muted_word(&state.pool, user.id, id).await?;
+    Ok(Redirect::to("/settings?saved=muted-word-removed").into_response())
+}
+
+async fn change_password(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<PasswordChangeForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    match auth::change_password(
+        &state.pool,
+        &state.settings,
+        user.id,
+        &form.current_password,
+        &form.new_password,
+        &form.confirm_new_password,
+    )
+    .await
+    {
+        Ok(()) => Ok(Redirect::to("/settings?saved=password").into_response()),
+        Err(err) => {
+            settings_response(
+                &state,
+                &user,
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "error",
+                &err.to_string(),
+            )
+            .await
+        }
+    }
+}
+
+async fn settings_response(
+    state: &AppState,
+    user: &CurrentUser,
+    headers: &HeaderMap,
+    status: StatusCode,
+    kind: &'static str,
+    message: &str,
+) -> AppResult<Response> {
+    let csrf = form_csrf(state, headers).await.unwrap_or_default();
+    Ok((
+        status,
+        Html(settings_page(state, user, &csrf, Some((kind, message))).await?),
+    )
+        .into_response())
+}
+
+async fn delete_account_warning(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> AppResult<Html<String>> {
+    let user = require_active_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let body = render_delete_account_warning();
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Delete account", &body).await?,
+    ))
+}
+
+async fn delete_account_final_warning(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> AppResult<Html<String>> {
+    let user = require_active_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let body = render_delete_account_final_warning(&csrf, None);
+    Ok(Html(
+        page_layout(
+            &state,
+            Some(&user),
+            Some(&csrf),
+            "Confirm delete account",
+            &body,
+        )
+        .await?,
+    ))
+}
+
+async fn delete_account_final(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteAccountPasswordForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    match account::delete_account(&state.pool, &state.paths, user.id, &form.password).await {
+        Ok(_summary) => {
+            let mut response = Redirect::to("/account-deleted").into_response();
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&auth::clear_session_cookie(
+                    state.settings.server.cookie_secure,
+                ))
+                .map_err(|err| AppError::BadRequest(err.to_string()))?,
+            );
+            Ok(response)
+        }
+        Err(account::DeleteAccountError::WrongPassword) => {
+            delete_account_final_response(
+                &state,
+                &user,
+                &headers,
+                StatusCode::UNAUTHORIZED,
+                "Password is incorrect.",
+            )
+            .await
+        }
+        Err(err) => {
+            tracing::warn!(user_id = user.id, error = %err, "account deletion failed");
+            delete_account_final_response(
+                &state,
+                &user,
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "Account deletion could not be completed. Review uploaded media paths and try again.",
+            )
+            .await
+        }
+    }
+}
+
+async fn delete_account_final_response(
+    state: &AppState,
+    user: &CurrentUser,
+    headers: &HeaderMap,
+    status: StatusCode,
+    message: &str,
+) -> AppResult<Response> {
+    let csrf = form_csrf(state, headers).await.unwrap_or_default();
+    let body = render_delete_account_final_warning(&csrf, Some(message));
+    Ok((
+        status,
+        Html(
+            page_layout(
+                state,
+                Some(user),
+                Some(&csrf),
+                "Confirm delete account",
+                &body,
+            )
+            .await?,
+        ),
+    )
+        .into_response())
+}
+
+async fn account_deleted(State(state): State<Arc<AppState>>) -> AppResult<Html<String>> {
+    let body = r#"<section class="panel"><h1>Account deleted</h1><p>Your account and its owned content have been removed.</p><p><a class="button-link" href="/login">Log in</a></p></section>"#;
+    Ok(Html(
+        page_layout(&state, None, None, "Account deleted", body).await?,
+    ))
+}
+
+fn render_delete_account_warning() -> String {
+    r#"<section class="panel danger-panel delete-account-panel"><h1>Delete account</h1><p>This is permanent. RustPost will remove your profile, posts, reposts, likes, follows, blocks, mutes, bookmarks, sessions, and uploaded media owned by your account.</p><div class="actions"><form method="get" action="/settings/delete/confirm"><button class="danger" type="submit">Confirm delete account</button></form><a class="button-link" href="/settings">Cancel</a></div></section>"#
+        .to_owned()
+}
+
+fn render_delete_account_final_warning(csrf: &str, error: Option<&str>) -> String {
+    let notice = error.map_or_else(String::new, |message| render::notice("error", message));
+    format!(
+        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf)
+    )
 }
 
 // Multipart parsing is kept in one place so uploaded profile media and text
@@ -1210,6 +1612,7 @@ async fn parse_profile_update(
         csrf_token: String::new(),
         display_name: String::new(),
         bio: String::new(),
+        location: String::new(),
         website: String::new(),
         theme: Theme::Light,
         delete_profile_picture: false,
@@ -1240,6 +1643,12 @@ async fn parse_profile_update(
             }
             "bio" => {
                 form.bio = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
+            "location" => {
+                form.location = field
                     .text()
                     .await
                     .map_err(|err| AppError::BadRequest(err.to_string()))?;
