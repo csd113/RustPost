@@ -835,8 +835,7 @@ fn post_card_with_options(
     };
     let timestamp = if options.show_timestamp {
         format!(
-            r#"<a class="post-time" href="/posts/{}">{}</a>"#,
-            post.id,
+            r#"<span class="post-time">{}</span>"#,
             html_escape::encode_text(&post.created_at)
         )
     } else {
@@ -1148,7 +1147,8 @@ mod tests {
         let post = test_post();
         let body = thread_post_card(&post, None, None);
 
-        assert!(body.contains(r#"class="post-time" href="/posts/42">2026-05-18 10:30</a>"#));
+        assert!(body.contains(r#"<span class="post-time">2026-05-18 10:30</span>"#));
+        assert!(!body.contains(r#"class="post-time" href="/posts/42""#));
     }
 
     #[test]
@@ -1168,6 +1168,8 @@ mod tests {
             .expect("root card");
         assert!(!root_card.contains(r#"data-card-href="/posts/42""#));
         assert!(!root_card.contains(r#"tabindex="0""#));
+        assert!(root_card.contains(r#"<span class="post-time">2026-05-18 10:30</span>"#));
+        assert!(!root_card.contains(r#"class="post-time" href="/posts/42""#));
         assert!(body.contains(r#"data-card-href="/posts/43""#));
     }
 

@@ -2447,6 +2447,7 @@ mod tests {
                 .contains("Read the conversation and add a reply.")
         );
         assert!(thread.body.contains(r#"class="post-time""#));
+        assert!(!thread.body.contains(r#"class="post-time" href="/posts/1""#));
         assert!(!thread.body.contains(r#"data-card-href="/posts/1""#));
         assert!(!thread.body.contains(r#"href="/posts/1">Open post</a>"#));
     }
