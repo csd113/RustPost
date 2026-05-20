@@ -13,7 +13,6 @@ pub enum DeleteAccountError {
     WrongPassword,
     UnsafeMediaPath(String),
     Database(String),
-    Io(String),
 }
 
 impl std::fmt::Display for DeleteAccountError {
@@ -23,12 +22,24 @@ impl std::fmt::Display for DeleteAccountError {
             Self::UnsafeMediaPath(path) => {
                 write!(formatter, "refusing to delete unsafe media path: {path}")
             }
-            Self::Database(message) | Self::Io(message) => formatter.write_str(message),
+            Self::Database(message) => formatter.write_str(message),
         }
     }
 }
 
 impl std::error::Error for DeleteAccountError {}
+
+impl From<rusqlite::Error> for DeleteAccountError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.to_string())
+    }
+}
+
+impl From<anyhow::Error> for DeleteAccountError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Database(error.to_string())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountDeletionSummary {
@@ -48,23 +59,9 @@ pub async fn delete_account(
         return Err(DeleteAccountError::WrongPassword);
     }
 
-    let media = account_media(pool, user_id)
-        .await
-        .map_err(|err| DeleteAccountError::Database(err.to_string()))?;
-    let mut media_files = BTreeSet::new();
-    for item in &media {
-        media_files.extend(safe_media_path(paths, &item.stored_path)?);
-        if let Some(thumbnail_path) = &item.thumbnail_path {
-            media_files.extend(safe_media_path(paths, thumbnail_path)?);
-        }
-    }
-    let media_ids = media.into_iter().map(|item| item.id).collect::<Vec<_>>();
+    let media_files = scrub_account_rows(pool, user_id, paths).await?;
 
-    scrub_account_rows(pool, user_id, media_ids)
-        .await
-        .map_err(|err| DeleteAccountError::Database(err.to_string()))?;
-
-    let deleted_media_files = remove_media_files(&media_files)?;
+    let deleted_media_files = remove_media_files(&media_files, user_id);
     Ok(AccountDeletionSummary {
         deleted_media_files,
     })
@@ -77,10 +74,12 @@ struct AccountMedia {
     thumbnail_path: Option<String>,
 }
 
-async fn account_media(pool: &SqlitePool, user_id: i64) -> anyhow::Result<Vec<AccountMedia>> {
-    pool.call(move |conn| {
-        let mut stmt = conn.prepare(
-            r#"
+fn account_media_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: i64,
+) -> anyhow::Result<Vec<AccountMedia>> {
+    let mut stmt = tx.prepare(
+        r#"
             SELECT DISTINCT m.id, m.stored_path, m.thumbnail_path
             FROM media m
             WHERE m.owner_user_id = ?
@@ -91,72 +90,92 @@ async fn account_media(pool: &SqlitePool, user_id: i64) -> anyhow::Result<Vec<Ac
                     WHERE p.user_id = ?
                )
             "#,
-        )?;
-        let rows = stmt
-            .query_map(params![user_id, user_id], |row| {
-                Ok(AccountMedia {
-                    id: row.get(0)?,
-                    stored_path: row.get(1)?,
-                    thumbnail_path: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })
-    .await
+    )?;
+    let rows = stmt
+        .query_map(params![user_id, user_id], |row| {
+            Ok(AccountMedia {
+                id: row.get(0)?,
+                stored_path: row.get(1)?,
+                thumbnail_path: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 async fn scrub_account_rows(
     pool: &SqlitePool,
     user_id: i64,
-    media_ids: Vec<i64>,
-) -> anyhow::Result<()> {
+    paths: &RuntimePaths,
+) -> Result<BTreeSet<PathBuf>, DeleteAccountError> {
+    let paths = paths.clone();
     pool.call(move |conn| {
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM sessions WHERE user_id = ?", [user_id])?;
-        tx.execute("DELETE FROM muted_words WHERE user_id = ?", [user_id])?;
-        tx.execute(
-            "DELETE FROM blocks WHERE blocker_id = ? OR blocked_id = ?",
-            params![user_id, user_id],
-        )?;
-        tx.execute(
-            "DELETE FROM mutes WHERE muter_id = ? OR muted_id = ?",
-            params![user_id, user_id],
-        )?;
-        tx.execute(
-            "DELETE FROM follows WHERE follower_id = ? OR followed_id = ?",
-            params![user_id, user_id],
-        )?;
-        tx.execute(
-            "DELETE FROM notifications WHERE user_id = ? OR actor_user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
-            params![user_id, user_id, user_id],
-        )?;
-        tx.execute(
-            "DELETE FROM reports WHERE reporter_user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
-            params![user_id, user_id],
-        )?;
-        tx.execute(
-            "DELETE FROM likes WHERE user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
-            params![user_id, user_id],
-        )?;
-        tx.execute(
-            "DELETE FROM bookmarks WHERE user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
-            params![user_id, user_id],
-        )?;
-        tx.execute(
-            "DELETE FROM reposts WHERE user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
-            params![user_id, user_id],
-        )?;
-        tx.execute("DELETE FROM posts WHERE user_id = ?", [user_id])?;
-        for media_id in media_ids {
-            tx.execute("DELETE FROM media_jobs WHERE media_id = ?", [media_id])?;
-            tx.execute("DELETE FROM media WHERE id = ?", [media_id])?;
-        }
-        tx.execute("DELETE FROM users WHERE id = ?", [user_id])?;
-        tx.commit()?;
-        Ok(())
+        let result: Result<BTreeSet<PathBuf>, DeleteAccountError> = (|| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE users SET is_deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
+                [user_id],
+            )?;
+            let media = account_media_in_tx(&tx, user_id)?;
+            let mut media_files = BTreeSet::new();
+            for item in &media {
+                media_files.extend(safe_media_path(&paths, &item.stored_path)?);
+                if let Some(thumbnail_path) = &item.thumbnail_path {
+                    media_files.extend(safe_media_path(&paths, thumbnail_path)?);
+                }
+            }
+            let media_ids = media.into_iter().map(|item| item.id).collect::<Vec<_>>();
+            tx.execute("DELETE FROM sessions WHERE user_id = ?", [user_id])?;
+            tx.execute("DELETE FROM muted_words WHERE user_id = ?", [user_id])?;
+            tx.execute(
+                "DELETE FROM rate_limit_events WHERE actor = ?",
+                [format!("user:{user_id}")],
+            )?;
+            tx.execute(
+                "DELETE FROM blocks WHERE blocker_id = ? OR blocked_id = ?",
+                params![user_id, user_id],
+            )?;
+            tx.execute(
+                "DELETE FROM mutes WHERE muter_id = ? OR muted_id = ?",
+                params![user_id, user_id],
+            )?;
+            tx.execute(
+                "DELETE FROM follows WHERE follower_id = ? OR followed_id = ?",
+                params![user_id, user_id],
+            )?;
+            tx.execute(
+                "DELETE FROM notifications WHERE user_id = ? OR actor_user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
+                params![user_id, user_id, user_id],
+            )?;
+            tx.execute(
+                "DELETE FROM reports WHERE reporter_user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
+                params![user_id, user_id],
+            )?;
+            tx.execute(
+                "DELETE FROM likes WHERE user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
+                params![user_id, user_id],
+            )?;
+            tx.execute(
+                "DELETE FROM bookmarks WHERE user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
+                params![user_id, user_id],
+            )?;
+            tx.execute(
+                "DELETE FROM reposts WHERE user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
+                params![user_id, user_id],
+            )?;
+            tx.execute("DELETE FROM posts WHERE user_id = ?", [user_id])?;
+            for media_id in media_ids {
+                tx.execute("DELETE FROM media_jobs WHERE media_id = ?", [media_id])?;
+                tx.execute("DELETE FROM media WHERE id = ?", [media_id])?;
+            }
+            tx.execute("DELETE FROM users WHERE id = ?", [user_id])?;
+            tx.commit()?;
+            Ok(media_files)
+        })();
+        Ok(result)
     })
     .await
+    .map_err(|err| DeleteAccountError::Database(err.to_string()))?
 }
 
 fn safe_media_path(
@@ -179,12 +198,12 @@ fn safe_media_path(
     if path.exists() {
         let canonical_path = path
             .canonicalize()
-            .map_err(|err| DeleteAccountError::Io(err.to_string()))?;
+            .map_err(|err| DeleteAccountError::Database(err.to_string()))?;
         let canonical_roots = allowed_media_roots(paths)
             .iter()
             .map(|root| root.canonicalize())
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| DeleteAccountError::Io(err.to_string()))?;
+            .map_err(|err| DeleteAccountError::Database(err.to_string()))?;
         if !canonical_roots
             .iter()
             .any(|root| canonical_path.starts_with(root))
@@ -210,16 +229,23 @@ fn has_parent_component(path: &Path) -> bool {
         .any(|component| matches!(component, Component::ParentDir))
 }
 
-fn remove_media_files(paths: &BTreeSet<PathBuf>) -> Result<usize, DeleteAccountError> {
+fn remove_media_files(paths: &BTreeSet<PathBuf>, user_id: i64) -> usize {
     let mut deleted = 0;
     for path in paths {
         match fs::remove_file(path) {
             Ok(()) => deleted += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(DeleteAccountError::Io(error.to_string())),
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    path = %path.display(),
+                    error = %error,
+                    "failed to remove media file after account database deletion"
+                );
+            }
         }
     }
-    Ok(deleted)
+    deleted
 }
 
 #[cfg(test)]
@@ -283,6 +309,10 @@ mod tests {
         social::add_muted_word(&pool, alice, "secret")
             .await
             .expect("muted word");
+        let alice_actor = format!("user:{alice}");
+        crate::rate_limit::record(&pool, crate::rate_limit::Scope::Post, &alice_actor)
+            .await
+            .expect("rate limit");
         let media_path = paths.uploads_images.join("alice.webp");
         fs::write(&media_path, b"image").expect("media file");
         let thumb_path = paths.uploads_thumbs.join("alice-thumb.webp");
@@ -315,7 +345,7 @@ mod tests {
         assert_eq!(summary.deleted_media_files, 2);
         assert!(!media_path.exists());
         assert!(!thumb_path.exists());
-        let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = pool
+        let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = pool
             .call(move |conn| {
                 Ok((
                     conn.query_row("SELECT COUNT(*) FROM users WHERE id = ?", [alice], |row| {
@@ -337,11 +367,84 @@ mod tests {
                     conn.query_row("SELECT COUNT(*) FROM follows", [], |row| row.get(0))?,
                     conn.query_row("SELECT COUNT(*) FROM blocks", [], |row| row.get(0))?,
                     conn.query_row("SELECT COUNT(*) FROM mutes", [], |row| row.get(0))?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM rate_limit_events WHERE actor = ?",
+                        [format!("user:{alice}")],
+                        |row| row.get(0),
+                    )?,
                 ))
             })
             .await
             .expect("counts");
-        assert_eq!(counts, (0, 0, 0, 0, 0, 0, 0, 0, 0));
+        assert_eq!(counts, (0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn delete_account_scrubs_media_inserted_after_password_check() {
+        let (_temp, paths, pool, _settings, alice, _bob) = fixture().await;
+        assert!(
+            auth::verify_user_password(&pool, alice, "very secure password")
+                .await
+                .expect("password")
+        );
+        let media_path = paths.uploads_images.join("late.webp");
+        fs::write(&media_path, b"late").expect("late media file");
+        let media_path_string = media_path.to_string_lossy().to_string();
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'late.webp', ?, '/uploads/images/late.webp', 'image/webp', 'image', 4)",
+                params![alice, media_path_string],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("late media row");
+
+        let summary = delete_account(&pool, &paths, alice, "very secure password")
+            .await
+            .expect("delete account");
+
+        assert_eq!(summary.deleted_media_files, 1);
+        assert!(!media_path.exists());
+        let rows: i64 = pool
+            .call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?))
+            .await
+            .expect("media count");
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_account_treats_file_cleanup_failure_as_success_after_db_scrub() {
+        let (_temp, paths, pool, _settings, alice, _bob) = fixture().await;
+        let media_path = paths.uploads_images.join("directory-media");
+        fs::create_dir(&media_path).expect("media directory");
+        let media_path_string = media_path.to_string_lossy().to_string();
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'directory-media', ?, '/uploads/images/directory-media', 'image/webp', 'image', 1)",
+                params![alice, media_path_string],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("media row");
+
+        let summary = delete_account(&pool, &paths, alice, "very secure password")
+            .await
+            .expect("delete account");
+
+        assert_eq!(summary.deleted_media_files, 0);
+        assert!(media_path.exists());
+        let user_exists: bool = pool
+            .call(move |conn| {
+                Ok(conn
+                    .query_row("SELECT 1 FROM users WHERE id = ?", [alice], |_| Ok(()))
+                    .optional()?
+                    .is_some())
+            })
+            .await
+            .expect("user lookup");
+        assert!(!user_exists);
     }
 
     #[tokio::test]

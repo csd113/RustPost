@@ -205,6 +205,7 @@ struct PasswordChangeForm {
 #[derive(Deserialize)]
 struct DeleteAccountPasswordForm {
     csrf: String,
+    delete_intent: Option<String>,
     password: String,
 }
 
@@ -1496,7 +1497,8 @@ async fn delete_account_final_warning(
 ) -> AppResult<Html<String>> {
     let user = require_active_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let body = render_delete_account_final_warning(&csrf, None);
+    let delete_intent = create_delete_account_intent(&state, &headers, user.id).await?;
+    let body = render_delete_account_final_warning(&csrf, &delete_intent, None);
     Ok(Html(
         page_layout(
             &state,
@@ -1516,6 +1518,23 @@ async fn delete_account_final(
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    if !consume_delete_account_intent(
+        &state,
+        &headers,
+        user.id,
+        form.delete_intent.as_deref().unwrap_or_default(),
+    )
+    .await?
+    {
+        return delete_account_final_response(
+            &state,
+            &user,
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "Delete confirmation expired. Start the delete account flow again.",
+        )
+        .await;
+    }
     match account::delete_account(&state.pool, &state.paths, user.id, &form.password).await {
         Ok(_summary) => {
             let mut response = Redirect::to("/account-deleted").into_response();
@@ -1560,7 +1579,8 @@ async fn delete_account_final_response(
     message: &str,
 ) -> AppResult<Response> {
     let csrf = form_csrf(state, headers).await.unwrap_or_default();
-    let body = render_delete_account_final_warning(&csrf, Some(message));
+    let delete_intent = create_delete_account_intent(state, headers, user.id).await?;
+    let body = render_delete_account_final_warning(&csrf, &delete_intent, Some(message));
     Ok((
         status,
         Html(
@@ -1577,6 +1597,75 @@ async fn delete_account_final_response(
         .into_response())
 }
 
+async fn create_delete_account_intent(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: i64,
+) -> AppResult<String> {
+    let token = auth::session_cookie(headers).ok_or(AppError::Forbidden)?;
+    let token_hash = auth::hash_token(&token);
+    let delete_intent = auth::secure_token();
+    let delete_intent_hash = auth::hash_token(&delete_intent);
+    let updated = state
+        .pool
+        .call(move |conn| {
+            Ok(conn.execute(
+                r#"
+                UPDATE sessions
+                SET delete_account_token_hash = ?,
+                    delete_account_token_expires_at = datetime('now', '+10 minutes')
+                WHERE token_hash = ?
+                  AND user_id = ?
+                  AND revoked_at IS NULL
+                  AND expires_at > CURRENT_TIMESTAMP
+                "#,
+                params![delete_intent_hash, token_hash, user_id],
+            )?)
+        })
+        .await
+        .map_err(AppError::Anyhow)?;
+    if updated != 1 {
+        return Err(AppError::Forbidden);
+    }
+    Ok(delete_intent)
+}
+
+async fn consume_delete_account_intent(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: i64,
+    delete_intent: &str,
+) -> AppResult<bool> {
+    let Some(token) = auth::session_cookie(headers) else {
+        return Ok(false);
+    };
+    if delete_intent.trim().is_empty() {
+        return Ok(false);
+    }
+    let token_hash = auth::hash_token(&token);
+    let delete_intent_hash = auth::hash_token(delete_intent);
+    state
+        .pool
+        .call(move |conn| {
+            Ok(conn.execute(
+                r#"
+                UPDATE sessions
+                SET delete_account_token_hash = NULL,
+                    delete_account_token_expires_at = NULL
+                WHERE token_hash = ?
+                  AND user_id = ?
+                  AND revoked_at IS NULL
+                  AND expires_at > CURRENT_TIMESTAMP
+                  AND delete_account_token_hash = ?
+                  AND delete_account_token_expires_at > CURRENT_TIMESTAMP
+                "#,
+                params![token_hash, user_id, delete_intent_hash],
+            )? == 1)
+        })
+        .await
+        .map_err(AppError::Anyhow)
+}
+
 async fn account_deleted(State(state): State<Arc<AppState>>) -> AppResult<Html<String>> {
     let body = r#"<section class="panel"><h1>Account deleted</h1><p>Your account and its owned content have been removed.</p><p><a class="button-link" href="/login">Log in</a></p></section>"#;
     Ok(Html(
@@ -1589,11 +1678,16 @@ fn render_delete_account_warning() -> String {
         .to_owned()
 }
 
-fn render_delete_account_final_warning(csrf: &str, error: Option<&str>) -> String {
+fn render_delete_account_final_warning(
+    csrf: &str,
+    delete_intent: &str,
+    error: Option<&str>,
+) -> String {
     let notice = error.map_or_else(String::new, |message| render::notice("error", message));
     format!(
-        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
-        html_escape::encode_double_quoted_attribute(csrf)
+        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="delete_intent" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_double_quoted_attribute(delete_intent)
     )
 }
 
@@ -3854,6 +3948,217 @@ mod tests {
         assert_eq!(location(&deleted), "/home#post-1");
     }
 
+    #[tokio::test]
+    async fn delete_account_requires_server_side_intent() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+        let cookie = session_cookie(&registered);
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&home.body);
+
+        let deleted = request(
+            &server.base_url,
+            "POST",
+            "/settings/delete/confirm",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&password=very%20secure%20password").into_bytes(),
+        )
+        .await;
+
+        assert_eq!(deleted.status, 400);
+        assert!(deleted.body.contains("Delete confirmation expired"));
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(login.status, 303);
+    }
+
+    #[tokio::test]
+    async fn delete_account_intent_and_password_control_final_delete() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+        let cookie = session_cookie(&registered);
+        let confirm = request(
+            &server.base_url,
+            "GET",
+            "/settings/delete/confirm",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(confirm.status, 200);
+        let csrf = csrf_token(&confirm.body);
+        let delete_intent = hidden_value(&confirm.body, "delete_intent");
+
+        let wrong_password = request(
+            &server.base_url,
+            "POST",
+            "/settings/delete/confirm",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&delete_intent={delete_intent}&password=wrong").into_bytes(),
+        )
+        .await;
+        assert_eq!(wrong_password.status, 401);
+        assert!(wrong_password.body.contains("Password is incorrect."));
+
+        let reused_intent = request(
+            &server.base_url,
+            "POST",
+            "/settings/delete/confirm",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&delete_intent={delete_intent}&password=very%20secure%20password")
+                .into_bytes(),
+        )
+        .await;
+        assert_eq!(reused_intent.status, 400);
+        assert!(reused_intent.body.contains("Delete confirmation expired"));
+
+        let confirm = request(
+            &server.base_url,
+            "GET",
+            "/settings/delete/confirm",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(confirm.status, 200);
+        let csrf = csrf_token(&confirm.body);
+        let delete_intent = hidden_value(&confirm.body, "delete_intent");
+        let deleted = request(
+            &server.base_url,
+            "POST",
+            "/settings/delete/confirm",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&delete_intent={delete_intent}&password=very%20secure%20password")
+                .into_bytes(),
+        )
+        .await;
+
+        assert_eq!(deleted.status, 303);
+        assert_eq!(location(&deleted), "/account-deleted");
+        assert!(
+            deleted
+                .headers
+                .iter()
+                .any(|(name, value)| name == "set-cookie" && value.contains("Max-Age=0"))
+        );
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(login.status, 401);
+    }
+
+    #[tokio::test]
+    async fn delete_account_route_succeeds_after_file_cleanup_failure() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+        let cookie = session_cookie(&registered);
+        let paths = RuntimePaths::from_data_dir(server.data_dir.clone());
+        let media_path = paths.uploads_images.join("directory-media");
+        std::fs::create_dir(&media_path).expect("media directory");
+        let media_path_string = media_path.to_string_lossy().to_string();
+        let conn = rusqlite::Connection::open(&paths.database_path).expect("open db");
+        let alice: i64 = conn
+            .query_row(
+                "SELECT id FROM users WHERE normalized_username = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("alice id");
+        conn.execute(
+            "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'directory-media', ?, '/uploads/images/directory-media', 'image/webp', 'image', 1)",
+            params![alice, media_path_string],
+        )
+        .expect("media row");
+        drop(conn);
+        let confirm = request(
+            &server.base_url,
+            "GET",
+            "/settings/delete/confirm",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(confirm.status, 200);
+        let csrf = csrf_token(&confirm.body);
+        let delete_intent = hidden_value(&confirm.body, "delete_intent");
+
+        let deleted = request(
+            &server.base_url,
+            "POST",
+            "/settings/delete/confirm",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&delete_intent={delete_intent}&password=very%20secure%20password")
+                .into_bytes(),
+        )
+        .await;
+
+        assert_eq!(deleted.status, 303);
+        assert_eq!(location(&deleted), "/account-deleted");
+        assert!(media_path.exists());
+        let conn = rusqlite::Connection::open(&paths.database_path).expect("open db");
+        let users: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .expect("users count");
+        assert_eq!(users, 0);
+    }
+
     fn multipart_body(
         boundary: &str,
         fields: &[(&str, &str)],
@@ -4070,6 +4375,13 @@ mod tests {
         let marker = r#"name="csrf" value=""#;
         let start = body.find(marker).expect("csrf marker") + marker.len();
         let end = body[start..].find('"').expect("csrf end") + start;
+        body[start..end].to_owned()
+    }
+
+    fn hidden_value(body: &str, name: &str) -> String {
+        let marker = format!(r#"name="{name}" value=""#);
+        let start = body.find(&marker).expect("hidden marker") + marker.len();
+        let end = body[start..].find('"').expect("hidden end") + start;
         body[start..end].to_owned()
     }
 }

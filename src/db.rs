@@ -108,6 +108,10 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_6)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (6)", [])?;
         }
+        if applied.unwrap_or(0) < 7 {
+            tx.execute_batch(MIGRATION_7)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (7)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -321,6 +325,11 @@ const MIGRATION_6: &str = r#"
 ALTER TABLE users ADD COLUMN location TEXT NOT NULL DEFAULT '';
 "#;
 
+const MIGRATION_7: &str = r#"
+ALTER TABLE sessions ADD COLUMN delete_account_token_hash TEXT;
+ALTER TABLE sessions ADD COLUMN delete_account_token_expires_at TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,7 +371,7 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 6);
+        assert_eq!(versions, 7);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);
