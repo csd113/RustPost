@@ -2669,7 +2669,7 @@ fn render_deep_settings_confirmation(
         .join("");
     let hidden = render_deep_settings_hidden_fields(values);
     format!(
-        r#"{notice_html}<section class="panel deep-settings-confirm"><h1>These settings are about to be changed</h1><p class="muted">Review the changed values before writing settings.toml. Saved changes require a RustPost restart before this running server uses them.</p><ul class="settings-item-list">{rows}</ul><div class="actions"><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}">{hidden}<button class="primary" type="submit" name="intent" value="confirm">Confirm/Save</button></form><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}">{hidden}<button type="submit" name="intent" value="discard">Discard Changes</button></form></div></section>"#,
+        r#"{notice_html}<section class="panel deep-settings-confirm"><h1>These settings are about to be changed</h1><p class="muted">Review the changed values before writing settings.toml. Saved changes require a RustPost restart before this running server uses them.</p><ul class="settings-item-list">{rows}</ul><div class="actions"><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="confirm">{hidden}<button class="primary" type="submit">Confirm/Save</button></form><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="discard">{hidden}<button type="submit">Discard Changes</button></form></div></section>"#,
         html_escape::encode_double_quoted_attribute(csrf),
         html_escape::encode_double_quoted_attribute(csrf),
     )
@@ -4072,6 +4072,23 @@ mod tests {
         assert!(response.body.contains(r#"name="allow_reposts""#));
         assert!(response.body.contains("<select"));
         assert!(response.body.contains(r#"name="max_bio_len" type="text""#));
+    }
+
+    #[test]
+    fn deep_settings_confirmation_forms_include_explicit_intents() {
+        let values = crate::admin::DeepSettingsValues::from_settings(&Settings::default());
+        let changes = [crate::admin::DeepSettingsChange {
+            label: "Maximum bio length",
+            old_value: "240 characters".to_owned(),
+            new_value: "300 characters".to_owned(),
+        }];
+
+        let html = render_deep_settings_confirmation("csrf-token", &values, &changes, None);
+
+        assert!(html.contains(r#"<input type="hidden" name="intent" value="confirm">"#));
+        assert!(html.contains(r#"<input type="hidden" name="intent" value="discard">"#));
+        assert!(html.contains(r#"<button class="primary" type="submit">Confirm/Save</button>"#));
+        assert!(html.contains(r#"<button type="submit">Discard Changes</button>"#));
     }
 
     #[tokio::test]
