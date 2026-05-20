@@ -1,4 +1,6 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   adminPassword,
   adminUser,
@@ -13,6 +15,27 @@ import {
   register,
   submitFirstPostAction,
 } from './helpers';
+
+const SECOND_PNG_BASE64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
+
+function writeGeneratedFixture(name: string, data: Buffer | string): string {
+  const file = path.join(process.cwd(), 'output/playwright/generated-fixtures', name);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, data);
+  return file;
+}
+
+function generatedPng(name: string, base64 = SECOND_PNG_BASE64): string {
+  const bytes = Buffer.from(base64, 'base64');
+  return writeGeneratedFixture(name, Buffer.concat([bytes, Buffer.from(name)]));
+}
+
+async function expectReachableImage(page: Page, src: string) {
+  const response = await page.request.get(src);
+  expect(response.status(), `${src} should be reachable`).toBe(200);
+  expect(response.headers()['content-type'] ?? '', `${src} content type`).toMatch(/^image\//);
+}
 
 test.beforeEach(async ({ page }, testInfo) => {
   await installQaGuards(page, testInfo);
@@ -202,4 +225,149 @@ test('normal UI forms post to real routes and forbidden duplicates are intention
   ]).then(([response]) => response);
   expect(emptyPost.status()).toBe(400);
   await expect(page.getByRole('heading', { name: 'Check the form' })).toBeVisible();
+});
+
+test('profile-picture thumbnails are used for compact avatars with original images preserved for full profile UI', async ({ page }) => {
+  const user = `pfp_${Date.now()}`;
+  const password = 'very secure password';
+  const firstPicture = fixturePath('tiny.png');
+  const secondPicture = generatedPng('replacement-profile-picture.png');
+
+  await register(page, user, password);
+  await page.goto('/settings');
+  await page.getByLabel('Display name').fill('Profile Thumb QA');
+  await page.getByLabel('Profile picture', { exact: true }).setInputFiles(firstPicture);
+  await Promise.all([
+    page.waitForURL('/settings'),
+    page.getByRole('button', { name: 'Save settings' }).click(),
+  ]);
+
+  const settingsPicture = page.locator('img.profile-picture').first();
+  await expect(settingsPicture).toBeVisible();
+  const originalSrc = await settingsPicture.getAttribute('src');
+  expect(originalSrc).toMatch(/^\/uploads\/(?:images|originals)\//);
+  expect(originalSrc).not.toContain('/uploads/thumbs/');
+  await expectReachableImage(page, originalSrc!);
+
+  await page.goto(`/users/${user}`);
+  const fullProfileSrc = await page.locator('section.profile img.profile-picture').getAttribute('src');
+  expect(fullProfileSrc).toBe(originalSrc);
+
+  const postText = `Profile thumbnail check ${Date.now()}`;
+  await createPost(page, postText);
+  const article = page.locator('article[data-post-id]').filter({ hasText: postText }).first();
+  const compactAvatar = article.locator('img.post-avatar');
+  await expect(compactAvatar).toBeVisible();
+  const compactSrc = await compactAvatar.getAttribute('src');
+  expect(compactSrc).toMatch(/^\/uploads\/(?:thumbs|images|originals)\//);
+  await expectReachableImage(page, compactSrc!);
+  if (compactSrc!.includes('/uploads/thumbs/')) {
+    expect(compactSrc).toMatch(/^\/uploads\/thumbs\/\d+-profile\.webp$/);
+    const thumbnail = await page.request.get(compactSrc!);
+    expect(thumbnail.headers()['content-type'] ?? '').toMatch(/^image\/webp\b/);
+  } else {
+    expect(compactSrc).toBe(originalSrc);
+  }
+
+  await page.goto('/settings');
+  await page.getByLabel('Profile picture', { exact: true }).setInputFiles(secondPicture);
+  await Promise.all([
+    page.waitForURL('/settings'),
+    page.getByRole('button', { name: 'Save settings' }).click(),
+  ]);
+  const replacementOriginalSrc = await page.locator('img.profile-picture').first().getAttribute('src');
+  expect(replacementOriginalSrc).toMatch(/^\/uploads\/(?:images|originals)\//);
+  expect(replacementOriginalSrc).not.toBe(originalSrc);
+  expect(replacementOriginalSrc).not.toContain('/uploads/thumbs/');
+  await expectReachableImage(page, replacementOriginalSrc!);
+
+  await page.goto('/home');
+  const replacedCompactSrc = await article.locator('img.post-avatar').getAttribute('src');
+  expect(replacedCompactSrc).not.toBe(compactSrc);
+  expect(replacedCompactSrc).not.toBe(originalSrc);
+  await expectReachableImage(page, replacedCompactSrc!);
+  if (replacedCompactSrc!.includes('/uploads/thumbs/')) {
+    expect(replacedCompactSrc).toMatch(/^\/uploads\/thumbs\/\d+-profile\.webp$/);
+    const replacementThumbnail = await page.request.get(replacedCompactSrc!);
+    expect(replacementThumbnail.headers()['content-type'] ?? '').toMatch(/^image\/webp\b/);
+  } else {
+    expect(replacedCompactSrc).toBe(replacementOriginalSrc);
+  }
+
+  await page.goto('/settings');
+  await page.getByLabel('Delete profile picture').check();
+  await Promise.all([
+    page.waitForURL('/settings'),
+    page.getByRole('button', { name: 'Save settings' }).click(),
+  ]);
+  await expect(page.locator('img.profile-picture')).toHaveCount(0);
+
+  await page.goto('/home');
+  const placeholderArticle = page.locator('article[data-post-id]').filter({ hasText: postText }).first();
+  await expect(placeholderArticle.locator('span.post-avatar.placeholder')).toBeVisible();
+  await expect(placeholderArticle.locator('img.post-avatar')).toHaveCount(0);
+});
+
+test('custom favicon can be uploaded, replaced, reset, and rejects unsupported uploads', async ({ page }) => {
+  const firstFavicon = fixturePath('tiny.png');
+  const secondFavicon = generatedPng('replacement-favicon.png');
+  const invalidFavicon = writeGeneratedFixture('invalid-favicon.txt', 'not a favicon');
+
+  const home = await page.goto('/home');
+  expect(home?.status()).toBeLessThan(400);
+  const faviconLink = page.locator('link[rel="icon"]');
+  await expect(faviconLink).toHaveAttribute('href', '/favicon.ico');
+
+  let favicon = await page.request.get('/favicon.ico');
+  expect(favicon.status()).toBe(200);
+  expect(favicon.headers()['content-type']).toMatch(/^image\/x-icon\b/);
+  expect(favicon.headers()['cache-control']).toBe('public, max-age=3600');
+  expect(favicon.headers()['x-content-type-options']).toBe('nosniff');
+  const defaultBytes = await favicon.body();
+
+  await login(page, adminUser, adminPassword);
+  await page.goto('/admin');
+  await page.getByLabel('Upload favicon').setInputFiles(firstFavicon);
+  await Promise.all([
+    page.waitForURL('/admin'),
+    page.getByRole('button', { name: 'Save favicon' }).click(),
+  ]);
+  await expect(page.getByText('Custom favicon configured')).toBeVisible();
+
+  favicon = await page.request.get('/favicon.ico');
+  expect(favicon.status()).toBe(200);
+  expect(favicon.headers()['content-type']).toMatch(/^image\/png\b/);
+  expect(favicon.headers()['cache-control']).toBe('public, max-age=3600');
+  expect(favicon.headers()['x-content-type-options']).toBe('nosniff');
+  const firstBytes = await favicon.body();
+  expect(firstBytes.equals(defaultBytes)).toBe(false);
+
+  await page.getByLabel('Upload favicon').setInputFiles(secondFavicon);
+  await Promise.all([
+    page.waitForURL('/admin'),
+    page.getByRole('button', { name: 'Save favicon' }).click(),
+  ]);
+  favicon = await page.request.get('/favicon.ico');
+  const replacementBytes = await favicon.body();
+  expect(favicon.headers()['content-type']).toMatch(/^image\/png\b/);
+  expect(replacementBytes.equals(firstBytes)).toBe(false);
+
+  await page.getByLabel('Upload favicon').setInputFiles(invalidFavicon);
+  const invalidUpload = await Promise.all([
+    page.waitForResponse((response) => response.url().includes('/admin/favicon') && response.request().method() === 'POST'),
+    page.getByRole('button', { name: 'Save favicon' }).click(),
+  ]).then(([response]) => response);
+  expect(invalidUpload.status()).toBe(400);
+  await expect(page.getByRole('heading', { name: 'Check the form' })).toBeVisible();
+  await expect(page.getByText('unsupported favicon type; upload .ico, .png, or .svg')).toBeVisible();
+  favicon = await page.request.get('/favicon.ico');
+  expect((await favicon.body()).equals(replacementBytes)).toBe(true);
+
+  await page.goto('/admin');
+  await page.getByRole('button', { name: 'Reset to the built-in favicon' }).click();
+  await expect(page).toHaveURL(/\/admin/);
+  await expect(page.getByText('Using built-in default favicon')).toBeVisible();
+  favicon = await page.request.get('/favicon.ico');
+  expect(favicon.headers()['content-type']).toMatch(/^image\/x-icon\b/);
+  expect((await favicon.body()).equals(defaultBytes)).toBe(true);
 });

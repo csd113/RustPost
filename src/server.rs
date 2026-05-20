@@ -106,6 +106,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/uploads/videos",
             ServeDir::new(state.paths.uploads_videos.clone()),
         )
+        .nest_service(
+            "/uploads/thumbs",
+            ServeDir::new(state.paths.uploads_thumbs.clone()),
+        )
         .layer(DefaultBodyLimit::max(upload_body_limit))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
