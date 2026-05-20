@@ -1,6 +1,7 @@
 use std::io::{self, IsTerminal as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Command as ProcessCommand;
 
 use anyhow::Context as _;
@@ -388,7 +389,8 @@ async fn bind_onion_listener(
 }
 
 fn onion_listener_target(listener: Option<&tokio::net::TcpListener>) -> Option<SocketAddr> {
-    listener.and_then(|listener| listener.local_addr().ok())
+    let listener = listener?;
+    listener.local_addr().ok()
 }
 
 async fn initial_tor_status(
@@ -652,6 +654,7 @@ fn stdout_raw(args: std::fmt::Arguments<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn stderr_line(args: std::fmt::Arguments<'_>) {
     let mut stderr = io::stderr().lock();
     let _write_result = stderr.write_fmt(args);

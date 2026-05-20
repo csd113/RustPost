@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.1.3 - Control Room
+
+### Admin Control Room
+- Added an admin deep server settings page for changing core site, post, account, and media limits from the web UI.
+- Deep settings changes now show a confirmation step with friendly labels, old and new values, and explicit save/discard intents.
+- Deep settings writes preserve unrelated settings file values and comments while validating the rewritten configuration before saving.
+- Added coverage for valid deep settings updates, invalid submissions, preview/discard flows, and confirmation intent handling.
+
+### Account Settings
+- Expanded account settings into a fuller profile, privacy, and account controls area.
+- Added persisted dark mode as a per-user setting.
+- Added profile location support.
+- Added muted users and muted words management, including timeline/search filtering for muted terms.
+- Added password change support with current-password validation and confirmation matching.
+- Moved blocked users, muted users, muted words, password changes, and delete-account access into the settings surface.
+
+### Account Deletion
+- Added a multi-step account deletion flow with CSRF protection, password confirmation, and a short-lived delete intent.
+- Account deletion now removes the user profile, posts, sessions, social relationships, notifications, reports, likes, bookmarks, reposts, muted words, and owned media rows.
+- Media file cleanup is constrained to known upload directories and rejects unsafe paths before database mutation.
+- File cleanup failures after database scrub are logged without leaving account data behind.
+
+### Timeline and UI
+- Post timestamps render as non-linked text instead of extra self-links.
+- Thread views continue to show timestamps while timeline cards stay compact.
+- Account settings, deep settings, danger states, lists, and dark mode received matching layout and style updates.
+
+### Release Prep and CI
+- Bumped the crate version to `0.1.3` and refreshed `Cargo.lock`.
+- Kept Playwright-related files ignored while preserving the ignored test-artifact policy.
+- Fixed focused Clippy findings for stderr output and optional listener handling.
+- Reduced upload handling complexity so strict Clippy passes without the old `too_many_lines` expectation.
+- Made startup dashboard path assertions portable for Windows CI and cfg-gated Unix-only terminal helpers.
+
 ## v0.1.2
 
 ### Search

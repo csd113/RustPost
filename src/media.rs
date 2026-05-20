@@ -42,10 +42,6 @@ impl MediaKind {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "upload handling keeps validation, staging, and persistence in one existing linear flow"
-)]
 pub async fn save_upload(
     pool: &SqlitePool,
     settings: &Settings,
@@ -58,17 +54,7 @@ pub async fn save_upload(
     reject_path_tricks(&original_filename)?;
     let id = Uuid::new_v4().simple().to_string();
     let staging = paths.staged_upload_path(&id);
-    let mut file = tokio::fs::File::create(&staging).await?;
-    let mut bytes = 0_u64;
-    while let Some(chunk) = field.chunk().await? {
-        bytes += u64::try_from(chunk.len())?;
-        if bytes > settings.media.max_video_size {
-            let _ = tokio::fs::remove_file(&staging).await;
-            anyhow::bail!("upload exceeds maximum size");
-        }
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
+    let bytes = write_upload_to_staging(settings, &staging, &mut field).await?;
     let data = tokio::fs::read(&staging).await?;
     let Some(kind) = infer::get(&data) else {
         remove_staged_upload(&staging).await;
@@ -153,6 +139,25 @@ pub async fn save_upload(
         .await?;
     }
     Ok(media_id)
+}
+
+async fn write_upload_to_staging(
+    settings: &Settings,
+    staging: &Path,
+    field: &mut Field<'_>,
+) -> anyhow::Result<u64> {
+    let mut file = tokio::fs::File::create(staging).await?;
+    let mut bytes = 0_u64;
+    while let Some(chunk) = field.chunk().await? {
+        bytes += u64::try_from(chunk.len())?;
+        if bytes > settings.media.max_video_size {
+            remove_staged_upload(staging).await;
+            anyhow::bail!("upload exceeds maximum size");
+        }
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(bytes)
 }
 
 pub async fn save_profile_picture_upload(
