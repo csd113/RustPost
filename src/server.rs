@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use crate::db::SqlitePool;
 use crate::errors::{AppError, AppResult};
 use crate::ffmpeg::FfmpegStatus;
 use crate::runtime::RuntimePaths;
-use crate::{admin, backup, csrf, media, rate_limit, render, social};
+use crate::{admin, backup, csrf, favicon, media, rate_limit, render, social};
 
 const CSRF_TOKEN_HISTORY_LIMIT: usize = 32;
 
@@ -56,6 +57,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(home))
         .route("/assets/rustpost.js", get(client_script))
+        .route("/favicon.ico", get(site_favicon))
         .route("/local", get(local_redirect))
         .route("/home", get(home))
         .route("/login", get(login_form).post(login))
@@ -87,6 +89,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/posts/{id}/delete", post(admin_delete_post))
         .route("/admin/health", get(admin_health))
         .route("/admin/media", get(admin_media))
+        .route("/admin/favicon", post(admin_favicon_upload))
+        .route("/admin/favicon/remove", post(admin_favicon_remove))
         .route(
             "/admin/backups",
             get(admin_backups).post(admin_create_backup),
@@ -102,6 +106,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest_service(
             "/uploads/videos",
             ServeDir::new(state.paths.uploads_videos.clone()),
+        )
+        .nest_service(
+            "/uploads/thumbs",
+            ServeDir::new(state.paths.uploads_thumbs.clone()),
         )
         .layer(DefaultBodyLimit::max(upload_body_limit))
         .layer(TraceLayer::new_for_http())
@@ -125,6 +133,10 @@ async fn client_script() -> Response {
         render::client_script(),
     )
         .into_response()
+}
+
+async fn site_favicon(State(state): State<Arc<AppState>>) -> Response {
+    favicon::response(&state.paths).await
 }
 
 #[derive(Deserialize)]
@@ -170,6 +182,10 @@ struct ParsedProfileUpdate {
     delete_banner: bool,
     profile_picture_media_id: Option<i64>,
     banner_media_id: Option<i64>,
+}
+
+struct ParsedFaviconUpload {
+    uploaded: bool,
 }
 
 struct ParsedPostCreate {
@@ -259,6 +275,7 @@ async fn layout_context(
         tor_onion_address: state.tor.onion_address(),
         follower_count: counts.map(|(followers, _following)| followers),
         following_count: counts.map(|(_followers, following)| following),
+        favicon_content_type: favicon::current(&state.paths).content_type(),
     })
 }
 
@@ -308,9 +325,17 @@ async fn login(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
-    let Some(session) = auth::login(&state.pool, &form.username, &form.password).await? else {
-        rate_limit::record(&state.pool, rate_limit::Scope::FailedLogin, &actor).await?;
-        return Err(AppError::Unauthorized);
+    let session = match auth::login(&state.pool, &form.username, &form.password).await? {
+        Ok(session) => session,
+        Err(failure) => {
+            let message = match failure {
+                auth::LoginFailure::NoAccount => "No account with that username.",
+                auth::LoginFailure::InvalidPassword => "The password is incorrect.",
+                auth::LoginFailure::UnavailableAccount => "This account cannot log in.",
+            };
+            rate_limit::record(&state.pool, rate_limit::Scope::FailedLogin, &actor).await?;
+            return auth_form_response(&state, StatusCode::UNAUTHORIZED, message).await;
+        }
     };
     let mut response = Redirect::to("/home").into_response();
     response.headers_mut().insert(
@@ -360,7 +385,7 @@ async fn register(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
-    let user_id = auth::register_user(
+    let user_id = match auth::register_user(
         &state.pool,
         &state.settings,
         &form.username,
@@ -368,7 +393,21 @@ async fn register(
         false,
     )
     .await
-    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    {
+        Ok(user_id) => user_id,
+        Err(err) => {
+            let message = err.to_string();
+            if message == auth::USERNAME_TAKEN_MESSAGE {
+                return register_form_response(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    "That username is already taken.",
+                )
+                .await;
+            }
+            return Err(AppError::BadRequest(message));
+        }
+    };
     let session = auth::create_session(&state.pool, user_id).await?;
     let mut response = Redirect::to("/home").into_response();
     response.headers_mut().insert(
@@ -380,6 +419,32 @@ async fn register(
         .map_err(|err| AppError::BadRequest(err.to_string()))?,
     );
     Ok(response)
+}
+
+async fn auth_form_response(
+    state: &AppState,
+    status: StatusCode,
+    message: &str,
+) -> AppResult<Response> {
+    let body = render::login_form(Some(message));
+    Ok((
+        status,
+        Html(page_layout(state, None, None, "Login", &body).await?),
+    )
+        .into_response())
+}
+
+async fn register_form_response(
+    state: &AppState,
+    status: StatusCode,
+    message: &str,
+) -> AppResult<Response> {
+    let body = render::register_form(Some(message));
+    Ok((
+        status,
+        Html(page_layout(state, None, None, "Register", &body).await?),
+    )
+        .into_response())
 }
 
 async fn logout(
@@ -606,7 +671,7 @@ async fn thread(
     };
     let body = format!(
         "{}{}{}",
-        render::page_header("Thread", "Read the conversation and add a reply."),
+        render::thread_back_control(),
         render::thread_posts(&posts, user.as_ref(), csrf.as_deref()),
         composer
     );
@@ -1189,12 +1254,12 @@ async fn parse_profile_update(
                     continue;
                 }
                 form.profile_picture_media_id = Some(
-                    media::save_upload(
+                    media::save_profile_picture_upload(
                         &state.pool,
                         &state.settings,
                         &state.paths,
                         &state.ffmpeg,
-                        Some(user_id),
+                        user_id,
                         field,
                     )
                     .await
@@ -1593,39 +1658,28 @@ async fn search(
     Query(query): Query<SearchQuery>,
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
-    let q = query.q.unwrap_or_default();
-    let (users, posts) = if q.trim().is_empty() {
+    let q = normalize_search_query(query.q.as_deref().unwrap_or_default());
+    let (users, posts) = if q.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        social::search(&state.pool, user.as_ref().map(|u| u.id), q.trim()).await?
+        social::search(&state.pool, user.as_ref().map(|u| u.id), &q).await?
     };
-    let user_results = users
-        .into_iter()
-        .map(|(_, username, display)| {
-            format!(
-                r#"<li><a href="/users/{}">{}</a></li>"#,
-                html_escape::encode_double_quoted_attribute(&username),
-                html_escape::encode_text(&display)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
     let csrf = form_csrf(&state, &headers).await;
-    let user_results = if user_results.is_empty() {
-        render::empty_state("No users found", "Try a username or display name.")
-    } else {
-        format!(r#"<ul class="item-list">{user_results}</ul>"#)
-    };
-    let body = format!(
-        r#"<section class="panel"><h1>Search</h1><form method="get"><label for="q">Search {}</label><input id="q" name="q" value="{}"><button type="submit">Search</button></form></section><section class="panel"><h2>Users</h2>{}</section><section><h2 class="section-title">Posts</h2>{}</section>"#,
-        html_escape::encode_text(&state.settings.site.name),
-        html_escape::encode_double_quoted_attribute(&q),
-        user_results,
-        render::posts(&posts, user.as_ref(), csrf.as_deref())
+    let body = render::search_page(
+        &state.settings.site.name,
+        &q,
+        &users,
+        &posts,
+        user.as_ref(),
+        csrf.as_deref(),
     );
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Search", &body).await?,
     ))
+}
+
+fn normalize_search_query(query: &str) -> String {
+    query.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 async fn tag(
@@ -1649,17 +1703,109 @@ async fn admin_dashboard(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let favicon_asset = favicon::current(&state.paths);
+    let remove_form = if favicon_asset.is_custom() {
+        small_form(
+            "/admin/favicon/remove",
+            &csrf,
+            "Remove favicon",
+            "Reset to the built-in favicon",
+        )
+    } else {
+        String::new()
+    };
+    let favicon_panel = format!(
+        r#"<section class="panel"><h2>Favicon</h2><p class="muted">{}</p><p><img class="favicon-preview" src="/favicon.ico" alt="Current favicon"></p><form method="post" action="/admin/favicon" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="favicon">Upload favicon</label><input id="favicon" name="favicon" type="file" accept=".ico,image/png,image/svg+xml"><p class="muted">Accepted: .ico, .png, .svg. Maximum size: 256 KiB.</p><button type="submit">Save favicon</button></form><div class="actions">{}</div></section>"#,
+        html_escape::encode_text(favicon_asset.state_label()),
+        html_escape::encode_double_quoted_attribute(&csrf),
+        remove_form
+    );
     let body = format!(
-        "{}{}",
+        "{}{}{}",
         render::page_header(
             "Admin",
             "Manage site health, users, media jobs, and backups."
         ),
-        r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/backups">Backups</a></section>"#
+        r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/backups">Backups</a></section>"#,
+        favicon_panel
     );
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Admin", &body).await?,
     ))
+}
+
+async fn admin_favicon_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> AppResult<Response> {
+    require_admin(&state, &headers).await?;
+    let parsed = parse_favicon_upload(&state, &headers, multipart).await?;
+    if !parsed.uploaded {
+        return Err(AppError::BadRequest(
+            "choose a .ico, .png, or .svg favicon to upload".to_owned(),
+        ));
+    }
+    Ok(Redirect::to("/admin").into_response())
+}
+
+async fn admin_favicon_remove(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    favicon::reset(&state.paths).await?;
+    Ok(Redirect::to("/admin").into_response())
+}
+
+async fn parse_favicon_upload(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut multipart: Multipart,
+) -> AppResult<ParsedFaviconUpload> {
+    let mut parsed = ParsedFaviconUpload { uploaded: false };
+    let mut csrf_validated = false;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?
+    {
+        let Some(name) = field.name().map(ToOwned::to_owned) else {
+            continue;
+        };
+        match name.as_str() {
+            "csrf" => {
+                let token = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+                validate_csrf(&state.pool, headers, &token).await?;
+                csrf_validated = true;
+            }
+            "favicon" if field.file_name().is_some() => {
+                if field.file_name().is_none_or(|name| name.trim().is_empty()) {
+                    continue;
+                }
+                if !csrf_validated {
+                    return Err(AppError::Forbidden);
+                }
+                favicon::save_upload(&state.paths, field)
+                    .await
+                    .map_err(|err| {
+                        tracing::warn!(error = %err, "favicon upload rejected");
+                        AppError::BadRequest(err.to_string())
+                    })?;
+                parsed.uploaded = true;
+            }
+            _ => {}
+        }
+    }
+    if !csrf_validated {
+        return Err(AppError::Forbidden);
+    }
+    Ok(parsed)
 }
 
 async fn admin_health(
@@ -1668,25 +1814,8 @@ async fn admin_health(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let recent_jobs = admin::recent_media_jobs(&state.pool).await?;
-    let jobs = recent_jobs
-        .into_iter()
-        .take(5)
-        .map(|(id, status, stderr)| {
-            format!(
-                r#"<li>#{} {} <pre>{}</pre></li>"#,
-                id,
-                html_escape::encode_text(&status),
-                html_escape::encode_text(&stderr)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let jobs = if jobs.is_empty() {
-        r#"<p class="muted">No media jobs yet.</p>"#.to_owned()
-    } else {
-        format!(r#"<ul class="item-list">{jobs}</ul>"#)
-    };
+    let media_jobs = admin::media_jobs_report(&state.pool).await?;
+    let jobs = render_media_jobs_report(&media_jobs);
     let onion = state
         .tor
         .onion_address()
@@ -1801,31 +1930,108 @@ async fn admin_media(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let jobs = admin::recent_media_jobs(&state.pool).await?;
-    let rows = jobs
-        .into_iter()
-        .map(|(id, status, stderr)| {
-            format!(
-                r#"<tr><td>{}</td><td>{}</td><td><pre>{}</pre></td></tr>"#,
-                id,
-                html_escape::encode_text(&status),
-                html_escape::encode_text(&stderr)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let body = if rows.is_empty() {
-        r#"<section class="panel"><h1>Media jobs</h1><p class="muted">No media jobs yet.</p></section>"#
-            .to_owned()
-    } else {
-        format!(
-            r#"<section class="panel"><h1>Media jobs</h1><table><thead><tr><th>ID</th><th>Status</th><th>Summary</th></tr></thead><tbody>{}</tbody></table></section>"#,
-            rows
-        )
-    };
+    let jobs = admin::media_jobs_report(&state.pool).await?;
+    let body = format!(
+        r#"<section class="panel"><h1>Media jobs</h1>{}</section>"#,
+        render_media_jobs_report(&jobs)
+    );
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Media jobs", &body).await?,
     ))
+}
+
+fn render_media_jobs_report(report: &admin::MediaJobsReport) -> String {
+    if report.total == 0 {
+        return r#"<p class="muted">No media jobs yet.</p>"#.to_owned();
+    }
+
+    let mut out = String::new();
+    let pending_age = match (
+        report.newest_pending_age_seconds,
+        report.oldest_pending_age_seconds,
+    ) {
+        (Some(newest), Some(oldest)) => {
+            format!(
+                "{} newest / {} oldest",
+                format_age(newest),
+                format_age(oldest)
+            )
+        }
+        _ => "none".to_owned(),
+    };
+    let _ = write!(
+        out,
+        r#"<table><thead><tr><th>Total</th><th>Pending</th><th>Running</th><th>Succeeded</th><th>Failed</th><th>Pending age</th></tr></thead><tbody><tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr></tbody></table>"#,
+        report.total,
+        report.pending,
+        report.running,
+        report.succeeded,
+        report.failed,
+        html_escape::encode_text(&pending_age),
+    );
+
+    if report.recent_failures.is_empty() {
+        if report.failed == 0 {
+            out.push_str(r#"<p class="muted">No recent media job failures.</p>"#);
+        }
+        return out;
+    }
+
+    out.push_str(
+        r#"<h2>Recent failures</h2><table><thead><tr><th>Job</th><th>Media</th><th>Kind</th><th>Age</th><th>Error</th></tr></thead><tbody>"#,
+    );
+    for failure in &report.recent_failures {
+        let media = failure
+            .media_path
+            .as_deref()
+            .map(|path| compact_text(path, 48))
+            .or_else(|| failure.media_id.map(|id| format!("#{id}")))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let kind = failure.job_kind.as_deref().unwrap_or("media");
+        let age = failure
+            .age_seconds
+            .map_or_else(|| "unknown".to_owned(), format_age);
+        let error = compact_text(&failure.error_summary, 80);
+        let _ = write!(
+            out,
+            r#"<tr><td>#{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+            failure.id,
+            html_escape::encode_text(&media),
+            html_escape::encode_text(kind),
+            html_escape::encode_text(&age),
+            html_escape::encode_text(&error),
+        );
+    }
+    out.push_str("</tbody></table>");
+    out
+}
+
+fn compact_text(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    let take = max_chars.saturating_sub(3);
+    let mut shortened = compact.chars().take(take).collect::<String>();
+    shortened.push_str("...");
+    shortened
+}
+
+fn format_age(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    format!("{}d", hours / 24)
 }
 
 async fn admin_backups(
@@ -1989,10 +2195,12 @@ fn user_actor(user_id: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     struct TestServer {
         base_url: String,
+        data_dir: PathBuf,
         _task: tokio::task::JoinHandle<()>,
         _temp: tempfile::TempDir,
     }
@@ -2020,6 +2228,65 @@ mod tests {
     }
 
     #[test]
+    fn compact_text_collapses_whitespace_and_truncates() {
+        let compact = compact_text(
+            "/uploads/originals/a/very/long/path.png\nffmpeg stderr repeated detail",
+            24,
+        );
+
+        assert_eq!(compact, "/uploads/originals/a/...");
+    }
+
+    #[test]
+    fn media_jobs_report_keeps_healthy_state_short() {
+        let report = admin::MediaJobsReport {
+            total: 3,
+            succeeded: 3,
+            ..admin::MediaJobsReport::default()
+        };
+
+        let output = render_media_jobs_report(&report);
+
+        assert!(output.contains("<th>Total</th>"));
+        assert!(output.contains("<td>3</td>"));
+        assert!(output.contains("No recent media job failures."));
+        assert!(!output.contains("Recent failures"));
+        assert!(!output.contains("<pre>"));
+    }
+
+    #[test]
+    fn media_jobs_report_shows_compact_recent_failures() {
+        let report = admin::MediaJobsReport {
+            total: 8,
+            pending: 1,
+            running: 1,
+            succeeded: 4,
+            failed: 2,
+            newest_pending_age_seconds: Some(90),
+            oldest_pending_age_seconds: Some(3_900),
+            recent_failures: vec![admin::MediaJobFailure {
+                id: 42,
+                media_id: Some(7),
+                media_path: Some("/media/uploads/a/really/long/path/that/should/not/dominate/report/video.webm".to_owned()),
+                job_kind: Some("video".to_owned()),
+                age_seconds: Some(3_600),
+                error_summary: "ffmpeg failed\nwith a very long diagnostic that should be clipped before it fills the admin table".to_owned(),
+            }],
+        };
+
+        let output = render_media_jobs_report(&report);
+
+        assert!(output.contains("Recent failures"));
+        assert!(output.contains("#42"));
+        assert!(output.contains("video"));
+        assert!(output.contains("1h"));
+        assert!(output.contains("1m newest / 1h oldest"));
+        assert!(output.contains("..."));
+        assert!(!output.contains("should be clipped before it fills"));
+        assert!(!output.contains("<pre>"));
+    }
+
+    #[test]
     fn delete_return_target_rejects_self_referential_confirmation_paths() {
         assert_eq!(safe_delete_return_target("/posts/42/delete", 42), None);
         assert_eq!(
@@ -2035,6 +2302,63 @@ mod tests {
             safe_delete_return_target("/home#post-42", 42),
             Some("/home#post-42".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn missing_login_account_renders_login_form_message() {
+        let server = spawn_test_server().await;
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=missing-user&password=not%20the%20password".to_vec(),
+        )
+        .await;
+
+        assert_eq!(response.status, 401);
+        assert!(response.body.contains("<h1>Log in</h1>"));
+        assert!(response.body.contains("No account with that username."));
+        assert!(
+            response
+                .body
+                .contains(r#"<button class="auth-submit" type="submit">Log in</button>"#)
+        );
+        assert!(!response.body.contains("Authentication required"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_renders_register_form_message() {
+        let server = spawn_test_server().await;
+        let first = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(first.status, 303);
+
+        let duplicate = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=Alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+
+        assert_eq!(duplicate.status, 400);
+        assert!(duplicate.body.contains("<h1>Create account</h1>"));
+        assert!(duplicate.body.contains("That username is already taken."));
+        assert!(
+            duplicate
+                .body
+                .contains(r#"<button class="auth-submit" type="submit">Create account</button>"#)
+        );
+        assert!(!duplicate.body.contains("Check the form"));
     }
 
     #[tokio::test]
@@ -2114,7 +2438,16 @@ mod tests {
         )
         .await;
         assert_eq!(thread.status, 200);
+        assert!(thread.body.contains(r#"class="thread-nav""#));
+        assert!(thread.body.contains(r#"aria-label="Back""#));
+        assert!(!thread.body.contains(r#"class="page-header""#));
+        assert!(
+            !thread
+                .body
+                .contains("Read the conversation and add a reply.")
+        );
         assert!(thread.body.contains(r#"class="post-time""#));
+        assert!(!thread.body.contains(r#"data-card-href="/posts/1""#));
         assert!(!thread.body.contains(r#"href="/posts/1">Open post</a>"#));
     }
 
@@ -2817,6 +3150,219 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_favicon_route_and_html_link_are_present() {
+        let server = spawn_test_server().await;
+
+        let favicon = request(&server.base_url, "GET", "/favicon.ico", &[], Vec::new()).await;
+        assert_eq!(favicon.status, 200);
+        assert_header(&favicon, "content-type", "image/x-icon");
+        assert_header(&favicon, "cache-control", "public, max-age=3600");
+
+        let home = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert_eq!(home.status, 200);
+        assert!(
+            home.body
+                .contains(r#"<link rel="icon" href="/favicon.ico" type="image/x-icon">"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_can_upload_replace_and_remove_png_favicon() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let admin = request(
+            &server.base_url,
+            "GET",
+            "/admin",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(admin.status, 200);
+        assert!(admin.body.contains("Using built-in default favicon"));
+        let csrf = csrf_token(&admin.body);
+
+        let uploaded = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=favicon-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "favicon-boundary",
+                &[("csrf", csrf.as_str())],
+                "favicon",
+                "site.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(uploaded.status, 303);
+        assert_eq!(location(&uploaded), "/admin");
+        assert!(server.data_dir.join("assets/favicon.png").is_file());
+
+        let favicon = request(&server.base_url, "GET", "/favicon.ico", &[], Vec::new()).await;
+        assert_eq!(favicon.status, 200);
+        assert_header(&favicon, "content-type", "image/png");
+
+        let admin = request(
+            &server.base_url,
+            "GET",
+            "/admin",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert!(admin.body.contains("Custom favicon configured"));
+        assert!(admin.body.contains("Remove favicon"));
+        let csrf = csrf_token(&admin.body);
+
+        let replacement = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=favicon-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "favicon-boundary",
+                &[("csrf", csrf.as_str())],
+                "favicon",
+                "site.ico",
+                "image/x-icon",
+                &[0, 0, 1, 0, 1, 0],
+            ),
+        )
+        .await;
+        assert_eq!(replacement.status, 303);
+        assert!(server.data_dir.join("assets/favicon.ico").is_file());
+        assert!(!server.data_dir.join("assets/favicon.png").exists());
+
+        let admin = request(
+            &server.base_url,
+            "GET",
+            "/admin",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&admin.body);
+        let removed = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon/remove",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(removed.status, 303);
+        assert!(!server.data_dir.join("assets/favicon.ico").exists());
+    }
+
+    #[tokio::test]
+    async fn favicon_upload_rejects_unsupported_content_and_unsafe_names() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let admin = request(
+            &server.base_url,
+            "GET",
+            "/admin",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&admin.body);
+
+        let unsupported = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=favicon-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "favicon-boundary",
+                &[("csrf", csrf.as_str())],
+                "favicon",
+                "favicon.gif",
+                "image/gif",
+                b"GIF89a",
+            ),
+        )
+        .await;
+        assert_eq!(unsupported.status, 400);
+        assert!(unsupported.body.contains("unsupported favicon type"));
+        assert!(!server.data_dir.join("assets/favicon.gif").exists());
+
+        let invalid_png = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=favicon-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "favicon-boundary",
+                &[("csrf", csrf.as_str())],
+                "favicon",
+                "favicon.png",
+                "image/png",
+                b"<html></html>",
+            ),
+        )
+        .await;
+        assert_eq!(invalid_png.status, 400);
+        assert!(invalid_png.body.contains("invalid file signature"));
+        assert!(!server.data_dir.join("assets/favicon.png").exists());
+
+        let traversal = request(
+            &server.base_url,
+            "POST",
+            "/admin/favicon",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=favicon-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "favicon-boundary",
+                &[("csrf", csrf.as_str())],
+                "favicon",
+                "../favicon.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(traversal.status, 400);
+        assert!(traversal.body.contains("unsafe upload filename"));
+        assert!(!server.data_dir.join("assets/favicon.png").exists());
+    }
+
+    #[tokio::test]
     async fn delete_requires_confirmation_and_preserves_cancel_target() {
         let server = spawn_test_server().await;
         let registered = request(
@@ -2951,14 +3497,28 @@ mod tests {
     }
 
     async fn spawn_test_server() -> TestServer {
+        spawn_test_server_inner(false).await
+    }
+
+    async fn spawn_test_server_with_admin() -> TestServer {
+        spawn_test_server_inner(true).await
+    }
+
+    async fn spawn_test_server_inner(create_admin: bool) -> TestServer {
         let temp = tempfile::tempdir().expect("temp dir");
         let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf());
         paths.ensure().expect("paths");
+        let data_dir = paths.data_dir.clone();
         let pool = crate::db::connect(&paths.database_path)
             .await
             .expect("connect");
         crate::db::migrate(&pool).await.expect("migrate");
         let settings = Settings::default();
+        if create_admin {
+            crate::admin::create_admin(&pool, &settings, "siteowner", "very secure password")
+                .await
+                .expect("admin");
+        }
         let ffmpeg = FfmpegStatus {
             available: false,
             version: String::new(),
@@ -2982,9 +3542,23 @@ mod tests {
         });
         TestServer {
             base_url: format!("127.0.0.1:{}", addr.port()),
+            data_dir,
             _task: task,
             _temp: temp,
         }
+    }
+
+    async fn admin_session_cookie(server: &TestServer) -> String {
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=siteowner&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(login.status, 303);
+        session_cookie(&login)
     }
 
     async fn request(
@@ -3056,6 +3630,17 @@ mod tests {
             .find(|(name, _)| name == "location")
             .map(|(_, value)| value.as_str())
             .expect("location")
+    }
+
+    fn assert_header(response: &TestResponse, name: &str, expected: &str) {
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(header_name, _)| header_name == name)
+                .map(|(_, value)| value.as_str()),
+            Some(expected)
+        );
     }
 
     fn csrf_token(body: &str) -> String {

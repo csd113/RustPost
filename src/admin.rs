@@ -4,6 +4,28 @@ use crate::auth;
 use crate::config::Settings;
 use crate::db::SqlitePool;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaJobsReport {
+    pub total: i64,
+    pub pending: i64,
+    pub running: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub newest_pending_age_seconds: Option<i64>,
+    pub oldest_pending_age_seconds: Option<i64>,
+    pub recent_failures: Vec<MediaJobFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaJobFailure {
+    pub id: i64,
+    pub media_id: Option<i64>,
+    pub media_path: Option<String>,
+    pub job_kind: Option<String>,
+    pub age_seconds: Option<i64>,
+    pub error_summary: String,
+}
+
 pub async fn create_admin(
     pool: &SqlitePool,
     settings: &Settings,
@@ -149,6 +171,78 @@ pub async fn recent_media_jobs(pool: &SqlitePool) -> anyhow::Result<Vec<(i64, St
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    })
+    .await
+}
+
+pub async fn media_jobs_report(pool: &SqlitePool) -> anyhow::Result<MediaJobsReport> {
+    pool.call(|conn| {
+        let (total, pending, running, succeeded, failed, newest_pending_age, oldest_pending_age) =
+            conn.query_row(
+                r"
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN status IN ('pending', 'queued') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status IN ('succeeded', 'success', 'converted') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status IN ('failed', 'error', 'fallback') THEN 1 ELSE 0 END), 0),
+                    MIN(CASE WHEN status IN ('pending', 'queued') THEN CAST(strftime('%s', 'now') - strftime('%s', created_at) AS INTEGER) END),
+                    MAX(CASE WHEN status IN ('pending', 'queued') THEN CAST(strftime('%s', 'now') - strftime('%s', created_at) AS INTEGER) END)
+                FROM media_jobs
+                ",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )?;
+
+        let mut stmt = conn.prepare(
+            r"
+            SELECT
+                j.id,
+                j.media_id,
+                COALESCE(NULLIF(m.public_path, ''), NULLIF(m.original_filename, ''), NULLIF(m.stored_path, '')),
+                NULLIF(m.media_kind, ''),
+                CAST(strftime('%s', 'now') - strftime('%s', COALESCE(j.finished_at, j.created_at)) AS INTEGER),
+                j.stderr_summary
+            FROM media_jobs j
+            LEFT JOIN media m ON m.id = j.media_id
+            WHERE j.status IN ('failed', 'error', 'fallback')
+            ORDER BY j.id DESC
+            LIMIT 5
+            ",
+        )?;
+        let recent_failures = stmt
+            .query_map([], |row| {
+                Ok(MediaJobFailure {
+                    id: row.get(0)?,
+                    media_id: row.get(1)?,
+                    media_path: row.get(2)?,
+                    job_kind: row.get(3)?,
+                    age_seconds: row.get(4)?,
+                    error_summary: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(MediaJobsReport {
+            total,
+            pending,
+            running,
+            succeeded,
+            failed,
+            newest_pending_age_seconds: newest_pending_age,
+            oldest_pending_age_seconds: oldest_pending_age,
+            recent_failures,
+        })
     })
     .await
 }

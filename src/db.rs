@@ -92,6 +92,10 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_2)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (2)", [])?;
         }
+        if applied.unwrap_or(0) < 3 {
+            tx.execute_batch(MIGRATION_3)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (3)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -279,6 +283,11 @@ const MIGRATION_2: &str = r#"
 ALTER TABLE sessions ADD COLUMN previous_csrf_token_hash TEXT;
 "#;
 
+const MIGRATION_3: &str = r#"
+ALTER TABLE media ADD COLUMN thumbnail_path TEXT;
+ALTER TABLE media ADD COLUMN thumbnail_public_path TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,7 +329,7 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 2);
+        assert_eq!(versions, 3);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);

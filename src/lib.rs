@@ -24,6 +24,7 @@ pub mod csrf;
 pub mod db;
 pub mod demo_seed;
 pub mod errors;
+pub mod favicon;
 pub mod ffmpeg;
 pub mod logging;
 pub mod media;

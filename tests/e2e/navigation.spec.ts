@@ -54,7 +54,7 @@ test('normal post actions preserve feed, thread, anchors, and profile context', 
   await expect(homeArticle.getByRole('button', { name: 'Unbookmark' })).toBeVisible();
 
   await page.goto(`/posts/${postId}`);
-  await expect(page.getByRole('heading', { name: 'Thread' })).toBeVisible();
+  await expect(page.locator(`article[data-post-id="${postId}"]`)).toBeVisible();
   await expectNotErrorPage(page);
   const threadUrl = new RegExp(`/posts/${postId}$`);
   const threadArticle = postArticle(page, postText);
@@ -118,6 +118,63 @@ test('normal post actions preserve feed, thread, anchors, and profile context', 
     () => page.getByRole('button', { name: 'Mute this account' }).click(),
     profileUrl,
   );
+});
+
+test('post cards open threads except for the current root post inside its own thread', async ({ page }) => {
+  await registerFresh(page, 'threadnav');
+  const postText = `thread navigation ${uniqueName('post')}`;
+  const postId = await createPost(page, postText);
+  const homeArticle = postArticle(page, postText);
+
+  await Promise.all([
+    page.waitForURL(new RegExp(`/posts/${postId}$`)),
+    homeArticle.locator('.text').click(),
+  ]);
+  await expectNotErrorPage(page);
+  await expect(page.getByRole('heading', { name: 'Thread' })).toHaveCount(0);
+  const backLink = page.getByRole('link', { name: 'Back' });
+  await expect(backLink).toHaveAttribute('href', '/home');
+
+  const rootArticle = postArticle(page, postText);
+  const backBox = await backLink.boundingBox();
+  const rootBox = await rootArticle.boundingBox();
+  expect(backBox, 'back control should be visible').not.toBeNull();
+  expect(rootBox, 'root post should be visible').not.toBeNull();
+  expect(backBox!.y).toBeLessThan(rootBox!.y);
+  expect(backBox!.x).toBeLessThan(rootBox!.x + 80);
+
+  await Promise.all([
+    page.waitForURL(new RegExp(`/home#post-${postId}$`)),
+    backLink.click(),
+  ]);
+  await expect(postArticle(page, postText)).toBeVisible();
+  await Promise.all([
+    page.waitForURL(new RegExp(`/posts/${postId}$`)),
+    postArticle(page, postText).locator('.text').click(),
+  ]);
+  await expectNotErrorPage(page);
+
+  const reopenedRootArticle = postArticle(page, postText);
+  await expect(reopenedRootArticle).not.toHaveAttribute('data-card-href', `/posts/${postId}`);
+  await page.evaluate(() => {
+    (window as Window & { __threadRootClickMarker?: string }).__threadRootClickMarker = 'alive';
+  });
+  const threadUrl = page.url();
+  await reopenedRootArticle.locator('.text').click();
+  await page.waitForTimeout(300);
+  expect(page.url()).toBe(threadUrl);
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as Window & { __threadRootClickMarker?: string }).__threadRootClickMarker),
+    )
+    .toBe('alive');
+
+  await page.goto('/home');
+  await Promise.all([
+    page.waitForURL(new RegExp(`/posts/${postId}$`)),
+    postArticle(page, postText).locator('.text').click(),
+  ]);
+  await expectNotErrorPage(page);
 });
 
 test('Back and Forward restore current like, bookmark, repost, follow, reply, and settings state', async ({ page }) => {

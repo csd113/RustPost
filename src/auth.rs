@@ -26,6 +26,15 @@ pub struct Session {
     pub csrf_token: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginFailure {
+    NoAccount,
+    InvalidPassword,
+    UnavailableAccount,
+}
+
+pub const USERNAME_TAKEN_MESSAGE: &str = "username is already taken";
+
 pub async fn register_user(
     pool: &SqlitePool,
     settings: &Settings,
@@ -47,7 +56,7 @@ pub async fn register_user(
             .optional()?
             .is_some();
         if existing {
-            anyhow::bail!("username is already taken");
+            anyhow::bail!(USERNAME_TAKEN_MESSAGE);
         }
         conn.execute(
             "INSERT INTO users (username, normalized_username, password_hash, display_name, is_admin) VALUES (?, ?, ?, ?, ?)",
@@ -62,7 +71,7 @@ pub async fn login(
     pool: &SqlitePool,
     username: &str,
     password: &str,
-) -> anyhow::Result<Option<Session>> {
+) -> anyhow::Result<Result<Session, LoginFailure>> {
     let normalized = username.trim().to_ascii_lowercase();
     let row = pool
         .call(move |conn| {
@@ -83,15 +92,15 @@ pub async fn login(
         })
         .await?;
     let Some(row) = row else {
-        return Ok(None);
+        return Ok(Err(LoginFailure::NoAccount));
     };
     if row.2 != 0 || row.3 != 0 {
-        return Ok(None);
+        return Ok(Err(LoginFailure::UnavailableAccount));
     }
     if !verify_password(password, &row.1)? {
-        return Ok(None);
+        return Ok(Err(LoginFailure::InvalidPassword));
     }
-    create_session(pool, row.0).await.map(Some)
+    create_session(pool, row.0).await.map(Ok)
 }
 
 pub async fn create_session(pool: &SqlitePool, user_id: i64) -> anyhow::Result<Session> {
