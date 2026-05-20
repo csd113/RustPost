@@ -528,17 +528,39 @@ pub async fn search(
     pool: &SqlitePool,
     viewer_id: Option<i64>,
     query: &str,
-) -> anyhow::Result<(Vec<(i64, String, String)>, Vec<PostView>)> {
-    let username_query = format!("%{}%", query.to_ascii_lowercase());
-    let display_query = format!("%{query}%");
+) -> anyhow::Result<(Vec<AccountView>, Vec<PostView>)> {
+    let user_query = user_query_from_input(query);
     let users = pool
         .call(move |conn| {
+            let Some(user_query) = user_query else {
+                return Ok(Vec::new());
+            };
+            let username_query = format!("%{}%", user_query.to_ascii_lowercase());
+            let display_query = format!("%{user_query}%");
+            let viewer_id = viewer_id.unwrap_or(-1);
             let mut stmt = conn.prepare(
-                "SELECT id, username, display_name FROM users WHERE is_deleted = 0 AND (normalized_username LIKE ? OR display_name LIKE ?) LIMIT 20",
+                r#"
+                SELECT u.id, u.username, u.display_name, u.bio,
+                  COALESCE(pic.thumbnail_public_path, pic.public_path),
+                  EXISTS(SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = u.id)
+                FROM users u
+                LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+                WHERE u.is_deleted = 0
+                  AND (u.normalized_username LIKE ? OR u.display_name LIKE ?)
+                ORDER BY lower(u.username)
+                LIMIT 20
+                "#,
             )?;
             let rows = stmt
-                .query_map(params![username_query, display_query], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                .query_map(params![viewer_id, username_query, display_query], |row| {
+                    Ok(AccountView {
+                        id: row.get(0)?,
+                        username: row.get(1)?,
+                        display_name: row.get(2)?,
+                        bio: row.get(3)?,
+                        profile_picture_path: row.get(4)?,
+                        viewer_following: row.get::<_, i64>(5)? != 0,
+                    })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -557,6 +579,18 @@ pub async fn search(
     Ok((users, rows_to_posts(pool, rows, viewer_id).await?))
 }
 
+fn user_query_from_input(query: &str) -> Option<String> {
+    let trimmed = query.trim().trim_start_matches('@').trim();
+    let value = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|character: char| {
+            !(character.is_alphanumeric() || character == '_' || character == '-')
+        });
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 fn fts_query_from_user_input(query: &str) -> Option<String> {
     let terms = query
         .split_whitespace()
@@ -569,7 +603,13 @@ fn fts_query_from_user_input(query: &str) -> Option<String> {
     if terms.is_empty() {
         None
     } else {
-        Some(terms.join(" "))
+        Some(
+            terms
+                .into_iter()
+                .map(|term| format!(r#""{term}""#))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
     }
 }
 
@@ -968,9 +1008,20 @@ mod reply_tests {
     fn search_fts_query_uses_safe_terms() {
         assert_eq!(
             fts_query_from_user_input("#self-hosted @ada"),
-            Some("self hosted ada".to_owned())
+            Some(r#""self" "hosted" "ada""#.to_owned())
+        );
+        assert_eq!(
+            fts_query_from_user_input("NEAR OR rust"),
+            Some(r#""NEAR" "OR" "rust""#.to_owned())
         );
         assert_eq!(fts_query_from_user_input("#"), None);
+    }
+
+    #[test]
+    fn search_user_query_supports_mentions() {
+        assert_eq!(user_query_from_input("@alice"), Some("alice".to_owned()));
+        assert_eq!(user_query_from_input(" @alice, "), Some("alice".to_owned()));
+        assert_eq!(user_query_from_input("@"), None);
     }
 
     #[tokio::test]

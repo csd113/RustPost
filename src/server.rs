@@ -1658,39 +1658,28 @@ async fn search(
     Query(query): Query<SearchQuery>,
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
-    let q = query.q.unwrap_or_default();
-    let (users, posts) = if q.trim().is_empty() {
+    let q = normalize_search_query(query.q.as_deref().unwrap_or_default());
+    let (users, posts) = if q.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        social::search(&state.pool, user.as_ref().map(|u| u.id), q.trim()).await?
+        social::search(&state.pool, user.as_ref().map(|u| u.id), &q).await?
     };
-    let user_results = users
-        .into_iter()
-        .map(|(_, username, display)| {
-            format!(
-                r#"<li><a href="/users/{}">{}</a></li>"#,
-                html_escape::encode_double_quoted_attribute(&username),
-                html_escape::encode_text(&display)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
     let csrf = form_csrf(&state, &headers).await;
-    let user_results = if user_results.is_empty() {
-        render::empty_state("No users found", "Try a username or display name.")
-    } else {
-        format!(r#"<ul class="item-list">{user_results}</ul>"#)
-    };
-    let body = format!(
-        r#"<section class="panel"><h1>Search</h1><form method="get"><label for="q">Search {}</label><input id="q" name="q" value="{}"><button type="submit">Search</button></form></section><section class="panel"><h2>Users</h2>{}</section><section><h2 class="section-title">Posts</h2>{}</section>"#,
-        html_escape::encode_text(&state.settings.site.name),
-        html_escape::encode_double_quoted_attribute(&q),
-        user_results,
-        render::posts(&posts, user.as_ref(), csrf.as_deref())
+    let body = render::search_page(
+        &state.settings.site.name,
+        &q,
+        &users,
+        &posts,
+        user.as_ref(),
+        csrf.as_deref(),
     );
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Search", &body).await?,
     ))
+}
+
+fn normalize_search_query(query: &str) -> String {
+    query.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 async fn tag(

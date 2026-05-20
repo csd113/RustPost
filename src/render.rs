@@ -499,6 +499,112 @@ pub fn accounts(accounts: &[AccountView], csrf: &str) -> String {
     format!(r#"<section class="account-list">{rows}</section>"#)
 }
 
+pub fn search_page(
+    site_name: &str,
+    query: &str,
+    users: &[AccountView],
+    posts: &[PostView],
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+) -> String {
+    let form = search_form(site_name, query);
+    let state = if query.is_empty() {
+        empty_state(
+            "Find posts and people",
+            "Search for posts, usernames, mentions, or hashtags.",
+        )
+    } else if users.is_empty() && posts.is_empty() {
+        empty_state("No results found", &format!(r#"No matches for "{query}"."#))
+    } else {
+        search_results(query, users, posts, user, csrf)
+    };
+    format!("{form}{state}")
+}
+
+fn search_form(site_name: &str, query: &str) -> String {
+    format!(
+        r#"<section class="panel search-panel"><h1>Search</h1><form method="get" action="/search" class="search-form"><label class="sr-only" for="q">Search {}</label><input id="q" name="q" type="search" value="{}" placeholder="Search posts, @users, or #tags" autocomplete="off"><button class="primary" type="submit">Search</button></form></section>"#,
+        html_escape::encode_text(site_name),
+        html_escape::encode_double_quoted_attribute(query)
+    )
+}
+
+fn search_results(
+    query: &str,
+    users: &[AccountView],
+    posts: &[PostView],
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+) -> String {
+    let total = users.len() + posts.len();
+    let plural = if total == 1 { "result" } else { "results" };
+    let users_section = search_user_results(users);
+    let posts_heading = if users.is_empty() || posts.is_empty() {
+        String::new()
+    } else {
+        r#"<h3 class="section-title">Posts</h3>"#.to_owned()
+    };
+    let posts_section = if posts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{posts_heading}{}",
+            posts_with_options(posts, user, csrf, PostRenderOptions::timeline())
+        )
+    };
+    format!(
+        r#"<section class="search-results" aria-labelledby="search-results-title"><h2 class="section-title" id="search-results-title">{} {} for "{}"</h2>{}{}</section>"#,
+        total,
+        plural,
+        html_escape::encode_text(query),
+        users_section,
+        posts_section
+    )
+}
+
+fn search_user_results(users: &[AccountView]) -> String {
+    if users.is_empty() {
+        return String::new();
+    }
+    let rows = users
+        .iter()
+        .map(|account| {
+            let avatar = account.profile_picture_path.as_ref().map_or_else(
+                || {
+                    let initial = account.display_name.chars().next().unwrap_or('R');
+                    format!(
+                        r#"<span class="post-avatar placeholder" aria-hidden="true">{}</span>"#,
+                        html_escape::encode_text(&initial.to_string())
+                    )
+                },
+                |path| {
+                    format!(
+                        r#"<img class="post-avatar" src="{}" alt="" loading="lazy">"#,
+                        html_escape::encode_double_quoted_attribute(path)
+                    )
+                },
+            );
+            let bio = if account.bio.trim().is_empty() {
+                String::new()
+            } else {
+                format!("<p>{}</p>", html_escape::encode_text(&account.bio))
+            };
+            format!(
+                r#"<article class="account-row search-account">{}<div><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span>{}</div></article>"#,
+                avatar,
+                html_escape::encode_double_quoted_attribute(&account.username),
+                html_escape::encode_text(&account.display_name),
+                html_escape::encode_text(&account.username),
+                bio
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<section class="panel search-users" aria-labelledby="search-users-title"><h3 class="section-title" id="search-users-title">People</h3><div class="account-list">{rows}</div></section>"#
+    )
+}
+
 pub fn follow_form(user_id: i64, csrf: &str, following: bool) -> String {
     let (action, label, aria_label) = if following {
         (
@@ -917,8 +1023,9 @@ nav a:hover,.button-link:hover{background:#eef3f0;text-decoration:none}nav form,
 main{padding:1.25rem}.content-shell{max-width:1120px;margin:0 auto;display:grid;grid-template-columns:minmax(0,720px) 280px;gap:1.25rem;align-items:start}.content-column{min-width:0}.side-panel{position:sticky;top:5rem;background:#fff;border:1px solid #dfe4dc;border-radius:8px;padding:1rem;color:#59625a}.side-panel h2{margin:.1rem 0 .6rem;font-size:1rem;color:#202124}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:#202124}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:#202124}.dashboard-account:hover{text-decoration:none}.quick-links{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:1120px;margin:0 auto;padding:1rem;color:#687068;font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:#fff;border:1px solid #dfe4dc;border-radius:8px;margin:0 0 .7rem;padding:.85rem;box-shadow:0 1px 2px rgba(20,35,30,.04)}
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.panel h1+table,.panel h1+form,.panel h1+p,.panel h1+dl{margin-top:.85rem}.page-header p,.muted,.empty-state p{color:#667064;margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
-label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button{font:inherit}input[type=text],input[type=password],input[type=url],input:not([type]),textarea{width:100%;padding:.72rem .8rem;border:1px solid #b9c2b8;border-radius:7px;background:#fff}textarea{resize:vertical;min-height:7rem}
+label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button{font:inherit}input[type=text],input[type=search],input[type=password],input[type=url],input:not([type]),textarea{width:100%;padding:.72rem .8rem;border:1px solid #b9c2b8;border-radius:7px;background:#fff}textarea{resize:vertical;min-height:7rem}
 input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{background:#fff;color:#24445f;border-color:#cdd7d0;min-width:4.5rem}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}
+.search-panel h1{margin-bottom:.75rem}.search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center}.search-form input{min-width:0}.search-results{display:grid;gap:.65rem}.section-title{margin:.2rem 0 .65rem;font-size:1.05rem;color:#202124}.search-users{margin-bottom:0}.search-users .section-title{margin-top:0}.search-account{grid-template-columns:auto minmax(0,1fr)}
 input:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:3px solid #93c5fd;outline-offset:2px}button,.primary{border:1px solid #163b2f;background:#163b2f;color:#fff;border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:#235544;text-decoration:none}
 .composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:#24445f;font-weight:700}.file-control input{max-width:15rem}
 .thread-nav{display:flex;margin:0 0 .45rem .85rem}.thread-back{width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:#24445f}.thread-back svg{width:1.2rem;height:1.2rem;fill:currentColor}.thread-back:hover{background:#eef3f0;text-decoration:none}
@@ -926,7 +1033,7 @@ input:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:3px soli
 .counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.actions{display:flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid #cdd7d0;border-radius:7px;background:#fff;color:#24445f;padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:#eef3f0;color:#163b2f;text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:#9aa39d;background:#f4f5f2;border-color:#dfe4dc;cursor:not-allowed}.icon-button.disabled:hover,.icon-button:disabled:hover{background:#f4f5f2;color:#9aa39d}.follow-button{min-width:6.6rem}.follow-button.active{background:#eef3f0;color:#163b2f;border-color:#9fb9ad}.profile-actions{margin-top:0}.profile-secondary button{background:#fff;color:#8a3d2d;border-color:#e0c4bb;padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:#fff8f5;color:#6f2f22}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:#4b655d;font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:#667064}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:#e6b8a8;background:#fff8f5}.notice.success{border-color:#add7b4;background:#f4fbf5}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:#6d766e;font-size:.78rem}
 .profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#dfe9e1}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#eef3f0;flex:0 0 auto}.favicon-preview{width:32px;height:32px;object-fit:contain;border:1px solid #d9ded6;border-radius:6px;background:#fff}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:#fff;border:1px solid #dfe4dc;border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:#59625a;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #e3e7e0;text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
 @media (max-width:900px){.content-shell{grid-template-columns:1fr}.side-panel{position:static;display:none}}
-@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1{font-size:1.25rem}}
+@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.search-form{grid-template-columns:1fr}.search-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1{font-size:1.25rem}}
 "#;
 
 #[cfg(test)]
@@ -1094,6 +1201,38 @@ mod tests {
         assert!(
             body.contains(r#"<span class="post-avatar placeholder" aria-hidden="true">A</span>"#)
         );
+    }
+
+    #[test]
+    fn search_page_preserves_and_escapes_query() {
+        let body = search_page("RustPost", r#"<rust> "query""#, &[], &[], None, None);
+
+        assert!(body.contains(r#"value="&lt;rust&gt; &quot;query&quot;""#));
+        assert!(body.contains("No results found"));
+        assert!(body.contains("No matches for"));
+        assert!(body.contains("&lt;rust&gt;"));
+        assert!(body.contains("&quot;query&quot;"));
+        assert!(!body.contains(r#"<rust> "query""#));
+    }
+
+    #[test]
+    fn search_page_uses_post_cards_for_results() {
+        let post = test_post();
+        let account = AccountView {
+            id: 1,
+            username: "ada".to_owned(),
+            display_name: "Ada".to_owned(),
+            bio: "Computing notes".to_owned(),
+            profile_picture_path: None,
+            viewer_following: false,
+        };
+
+        let body = search_page("RustPost", "ada", &[account], &[post], None, None);
+
+        assert!(body.contains(r#"2 results for "ada""#));
+        assert!(body.contains(r#"id="search-users-title">People"#));
+        assert!(body.contains(r#"class="account-row search-account""#));
+        assert!(body.contains(r#"data-card-href="/posts/42""#));
     }
 
     #[test]
