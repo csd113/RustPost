@@ -57,6 +57,12 @@ pub struct MediaView {
     pub alt_text: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct MutedWord {
+    pub id: i64,
+    pub term: String,
+}
+
 #[derive(Debug)]
 struct PostRow {
     event_kind: String,
@@ -447,6 +453,103 @@ pub async fn mute(pool: &SqlitePool, muter_id: i64, muted_id: i64) -> anyhow::Re
     .await
 }
 
+pub async fn unmute(pool: &SqlitePool, muter_id: i64, muted_id: i64) -> anyhow::Result<()> {
+    pool.call(move |conn| {
+        conn.execute(
+            "DELETE FROM mutes WHERE muter_id = ? AND muted_id = ?",
+            params![muter_id, muted_id],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn muted_users(
+    pool: &SqlitePool,
+    muter_id: i64,
+) -> anyhow::Result<Vec<(i64, String, String)>> {
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name
+            FROM mutes m
+            JOIN users u ON u.id = m.muted_id
+            WHERE m.muter_id = ? AND u.is_deleted = 0
+            ORDER BY lower(u.username)
+            "#,
+        )?;
+        let rows = stmt
+            .query_map([muter_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+pub async fn add_muted_word(pool: &SqlitePool, user_id: i64, term: &str) -> anyhow::Result<()> {
+    let term = clean_muted_word(term)?;
+    let normalized = term.to_ascii_lowercase();
+    pool.call(move |conn| {
+        conn.execute(
+            "INSERT OR IGNORE INTO muted_words (user_id, term, normalized_term) VALUES (?, ?, ?)",
+            params![user_id, term, normalized],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn remove_muted_word(
+    pool: &SqlitePool,
+    user_id: i64,
+    muted_word_id: i64,
+) -> anyhow::Result<()> {
+    pool.call(move |conn| {
+        conn.execute(
+            "DELETE FROM muted_words WHERE user_id = ? AND id = ?",
+            params![user_id, muted_word_id],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn muted_words(pool: &SqlitePool, user_id: i64) -> anyhow::Result<Vec<MutedWord>> {
+    pool.call(move |conn| {
+        let mut stmt = conn
+            .prepare("SELECT id, term FROM muted_words WHERE user_id = ? ORDER BY lower(term)")?;
+        let rows = stmt
+            .query_map([user_id], |row| {
+                Ok(MutedWord {
+                    id: row.get(0)?,
+                    term: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+fn clean_muted_word(term: &str) -> anyhow::Result<String> {
+    let trimmed = term.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("muted word cannot be empty");
+    }
+    if trimmed.chars().count() > 100 {
+        anyhow::bail!("muted word is too long");
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        anyhow::bail!("muted word contains unsupported control characters");
+    }
+    Ok(trimmed.to_owned())
+}
+
 pub async fn like(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<()> {
     pool.call(move |conn| {
         let tx = conn.transaction()?;
@@ -568,11 +671,21 @@ pub async fn search(
         .await?;
     let rows = if let Some(fts_query) = fts_query_from_user_input(query) {
         let mut post_sql = base_post_query();
-        post_sql.push_str(
-            " AND p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?) LIMIT 40",
-        );
-        pool.call(move |conn| query_post_rows(conn, &post_sql, params![fts_query]))
-            .await?
+        post_sql.push_str(" AND p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?)");
+        append_viewer_filters(&mut post_sql, "p.user_id", viewer_id);
+        post_sql.push_str(" LIMIT 40");
+        pool.call(move |conn| {
+            if let Some(viewer_id) = viewer_id {
+                query_post_rows(
+                    conn,
+                    &post_sql,
+                    params![fts_query, viewer_id, viewer_id, viewer_id],
+                )
+            } else {
+                query_post_rows(conn, &post_sql, params![fts_query])
+            }
+        })
+        .await?
     } else {
         Vec::new()
     };
@@ -782,11 +895,15 @@ fn append_viewer_filters(sql: &mut String, user_column: &str, viewer_id: Option<
         sql.push_str(&format!(
             " AND ({user_column} IS NULL OR {user_column} NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?))"
         ));
+        sql.push_str(
+            " AND NOT EXISTS (SELECT 1 FROM muted_words mw WHERE mw.user_id = ? AND instr(lower(p.text), mw.normalized_term) > 0)",
+        );
     }
 }
 
 fn push_viewer_filter_bindings(bindings: &mut Vec<i64>, viewer_id: Option<i64>) {
     if let Some(id) = viewer_id {
+        bindings.push(id);
         bindings.push(id);
         bindings.push(id);
     }
@@ -1215,6 +1332,72 @@ mod tests {
         assert!(!repost(&pool, bob, post).await.expect("duplicate repost"));
         block(&pool, alice, bob).await.expect("block");
         mute(&pool, alice, bob).await.expect("mute");
+    }
+
+    #[tokio::test]
+    async fn muted_users_can_be_listed_and_removed() {
+        let (pool, _settings, alice, bob) = fixture().await;
+
+        mute(&pool, alice, bob).await.expect("mute");
+        let muted = muted_users(&pool, alice).await.expect("muted users");
+
+        assert_eq!(muted, vec![(bob, "bob".to_owned(), "bob".to_owned())]);
+        unmute(&pool, alice, bob).await.expect("unmute");
+        assert!(
+            muted_users(&pool, alice)
+                .await
+                .expect("muted users after unmute")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn muted_words_persist_and_filter_viewer_timelines_and_search() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let hidden = create_post(
+            &pool,
+            &settings,
+            Some(bob),
+            "This contains Spoilers",
+            None,
+            &[],
+        )
+        .await
+        .expect("hidden post");
+        let visible = create_post(&pool, &settings, Some(bob), "plain update", None, &[])
+            .await
+            .expect("visible post");
+
+        add_muted_word(&pool, alice, "spoilers")
+            .await
+            .expect("add muted word");
+        let words = muted_words(&pool, alice).await.expect("muted words");
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].term, "spoilers");
+
+        let alice_timeline = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("alice timeline");
+        assert!(!alice_timeline.iter().any(|post| post.id == hidden));
+        assert!(alice_timeline.iter().any(|post| post.id == visible));
+
+        let bob_timeline = timeline(&pool, Some(bob), "local", None)
+            .await
+            .expect("bob timeline");
+        assert!(bob_timeline.iter().any(|post| post.id == hidden));
+
+        let (_users, alice_search) = search(&pool, Some(alice), "Spoilers")
+            .await
+            .expect("alice search");
+        assert!(alice_search.is_empty());
+
+        remove_muted_word(&pool, alice, words[0].id)
+            .await
+            .expect("remove muted word");
+        let alice_timeline = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("alice timeline after remove");
+        assert!(alice_timeline.iter().any(|post| post.id == hidden));
     }
 
     #[tokio::test]

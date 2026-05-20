@@ -11,6 +11,31 @@ use crate::config::Settings;
 use crate::db::SqlitePool;
 use crate::validation::{normalize_username, validate_password};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+impl From<&str> for Theme {
+    fn from(value: &str) -> Self {
+        match value {
+            "dark" => Self::Dark,
+            _ => Self::Light,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CurrentUser {
     pub id: i64,
@@ -18,6 +43,7 @@ pub struct CurrentUser {
     pub display_name: String,
     pub is_admin: bool,
     pub is_suspended: bool,
+    pub theme: Theme,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +159,54 @@ pub async fn revoke_session(pool: &SqlitePool, token: &str) -> anyhow::Result<()
     .await
 }
 
+pub async fn verify_user_password(
+    pool: &SqlitePool,
+    user_id: i64,
+    password: &str,
+) -> anyhow::Result<bool> {
+    let hash: Option<String> = pool
+        .call(move |conn| {
+            conn.query_row(
+                "SELECT password_hash FROM users WHERE id = ? AND is_deleted = 0",
+                [user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?;
+    let Some(hash) = hash else {
+        return Ok(false);
+    };
+    verify_password(password, &hash)
+}
+
+pub async fn change_password(
+    pool: &SqlitePool,
+    settings: &Settings,
+    user_id: i64,
+    current_password: &str,
+    new_password: &str,
+    confirm_new_password: &str,
+) -> anyhow::Result<()> {
+    if new_password != confirm_new_password {
+        anyhow::bail!("new passwords do not match");
+    }
+    validate_password(new_password, settings)?;
+    if !verify_user_password(pool, user_id, current_password).await? {
+        anyhow::bail!("current password is incorrect");
+    }
+    let hash = hash_password(new_password)?;
+    pool.call(move |conn| {
+        conn.execute(
+            "UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
+            params![hash, user_id],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
 pub async fn current_user(
     pool: &SqlitePool,
     headers: &HeaderMap,
@@ -144,7 +218,7 @@ pub async fn current_user(
     pool.call(move |conn| {
         conn.query_row(
             r#"
-        SELECT u.id, u.username, u.display_name, u.is_admin, u.is_suspended
+        SELECT u.id, u.username, u.display_name, u.is_admin, u.is_suspended, u.theme
         FROM sessions s
         JOIN users u ON u.id = s.user_id
         WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP AND u.is_deleted = 0
@@ -157,6 +231,7 @@ pub async fn current_user(
                     display_name: row.get(2)?,
                     is_admin: row.get::<_, i64>(3)? != 0,
                     is_suspended: row.get::<_, i64>(4)? != 0,
+                    theme: Theme::from(row.get::<_, String>(5)?.as_str()),
                 })
             },
         )
@@ -287,6 +362,105 @@ mod tests {
             register_user(&pool, &settings, "alice", "very secure password", false)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn password_change_updates_hash() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        crate::db::migrate(&pool).await.expect("migrate");
+        let settings = Settings::default();
+        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
+            .await
+            .expect("user");
+
+        change_password(
+            &pool,
+            &settings,
+            user_id,
+            "very secure password",
+            "much better password",
+            "much better password",
+        )
+        .await
+        .expect("password change");
+
+        assert!(
+            login(&pool, "alice", "very secure password")
+                .await
+                .expect("old login")
+                .is_err()
+        );
+        assert!(
+            login(&pool, "alice", "much better password")
+                .await
+                .expect("new login")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn password_change_rejects_wrong_current_password() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        crate::db::migrate(&pool).await.expect("migrate");
+        let settings = Settings::default();
+        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
+            .await
+            .expect("user");
+
+        let result = change_password(
+            &pool,
+            &settings,
+            user_id,
+            "wrong password",
+            "much better password",
+            "much better password",
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("wrong current password").to_string(),
+            "current password is incorrect"
+        );
+        assert!(
+            login(&pool, "alice", "very secure password")
+                .await
+                .expect("old login")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn password_change_rejects_confirmation_mismatch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        crate::db::migrate(&pool).await.expect("migrate");
+        let settings = Settings::default();
+        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
+            .await
+            .expect("user");
+
+        let result = change_password(
+            &pool,
+            &settings,
+            user_id,
+            "very secure password",
+            "much better password",
+            "different password",
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("password mismatch").to_string(),
+            "new passwords do not match"
         );
     }
 }

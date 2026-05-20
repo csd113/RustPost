@@ -445,6 +445,11 @@ mod tests {
     #[test]
     fn startup_dashboard_groups_copyable_urls_paths_and_commands() {
         let paths = RuntimePaths::from_data_dir(PathBuf::from("/tmp/rustpost-data"));
+        let data_dir = display(paths.data_dir.as_path());
+        let database_path = display(paths.database_path.as_path());
+        let originals_dir = display(paths.uploads_originals.as_path());
+        let logs_dir = display(paths.logs_dir.as_path());
+        let backups_dir = display(paths.backups_dir.as_path());
         let settings = Settings::default();
         let ffmpeg = FfmpegStatus {
             available: false,
@@ -473,14 +478,14 @@ mod tests {
         assert!(output.contains("Local URL"));
         assert!(output.contains("http://127.0.0.1:8080"));
         assert!(output.contains("Data directory"));
-        assert!(output.contains("/tmp/rustpost-data"));
-        assert!(output.contains("/tmp/rustpost-data/db/rustpost.sqlite3"));
-        assert!(output.contains("/tmp/rustpost-data/uploads/originals"));
-        assert!(output.contains("/tmp/rustpost-data/logs"));
-        assert!(output.contains("/tmp/rustpost-data/backups"));
-        assert!(
-            output.contains("rustpost-cli --data-dir /tmp/rustpost-data create-admin-interactive")
-        );
+        assert!(output.contains(&data_dir));
+        assert!(output.contains(&database_path));
+        assert!(output.contains(&originals_dir));
+        assert!(output.contains(&logs_dir));
+        assert!(output.contains(&backups_dir));
+        assert!(output.contains(&format!(
+            "rustpost-cli --data-dir {data_dir} create-admin-interactive"
+        )));
         assert!(output.contains("FFmpeg"));
         assert!(output.contains("[WARN] unavailable"));
     }

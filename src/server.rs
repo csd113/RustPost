@@ -14,13 +14,13 @@ use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
-use crate::auth::{self, CurrentUser};
+use crate::auth::{self, CurrentUser, Theme};
 use crate::config::Settings;
 use crate::db::SqlitePool;
 use crate::errors::{AppError, AppResult};
 use crate::ffmpeg::FfmpegStatus;
 use crate::runtime::RuntimePaths;
-use crate::{admin, backup, csrf, favicon, media, rate_limit, render, social};
+use crate::{account, admin, backup, csrf, favicon, media, rate_limit, render, social};
 
 const CSRF_TOKEN_HISTORY_LIMIT: usize = 32;
 
@@ -76,7 +76,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/users/{id}/block", post(block))
         .route("/users/{id}/unblock", post(unblock))
         .route("/users/{id}/mute", post(mute))
+        .route("/users/{id}/unmute", post(unmute))
         .route("/settings", get(settings_form).post(settings_update))
+        .route("/settings/muted-words", post(add_muted_word))
+        .route("/settings/muted-words/{id}/remove", post(remove_muted_word))
+        .route("/settings/password", post(change_password))
+        .route("/settings/delete", get(delete_account_warning))
+        .route(
+            "/settings/delete/confirm",
+            get(delete_account_final_warning).post(delete_account_final),
+        )
+        .route("/account-deleted", get(account_deleted))
         .route("/following", get(following))
         .route("/bookmarks", get(bookmarks))
         .route("/notifications", get(notifications))
@@ -89,6 +99,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/posts/{id}/delete", post(admin_delete_post))
         .route("/admin/health", get(admin_health))
         .route("/admin/media", get(admin_media))
+        .route(
+            "/admin/deep-settings",
+            get(admin_deep_settings).post(admin_deep_settings_update),
+        )
         .route("/admin/favicon", post(admin_favicon_upload))
         .route("/admin/favicon/remove", post(admin_favicon_remove))
         .route(
@@ -173,11 +187,45 @@ struct SearchQuery {
     q: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SettingsQuery {
+    saved: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeepSettingsQuery {
+    saved: Option<String>,
+    discarded: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MutedWordForm {
+    csrf: String,
+    term: String,
+}
+
+#[derive(Deserialize)]
+struct PasswordChangeForm {
+    csrf: String,
+    current_password: String,
+    new_password: String,
+    confirm_new_password: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteAccountPasswordForm {
+    csrf: String,
+    delete_intent: Option<String>,
+    password: String,
+}
+
 struct ParsedProfileUpdate {
     csrf_token: String,
     display_name: String,
     bio: String,
+    location: String,
     website: String,
+    theme: Theme,
     delete_profile_picture: bool,
     delete_banner: bool,
     profile_picture_media_id: Option<i64>,
@@ -823,6 +871,10 @@ async fn reply_redirect(Path(id): Path<i64>) -> Redirect {
     Redirect::to(&format!("/posts/{id}"))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "profile rendering combines existing viewer controls and page assembly in one route handler"
+)]
 async fn profile(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -834,7 +886,7 @@ async fn profile(
         .call(move |conn| {
             conn.query_row(
                 r#"
-        SELECT u.id, u.username, u.display_name, u.bio, u.website,
+        SELECT u.id, u.username, u.display_name, u.bio, u.location, u.website,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path
         FROM users u
@@ -850,8 +902,9 @@ async fn profile(
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
@@ -859,8 +912,16 @@ async fn profile(
             .map_err(Into::into)
         })
         .await?;
-    let Some((profile_id, profile_username, display_name, bio, website, picture_path, banner_path)) =
-        profile
+    let Some((
+        profile_id,
+        profile_username,
+        display_name,
+        bio,
+        location,
+        website,
+        picture_path,
+        banner_path,
+    )) = profile
     else {
         return Err(AppError::NotFound);
     };
@@ -896,8 +957,16 @@ async fn profile(
             html_escape::encode_text(website.as_str())
         )
     };
+    let location_line = if location.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="profile-meta">{}</p>"#,
+            html_escape::encode_text(location.as_str())
+        )
+    };
     let body = format!(
-        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p><p>{}</p>{}</div></div></section>{}"#,
+        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p>{}<p>{}</p>{}</div></div></section>{}"#,
         banner,
         picture,
         html_escape::encode_text(display_name.as_str()),
@@ -907,6 +976,7 @@ async fn profile(
         followers,
         profile_id,
         following,
+        location_line,
         html_escape::encode_text(bio.as_str()),
         website_link,
         render::posts(&posts, user.as_ref(), csrf.as_deref())
@@ -1019,7 +1089,146 @@ async fn unblock(
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::unblock(&state.pool, user.id, id).await?;
-    Ok(Redirect::to("/settings").into_response())
+    Ok(Redirect::to("/settings?saved=profile").into_response())
+}
+
+fn settings_query_notice(saved: Option<&str>) -> Option<(&'static str, &'static str)> {
+    match saved {
+        Some("profile") => Some(("success", "Profile settings saved.")),
+        Some("muted-word") => Some(("success", "Muted word saved.")),
+        Some("muted-word-removed") => Some(("success", "Muted word removed.")),
+        Some("password") => Some(("success", "Password changed.")),
+        _ => None,
+    }
+}
+
+fn settings_profile_media(
+    picture_path: Option<&str>,
+    banner_path: Option<&str>,
+    allow_profile_pictures: bool,
+    allow_profile_banners: bool,
+) -> String {
+    let banner = banner_path.map_or_else(
+        || {
+            r#"<div class="settings-banner-preview placeholder" aria-hidden="true"></div>"#
+                .to_owned()
+        },
+        |path| {
+            format!(
+                r#"<img class="settings-banner-preview" src="{}" alt="">"#,
+                html_escape::encode_double_quoted_attribute(path)
+            )
+        },
+    );
+    let picture = picture_path.map_or_else(
+        || {
+            r#"<div class="settings-picture-preview placeholder" aria-hidden="true"></div>"#
+                .to_owned()
+        },
+        |path| {
+            format!(
+                r#"<img class="settings-picture-preview" src="{}" alt="">"#,
+                html_escape::encode_double_quoted_attribute(path)
+            )
+        },
+    );
+    let banner_control = if allow_profile_banners {
+        let delete = banner_path.map_or_else(String::new, |_| {
+            r#"<label class="check-row"><input type="checkbox" name="delete_banner" value="true"> Remove banner</label>"#
+                .to_owned()
+        });
+        format!(
+            r#"<div class="media-control-row"><label class="file-control" for="banner">Change banner<input id="banner" name="banner" type="file" accept="image/*"></label>{delete}</div>"#
+        )
+    } else {
+        r#"<p class="muted">Profile banners are disabled.</p>"#.to_owned()
+    };
+    let picture_control = if allow_profile_pictures {
+        let delete = picture_path.map_or_else(String::new, |_| {
+            r#"<label class="check-row"><input type="checkbox" name="delete_profile_picture" value="true"> Remove profile picture</label>"#
+                .to_owned()
+        });
+        format!(
+            r#"<div class="media-control-row"><label class="file-control" for="profile_picture">Change profile picture<input id="profile_picture" name="profile_picture" type="file" accept="image/*"></label>{delete}</div>"#
+        )
+    } else {
+        r#"<p class="muted">Profile pictures are disabled.</p>"#.to_owned()
+    };
+    format!(
+        r#"<div class="settings-profile-media"><div class="settings-banner-wrap">{banner}</div><div class="settings-picture-row">{picture}<div class="settings-media-controls">{banner_control}{picture_control}</div></div></div>"#
+    )
+}
+
+fn settings_user_list(
+    users: &[(i64, String, String)],
+    action_suffix: &str,
+    csrf: &str,
+    label: &str,
+    empty_title: &str,
+    empty_message: &str,
+) -> String {
+    if users.is_empty() {
+        return compact_empty_state(empty_title, empty_message);
+    }
+    let rows = users
+        .iter()
+        .map(|(id, username, display_name)| {
+            format!(
+                r#"<li><span><strong>{}</strong> <span class="muted">@{}</span></span>{}</li>"#,
+                html_escape::encode_text(display_name),
+                html_escape::encode_text(username),
+                small_form(&format!("/users/{id}{action_suffix}"), csrf, label, label,)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<ul class="settings-item-list">{rows}</ul>"#)
+}
+
+fn settings_muted_word_list(words: &[social::MutedWord], csrf: &str) -> String {
+    if words.is_empty() {
+        return compact_empty_state(
+            "No muted words",
+            "Posts containing muted words will be hidden.",
+        );
+    }
+    let rows = words
+        .iter()
+        .map(|word| {
+            format!(
+                r#"<li><span>{}</span>{}</li>"#,
+                html_escape::encode_text(&word.term),
+                small_form(
+                    &format!("/settings/muted-words/{}/remove", word.id),
+                    csrf,
+                    "Remove",
+                    "Remove muted word",
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<ul class="settings-item-list">{rows}</ul>"#)
+}
+
+fn compact_empty_state(title: &str, message: &str) -> String {
+    format!(
+        r#"<div class="compact-empty"><strong>{}</strong><p>{}</p></div>"#,
+        html_escape::encode_text(title),
+        html_escape::encode_text(message)
+    )
+}
+
+fn validate_profile_location(location: &str) -> AppResult<()> {
+    if location.chars().count() > 100 {
+        return Err(AppError::BadRequest("location is too long".to_owned()));
+    }
+    if location.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "location contains unsupported control characters".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn mute(
@@ -1039,18 +1248,42 @@ async fn mute(
     Ok(Redirect::to(&account_action_return(&state.pool, &headers, id).await?).into_response())
 }
 
+async fn unmute(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    social::unmute(&state.pool, user.id, id).await?;
+    Ok(Redirect::to("/settings").into_response())
+}
+
 async fn settings_form(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<SettingsQuery>,
 ) -> AppResult<Html<String>> {
     let user = require_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let notice = settings_query_notice(query.saved.as_deref());
+    Ok(Html(settings_page(&state, &user, &csrf, notice).await?))
+}
+
+async fn settings_page(
+    state: &AppState,
+    user: &CurrentUser,
+    csrf: &str,
+    notice: Option<(&str, &str)>,
+) -> AppResult<String> {
+    let user_id = user.id;
     let profile = state
         .pool
         .call(move |conn| {
             conn.query_row(
                 r#"
-        SELECT u.display_name, u.bio, u.website,
+        SELECT u.display_name, u.bio, u.location, u.website, u.theme,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path
         FROM users u
@@ -1058,83 +1291,71 @@ async fn settings_form(
         LEFT JOIN media banner ON banner.id = u.banner_media_id
         WHERE u.id = ?
         "#,
-                [user.id],
+                [user_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .map_err(Into::into)
         })
         .await?;
-    let (display_name, bio, website, picture_path, banner_path) = profile;
-    let picture = picture_path.map_or_else(String::new, |path| {
-            format!(
-            r#"<img class="profile-picture" src="{}" alt=""><label class="check-row"><input type="checkbox" name="delete_profile_picture" value="true"> Delete profile picture</label>"#,
-                html_escape::encode_double_quoted_attribute(&path)
-            )
-        });
-    let banner = banner_path.map_or_else(String::new, |path| {
-            format!(
-                r#"<img class="profile-banner" src="{}" alt=""><label class="check-row"><input type="checkbox" name="delete_banner" value="true"> Delete banner</label>"#,
-                html_escape::encode_double_quoted_attribute(&path)
-            )
-        });
-    let banner_input = if state.settings.accounts.allow_profile_banners {
-        format!(
-            r#"{banner}<label for="banner">Banner</label><input id="banner" name="banner" type="file" accept="image/*">"#
-        )
-    } else {
-        r#"<p>Profile banners are disabled.</p>"#.to_owned()
-    };
-    let picture_input = if state.settings.accounts.allow_profile_pictures {
-        format!(
-            r#"{picture}<label for="profile_picture">Profile picture</label><input id="profile_picture" name="profile_picture" type="file" accept="image/*">"#
-        )
-    } else {
-        r#"<p>Profile pictures are disabled.</p>"#.to_owned()
-    };
+    let (display_name, bio, location, website, theme, picture_path, banner_path) = profile;
     let blocked = social::blocked_users(&state.pool, user.id).await?;
-    let blocked_rows = blocked
-        .into_iter()
-        .map(|(id, username, display_name)| {
-            format!(
-                r#"<li><span><strong>{}</strong> <span class="muted">@{}</span></span>{}</li>"#,
-                html_escape::encode_text(&display_name),
-                html_escape::encode_text(&username),
-                small_form(
-                    &format!("/users/{id}/unblock"),
-                    &csrf,
-                    "Unblock",
-                    "Unblock this account",
-                )
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let blocked_panel = if blocked_rows.is_empty() {
-        render::empty_state("No blocked users", "Blocked accounts will appear here.")
+    let muted = social::muted_users(&state.pool, user.id).await?;
+    let muted_words = social::muted_words(&state.pool, user.id).await?;
+    let dark_checked = if Theme::from(theme.as_str()) == Theme::Dark {
+        " checked"
     } else {
-        format!(r#"<ul class="item-list">{blocked_rows}</ul>"#)
+        ""
     };
+    let notice_html =
+        notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
+    let profile_media = settings_profile_media(
+        picture_path.as_deref(),
+        banner_path.as_deref(),
+        state.settings.accounts.allow_profile_pictures,
+        state.settings.accounts.allow_profile_banners,
+    );
     let body = format!(
-        r#"<section class="panel"><h1>Account settings</h1><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="website">Website</label><input id="website" type="url" name="website" value="{}">{}{}<button type="submit">Save settings</button></form></section><section class="panel"><h2>Blocked users</h2>{}</section>"#,
+        r#"{notice_html}<section class="panel settings-profile-editor"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel compact-panel"><h2>Blocked users</h2>{}</section><section class="panel compact-panel"><h2>Muted users</h2>{}</section></div><section class="panel compact-panel"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel compact-panel"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password" minlength="{}" required><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password" minlength="{}" required><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel danger-panel"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
+        profile_media,
+        dark_checked,
         html_escape::encode_double_quoted_attribute(display_name.as_str()),
         html_escape::encode_text(bio.as_str()),
+        html_escape::encode_double_quoted_attribute(location.as_str()),
         html_escape::encode_double_quoted_attribute(website.as_str()),
-        picture_input,
-        banner_input,
-        blocked_panel,
+        settings_user_list(
+            &blocked,
+            "/unblock",
+            csrf,
+            "Unblock",
+            "No blocked users",
+            "Blocked accounts will appear here."
+        ),
+        settings_user_list(
+            &muted,
+            "/unmute",
+            csrf,
+            "Unmute",
+            "No muted users",
+            "Muted accounts will appear here."
+        ),
+        html_escape::encode_double_quoted_attribute(&csrf),
+        settings_muted_word_list(&muted_words, csrf),
+        html_escape::encode_double_quoted_attribute(&csrf),
+        state.settings.accounts.min_password_length,
+        state.settings.accounts.min_password_length,
     );
-    Ok(Html(
-        page_layout(&state, Some(&user), Some(&csrf), "Settings", &body).await?,
-    ))
+    page_layout(state, Some(user), Some(csrf), "Settings", &body).await
 }
 
 async fn settings_update(
@@ -1146,15 +1367,18 @@ async fn settings_update(
     let form = parse_profile_update(&state, user.id, multipart).await?;
     validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
     crate::validation::validate_profile_text(&form.display_name, &form.bio, &state.settings)?;
+    validate_profile_location(&form.location)?;
     let display_name = form.display_name.trim().to_owned();
     let bio = form.bio.trim().to_owned();
+    let location = form.location.trim().to_owned();
     let website = form.website.trim().to_owned();
+    let theme = form.theme.as_str().to_owned();
     state
         .pool
         .call(move |conn| {
             conn.execute(
-                "UPDATE users SET display_name = ?, bio = ?, website = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                params![display_name, bio, website, user.id],
+                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                params![display_name, bio, location, website, theme, user.id],
             )?;
             Ok(())
         })
@@ -1183,7 +1407,302 @@ async fn settings_update(
         )
         .await?;
     }
-    Ok(Redirect::to("/settings").into_response())
+    Ok(Redirect::to("/settings?saved=profile").into_response())
+}
+
+async fn add_muted_word(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<MutedWordForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    match social::add_muted_word(&state.pool, user.id, &form.term).await {
+        Ok(()) => Ok(Redirect::to("/settings?saved=muted-word").into_response()),
+        Err(err) => {
+            settings_response(
+                &state,
+                &user,
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "error",
+                &err.to_string(),
+            )
+            .await
+        }
+    }
+}
+
+async fn remove_muted_word(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    social::remove_muted_word(&state.pool, user.id, id).await?;
+    Ok(Redirect::to("/settings?saved=muted-word-removed").into_response())
+}
+
+async fn change_password(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<PasswordChangeForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    match auth::change_password(
+        &state.pool,
+        &state.settings,
+        user.id,
+        &form.current_password,
+        &form.new_password,
+        &form.confirm_new_password,
+    )
+    .await
+    {
+        Ok(()) => Ok(Redirect::to("/settings?saved=password").into_response()),
+        Err(err) => {
+            settings_response(
+                &state,
+                &user,
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "error",
+                &err.to_string(),
+            )
+            .await
+        }
+    }
+}
+
+async fn settings_response(
+    state: &AppState,
+    user: &CurrentUser,
+    headers: &HeaderMap,
+    status: StatusCode,
+    kind: &'static str,
+    message: &str,
+) -> AppResult<Response> {
+    let csrf = form_csrf(state, headers).await.unwrap_or_default();
+    Ok((
+        status,
+        Html(settings_page(state, user, &csrf, Some((kind, message))).await?),
+    )
+        .into_response())
+}
+
+async fn delete_account_warning(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> AppResult<Html<String>> {
+    let user = require_active_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let body = render_delete_account_warning();
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Delete account", &body).await?,
+    ))
+}
+
+async fn delete_account_final_warning(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> AppResult<Html<String>> {
+    let user = require_active_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let delete_intent = create_delete_account_intent(&state, &headers, user.id).await?;
+    let body = render_delete_account_final_warning(&csrf, &delete_intent, None);
+    Ok(Html(
+        page_layout(
+            &state,
+            Some(&user),
+            Some(&csrf),
+            "Confirm delete account",
+            &body,
+        )
+        .await?,
+    ))
+}
+
+async fn delete_account_final(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteAccountPasswordForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    if !consume_delete_account_intent(
+        &state,
+        &headers,
+        user.id,
+        form.delete_intent.as_deref().unwrap_or_default(),
+    )
+    .await?
+    {
+        return delete_account_final_response(
+            &state,
+            &user,
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "Delete confirmation expired. Start the delete account flow again.",
+        )
+        .await;
+    }
+    match account::delete_account(&state.pool, &state.paths, user.id, &form.password).await {
+        Ok(_summary) => {
+            let mut response = Redirect::to("/account-deleted").into_response();
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&auth::clear_session_cookie(
+                    state.settings.server.cookie_secure,
+                ))
+                .map_err(|err| AppError::BadRequest(err.to_string()))?,
+            );
+            Ok(response)
+        }
+        Err(account::DeleteAccountError::WrongPassword) => {
+            delete_account_final_response(
+                &state,
+                &user,
+                &headers,
+                StatusCode::UNAUTHORIZED,
+                "Password is incorrect.",
+            )
+            .await
+        }
+        Err(err) => {
+            tracing::warn!(user_id = user.id, error = %err, "account deletion failed");
+            delete_account_final_response(
+                &state,
+                &user,
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "Account deletion could not be completed. Review uploaded media paths and try again.",
+            )
+            .await
+        }
+    }
+}
+
+async fn delete_account_final_response(
+    state: &AppState,
+    user: &CurrentUser,
+    headers: &HeaderMap,
+    status: StatusCode,
+    message: &str,
+) -> AppResult<Response> {
+    let csrf = form_csrf(state, headers).await.unwrap_or_default();
+    let delete_intent = create_delete_account_intent(state, headers, user.id).await?;
+    let body = render_delete_account_final_warning(&csrf, &delete_intent, Some(message));
+    Ok((
+        status,
+        Html(
+            page_layout(
+                state,
+                Some(user),
+                Some(&csrf),
+                "Confirm delete account",
+                &body,
+            )
+            .await?,
+        ),
+    )
+        .into_response())
+}
+
+async fn create_delete_account_intent(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: i64,
+) -> AppResult<String> {
+    let token = auth::session_cookie(headers).ok_or(AppError::Forbidden)?;
+    let token_hash = auth::hash_token(&token);
+    let delete_intent = auth::secure_token();
+    let delete_intent_hash = auth::hash_token(&delete_intent);
+    let updated = state
+        .pool
+        .call(move |conn| {
+            Ok(conn.execute(
+                r#"
+                UPDATE sessions
+                SET delete_account_token_hash = ?,
+                    delete_account_token_expires_at = datetime('now', '+10 minutes')
+                WHERE token_hash = ?
+                  AND user_id = ?
+                  AND revoked_at IS NULL
+                  AND expires_at > CURRENT_TIMESTAMP
+                "#,
+                params![delete_intent_hash, token_hash, user_id],
+            )?)
+        })
+        .await
+        .map_err(AppError::Anyhow)?;
+    if updated != 1 {
+        return Err(AppError::Forbidden);
+    }
+    Ok(delete_intent)
+}
+
+async fn consume_delete_account_intent(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: i64,
+    delete_intent: &str,
+) -> AppResult<bool> {
+    let Some(token) = auth::session_cookie(headers) else {
+        return Ok(false);
+    };
+    if delete_intent.trim().is_empty() {
+        return Ok(false);
+    }
+    let token_hash = auth::hash_token(&token);
+    let delete_intent_hash = auth::hash_token(delete_intent);
+    state
+        .pool
+        .call(move |conn| {
+            Ok(conn.execute(
+                r#"
+                UPDATE sessions
+                SET delete_account_token_hash = NULL,
+                    delete_account_token_expires_at = NULL
+                WHERE token_hash = ?
+                  AND user_id = ?
+                  AND revoked_at IS NULL
+                  AND expires_at > CURRENT_TIMESTAMP
+                  AND delete_account_token_hash = ?
+                  AND delete_account_token_expires_at > CURRENT_TIMESTAMP
+                "#,
+                params![token_hash, user_id, delete_intent_hash],
+            )? == 1)
+        })
+        .await
+        .map_err(AppError::Anyhow)
+}
+
+async fn account_deleted(State(state): State<Arc<AppState>>) -> AppResult<Html<String>> {
+    let body = r#"<section class="panel"><h1>Account deleted</h1><p>Your account and its owned content have been removed.</p><p><a class="button-link" href="/login">Log in</a></p></section>"#;
+    Ok(Html(
+        page_layout(&state, None, None, "Account deleted", body).await?,
+    ))
+}
+
+fn render_delete_account_warning() -> String {
+    r#"<section class="panel danger-panel delete-account-panel"><h1>Delete account</h1><p>This is permanent. RustPost will remove your profile, posts, reposts, likes, follows, blocks, mutes, bookmarks, sessions, and uploaded media owned by your account.</p><div class="actions"><form method="get" action="/settings/delete/confirm"><button class="danger" type="submit">Confirm delete account</button></form><a class="button-link" href="/settings">Cancel</a></div></section>"#
+        .to_owned()
+}
+
+fn render_delete_account_final_warning(
+    csrf: &str,
+    delete_intent: &str,
+    error: Option<&str>,
+) -> String {
+    let notice = error.map_or_else(String::new, |message| render::notice("error", message));
+    format!(
+        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="delete_intent" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_double_quoted_attribute(delete_intent)
+    )
 }
 
 // Multipart parsing is kept in one place so uploaded profile media and text
@@ -1201,7 +1720,9 @@ async fn parse_profile_update(
         csrf_token: String::new(),
         display_name: String::new(),
         bio: String::new(),
+        location: String::new(),
         website: String::new(),
+        theme: Theme::Light,
         delete_profile_picture: false,
         delete_banner: false,
         profile_picture_media_id: None,
@@ -1234,11 +1755,20 @@ async fn parse_profile_update(
                     .await
                     .map_err(|err| AppError::BadRequest(err.to_string()))?;
             }
+            "location" => {
+                form.location = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
             "website" => {
                 form.website = field
                     .text()
                     .await
                     .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
+            "dark_mode" => {
+                form.theme = Theme::Dark;
             }
             "delete_profile_picture" => {
                 form.delete_profile_picture = true;
@@ -1724,9 +2254,9 @@ async fn admin_dashboard(
         "{}{}{}",
         render::page_header(
             "Admin",
-            "Manage site health, users, media jobs, and backups."
+            "Manage site health, users, media jobs, settings, and backups."
         ),
-        r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/backups">Backups</a></section>"#,
+        r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/deep-settings">Deep server settings</a><a class="panel" href="/admin/backups">Backups</a></section>"#,
         favicon_panel
     );
     Ok(Html(
@@ -1938,6 +2468,226 @@ async fn admin_media(
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Media jobs", &body).await?,
     ))
+}
+
+async fn admin_deep_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<DeepSettingsQuery>,
+) -> AppResult<Html<String>> {
+    let user = require_admin(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let current = load_deep_settings(&state)?;
+    let values = admin::DeepSettingsValues::from_settings(&current);
+    let notice = if query.saved.is_some() {
+        Some(("success", "Settings saved successfully"))
+    } else if query.discarded.is_some() {
+        Some(("info", "Changes discarded."))
+    } else {
+        None
+    };
+    let body = render_deep_settings_form(&csrf, &values, notice);
+    deep_settings_html(&state, &user, &csrf, &body).await
+}
+
+async fn admin_deep_settings_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<admin::DeepSettingsForm>,
+) -> AppResult<Html<String>> {
+    let user = require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let current = load_deep_settings(&state)?;
+    if form.intent.as_deref() == Some("discard") {
+        let values = admin::DeepSettingsValues::from_settings(&current);
+        let body = render_deep_settings_form(&csrf, &values, Some(("info", "Changes discarded.")));
+        return deep_settings_html(&state, &user, &csrf, &body).await;
+    }
+
+    let values = match admin::parse_deep_settings_form(&form, &current) {
+        Ok(values) => values,
+        Err(err) => {
+            let fallback = admin::DeepSettingsValues::from_settings(&current);
+            let body =
+                render_deep_settings_form(&csrf, &fallback, Some(("error", &err.to_string())));
+            return deep_settings_html(&state, &user, &csrf, &body).await;
+        }
+    };
+    let changes = admin::diff_deep_settings(&current, &values);
+    if changes.is_empty() {
+        let body =
+            render_deep_settings_form(&csrf, &values, Some(("info", "No settings changed.")));
+        return deep_settings_html(&state, &user, &csrf, &body).await;
+    }
+
+    if form.intent.as_deref() == Some("confirm") {
+        let updated = values.apply_to(&current);
+        if let Err(err) = admin::write_deep_settings(&state.paths.settings_path, &updated) {
+            tracing::error!(error = %err, "failed to save deep server settings");
+            let body = render_deep_settings_confirmation(
+                &csrf,
+                &values,
+                &changes,
+                Some((
+                    "error",
+                    "Settings could not be saved. Check the server logs for details.",
+                )),
+            );
+            return deep_settings_html(&state, &user, &csrf, &body).await;
+        }
+        admin::audit(
+            &state.pool,
+            user.id,
+            "update_deep_settings",
+            "settings.toml",
+        )
+        .await?;
+        let saved = load_deep_settings(&state).unwrap_or(updated);
+        let values = admin::DeepSettingsValues::from_settings(&saved);
+        let body = render_deep_settings_form(
+            &csrf,
+            &values,
+            Some(("success", "Settings saved successfully")),
+        );
+        return deep_settings_html(&state, &user, &csrf, &body).await;
+    }
+
+    let body = render_deep_settings_confirmation(&csrf, &values, &changes, None);
+    deep_settings_html(&state, &user, &csrf, &body).await
+}
+
+async fn deep_settings_html(
+    state: &AppState,
+    user: &CurrentUser,
+    csrf: &str,
+    body: &str,
+) -> AppResult<Html<String>> {
+    Ok(Html(
+        page_layout(state, Some(user), Some(csrf), "Deep server settings", body).await?,
+    ))
+}
+
+fn load_deep_settings(state: &AppState) -> AppResult<Settings> {
+    let settings = Settings::load(&state.paths.settings_path)?;
+    settings.validate()?;
+    Ok(settings)
+}
+
+fn render_deep_settings_form(
+    csrf: &str,
+    values: &admin::DeepSettingsValues,
+    notice: Option<(&str, &str)>,
+) -> String {
+    let notice_html =
+        notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
+    let fields = render_deep_settings_groups(values);
+    format!(
+        r#"{notice_html}<section class="panel deep-settings-panel"><div class="settings-editor-bar"><div><h1>Deep server settings</h1><p class="muted">Durable settings from settings.toml. Saved changes require a RustPost restart before this running server uses them.</p></div><button class="primary" type="submit" form="deep-settings-form">Save</button></div><form id="deep-settings-form" method="post" action="/admin/deep-settings" class="deep-settings-form"><input type="hidden" name="csrf" value="{}">{fields}<input type="hidden" name="intent" value="preview"></form></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+    )
+}
+
+fn render_deep_settings_groups(values: &admin::DeepSettingsValues) -> String {
+    let mut body = String::new();
+    let mut active_section = "";
+    for field in admin::DeepSettingsField::ALL {
+        if field.section() != active_section {
+            if !active_section.is_empty() {
+                body.push_str("</fieldset>");
+            }
+            active_section = field.section();
+            let _ = write!(
+                body,
+                r#"<fieldset class="deep-settings-group"><legend>{}</legend>"#,
+                html_escape::encode_text(active_section)
+            );
+        }
+        body.push_str(&render_deep_settings_field(field, values));
+    }
+    if !active_section.is_empty() {
+        body.push_str("</fieldset>");
+    }
+    body
+}
+
+fn render_deep_settings_field(
+    field: admin::DeepSettingsField,
+    values: &admin::DeepSettingsValues,
+) -> String {
+    let name = field.form_name();
+    let id = format!("deep-{name}");
+    let value = values.form_value(field);
+    let control = match field.input_kind() {
+        admin::DeepSettingsInputKind::Text => format!(
+            r#"<input id="{id}" name="{name}" type="text" value="{}">"#,
+            html_escape::encode_double_quoted_attribute(&value),
+        ),
+        admin::DeepSettingsInputKind::Number => format!(
+            r#"<input id="{id}" name="{name}" type="text" inputmode="numeric" pattern="[0-9]+" value="{}">"#,
+            html_escape::encode_double_quoted_attribute(&value),
+        ),
+        admin::DeepSettingsInputKind::Boolean => {
+            let true_selected = if value == "true" { " selected" } else { "" };
+            let false_selected = if value == "false" { " selected" } else { "" };
+            format!(
+                r#"<select id="{id}" name="{name}"><option value="true"{true_selected}>true</option><option value="false"{false_selected}>false</option></select>"#
+            )
+        }
+    };
+    let helper = field.helper().map_or_else(String::new, |helper| {
+        format!(
+            r#"<p class="muted field-help">{}</p>"#,
+            html_escape::encode_text(helper)
+        )
+    });
+    format!(
+        r#"<div class="deep-settings-field"><label for="{id}">{}</label>{control}{helper}</div>"#,
+        html_escape::encode_text(field.label()),
+    )
+}
+
+fn render_deep_settings_confirmation(
+    csrf: &str,
+    values: &admin::DeepSettingsValues,
+    changes: &[admin::DeepSettingsChange],
+    notice: Option<(&str, &str)>,
+) -> String {
+    let notice_html =
+        notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
+    let rows = changes
+        .iter()
+        .map(|change| {
+            format!(
+                r#"<li><strong>{}</strong><br><span>{} -&gt; {}</span></li>"#,
+                html_escape::encode_text(change.label),
+                html_escape::encode_text(&change.old_value),
+                html_escape::encode_text(&change.new_value),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let hidden = render_deep_settings_hidden_fields(values);
+    format!(
+        r#"{notice_html}<section class="panel deep-settings-confirm"><h1>These settings are about to be changed</h1><p class="muted">Review the changed values before writing settings.toml. Saved changes require a RustPost restart before this running server uses them.</p><ul class="settings-item-list">{rows}</ul><div class="actions"><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="confirm">{hidden}<button class="primary" type="submit">Confirm/Save</button></form><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="discard">{hidden}<button type="submit">Discard Changes</button></form></div></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_double_quoted_attribute(csrf),
+    )
+}
+
+fn render_deep_settings_hidden_fields(values: &admin::DeepSettingsValues) -> String {
+    admin::DeepSettingsField::ALL
+        .iter()
+        .copied()
+        .fold(String::new(), |mut fields, field| {
+            let _ = write!(
+                fields,
+                r#"<input type="hidden" name="{}" value="{}">"#,
+                field.form_name(),
+                html_escape::encode_double_quoted_attribute(&values.form_value(field))
+            );
+            fields
+        })
 }
 
 fn render_media_jobs_report(report: &admin::MediaJobsReport) -> String {
@@ -2447,6 +3197,7 @@ mod tests {
                 .contains("Read the conversation and add a reply.")
         );
         assert!(thread.body.contains(r#"class="post-time""#));
+        assert!(!thread.body.contains(r#"class="post-time" href="/posts/1""#));
         assert!(!thread.body.contains(r#"data-card-href="/posts/1""#));
         assert!(!thread.body.contains(r#"href="/posts/1">Open post</a>"#));
     }
@@ -3273,6 +4024,256 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_admin_cannot_access_deep_server_settings() {
+        let server = spawn_test_server().await;
+        let register = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=member&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(register.status, 303);
+        let cookie = session_cookie(&register);
+
+        let response = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(response.status, 403);
+    }
+
+    #[tokio::test]
+    async fn admin_get_renders_deep_server_settings_groups() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+
+        let response = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("Deep server settings"));
+        assert!(response.body.contains("<legend>Site</legend>"));
+        assert!(response.body.contains("<legend>Posts</legend>"));
+        assert!(response.body.contains("<legend>Accounts</legend>"));
+        assert!(response.body.contains("<legend>Media limits</legend>"));
+        assert!(response.body.contains(r#"name="allow_reposts""#));
+        assert!(response.body.contains("<select"));
+        assert!(response.body.contains(r#"name="max_bio_len" type="text""#));
+    }
+
+    #[test]
+    fn deep_settings_confirmation_forms_include_explicit_intents() {
+        let values = crate::admin::DeepSettingsValues::from_settings(&Settings::default());
+        let changes = [crate::admin::DeepSettingsChange {
+            label: "Maximum bio length",
+            old_value: "240 characters".to_owned(),
+            new_value: "300 characters".to_owned(),
+        }];
+
+        let html = render_deep_settings_confirmation("csrf-token", &values, &changes, None);
+
+        assert!(html.contains(r#"<input type="hidden" name="intent" value="confirm">"#));
+        assert!(html.contains(r#"<input type="hidden" name="intent" value="discard">"#));
+        assert!(html.contains(r#"<button class="primary" type="submit">Confirm/Save</button>"#));
+        assert!(html.contains(r#"<button type="submit">Discard Changes</button>"#));
+    }
+
+    #[tokio::test]
+    async fn admin_save_preview_shows_changed_values_without_writing_settings() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&page.body);
+        let before =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(
+                &csrf,
+                "preview",
+                &[("max_bio_len", "300"), ("allow_profile_pictures", "false")],
+            ),
+        )
+        .await;
+        let after =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(before, after);
+        assert!(
+            response
+                .body
+                .contains("These settings are about to be changed")
+        );
+        assert!(response.body.contains("Maximum bio length"));
+        assert!(
+            response
+                .body
+                .contains("240 characters -&gt; 300 characters")
+        );
+        assert!(response.body.contains("Allow profile pictures"));
+        assert!(response.body.contains("true -&gt; false"));
+    }
+
+    #[tokio::test]
+    async fn admin_discard_returns_to_persisted_deep_settings_without_writing() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&page.body);
+        let before =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(&csrf, "discard", &[("max_bio_len", "300")]),
+        )
+        .await;
+        let after =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(before, after);
+        assert!(response.body.contains("Changes discarded."));
+        assert!(response.body.contains(
+            r#"name="max_bio_len" type="text" inputmode="numeric" pattern="[0-9]+" value="240""#
+        ));
+    }
+
+    #[tokio::test]
+    async fn admin_confirm_writes_deep_settings_and_fresh_load_shows_saved_values() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&page.body);
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(
+                &csrf,
+                "confirm",
+                &[("max_bio_len", "300"), ("allow_profile_pictures", "false")],
+            ),
+        )
+        .await;
+        let saved = Settings::load(&server.data_dir.join("settings.toml")).expect("settings");
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("Settings saved successfully"));
+        assert_eq!(saved.accounts.max_bio_len, 300);
+        assert!(!saved.accounts.allow_profile_pictures);
+
+        let fresh = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert!(fresh.body.contains(
+            r#"name="max_bio_len" type="text" inputmode="numeric" pattern="[0-9]+" value="300""#
+        ));
+        assert!(
+            fresh
+                .body
+                .contains(r#"<option value="false" selected>false</option>"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_deep_settings_submission_shows_error_without_writing() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&page.body);
+        let before =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(&csrf, "preview", &[("min_password_length", "5")]),
+        )
+        .await;
+        let after =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(before, after);
+        assert!(
+            response
+                .body
+                .contains("accounts.min_password_length must be at least 10")
+        );
+    }
+
+    #[tokio::test]
     async fn favicon_upload_rejects_unsupported_content_and_unsafe_names() {
         let server = spawn_test_server_with_admin().await;
         let cookie = admin_session_cookie(&server).await;
@@ -3431,6 +4432,217 @@ mod tests {
         assert_eq!(location(&deleted), "/home#post-1");
     }
 
+    #[tokio::test]
+    async fn delete_account_requires_server_side_intent() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+        let cookie = session_cookie(&registered);
+        let home = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&home.body);
+
+        let deleted = request(
+            &server.base_url,
+            "POST",
+            "/settings/delete/confirm",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&password=very%20secure%20password").into_bytes(),
+        )
+        .await;
+
+        assert_eq!(deleted.status, 400);
+        assert!(deleted.body.contains("Delete confirmation expired"));
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(login.status, 303);
+    }
+
+    #[tokio::test]
+    async fn delete_account_intent_and_password_control_final_delete() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+        let cookie = session_cookie(&registered);
+        let confirm = request(
+            &server.base_url,
+            "GET",
+            "/settings/delete/confirm",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(confirm.status, 200);
+        let csrf = csrf_token(&confirm.body);
+        let delete_intent = hidden_value(&confirm.body, "delete_intent");
+
+        let wrong_password = request(
+            &server.base_url,
+            "POST",
+            "/settings/delete/confirm",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&delete_intent={delete_intent}&password=wrong").into_bytes(),
+        )
+        .await;
+        assert_eq!(wrong_password.status, 401);
+        assert!(wrong_password.body.contains("Password is incorrect."));
+
+        let reused_intent = request(
+            &server.base_url,
+            "POST",
+            "/settings/delete/confirm",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&delete_intent={delete_intent}&password=very%20secure%20password")
+                .into_bytes(),
+        )
+        .await;
+        assert_eq!(reused_intent.status, 400);
+        assert!(reused_intent.body.contains("Delete confirmation expired"));
+
+        let confirm = request(
+            &server.base_url,
+            "GET",
+            "/settings/delete/confirm",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(confirm.status, 200);
+        let csrf = csrf_token(&confirm.body);
+        let delete_intent = hidden_value(&confirm.body, "delete_intent");
+        let deleted = request(
+            &server.base_url,
+            "POST",
+            "/settings/delete/confirm",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&delete_intent={delete_intent}&password=very%20secure%20password")
+                .into_bytes(),
+        )
+        .await;
+
+        assert_eq!(deleted.status, 303);
+        assert_eq!(location(&deleted), "/account-deleted");
+        assert!(
+            deleted
+                .headers
+                .iter()
+                .any(|(name, value)| name == "set-cookie" && value.contains("Max-Age=0"))
+        );
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(login.status, 401);
+    }
+
+    #[tokio::test]
+    async fn delete_account_route_succeeds_after_file_cleanup_failure() {
+        let server = spawn_test_server().await;
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+        let cookie = session_cookie(&registered);
+        let paths = RuntimePaths::from_data_dir(server.data_dir.clone());
+        let media_path = paths.uploads_images.join("directory-media");
+        std::fs::create_dir(&media_path).expect("media directory");
+        let media_path_string = media_path.to_string_lossy().to_string();
+        let conn = rusqlite::Connection::open(&paths.database_path).expect("open db");
+        let alice: i64 = conn
+            .query_row(
+                "SELECT id FROM users WHERE normalized_username = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("alice id");
+        conn.execute(
+            "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'directory-media', ?, '/uploads/images/directory-media', 'image/webp', 'image', 1)",
+            params![alice, media_path_string],
+        )
+        .expect("media row");
+        drop(conn);
+        let confirm = request(
+            &server.base_url,
+            "GET",
+            "/settings/delete/confirm",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(confirm.status, 200);
+        let csrf = csrf_token(&confirm.body);
+        let delete_intent = hidden_value(&confirm.body, "delete_intent");
+
+        let deleted = request(
+            &server.base_url,
+            "POST",
+            "/settings/delete/confirm",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&delete_intent={delete_intent}&password=very%20secure%20password")
+                .into_bytes(),
+        )
+        .await;
+
+        assert_eq!(deleted.status, 303);
+        assert_eq!(location(&deleted), "/account-deleted");
+        assert!(media_path.exists());
+        let conn = rusqlite::Connection::open(&paths.database_path).expect("open db");
+        let users: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .expect("users count");
+        assert_eq!(users, 0);
+    }
+
     fn multipart_body(
         boundary: &str,
         fields: &[(&str, &str)],
@@ -3508,6 +4720,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf());
         paths.ensure().expect("paths");
+        crate::config::write_default_if_missing(&paths.settings_path).expect("settings");
         let data_dir = paths.data_dir.clone();
         let pool = crate::db::connect(&paths.database_path)
             .await
@@ -3643,10 +4856,57 @@ mod tests {
         );
     }
 
+    fn deep_settings_form_body(csrf: &str, intent: &str, overrides: &[(&str, &str)]) -> Vec<u8> {
+        let values = crate::admin::DeepSettingsValues::from_settings(&Settings::default());
+        let mut pairs = vec![
+            ("csrf".to_owned(), csrf.to_owned()),
+            ("intent".to_owned(), intent.to_owned()),
+        ];
+        for field in crate::admin::DeepSettingsField::ALL {
+            let value = overrides
+                .iter()
+                .find(|(name, _)| *name == field.form_name())
+                .map_or_else(
+                    || values.form_value(field),
+                    |(_, value)| (*value).to_owned(),
+                );
+            pairs.push((field.form_name().to_owned(), value));
+        }
+        pairs
+            .iter()
+            .map(|(name, value)| format!("{}={}", form_encode(name), form_encode(value)))
+            .collect::<Vec<_>>()
+            .join("&")
+            .into_bytes()
+    }
+
+    fn form_encode(value: &str) -> String {
+        let mut encoded = String::new();
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(char::from(byte));
+                }
+                b' ' => encoded.push('+'),
+                _ => {
+                    let _ = write!(encoded, "%{byte:02X}");
+                }
+            }
+        }
+        encoded
+    }
+
     fn csrf_token(body: &str) -> String {
         let marker = r#"name="csrf" value=""#;
         let start = body.find(marker).expect("csrf marker") + marker.len();
         let end = body[start..].find('"').expect("csrf end") + start;
+        body[start..end].to_owned()
+    }
+
+    fn hidden_value(body: &str, name: &str) -> String {
+        let marker = format!(r#"name="{name}" value=""#);
+        let start = body.find(&marker).expect("hidden marker") + marker.len();
+        let end = body[start..].find('"').expect("hidden end") + start;
         body[start..end].to_owned()
     }
 }

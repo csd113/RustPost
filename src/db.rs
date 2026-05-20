@@ -96,6 +96,22 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_3)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (3)", [])?;
         }
+        if applied.unwrap_or(0) < 4 {
+            tx.execute_batch(MIGRATION_4)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (4)", [])?;
+        }
+        if applied.unwrap_or(0) < 5 {
+            tx.execute_batch(MIGRATION_5)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (5)", [])?;
+        }
+        if applied.unwrap_or(0) < 6 {
+            tx.execute_batch(MIGRATION_6)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (6)", [])?;
+        }
+        if applied.unwrap_or(0) < 7 {
+            tx.execute_batch(MIGRATION_7)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (7)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -288,6 +304,32 @@ ALTER TABLE media ADD COLUMN thumbnail_path TEXT;
 ALTER TABLE media ADD COLUMN thumbnail_public_path TEXT;
 "#;
 
+const MIGRATION_4: &str = r#"
+ALTER TABLE users ADD COLUMN theme TEXT NOT NULL DEFAULT 'light' CHECK (theme IN ('light', 'dark'));
+"#;
+
+const MIGRATION_5: &str = r#"
+CREATE TABLE IF NOT EXISTS muted_words (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    term TEXT NOT NULL,
+    normalized_term TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, normalized_term)
+);
+
+CREATE INDEX IF NOT EXISTS idx_muted_words_user ON muted_words(user_id, normalized_term);
+"#;
+
+const MIGRATION_6: &str = r#"
+ALTER TABLE users ADD COLUMN location TEXT NOT NULL DEFAULT '';
+"#;
+
+const MIGRATION_7: &str = r#"
+ALTER TABLE sessions ADD COLUMN delete_account_token_hash TEXT;
+ALTER TABLE sessions ADD COLUMN delete_account_token_expires_at TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,9 +371,71 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 3);
+        assert_eq!(versions, 7);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);
+    }
+
+    #[tokio::test]
+    async fn users_get_light_theme_by_default() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        let theme: String = pool
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO users (username, normalized_username, password_hash, display_name) VALUES ('Alice', 'alice', 'hash', 'Alice')",
+                    [],
+                )?;
+                Ok(conn.query_row("SELECT theme FROM users WHERE normalized_username = 'alice'", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("theme");
+
+        assert_eq!(theme, "light");
+    }
+
+    #[tokio::test]
+    async fn muted_words_table_is_created() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        let count: i64 = pool
+            .call(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM muted_words", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("count");
+
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn users_get_empty_location_by_default() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        let location: String = pool
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO users (username, normalized_username, password_hash, display_name) VALUES ('Alice', 'alice', 'hash', 'Alice')",
+                    [],
+                )?;
+                Ok(conn.query_row("SELECT location FROM users WHERE normalized_username = 'alice'", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("location");
+
+        assert_eq!(location, "");
     }
 }

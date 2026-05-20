@@ -27,7 +27,9 @@ videos/
 trace.zip
 *.trace
 *.har
-tests/
+tests/*
+!tests/playwright/
+!tests/playwright/**
 package-lock.json
 package.json
 playwright.config.ts
@@ -69,3 +71,4 @@ uploads/**/*
 # macOS
 .DS_Store
 **/.DS_Store
+/tests

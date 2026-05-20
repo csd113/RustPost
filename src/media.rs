@@ -54,17 +54,7 @@ pub async fn save_upload(
     reject_path_tricks(&original_filename)?;
     let id = Uuid::new_v4().simple().to_string();
     let staging = paths.staged_upload_path(&id);
-    let mut file = tokio::fs::File::create(&staging).await?;
-    let mut bytes = 0_u64;
-    while let Some(chunk) = field.chunk().await? {
-        bytes += u64::try_from(chunk.len())?;
-        if bytes > settings.media.max_video_size {
-            let _ = tokio::fs::remove_file(&staging).await;
-            anyhow::bail!("upload exceeds maximum size");
-        }
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
+    let bytes = write_upload_to_staging(settings, &staging, &mut field).await?;
     let data = tokio::fs::read(&staging).await?;
     let Some(kind) = infer::get(&data) else {
         remove_staged_upload(&staging).await;
@@ -94,12 +84,13 @@ pub async fn save_upload(
     if state == "converted" && !settings.media.keep_original_uploads {
         let _ = tokio::fs::remove_file(&original_path).await;
     }
+    let cleanup_paths = [original_path.clone(), stored_path.clone()];
     let stored_path = stored_path.to_string_lossy().to_string();
     let media_kind = media_kind.as_str().to_owned();
     let byte_len = i64::try_from(bytes)?;
     let db_state = state.clone();
     let db_stderr = stderr.clone();
-    let media_id = pool
+    let media_insert = pool
         .call(move |conn| {
             conn.execute(
                 "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, conversion_state, ffmpeg_stderr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -117,7 +108,24 @@ pub async fn save_upload(
             )?;
             Ok(conn.last_insert_rowid())
         })
-        .await?;
+        .await;
+    let media_id = match media_insert {
+        Ok(media_id) => media_id,
+        Err(error) => {
+            for path in cleanup_paths {
+                if let Err(remove_error) = tokio::fs::remove_file(&path).await
+                    && remove_error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %remove_error,
+                        "failed to remove uploaded file after media database insert failed"
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
     if state == "converted" || state == "fallback" {
         let status = state;
         let stderr_summary = stderr_summary_for_db(&stderr);
@@ -131,6 +139,25 @@ pub async fn save_upload(
         .await?;
     }
     Ok(media_id)
+}
+
+async fn write_upload_to_staging(
+    settings: &Settings,
+    staging: &Path,
+    field: &mut Field<'_>,
+) -> anyhow::Result<u64> {
+    let mut file = tokio::fs::File::create(staging).await?;
+    let mut bytes = 0_u64;
+    while let Some(chunk) = field.chunk().await? {
+        bytes += u64::try_from(chunk.len())?;
+        if bytes > settings.media.max_video_size {
+            remove_staged_upload(staging).await;
+            anyhow::bail!("upload exceeds maximum size");
+        }
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(bytes)
 }
 
 pub async fn save_profile_picture_upload(
