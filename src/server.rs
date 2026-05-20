@@ -99,6 +99,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/posts/{id}/delete", post(admin_delete_post))
         .route("/admin/health", get(admin_health))
         .route("/admin/media", get(admin_media))
+        .route(
+            "/admin/deep-settings",
+            get(admin_deep_settings).post(admin_deep_settings_update),
+        )
         .route("/admin/favicon", post(admin_favicon_upload))
         .route("/admin/favicon/remove", post(admin_favicon_remove))
         .route(
@@ -186,6 +190,12 @@ struct SearchQuery {
 #[derive(Deserialize)]
 struct SettingsQuery {
     saved: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeepSettingsQuery {
+    saved: Option<String>,
+    discarded: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -861,6 +871,10 @@ async fn reply_redirect(Path(id): Path<i64>) -> Redirect {
     Redirect::to(&format!("/posts/{id}"))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "profile rendering combines existing viewer controls and page assembly in one route handler"
+)]
 async fn profile(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2240,9 +2254,9 @@ async fn admin_dashboard(
         "{}{}{}",
         render::page_header(
             "Admin",
-            "Manage site health, users, media jobs, and backups."
+            "Manage site health, users, media jobs, settings, and backups."
         ),
-        r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/backups">Backups</a></section>"#,
+        r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/deep-settings">Deep server settings</a><a class="panel" href="/admin/backups">Backups</a></section>"#,
         favicon_panel
     );
     Ok(Html(
@@ -2454,6 +2468,226 @@ async fn admin_media(
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Media jobs", &body).await?,
     ))
+}
+
+async fn admin_deep_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<DeepSettingsQuery>,
+) -> AppResult<Html<String>> {
+    let user = require_admin(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let current = load_deep_settings(&state)?;
+    let values = admin::DeepSettingsValues::from_settings(&current);
+    let notice = if query.saved.is_some() {
+        Some(("success", "Settings saved successfully"))
+    } else if query.discarded.is_some() {
+        Some(("info", "Changes discarded."))
+    } else {
+        None
+    };
+    let body = render_deep_settings_form(&csrf, &values, notice);
+    deep_settings_html(&state, &user, &csrf, &body).await
+}
+
+async fn admin_deep_settings_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<admin::DeepSettingsForm>,
+) -> AppResult<Html<String>> {
+    let user = require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let current = load_deep_settings(&state)?;
+    if form.intent.as_deref() == Some("discard") {
+        let values = admin::DeepSettingsValues::from_settings(&current);
+        let body = render_deep_settings_form(&csrf, &values, Some(("info", "Changes discarded.")));
+        return deep_settings_html(&state, &user, &csrf, &body).await;
+    }
+
+    let values = match admin::parse_deep_settings_form(&form, &current) {
+        Ok(values) => values,
+        Err(err) => {
+            let fallback = admin::DeepSettingsValues::from_settings(&current);
+            let body =
+                render_deep_settings_form(&csrf, &fallback, Some(("error", &err.to_string())));
+            return deep_settings_html(&state, &user, &csrf, &body).await;
+        }
+    };
+    let changes = admin::diff_deep_settings(&current, &values);
+    if changes.is_empty() {
+        let body =
+            render_deep_settings_form(&csrf, &values, Some(("info", "No settings changed.")));
+        return deep_settings_html(&state, &user, &csrf, &body).await;
+    }
+
+    if form.intent.as_deref() == Some("confirm") {
+        let updated = values.apply_to(&current);
+        if let Err(err) = admin::write_deep_settings(&state.paths.settings_path, &updated) {
+            tracing::error!(error = %err, "failed to save deep server settings");
+            let body = render_deep_settings_confirmation(
+                &csrf,
+                &values,
+                &changes,
+                Some((
+                    "error",
+                    "Settings could not be saved. Check the server logs for details.",
+                )),
+            );
+            return deep_settings_html(&state, &user, &csrf, &body).await;
+        }
+        admin::audit(
+            &state.pool,
+            user.id,
+            "update_deep_settings",
+            "settings.toml",
+        )
+        .await?;
+        let saved = load_deep_settings(&state).unwrap_or(updated);
+        let values = admin::DeepSettingsValues::from_settings(&saved);
+        let body = render_deep_settings_form(
+            &csrf,
+            &values,
+            Some(("success", "Settings saved successfully")),
+        );
+        return deep_settings_html(&state, &user, &csrf, &body).await;
+    }
+
+    let body = render_deep_settings_confirmation(&csrf, &values, &changes, None);
+    deep_settings_html(&state, &user, &csrf, &body).await
+}
+
+async fn deep_settings_html(
+    state: &AppState,
+    user: &CurrentUser,
+    csrf: &str,
+    body: &str,
+) -> AppResult<Html<String>> {
+    Ok(Html(
+        page_layout(state, Some(user), Some(csrf), "Deep server settings", body).await?,
+    ))
+}
+
+fn load_deep_settings(state: &AppState) -> AppResult<Settings> {
+    let settings = Settings::load(&state.paths.settings_path)?;
+    settings.validate()?;
+    Ok(settings)
+}
+
+fn render_deep_settings_form(
+    csrf: &str,
+    values: &admin::DeepSettingsValues,
+    notice: Option<(&str, &str)>,
+) -> String {
+    let notice_html =
+        notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
+    let fields = render_deep_settings_groups(values);
+    format!(
+        r#"{notice_html}<section class="panel deep-settings-panel"><div class="settings-editor-bar"><div><h1>Deep server settings</h1><p class="muted">Durable settings from settings.toml. Saved changes require a RustPost restart before this running server uses them.</p></div><button class="primary" type="submit" form="deep-settings-form">Save</button></div><form id="deep-settings-form" method="post" action="/admin/deep-settings" class="deep-settings-form"><input type="hidden" name="csrf" value="{}">{fields}<input type="hidden" name="intent" value="preview"></form></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+    )
+}
+
+fn render_deep_settings_groups(values: &admin::DeepSettingsValues) -> String {
+    let mut body = String::new();
+    let mut active_section = "";
+    for field in admin::DeepSettingsField::ALL {
+        if field.section() != active_section {
+            if !active_section.is_empty() {
+                body.push_str("</fieldset>");
+            }
+            active_section = field.section();
+            let _ = write!(
+                body,
+                r#"<fieldset class="deep-settings-group"><legend>{}</legend>"#,
+                html_escape::encode_text(active_section)
+            );
+        }
+        body.push_str(&render_deep_settings_field(field, values));
+    }
+    if !active_section.is_empty() {
+        body.push_str("</fieldset>");
+    }
+    body
+}
+
+fn render_deep_settings_field(
+    field: admin::DeepSettingsField,
+    values: &admin::DeepSettingsValues,
+) -> String {
+    let name = field.form_name();
+    let id = format!("deep-{name}");
+    let value = values.form_value(field);
+    let control = match field.input_kind() {
+        admin::DeepSettingsInputKind::Text => format!(
+            r#"<input id="{id}" name="{name}" type="text" value="{}">"#,
+            html_escape::encode_double_quoted_attribute(&value),
+        ),
+        admin::DeepSettingsInputKind::Number => format!(
+            r#"<input id="{id}" name="{name}" type="text" inputmode="numeric" pattern="[0-9]+" value="{}">"#,
+            html_escape::encode_double_quoted_attribute(&value),
+        ),
+        admin::DeepSettingsInputKind::Boolean => {
+            let true_selected = if value == "true" { " selected" } else { "" };
+            let false_selected = if value == "false" { " selected" } else { "" };
+            format!(
+                r#"<select id="{id}" name="{name}"><option value="true"{true_selected}>true</option><option value="false"{false_selected}>false</option></select>"#
+            )
+        }
+    };
+    let helper = field.helper().map_or_else(String::new, |helper| {
+        format!(
+            r#"<p class="muted field-help">{}</p>"#,
+            html_escape::encode_text(helper)
+        )
+    });
+    format!(
+        r#"<div class="deep-settings-field"><label for="{id}">{}</label>{control}{helper}</div>"#,
+        html_escape::encode_text(field.label()),
+    )
+}
+
+fn render_deep_settings_confirmation(
+    csrf: &str,
+    values: &admin::DeepSettingsValues,
+    changes: &[admin::DeepSettingsChange],
+    notice: Option<(&str, &str)>,
+) -> String {
+    let notice_html =
+        notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
+    let rows = changes
+        .iter()
+        .map(|change| {
+            format!(
+                r#"<li><strong>{}</strong><br><span>{} -&gt; {}</span></li>"#,
+                html_escape::encode_text(change.label),
+                html_escape::encode_text(&change.old_value),
+                html_escape::encode_text(&change.new_value),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let hidden = render_deep_settings_hidden_fields(values);
+    format!(
+        r#"{notice_html}<section class="panel deep-settings-confirm"><h1>These settings are about to be changed</h1><p class="muted">Review the changed values before writing settings.toml. Saved changes require a RustPost restart before this running server uses them.</p><ul class="settings-item-list">{rows}</ul><div class="actions"><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}">{hidden}<button class="primary" type="submit" name="intent" value="confirm">Confirm/Save</button></form><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}">{hidden}<button type="submit" name="intent" value="discard">Discard Changes</button></form></div></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_double_quoted_attribute(csrf),
+    )
+}
+
+fn render_deep_settings_hidden_fields(values: &admin::DeepSettingsValues) -> String {
+    admin::DeepSettingsField::ALL
+        .iter()
+        .copied()
+        .fold(String::new(), |mut fields, field| {
+            let _ = write!(
+                fields,
+                r#"<input type="hidden" name="{}" value="{}">"#,
+                field.form_name(),
+                html_escape::encode_double_quoted_attribute(&values.form_value(field))
+            );
+            fields
+        })
 }
 
 fn render_media_jobs_report(report: &admin::MediaJobsReport) -> String {
@@ -3790,6 +4024,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_admin_cannot_access_deep_server_settings() {
+        let server = spawn_test_server().await;
+        let register = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=member&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(register.status, 303);
+        let cookie = session_cookie(&register);
+
+        let response = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(response.status, 403);
+    }
+
+    #[tokio::test]
+    async fn admin_get_renders_deep_server_settings_groups() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+
+        let response = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("Deep server settings"));
+        assert!(response.body.contains("<legend>Site</legend>"));
+        assert!(response.body.contains("<legend>Posts</legend>"));
+        assert!(response.body.contains("<legend>Accounts</legend>"));
+        assert!(response.body.contains("<legend>Media limits</legend>"));
+        assert!(response.body.contains(r#"name="allow_reposts""#));
+        assert!(response.body.contains("<select"));
+        assert!(response.body.contains(r#"name="max_bio_len" type="text""#));
+    }
+
+    #[tokio::test]
+    async fn admin_save_preview_shows_changed_values_without_writing_settings() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&page.body);
+        let before =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(
+                &csrf,
+                "preview",
+                &[("max_bio_len", "300"), ("allow_profile_pictures", "false")],
+            ),
+        )
+        .await;
+        let after =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(before, after);
+        assert!(
+            response
+                .body
+                .contains("These settings are about to be changed")
+        );
+        assert!(response.body.contains("Maximum bio length"));
+        assert!(
+            response
+                .body
+                .contains("240 characters -&gt; 300 characters")
+        );
+        assert!(response.body.contains("Allow profile pictures"));
+        assert!(response.body.contains("true -&gt; false"));
+    }
+
+    #[tokio::test]
+    async fn admin_discard_returns_to_persisted_deep_settings_without_writing() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&page.body);
+        let before =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(&csrf, "discard", &[("max_bio_len", "300")]),
+        )
+        .await;
+        let after =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(before, after);
+        assert!(response.body.contains("Changes discarded."));
+        assert!(response.body.contains(
+            r#"name="max_bio_len" type="text" inputmode="numeric" pattern="[0-9]+" value="240""#
+        ));
+    }
+
+    #[tokio::test]
+    async fn admin_confirm_writes_deep_settings_and_fresh_load_shows_saved_values() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&page.body);
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(
+                &csrf,
+                "confirm",
+                &[("max_bio_len", "300"), ("allow_profile_pictures", "false")],
+            ),
+        )
+        .await;
+        let saved = Settings::load(&server.data_dir.join("settings.toml")).expect("settings");
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("Settings saved successfully"));
+        assert_eq!(saved.accounts.max_bio_len, 300);
+        assert!(!saved.accounts.allow_profile_pictures);
+
+        let fresh = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        assert!(fresh.body.contains(
+            r#"name="max_bio_len" type="text" inputmode="numeric" pattern="[0-9]+" value="300""#
+        ));
+        assert!(
+            fresh
+                .body
+                .contains(r#"<option value="false" selected>false</option>"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_deep_settings_submission_shows_error_without_writing() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&page.body);
+        let before =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(&csrf, "preview", &[("min_password_length", "5")]),
+        )
+        .await;
+        let after =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(before, after);
+        assert!(
+            response
+                .body
+                .contains("accounts.min_password_length must be at least 10")
+        );
+    }
+
+    #[tokio::test]
     async fn favicon_upload_rejects_unsupported_content_and_unsafe_names() {
         let server = spawn_test_server_with_admin().await;
         let cookie = admin_session_cookie(&server).await;
@@ -4236,6 +4703,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf());
         paths.ensure().expect("paths");
+        crate::config::write_default_if_missing(&paths.settings_path).expect("settings");
         let data_dir = paths.data_dir.clone();
         let pool = crate::db::connect(&paths.database_path)
             .await
@@ -4369,6 +4837,46 @@ mod tests {
                 .map(|(_, value)| value.as_str()),
             Some(expected)
         );
+    }
+
+    fn deep_settings_form_body(csrf: &str, intent: &str, overrides: &[(&str, &str)]) -> Vec<u8> {
+        let values = crate::admin::DeepSettingsValues::from_settings(&Settings::default());
+        let mut pairs = vec![
+            ("csrf".to_owned(), csrf.to_owned()),
+            ("intent".to_owned(), intent.to_owned()),
+        ];
+        for field in crate::admin::DeepSettingsField::ALL {
+            let value = overrides
+                .iter()
+                .find(|(name, _)| *name == field.form_name())
+                .map_or_else(
+                    || values.form_value(field),
+                    |(_, value)| (*value).to_owned(),
+                );
+            pairs.push((field.form_name().to_owned(), value));
+        }
+        pairs
+            .iter()
+            .map(|(name, value)| format!("{}={}", form_encode(name), form_encode(value)))
+            .collect::<Vec<_>>()
+            .join("&")
+            .into_bytes()
+    }
+
+    fn form_encode(value: &str) -> String {
+        let mut encoded = String::new();
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(char::from(byte));
+                }
+                b' ' => encoded.push('+'),
+                _ => {
+                    let _ = write!(encoded, "%{byte:02X}");
+                }
+            }
+        }
+        encoded
     }
 
     fn csrf_token(body: &str) -> String {

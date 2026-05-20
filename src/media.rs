@@ -42,6 +42,10 @@ impl MediaKind {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "upload handling keeps validation, staging, and persistence in one existing linear flow"
+)]
 pub async fn save_upload(
     pool: &SqlitePool,
     settings: &Settings,
