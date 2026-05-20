@@ -27,6 +27,10 @@ videos/
 trace.zip
 *.trace
 *.har
+tests/
+package-lock.json
+package.json
+playwright.config.ts
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
