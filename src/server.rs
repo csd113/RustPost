@@ -671,7 +671,7 @@ async fn thread(
     };
     let body = format!(
         "{}{}{}",
-        render::page_header("Thread", "Read the conversation and add a reply."),
+        render::thread_back_control(),
         render::thread_posts(&posts, user.as_ref(), csrf.as_deref()),
         composer
     );
@@ -2449,7 +2449,16 @@ mod tests {
         )
         .await;
         assert_eq!(thread.status, 200);
+        assert!(thread.body.contains(r#"class="thread-nav""#));
+        assert!(thread.body.contains(r#"aria-label="Back""#));
+        assert!(!thread.body.contains(r#"class="page-header""#));
+        assert!(
+            !thread
+                .body
+                .contains("Read the conversation and add a reply.")
+        );
         assert!(thread.body.contains(r#"class="post-time""#));
+        assert!(!thread.body.contains(r#"data-card-href="/posts/1""#));
         assert!(!thread.body.contains(r#"href="/posts/1">Open post</a>"#));
     }
 

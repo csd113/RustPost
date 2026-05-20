@@ -223,6 +223,18 @@ document.addEventListener("keydown", (event) => {
 });
 
 document.addEventListener("click", (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const backLink = event.target.closest("[data-history-back]");
+  if (!backLink || window.history.length <= 1) {
+    return;
+  }
+  event.preventDefault();
+  window.history.back();
+});
+
+document.addEventListener("click", (event) => {
   const button = event.target.closest("[data-password-toggle]");
   if (!button) {
     return;
@@ -519,7 +531,27 @@ pub fn posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option<&str>)
 }
 
 pub fn thread_posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option<&str>) -> String {
-    posts_with_options(posts, user, csrf, PostRenderOptions::thread())
+    if posts.is_empty() {
+        return empty_state(
+            "No posts yet",
+            "The timeline will fill in once people start posting.",
+        );
+    }
+    format!(
+        r#"<section class="timeline" aria-label="Posts">{}</section>"#,
+        posts
+            .iter()
+            .enumerate()
+            .map(|(index, post)| {
+                let mut options = PostRenderOptions::thread();
+                if index == 0 {
+                    options.clickable_card = false;
+                }
+                post_card_with_options(post, user, csrf, options)
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    )
 }
 
 fn posts_with_options(
@@ -839,6 +871,11 @@ pub fn page_header(title: &str, subtitle: &str) -> String {
     )
 }
 
+pub fn thread_back_control() -> String {
+    r##"<div class="thread-nav"><a class="thread-back" href="/home" data-history-back aria-label="Back" title="Back"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M11 5 4 12l7 7 1.8-1.8L8.9 13H20v-2H8.9l3.9-4.2L11 5z"/></svg><span class="sr-only">Back</span></a></div>"##
+        .to_owned()
+}
+
 pub fn notice(kind: &str, message: &str) -> String {
     format!(
         r#"<section class="notice {}"><p>{}</p></section>"#,
@@ -884,6 +921,7 @@ label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button
 input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{background:#fff;color:#24445f;border-color:#cdd7d0;min-width:4.5rem}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}
 input:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:3px solid #93c5fd;outline-offset:2px}button,.primary{border:1px solid #163b2f;background:#163b2f;color:#fff;border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:#235544;text-decoration:none}
 .composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:#24445f;font-weight:700}.file-control input{max-width:15rem}
+.thread-nav{display:flex;margin:0 0 .45rem .85rem}.thread-back{width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:#24445f}.thread-back svg{width:1.2rem;height:1.2rem;fill:currentColor}.thread-back:hover{background:#eef3f0;text-decoration:none}
 .timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.post[data-card-href]{cursor:pointer}.post[data-card-href]:hover{border-color:#c7d2ca}.post[data-card-href]:focus-visible{outline:3px solid #93c5fd;outline-offset:2px}.reply-post{margin-left:1.1rem;border-left:4px solid #c8d8d0;background:#fbfcfa}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid #c8d8d0}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid #d0d8d2;background:#eef3f0;flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:#526159;font-weight:800}.author-name{font-weight:800;color:#202124}.username,.post-time,.counts{color:#687068;font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid #d9ded6;margin-top:.5rem;background:#f6f7f4}.post img.post-avatar{display:block;margin:0;border-radius:999px}
 .counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.actions{display:flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid #cdd7d0;border-radius:7px;background:#fff;color:#24445f;padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:#eef3f0;color:#163b2f;text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:#9aa39d;background:#f4f5f2;border-color:#dfe4dc;cursor:not-allowed}.icon-button.disabled:hover,.icon-button:disabled:hover{background:#f4f5f2;color:#9aa39d}.follow-button{min-width:6.6rem}.follow-button.active{background:#eef3f0;color:#163b2f;border-color:#9fb9ad}.profile-actions{margin-top:0}.profile-secondary button{background:#fff;color:#8a3d2d;border-color:#e0c4bb;padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:#fff8f5;color:#6f2f22}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:#4b655d;font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:#667064}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:#e6b8a8;background:#fff8f5}.notice.success{border-color:#add7b4;background:#f4fbf5}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:#6d766e;font-size:.78rem}
 .profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#dfe9e1}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:8px;border:1px solid #d9ded6;background:#eef3f0;flex:0 0 auto}.favicon-preview{width:32px;height:32px;object-fit:contain;border:1px solid #d9ded6;border-radius:6px;background:#fff}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:#fff;border:1px solid #dfe4dc;border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:#59625a;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #e3e7e0;text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
@@ -1004,6 +1042,35 @@ mod tests {
         let body = thread_post_card(&post, None, None);
 
         assert!(body.contains(r#"class="post-time" href="/posts/42">2026-05-18 10:30</a>"#));
+    }
+
+    #[test]
+    fn thread_posts_do_not_make_root_card_self_navigating() {
+        let root = test_post();
+        let mut reply = test_post();
+        reply.id = 43;
+        reply.parent_post_id = Some(42);
+        reply.event_id = "p:43".to_owned();
+
+        let body = thread_posts(&[root, reply], None, None);
+
+        let root_card = body
+            .split_once(r#"id="post-42""#)
+            .and_then(|(_, rest)| rest.split_once(r#"id="post-43""#))
+            .map(|(card, _)| card)
+            .expect("root card");
+        assert!(!root_card.contains(r#"data-card-href="/posts/42""#));
+        assert!(!root_card.contains(r#"tabindex="0""#));
+        assert!(body.contains(r#"data-card-href="/posts/43""#));
+    }
+
+    #[test]
+    fn thread_back_control_has_history_hook_and_home_fallback() {
+        let body = thread_back_control();
+
+        assert!(body.contains(r#"aria-label="Back""#));
+        assert!(body.contains(r#"href="/home""#));
+        assert!(body.contains("data-history-back"));
     }
 
     #[test]

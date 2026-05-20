@@ -90,7 +90,7 @@ test('account, posting, thread, profile, search, and social actions work', async
   const postId = await createPost(page, postText, fixturePath('tiny.png'));
 
   await page.goto(`/posts/${postId}`);
-  await expect(page.getByRole('heading', { name: 'Thread' })).toBeVisible();
+  await expect(page.locator(`article[data-post-id="${postId}"]`)).toBeVisible();
   await page.getByLabel('What is happening?').fill('Reply from the same account');
   await Promise.all([
     page.waitForURL(/\/posts\/\d+#reply-\d+/),

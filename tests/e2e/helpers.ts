@@ -52,7 +52,7 @@ export async function goForwardToHealthyPage(page: Page): Promise<void> {
 
 export async function openPostThread(page: Page, postId: string): Promise<void> {
   await page.goto(`/posts/${postId}`);
-  await expect(page.getByRole('heading', { name: 'Thread' })).toBeVisible();
+  await expect(page.locator(`article[data-post-id="${postId}"]`)).toBeVisible();
   await expectNotErrorPage(page);
 }
 
