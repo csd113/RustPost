@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -1824,25 +1825,8 @@ async fn admin_health(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let recent_jobs = admin::recent_media_jobs(&state.pool).await?;
-    let jobs = recent_jobs
-        .into_iter()
-        .take(5)
-        .map(|(id, status, stderr)| {
-            format!(
-                r#"<li>#{} {} <pre>{}</pre></li>"#,
-                id,
-                html_escape::encode_text(&status),
-                html_escape::encode_text(&stderr)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let jobs = if jobs.is_empty() {
-        r#"<p class="muted">No media jobs yet.</p>"#.to_owned()
-    } else {
-        format!(r#"<ul class="item-list">{jobs}</ul>"#)
-    };
+    let media_jobs = admin::media_jobs_report(&state.pool).await?;
+    let jobs = render_media_jobs_report(&media_jobs);
     let onion = state
         .tor
         .onion_address()
@@ -1957,31 +1941,108 @@ async fn admin_media(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let jobs = admin::recent_media_jobs(&state.pool).await?;
-    let rows = jobs
-        .into_iter()
-        .map(|(id, status, stderr)| {
-            format!(
-                r#"<tr><td>{}</td><td>{}</td><td><pre>{}</pre></td></tr>"#,
-                id,
-                html_escape::encode_text(&status),
-                html_escape::encode_text(&stderr)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let body = if rows.is_empty() {
-        r#"<section class="panel"><h1>Media jobs</h1><p class="muted">No media jobs yet.</p></section>"#
-            .to_owned()
-    } else {
-        format!(
-            r#"<section class="panel"><h1>Media jobs</h1><table><thead><tr><th>ID</th><th>Status</th><th>Summary</th></tr></thead><tbody>{}</tbody></table></section>"#,
-            rows
-        )
-    };
+    let jobs = admin::media_jobs_report(&state.pool).await?;
+    let body = format!(
+        r#"<section class="panel"><h1>Media jobs</h1>{}</section>"#,
+        render_media_jobs_report(&jobs)
+    );
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Media jobs", &body).await?,
     ))
+}
+
+fn render_media_jobs_report(report: &admin::MediaJobsReport) -> String {
+    if report.total == 0 {
+        return r#"<p class="muted">No media jobs yet.</p>"#.to_owned();
+    }
+
+    let mut out = String::new();
+    let pending_age = match (
+        report.newest_pending_age_seconds,
+        report.oldest_pending_age_seconds,
+    ) {
+        (Some(newest), Some(oldest)) => {
+            format!(
+                "{} newest / {} oldest",
+                format_age(newest),
+                format_age(oldest)
+            )
+        }
+        _ => "none".to_owned(),
+    };
+    let _ = write!(
+        out,
+        r#"<table><thead><tr><th>Total</th><th>Pending</th><th>Running</th><th>Succeeded</th><th>Failed</th><th>Pending age</th></tr></thead><tbody><tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr></tbody></table>"#,
+        report.total,
+        report.pending,
+        report.running,
+        report.succeeded,
+        report.failed,
+        html_escape::encode_text(&pending_age),
+    );
+
+    if report.recent_failures.is_empty() {
+        if report.failed == 0 {
+            out.push_str(r#"<p class="muted">No recent media job failures.</p>"#);
+        }
+        return out;
+    }
+
+    out.push_str(
+        r#"<h2>Recent failures</h2><table><thead><tr><th>Job</th><th>Media</th><th>Kind</th><th>Age</th><th>Error</th></tr></thead><tbody>"#,
+    );
+    for failure in &report.recent_failures {
+        let media = failure
+            .media_path
+            .as_deref()
+            .map(|path| compact_text(path, 48))
+            .or_else(|| failure.media_id.map(|id| format!("#{id}")))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let kind = failure.job_kind.as_deref().unwrap_or("media");
+        let age = failure
+            .age_seconds
+            .map_or_else(|| "unknown".to_owned(), format_age);
+        let error = compact_text(&failure.error_summary, 80);
+        let _ = write!(
+            out,
+            r#"<tr><td>#{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+            failure.id,
+            html_escape::encode_text(&media),
+            html_escape::encode_text(kind),
+            html_escape::encode_text(&age),
+            html_escape::encode_text(&error),
+        );
+    }
+    out.push_str("</tbody></table>");
+    out
+}
+
+fn compact_text(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    let take = max_chars.saturating_sub(3);
+    let mut shortened = compact.chars().take(take).collect::<String>();
+    shortened.push_str("...");
+    shortened
+}
+
+fn format_age(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    format!("{}d", hours / 24)
 }
 
 async fn admin_backups(
@@ -2175,6 +2236,65 @@ mod tests {
         assert_eq!(hashes[0], "current");
         assert_eq!(hashes[1], "token-1");
         assert_eq!(hashes[CSRF_TOKEN_HISTORY_LIMIT - 2], "token-30");
+    }
+
+    #[test]
+    fn compact_text_collapses_whitespace_and_truncates() {
+        let compact = compact_text(
+            "/uploads/originals/a/very/long/path.png\nffmpeg stderr repeated detail",
+            24,
+        );
+
+        assert_eq!(compact, "/uploads/originals/a/...");
+    }
+
+    #[test]
+    fn media_jobs_report_keeps_healthy_state_short() {
+        let report = admin::MediaJobsReport {
+            total: 3,
+            succeeded: 3,
+            ..admin::MediaJobsReport::default()
+        };
+
+        let output = render_media_jobs_report(&report);
+
+        assert!(output.contains("<th>Total</th>"));
+        assert!(output.contains("<td>3</td>"));
+        assert!(output.contains("No recent media job failures."));
+        assert!(!output.contains("Recent failures"));
+        assert!(!output.contains("<pre>"));
+    }
+
+    #[test]
+    fn media_jobs_report_shows_compact_recent_failures() {
+        let report = admin::MediaJobsReport {
+            total: 8,
+            pending: 1,
+            running: 1,
+            succeeded: 4,
+            failed: 2,
+            newest_pending_age_seconds: Some(90),
+            oldest_pending_age_seconds: Some(3_900),
+            recent_failures: vec![admin::MediaJobFailure {
+                id: 42,
+                media_id: Some(7),
+                media_path: Some("/media/uploads/a/really/long/path/that/should/not/dominate/report/video.webm".to_owned()),
+                job_kind: Some("video".to_owned()),
+                age_seconds: Some(3_600),
+                error_summary: "ffmpeg failed\nwith a very long diagnostic that should be clipped before it fills the admin table".to_owned(),
+            }],
+        };
+
+        let output = render_media_jobs_report(&report);
+
+        assert!(output.contains("Recent failures"));
+        assert!(output.contains("#42"));
+        assert!(output.contains("video"));
+        assert!(output.contains("1h"));
+        assert!(output.contains("1m newest / 1h oldest"));
+        assert!(output.contains("..."));
+        assert!(!output.contains("should be clipped before it fills"));
+        assert!(!output.contains("<pre>"));
     }
 
     #[test]
