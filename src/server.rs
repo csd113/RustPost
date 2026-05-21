@@ -3646,7 +3646,7 @@ mod tests {
         assert!(
             bob_home
                 .body
-                .contains(r#"class="quote-fallback" href="/posts/1/quote""#)
+                .contains(r#"class="icon-button quote-fallback" href="/posts/1/quote" aria-label="Quote post" title="Quote post""#)
         );
         assert!(bob_home.body.contains("data-repost-menu-button"));
 
