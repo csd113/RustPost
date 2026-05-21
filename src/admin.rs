@@ -272,7 +272,7 @@ impl DeepSettingsField {
             Self::MaxImagesPerPost | Self::MaxVideosPerPost | Self::MaxMediaPerPost => {
                 Some("Attachments per post.")
             }
-            Self::MinPasswordLength => Some("Characters. Values below 10 are rejected."),
+            Self::MinPasswordLength => Some("Characters. Recommended default is 10."),
             Self::MaxImageSizeMb | Self::MaxVideoSizeMb => Some("MB."),
             _ => None,
         }
@@ -515,9 +515,6 @@ fn parse_mb(value: &str, field: DeepSettingsField) -> anyhow::Result<u64> {
     let mb = trimmed
         .parse::<u64>()
         .with_context(|| format!("{} must be a whole number of MB", field.label()))?;
-    if mb == 0 {
-        anyhow::bail!("{} must be at least 1 MB", field.label());
-    }
     mb.checked_mul(MIB)
         .with_context(|| format!("{} is too large to convert from MB", field.label()))?;
     Ok(mb)
@@ -1073,17 +1070,15 @@ mod tests {
     }
 
     #[test]
-    fn deep_settings_validation_rejects_short_minimum_password_length() {
+    fn deep_settings_accepts_operator_chosen_minimum_password_length() {
         let settings = Settings::default();
         let mut form = form_from_settings(&settings);
         form.min_password_length = "5".to_owned();
 
-        let err = parse_deep_settings_form(&form, &settings).expect_err("invalid password length");
+        let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
+        let updated = parsed.apply_to(&settings);
 
-        assert!(
-            err.to_string()
-                .contains("accounts.min_password_length must be at least 10")
-        );
+        assert_eq!(updated.accounts.min_password_length, 5);
     }
 
     #[test]
