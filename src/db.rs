@@ -116,6 +116,10 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_8)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (8)", [])?;
         }
+        if applied.unwrap_or(0) < 9 {
+            tx.execute_batch(MIGRATION_9)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (9)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -343,6 +347,11 @@ CREATE UNIQUE INDEX idx_posts_quote_dedupe
     WHERE quote_post_id IS NOT NULL AND is_deleted = 0;
 "#;
 
+const MIGRATION_9: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_notifications_user_id_desc ON notifications(user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user_id, actor_user_id, post_id, kind);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,7 +393,7 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 8);
+        assert_eq!(versions, 9);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);

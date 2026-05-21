@@ -320,16 +320,20 @@ async fn layout_context(
     state: &AppState,
     user: Option<&CurrentUser>,
 ) -> AppResult<render::LayoutContext> {
-    let counts = if let Some(user) = user {
-        Some(social::follow_counts(&state.pool, user.id).await?)
+    let (counts, notification_unread_count) = if let Some(user) = user {
+        (
+            Some(social::follow_counts(&state.pool, user.id).await?),
+            Some(social::unread_notification_count(&state.pool, user.id).await?),
+        )
     } else {
-        None
+        (None, None)
     };
     Ok(render::LayoutContext {
         anonymous_mode_enabled: state.settings.accounts.anonymous_mode_enabled,
         tor_onion_address: state.tor.onion_address(),
         follower_count: counts.map(|(followers, _following)| followers),
         following_count: counts.map(|(_followers, following)| following),
+        notification_unread_count,
         favicon_content_type: favicon::current(&state.paths).content_type(),
     })
 }
@@ -2223,35 +2227,8 @@ async fn notifications(
     let user = require_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let items = social::notifications(&state.pool, user.id).await?;
-    let list = items
-        .into_iter()
-        .map(|(_, kind, message, post_id, created)| {
-            let link = post_id.map_or_else(String::new, |id| {
-                format!(r#"<a href="/posts/{id}">Open</a>"#)
-            });
-            format!(
-                r#"<li><strong>{}</strong> {} <span>{}</span> {}</li>"#,
-                html_escape::encode_text(&kind),
-                html_escape::encode_text(&message),
-                html_escape::encode_text(&created),
-                link
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let list = if list.is_empty() {
-        render::empty_state(
-            "No notifications",
-            "Likes, replies, reposts, and follows will appear here.",
-        )
-    } else {
-        format!(r#"<ul class="item-list">{list}</ul>"#)
-    };
-    let body = format!(
-        r#"<section class="panel"><div class="section-heading"><h1>Notifications</h1><form method="post" action="/notifications/read"><input type="hidden" name="csrf" value="{}"><button type="submit">Mark all read</button></form></div>{}</section>"#,
-        html_escape::encode_double_quoted_attribute(&csrf),
-        list
-    );
+    let unread_count = social::unread_notification_count(&state.pool, user.id).await?;
+    let body = render::notifications_page(&items, unread_count, &csrf);
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Notifications", &body).await?,
     ))
@@ -4113,6 +4090,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notifications_page_renders_unread_badges_and_mark_all_read() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "alice original post").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+
+        let thread = get_with_cookie(&server, "/posts/1", &bob_cookie).await;
+        let csrf = csrf_token(&thread.body);
+        let reply = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &bob_cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("parent_post_id", "1"),
+                    ("text", "bob reply"),
+                ],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, 303);
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let csrf = csrf_token(&bob_home.body);
+        let liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(liked.status, 303);
+        let reposted = post_form_with_cookie(
+            &server,
+            "/posts/1/repost",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(reposted.status, 303);
+        let followed = post_form_with_cookie(
+            &server,
+            "/users/1/follow",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(followed.status, 303);
+
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert_eq!(notifications.status, 200);
+        assert_populated_notifications_page(&notifications.body);
+
+        let csrf = csrf_token(&notifications.body);
+        let read = post_form_with_cookie(
+            &server,
+            "/notifications/read",
+            &alice_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(read.status, 303);
+        assert_eq!(location(&read), "/notifications");
+
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert!(notifications.body.contains("No unread notifications"));
+        assert!(
+            notifications
+                .body
+                .contains("All caught up. Everything here has been read.")
+        );
+        assert!(!notifications.body.contains(r#"<span class="nav-badge""#));
+        assert!(
+            !notifications
+                .body
+                .contains(r#"class="notification-row unread""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_page_has_polished_empty_state() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+
+        let notifications = get_with_cookie(&server, "/notifications", &cookie).await;
+
+        assert_eq!(notifications.status, 200);
+        assert!(notifications.body.contains(r#"class="notifications-hero""#));
+        assert!(notifications.body.contains("No unread notifications"));
+        assert!(notifications.body.contains("No notifications yet"));
+        assert!(
+            notifications
+                .body
+                .contains("Replies, likes, reposts, follows, and mentions will appear here.")
+        );
+    }
+
+    #[tokio::test]
     async fn default_favicon_route_and_html_link_are_present() {
         let server = spawn_test_server().await;
 
@@ -4989,6 +5074,29 @@ mod tests {
         )
         .await;
         assert_eq!(posted.status, 303);
+    }
+
+    fn assert_populated_notifications_page(body: &str) {
+        assert!(body.contains("4 unread notifications"));
+        assert!(
+            body.contains(
+                r#"<span class="nav-badge" aria-label="4 unread notifications">4</span>"#
+            )
+        );
+        assert!(body.contains(r#"<h2 class="notification-group">New</h2>"#));
+        assert_eq!(
+            body.matches(r#"class="notification-row unread""#).count(),
+            4
+        );
+        assert!(body.contains(">bob</a> <span class=\"username\">@bob</span>"));
+        assert!(body.contains("replied to your post"));
+        assert!(body.contains("liked your post"));
+        assert!(body.contains("reposted your post"));
+        assert!(body.contains("followed you"));
+        assert!(body.contains("alice original post"));
+        assert!(body.contains(r#"data-card-href="/posts/1""#));
+        assert!(body.contains(r#"data-card-href="/posts/2""#));
+        assert!(body.contains(r#"data-card-href="/users/bob""#));
     }
 
     fn quote_form_body(response: &TestResponse, text: &str) -> String {
