@@ -81,24 +81,35 @@ pub fn layout_with_context(
 ) -> String {
     let auth_nav = if let Some(user) = user {
         let admin = if user.is_admin {
-            r#"<a href="/admin">Admin</a>"#
+            nav_link("/admin", "Admin", "admin")
         } else {
-            ""
+            String::new()
         };
         let notifications = notification_nav_link(context.notification_unread_count.unwrap_or(0));
         let logout = csrf.map_or_else(String::new, |token| {
             format!(
-                r#"<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button>Log out</button></form>"#,
-                html_escape::encode_double_quoted_attribute(token)
+                r#"<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button>{}<span>Log out</span></button></form>"#,
+                html_escape::encode_double_quoted_attribute(token),
+                icon_svg("log-out")
             )
         });
+        let profile = nav_link(&format!("/users/{}", user.username), "Profile", "profile");
         format!(
-            r#"<a href="/home">Home Feed</a><a href="/following">Following</a><a href="/search">Search</a>{notifications}<a href="/bookmarks">Bookmarks</a><a href="/users/{}">Profile</a>{admin}{logout}"#,
-            html_escape::encode_double_quoted_attribute(&user.username)
+            "{}{}{}{notifications}{}{}{admin}{logout}",
+            nav_link("/home", "Home Feed", "home"),
+            nav_link("/following", "Following", "users"),
+            nav_link("/search", "Search", "search"),
+            nav_link("/bookmarks", "Bookmarks", "bookmark"),
+            profile,
         )
     } else {
-        r#"<a href="/home">Home Feed</a><a href="/search">Search</a><a href="/login">Log in</a><a href="/register">Register</a>"#
-            .to_owned()
+        format!(
+            "{}{}{}{}",
+            nav_link("/home", "Home Feed", "home"),
+            nav_link("/search", "Search", "search"),
+            nav_link("/login", "Log in", "log-in"),
+            nav_link("/register", "Register", "user-plus")
+        )
     };
     let brand_mark = site_name.chars().next().unwrap_or('R');
     let left_rail = left_rail(user, &auth_nav);
@@ -149,6 +160,15 @@ pub fn layout_with_context(
     )
 }
 
+fn nav_link(href: &str, label: &str, icon: &str) -> String {
+    format!(
+        r#"<a href="{}">{}<span>{}</span></a>"#,
+        html_escape::encode_double_quoted_attribute(href),
+        icon_svg(icon),
+        html_escape::encode_text(label)
+    )
+}
+
 fn left_rail(user: Option<&CurrentUser>, nav: &str) -> String {
     let account = user.map_or_else(
         || r#"<p class="rail-kicker">Guest session</p><p class="muted">Log in or register to post.</p>"#.to_owned(),
@@ -169,10 +189,11 @@ fn left_rail(user: Option<&CurrentUser>, nav: &str) -> String {
 fn notification_nav_link(unread_count: i64) -> String {
     if unread_count > 0 {
         format!(
-            r#"<a href="/notifications">Notifications <span class="nav-badge" aria-label="{unread_count} unread notifications">{unread_count}</span></a>"#
+            r#"<a href="/notifications">{}<span>Notifications</span> <span class="nav-badge" aria-label="{unread_count} unread notifications">{unread_count}</span></a>"#,
+            icon_svg("bell")
         )
     } else {
-        r#"<a href="/notifications">Notifications</a>"#.to_owned()
+        nav_link("/notifications", "Notifications", "bell")
     }
 }
 
@@ -1113,6 +1134,33 @@ fn quote_preview_card(quote: &QuotePreview) -> String {
 
 fn icon_svg(icon: &str) -> &'static str {
     match icon {
+        "home" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 11.3 12 3l9 8.3-2 2.1-1.1-1V20h-4.6v-5.2h-2.6V20H6.1v-7.6l-1.1 1-2-2.1z"/></svg>"#
+        }
+        "users" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 11.5a4 4 0 1 1 0-8 4 4 0 0 1 0 8zm-7 8.2c.4-4.3 3.1-6.5 7-6.5s6.6 2.2 7 6.5V21H2v-1.3zm14.5-7.3a3.4 3.4 0 1 0 0-6.8 3.4 3.4 0 0 0-.9.1 5.8 5.8 0 0 1-1.3 6.4c.7.1 1.5.2 2.2.3zm.2 1.7c2.9.4 4.9 2.3 5.3 5.6V21h-3.9v-1.6a8.7 8.7 0 0 0-1.4-5.3z"/></svg>"#
+        }
+        "search" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M10.5 4a6.5 6.5 0 0 1 5.1 10.5l4.4 4.4-2.1 2.1-4.4-4.4A6.5 6.5 0 1 1 10.5 4zm0 3a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z"/></svg>"#
+        }
+        "bell" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 22a2.8 2.8 0 0 0 2.7-2h-5.4A2.8 2.8 0 0 0 12 22zm7-6.5-1.8-2.1V9a5.2 5.2 0 0 0-3.7-5V2h-3v2A5.2 5.2 0 0 0 6.8 9v4.4L5 15.5V18h14v-2.5z"/></svg>"#
+        }
+        "profile" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 12a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9zm-8 8.2c.5-4.6 3.6-7 8-7s7.5 2.4 8 7V22H4v-1.8z"/></svg>"#
+        }
+        "admin" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 2 20 5v6c0 5.1-3.2 8.7-8 11-4.8-2.3-8-5.9-8-11V5l8-3zm0 4-4 1.5V11c0 3.1 1.5 5.4 4 7 2.5-1.6 4-3.9 4-7V7.5L12 6z"/></svg>"#
+        }
+        "log-in" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 4h8v3H7v10h5v3H4V4zm10.5 3.2L20.3 12l-5.8 4.8-1.9-2.3 1.8-1.5H9v-3h5.4l-1.8-1.5 1.9-2.3z"/></svg>"#
+        }
+        "log-out" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 4h8v3H7v10h5v3H4V4zm12.5 3.2 1.9 2.3-1.8 1.5H11v3h5.6l-1.8 1.5 1.9 2.3 5.8-4.8-6-4.8z"/></svg>"#
+        }
+        "user-plus" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9.5 12a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9zM2 20.5c.5-4.4 3.3-6.7 7.5-6.7 1.7 0 3.1.4 4.2 1.1A6.8 6.8 0 0 0 12.5 21H2v-.5zM18 14v3h3v3h-3v3h-3v-3h-3v-3h3v-3h3z"/></svg>"#
+        }
         "heart" => {
             r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 21s-7-4.4-9.4-8.8C.6 8.5 2.7 4.5 6.7 4.5c2 0 3.5 1.1 4.3 2.4.8-1.3 2.3-2.4 4.3-2.4 4 0 6.1 4 4.1 7.7C19 16.6 12 21 12 21z"/></svg>"#
         }
@@ -1454,6 +1502,7 @@ const CSS: &str = r#"
 .brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:var(--text-strong)}.brand-mark{display:inline-grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--brand);color:var(--brand-text)}
 nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}nav a,nav button,.button-link{display:inline-flex;align-items:center;gap:.35rem;min-height:2.15rem;border-radius:7px;padding:.42rem .65rem;color:var(--link-strong);border:1px solid transparent;background:transparent}
 nav a:hover,nav button:hover,.button-link:hover{background:var(--hover);text-decoration:none}nav form,.actions form{display:inline}
+nav svg{width:1.05rem;height:1.05rem;fill:currentColor;flex:0 0 auto}
 .nav-badge{display:inline-grid;place-items:center;min-width:1.25rem;height:1.25rem;border-radius:999px;padding:0 .35rem;background:var(--brand);color:var(--brand-text);font-size:.78rem;font-weight:800;line-height:1}
 main{padding:1.25rem}.app-shell{width:min(100%,1180px);margin:0 auto;display:grid;grid-template-columns:220px minmax(0,640px) 260px;gap:1.25rem;align-items:start;justify-content:center}.primary-column{min-width:0;width:100%}.left-rail,.right-rail{min-width:0;position:sticky;top:5rem;display:grid;gap:.75rem}.side-rail-card,.rail-nav{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem;color:var(--muted-strong);box-shadow:0 1px 2px var(--shadow)}.side-rail-card h2{margin:.1rem 0 .6rem;font-size:1rem;color:var(--text)}.rail-kicker{margin:0 0 .25rem;color:var(--muted);font-size:.78rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em}.rail-account{display:grid;color:var(--text);overflow-wrap:anywhere}.rail-account span{color:var(--muted);font-size:.9rem}.rail-account:hover{text-decoration:none}.rail-nav{display:grid;gap:.25rem}.rail-nav a,.rail-nav button{width:100%;justify-content:flex-start}.rail-nav form{display:block}.mobile-nav{display:none}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:var(--text)}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:var(--text)}.dashboard-account:hover{text-decoration:none}.quick-links{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:1180px;margin:0 auto;padding:1rem;color:var(--muted);font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:.85rem;box-shadow:0 1px 2px var(--shadow)}
