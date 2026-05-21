@@ -72,6 +72,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/posts/{id}/quote", get(quote_form).post(quote_post))
         .route("/posts/{id}/reply", post(reply_redirect))
         .route("/users/{username}", get(profile))
+        .route("/users/{username}/followers", get(profile_followers))
+        .route("/users/{username}/following", get(profile_following))
         .route("/users/{id}/follow", post(follow))
         .route("/users/{id}/unfollow", post(unfollow))
         .route("/users/{id}/block", post(block))
@@ -1058,6 +1060,100 @@ async fn profile(
             user.as_ref(),
             csrf.as_deref(),
             &profile_username,
+            &body,
+        )
+        .await?,
+    ))
+}
+
+async fn profile_identity(
+    pool: &SqlitePool,
+    username: &str,
+) -> anyhow::Result<Option<(i64, String, String)>> {
+    let normalized_username = username.to_ascii_lowercase();
+    pool.call(move |conn| {
+        conn.query_row(
+            r#"
+            SELECT id, username, display_name
+            FROM users
+            WHERE normalized_username = ? AND is_deleted = 0
+            "#,
+            [normalized_username],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    })
+    .await
+}
+
+async fn profile_followers(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> AppResult<Html<String>> {
+    let user = current(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await;
+    let Some((profile_id, profile_username, display_name)) =
+        profile_identity(&state.pool, &username).await?
+    else {
+        return Err(AppError::NotFound);
+    };
+    let accounts =
+        social::followers_accounts(&state.pool, profile_id, user.as_ref().map(|user| user.id))
+            .await?;
+    let body = format!(
+        "{}{}",
+        render::page_header(
+            &format!("{display_name} followers"),
+            &format!("Users who follow @{profile_username}.")
+        ),
+        render::account_links(&accounts, "No followers yet.")
+    );
+    Ok(Html(
+        page_layout(
+            &state,
+            user.as_ref(),
+            csrf.as_deref(),
+            &format!("{display_name} followers"),
+            &body,
+        )
+        .await?,
+    ))
+}
+
+async fn profile_following(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> AppResult<Html<String>> {
+    let user = current(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await;
+    let Some((profile_id, profile_username, display_name)) =
+        profile_identity(&state.pool, &username).await?
+    else {
+        return Err(AppError::NotFound);
+    };
+    let accounts = social::following_accounts_for_profile(
+        &state.pool,
+        profile_id,
+        user.as_ref().map(|user| user.id),
+    )
+    .await?;
+    let body = format!(
+        "{}{}",
+        render::page_header(
+            &format!("{display_name} following"),
+            &format!("Users @{profile_username} follows.")
+        ),
+        render::account_links(&accounts, "Not following anyone yet.")
+    );
+    Ok(Html(
+        page_layout(
+            &state,
+            user.as_ref(),
+            csrf.as_deref(),
+            &format!("{display_name} following"),
             &body,
         )
         .await?,

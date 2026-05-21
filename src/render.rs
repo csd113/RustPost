@@ -169,20 +169,9 @@ fn nav_link(href: &str, label: &str, icon: &str) -> String {
     )
 }
 
-fn left_rail(user: Option<&CurrentUser>, nav: &str) -> String {
-    let account = user.map_or_else(
-        || r#"<p class="rail-kicker">Guest session</p><p class="muted">Log in or register to post.</p>"#.to_owned(),
-        |user| {
-            format!(
-                r#"<p class="rail-kicker">Signed in</p><a class="rail-account" href="/users/{}"><strong>{}</strong><span>@{}</span></a>"#,
-                html_escape::encode_double_quoted_attribute(&user.username),
-                html_escape::encode_text(&user.display_name),
-                html_escape::encode_text(&user.username)
-            )
-        },
-    );
+fn left_rail(_user: Option<&CurrentUser>, nav: &str) -> String {
     format!(
-        r#"<aside class="left-rail" data-testid="left-rail"><section class="side-rail-card">{account}</section><nav class="rail-nav" aria-label="Primary">{nav}</nav></aside>"#
+        r#"<aside class="left-rail" data-testid="left-rail"><nav class="rail-nav" aria-label="Primary">{nav}</nav></aside>"#
     )
 }
 
@@ -218,14 +207,15 @@ fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> Strin
     );
     let social = match (context.follower_count, context.following_count) {
         (Some(followers), Some(following)) => {
-            format!(r#"<dt>Social</dt><dd>{followers} followers<br>{following} following</dd>"#)
+            user.map_or_else(String::new, |user| {
+                let username = html_escape::encode_double_quoted_attribute(&user.username);
+                let display_name = html_escape::encode_double_quoted_attribute(&user.display_name);
+                format!(
+                    r#"<dt>Social</dt><dd><a data-testid="dashboard-followers-link" href="/users/{username}/followers" aria-label="View followers for {display_name}">{followers} followers</a><br><a data-testid="dashboard-following-link" href="/users/{username}/following" aria-label="View users {display_name} follows">{following} following</a></dd>"#
+                )
+            })
         }
         _ => String::new(),
-    };
-    let admin = if user.is_some_and(|user| user.is_admin) {
-        r#"<a class="button-link" href="/admin">Admin</a>"#
-    } else {
-        ""
     };
     let settings = if user.is_some() {
         r#"<a class="button-link" href="/settings">Settings</a>"#
@@ -233,7 +223,7 @@ fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> Strin
         ""
     };
     format!(
-        r#"<aside class="right-rail" data-testid="right-rail"><section class="side-rail-card"><h2>Dashboard</h2><dl class="dashboard-list">{}<dt>Posting</dt><dd>{}</dd>{}</dl><div class="quick-links">{settings}{admin}</div></section></aside>"#,
+        r#"<aside class="right-rail" data-testid="right-rail"><section class="side-rail-card"><h2>Dashboard</h2><dl class="dashboard-list">{}<dt>Posting</dt><dd>{}</dd>{}</dl><div class="dashboard-actions">{settings}</div></section></aside>"#,
         account, posting, social
     )
 }
@@ -671,6 +661,41 @@ pub fn accounts(accounts: &[AccountView], csrf: &str) -> String {
         .collect::<Vec<_>>()
         .join("");
     format!(r#"<section class="account-list">{rows}</section>"#)
+}
+
+pub fn account_links(accounts: &[AccountView], empty_message: &str) -> String {
+    if accounts.is_empty() {
+        return empty_state(empty_message, "");
+    }
+    let rows = accounts
+        .iter()
+        .map(|account| {
+            let avatar = account.profile_picture_path.as_ref().map_or_else(
+                || {
+                    let initial = account.display_name.chars().next().unwrap_or('R');
+                    format!(
+                        r#"<span class="post-avatar placeholder" aria-hidden="true">{}</span>"#,
+                        html_escape::encode_text(&initial.to_string())
+                    )
+                },
+                |path| {
+                    format!(
+                        r#"<img class="post-avatar" src="{}" alt="" loading="lazy">"#,
+                        html_escape::encode_double_quoted_attribute(path)
+                    )
+                },
+            );
+            format!(
+                r#"<article class="account-row" data-testid="account-row">{}<div><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span></div></article>"#,
+                avatar,
+                html_escape::encode_double_quoted_attribute(&account.username),
+                html_escape::encode_text(&account.display_name),
+                html_escape::encode_text(&account.username)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<section class="account-list" data-testid="account-list">{rows}</section>"#)
 }
 
 pub fn search_page(
@@ -1504,7 +1529,7 @@ nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:fl
 nav a:hover,nav button:hover,.button-link:hover{background:var(--hover);text-decoration:none}nav form,.actions form{display:inline}
 nav svg{width:1.05rem;height:1.05rem;fill:currentColor;flex:0 0 auto}
 .nav-badge{display:inline-grid;place-items:center;min-width:1.25rem;height:1.25rem;border-radius:999px;padding:0 .35rem;background:var(--brand);color:var(--brand-text);font-size:.78rem;font-weight:800;line-height:1}
-main{padding:1.25rem}.app-shell{width:min(100%,1180px);margin:0 auto;display:grid;grid-template-columns:220px minmax(0,640px) 260px;gap:1.25rem;align-items:start;justify-content:center}.primary-column{min-width:0;width:100%}.left-rail,.right-rail{min-width:0;position:sticky;top:5rem;display:grid;gap:.75rem}.side-rail-card,.rail-nav{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem;color:var(--muted-strong);box-shadow:0 1px 2px var(--shadow)}.side-rail-card h2{margin:.1rem 0 .6rem;font-size:1rem;color:var(--text)}.rail-kicker{margin:0 0 .25rem;color:var(--muted);font-size:.78rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em}.rail-account{display:grid;color:var(--text);overflow-wrap:anywhere}.rail-account span{color:var(--muted);font-size:.9rem}.rail-account:hover{text-decoration:none}.rail-nav{display:grid;gap:.25rem}.rail-nav a,.rail-nav button{width:100%;justify-content:flex-start}.rail-nav form{display:block}.mobile-nav{display:none}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:var(--text)}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:var(--text)}.dashboard-account:hover{text-decoration:none}.quick-links{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:1180px;margin:0 auto;padding:1rem;color:var(--muted);font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
+main{padding:1.25rem}.app-shell{width:min(100%,1180px);margin:0 auto;display:grid;grid-template-columns:220px minmax(0,640px) 260px;gap:1.25rem;align-items:start;justify-content:center}.primary-column{min-width:0;width:100%}.left-rail,.right-rail{min-width:0;position:sticky;top:5rem;display:grid;gap:.75rem}.side-rail-card,.rail-nav{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem;color:var(--muted-strong);box-shadow:0 1px 2px var(--shadow)}.side-rail-card h2{margin:.1rem 0 .6rem;font-size:1rem;color:var(--text)}.rail-nav{display:grid;gap:.25rem}.rail-nav a,.rail-nav button{width:100%;justify-content:flex-start}.rail-nav form{display:block}.mobile-nav{display:none}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:var(--text)}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:var(--text)}.dashboard-account:hover{text-decoration:none}.dashboard-actions{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:1180px;margin:0 auto;padding:1rem;color:var(--muted);font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:.85rem;box-shadow:0 1px 2px var(--shadow)}
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.panel h1+table,.panel h1+form,.panel h1+p,.panel h1+dl{margin-top:.85rem}.page-header p,.muted,.empty-state p{color:var(--muted);margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
 .notifications-hero{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:1rem;box-shadow:0 1px 2px var(--shadow);display:flex;align-items:center;justify-content:space-between;gap:1rem}.notifications-hero h1{margin:0;font-size:1.55rem;line-height:1.15}.notifications-hero p:not(.eyebrow){margin:.35rem 0 0;color:var(--muted-strong)}.caught-up-pill{display:inline-flex;align-items:center;min-height:2rem;border:1px solid var(--success-border);border-radius:999px;background:var(--success-bg);color:var(--text-strong);padding:.32rem .75rem;font-weight:800}.caught-up{padding:.75rem .85rem}.caught-up p{margin:0}.notifications-list{display:grid;gap:.5rem}.notification-group{margin:.8rem .15rem .2rem;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.notification-row{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:start;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.8rem;box-shadow:0 1px 2px var(--shadow)}.notification-row.unread{border-color:var(--border-strong);background:var(--surface-subtle)}.notification-row[data-card-href]{cursor:pointer}.notification-row[data-card-href]:hover{border-color:var(--border-strong);background:var(--hover)}.notification-kind{display:grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--surface-muted);color:var(--link-strong);font-weight:900;font-size:.8rem}.notification-row.unread .notification-kind{background:var(--brand);color:var(--brand-text)}.notification-body{min-width:0}.notification-line{margin:0;overflow-wrap:anywhere}.notification-meta{margin:.35rem 0 0;color:var(--muted);font-size:.88rem}.notification-preview{display:block;margin:.5rem 0 0;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle);color:var(--muted-strong);overflow-wrap:anywhere}.notification-preview:hover{background:var(--surface);text-decoration:none}.notification-preview.unavailable{border-style:dashed}.unread-dot{width:.65rem;height:.65rem;border-radius:999px;background:var(--brand);margin-top:.7rem}
@@ -1591,6 +1616,41 @@ mod tests {
     }
 
     #[test]
+    fn signed_in_left_rail_contains_navigation_only() {
+        let user = CurrentUser {
+            id: 1,
+            username: "ada".to_owned(),
+            display_name: "Ada Lovelace".to_owned(),
+            is_admin: false,
+            is_suspended: false,
+            theme: Theme::Light,
+        };
+        let body = layout_with_csrf(
+            Some(&user),
+            Some("csrf"),
+            "Home Feed",
+            "<p>body</p>",
+            "RustPost",
+        );
+        let left_rail = body
+            .split_once(r#"<aside class="left-rail" data-testid="left-rail">"#)
+            .and_then(|(_, rest)| rest.split_once("</aside>"))
+            .map(|(panel, _)| panel)
+            .expect("left rail");
+
+        assert!(left_rail.contains("Home Feed"));
+        assert!(left_rail.contains("Following"));
+        assert!(left_rail.contains("Search"));
+        assert!(left_rail.contains("Notifications"));
+        assert!(left_rail.contains("Bookmarks"));
+        assert!(left_rail.contains("Profile"));
+        assert!(left_rail.contains("Log out"));
+        assert!(!left_rail.contains("Signed in"));
+        assert!(!left_rail.contains("Ada Lovelace"));
+        assert!(!left_rail.contains("rail-account"));
+    }
+
+    #[test]
     fn dashboard_uses_account_link_without_duplicate_feed_links_or_onion() {
         let user = CurrentUser {
             id: 1,
@@ -1621,8 +1681,16 @@ mod tests {
             .expect("dashboard panel");
         assert!(dashboard.contains(r#"href="/users/ada""#));
         assert!(dashboard.contains("Ada Lovelace"));
+        assert!(dashboard.contains(r#"href="/users/ada/followers""#));
+        assert!(dashboard.contains(r#"aria-label="View followers for Ada Lovelace""#));
+        assert!(dashboard.contains(">2 followers</a>"));
+        assert!(dashboard.contains(r#"href="/users/ada/following""#));
+        assert!(dashboard.contains(r#"aria-label="View users Ada Lovelace follows""#));
+        assert!(dashboard.contains(">3 following</a>"));
+        assert!(dashboard.contains(r#"<a class="button-link" href="/settings">Settings</a>"#));
         assert!(!dashboard.contains(r#"href="/home">Home Feed"#));
         assert!(!dashboard.contains(r#"href="/following">Following"#));
+        assert!(!dashboard.contains("quick-links"));
         assert!(!dashboard.contains("examplehiddenservice.onion"));
     }
 

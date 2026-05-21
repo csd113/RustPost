@@ -487,6 +487,84 @@ pub async fn following_accounts(
     .await
 }
 
+pub async fn followers_accounts(
+    pool: &SqlitePool,
+    account_id: i64,
+    viewer_id: Option<i64>,
+) -> anyhow::Result<Vec<AccountView>> {
+    let viewer_id = viewer_id.unwrap_or(0);
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name, u.bio,
+              COALESCE(pic.thumbnail_public_path, pic.public_path),
+              EXISTS(
+                SELECT 1 FROM follows vf
+                WHERE vf.follower_id = ? AND vf.followed_id = u.id
+              )
+            FROM follows f
+            JOIN users u ON u.id = f.follower_id
+            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+            WHERE f.followed_id = ? AND u.is_deleted = 0
+            ORDER BY lower(u.username)
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![viewer_id, account_id], |row| {
+                Ok(AccountView {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    display_name: row.get(2)?,
+                    bio: row.get(3)?,
+                    profile_picture_path: row.get(4)?,
+                    viewer_following: row.get::<_, i64>(5)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+pub async fn following_accounts_for_profile(
+    pool: &SqlitePool,
+    account_id: i64,
+    viewer_id: Option<i64>,
+) -> anyhow::Result<Vec<AccountView>> {
+    let viewer_id = viewer_id.unwrap_or(0);
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name, u.bio,
+              COALESCE(pic.thumbnail_public_path, pic.public_path),
+              EXISTS(
+                SELECT 1 FROM follows vf
+                WHERE vf.follower_id = ? AND vf.followed_id = u.id
+              )
+            FROM follows f
+            JOIN users u ON u.id = f.followed_id
+            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+            WHERE f.follower_id = ? AND u.is_deleted = 0
+            ORDER BY lower(u.username)
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![viewer_id, account_id], |row| {
+                Ok(AccountView {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    display_name: row.get(2)?,
+                    bio: row.get(3)?,
+                    profile_picture_path: row.get(4)?,
+                    viewer_following: row.get::<_, i64>(5)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
 pub async fn block(pool: &SqlitePool, blocker_id: i64, blocked_id: i64) -> anyhow::Result<()> {
     if blocker_id == blocked_id {
         anyhow::bail!("cannot block yourself");
