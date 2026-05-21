@@ -1,5 +1,5 @@
 use crate::auth::{CurrentUser, Theme};
-use crate::social::{AccountView, MediaView, PostView, TimelineEventKind};
+use crate::social::{AccountView, MediaView, PostView, QuotePreview, TimelineEventKind};
 use axum::http::StatusCode;
 
 #[derive(Debug, Clone)]
@@ -182,18 +182,42 @@ fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> Strin
     )
 }
 
-pub fn login_form(message: Option<&str>) -> String {
+pub fn login_form(message: Option<&str>, min_password_length: usize) -> String {
     let notice = message.map_or_else(String::new, |message| notice("error", message));
+    let hint = password_requirement_hint(min_password_length);
+    let attrs = password_length_attrs(min_password_length, "password-requirement");
     format!(
-        r#"<section class="panel auth-panel"><h1>Log in</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><div class="password-control"><input id="password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><button class="auth-submit" type="submit">Log in</button></form></section>"#
+        r#"<section class="panel auth-panel"><h1>Log in</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="current-password"{attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><button class="auth-submit" type="submit">Log in</button></form></section>"#
     )
 }
 
-pub fn register_form(message: Option<&str>) -> String {
+pub fn register_form(message: Option<&str>, min_password_length: usize) -> String {
     let notice = message.map_or_else(String::new, |message| notice("error", message));
+    let hint = password_requirement_hint(min_password_length);
+    let password_attrs = password_length_attrs(min_password_length, "password-requirement");
+    let confirm_attrs = password_length_attrs(min_password_length, "confirm-password-requirement");
     format!(
-        r#"<section class="panel auth-panel"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><div class="password-control"><input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" minlength="10" autocomplete="new-password" required><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div><button class="auth-submit" type="submit">Create account</button></form></section>"#
+        r#"<section class="panel auth-panel"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="new-password"{password_attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><p class="field-help" id="confirm-password-requirement">{hint}</p><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"{confirm_attrs}><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div><button class="auth-submit" type="submit">Create account</button></form></section>"#
     )
+}
+
+pub fn password_length_attrs(min_password_length: usize, described_by: &str) -> String {
+    let described_by = html_escape::encode_double_quoted_attribute(described_by);
+    if min_password_length == 0 {
+        format!(r#" aria-describedby="{described_by}""#)
+    } else {
+        format!(r#" minlength="{min_password_length}" required aria-describedby="{described_by}""#)
+    }
+}
+
+fn password_requirement_hint(min_password_length: usize) -> String {
+    if min_password_length == 0 {
+        "No minimum password length is currently required.".to_owned()
+    } else if min_password_length == 1 {
+        "Password must be at least 1 character.".to_owned()
+    } else {
+        format!("Password must be at least {min_password_length} characters.")
+    }
 }
 
 const CLIENT_SCRIPT: &str = r#"function cardInteractiveTarget(target) {
@@ -251,12 +275,85 @@ document.addEventListener("click", (event) => {
   button.setAttribute("aria-label", show ? "Hide password" : "Show password");
 });
 
+function closeRepostMenus(except) {
+  document.querySelectorAll("[data-repost-menu]").forEach((menu) => {
+    if (menu === except) {
+      return;
+    }
+    menu.hidden = true;
+    const button = document.querySelector(`[aria-controls="${menu.id}"]`);
+    if (button) {
+      button.setAttribute("aria-expanded", "false");
+    }
+  });
+}
+
+function openRepostMenu(button) {
+  const menu = document.getElementById(button.getAttribute("aria-controls"));
+  if (!menu) {
+    return;
+  }
+  closeRepostMenus(menu);
+  menu.hidden = false;
+  button.setAttribute("aria-expanded", "true");
+  const firstItem = menu.querySelector('[role="menuitem"]');
+  if (firstItem) {
+    firstItem.focus();
+  }
+}
+
+document.addEventListener("pointerdown", (event) => {
+  const button = event.target.closest("[data-repost-menu-button]");
+  if (!button) {
+    return;
+  }
+  const timer = window.setTimeout(() => {
+    button.dataset.longPressOpen = "true";
+    openRepostMenu(button);
+  }, 450);
+  button.dataset.longPressTimer = String(timer);
+});
+
+document.addEventListener("pointerup", (event) => {
+  const button = event.target.closest("[data-repost-menu-button]");
+  if (!button || !button.dataset.longPressTimer) {
+    return;
+  }
+  window.clearTimeout(Number.parseInt(button.dataset.longPressTimer, 10));
+  delete button.dataset.longPressTimer;
+});
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-repost-menu-button]");
+  if (button && button.dataset.longPressOpen === "true") {
+    event.preventDefault();
+    event.stopPropagation();
+    delete button.dataset.longPressOpen;
+    return;
+  }
+  if (!event.target.closest("[data-repost-control]")) {
+    closeRepostMenus(null);
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  const button = event.target.closest("[data-repost-menu-button]");
+  if (button && (event.key === "ArrowDown" || event.key === "F10")) {
+    event.preventDefault();
+    openRepostMenu(button);
+    return;
+  }
+  if (event.key === "Escape") {
+    closeRepostMenus(null);
+  }
+});
+
 function updateComposerCount(textarea) {
   const counter = document.querySelector(`[data-character-counter="${textarea.id}"]`);
   if (!counter) {
     return;
   }
-  const max = Number.parseInt(textarea.getAttribute("maxlength") || "280", 10);
+  const max = Number.parseInt(textarea.getAttribute("data-character-limit") || "0", 10);
   const length = Array.from(textarea.value).length;
   counter.textContent = `${Math.max(0, max - length)} remaining`;
 }
@@ -430,17 +527,17 @@ pub fn client_script() -> &'static str {
     CLIENT_SCRIPT
 }
 
-pub fn composer(csrf: Option<&str>, parent: Option<i64>) -> String {
+pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) -> String {
     let parent_input = parent.map_or_else(String::new, |id| {
         format!(r#"<input type="hidden" name="parent_post_id" value="{id}">"#)
     });
     let csrf = csrf.unwrap_or_default();
     let input_id = parent.map_or_else(|| "post-text".to_owned(), |id| format!("reply-text-{id}"));
     format!(
-        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted" data-character-counter="{}">280 remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
+        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted" data-character-counter="{}">{} remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
 <input type="hidden" name="csrf" value="{}">{}
 <label class="sr-only" for="{}">What is happening?</label>
-<textarea id="{}" name="text" maxlength="280" rows="4" data-character-limit="280"></textarea>
+<textarea id="{}" name="text" maxlength="{}" rows="4" data-character-limit="{}"></textarea>
 <div class="composer-tools"><label class="file-control" for="media">Attach media<input id="media" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime"></label><button class="primary" type="submit">Post</button></div>
 </form></section>"#,
         if parent.is_some() {
@@ -449,10 +546,29 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>) -> String {
             "New post"
         },
         html_escape::encode_double_quoted_attribute(&input_id),
+        max_text_chars,
         html_escape::encode_double_quoted_attribute(csrf),
         parent_input,
         html_escape::encode_double_quoted_attribute(&input_id),
-        html_escape::encode_double_quoted_attribute(&input_id)
+        html_escape::encode_double_quoted_attribute(&input_id),
+        max_text_chars,
+        max_text_chars
+    )
+}
+
+pub fn quote_composer(csrf: &str, quote: &QuotePreview, max_text_chars: usize) -> String {
+    let preview = quote_preview_card(quote);
+    format!(
+        r#"<section class="composer quote-composer" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">Quote post</h1><span class="muted" data-character-counter="quote-text">{max_text_chars} remaining</span></div>{preview}<form method="post" action="/posts/{}/quote" class="quote-form">
+<input type="hidden" name="csrf" value="{}">
+<label class="sr-only" for="quote-text">Add your comment</label>
+<textarea id="quote-text" name="text" maxlength="{}" rows="4" data-character-limit="{}" required></textarea>
+<div class="composer-tools"><span></span><button class="primary" type="submit">Post quote</button></div>
+</form></section>"#,
+        quote.id,
+        html_escape::encode_double_quoted_attribute(csrf),
+        max_text_chars,
+        max_text_chars
     )
 }
 
@@ -781,16 +897,15 @@ fn post_card_with_options(
                 post.viewer_liked
             ),
             if post.viewer_can_repost {
-                icon_action_form(
+                repost_action_with_quote(
                     &format!("/posts/{}/repost", post.id),
+                    &format!("/posts/{}/quote", post.id),
                     csrf,
                     if post.viewer_reposted {
                         "Unrepost"
                     } else {
                         "Repost"
                     },
-                    "repost",
-                    "repost",
                     post.viewer_reposted,
                 )
             } else {
@@ -843,8 +958,12 @@ fn post_card_with_options(
     } else {
         String::new()
     };
+    let quote = post
+        .quote
+        .as_ref()
+        .map_or_else(String::new, quote_preview_card);
     format!(
-        r#"<article class="{}" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}<div class="counts"><span data-count="likes">{} likes</span><span data-count="reposts">{} reposts</span><span data-count="replies">{} replies</span></div>{}</article>"#,
+        r#"<article class="{}" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}{}<div class="counts"><span data-count="likes">{} likes</span><span data-count="reposts">{} reposts</span><span data-count="replies">{} replies</span></div>{}</article>"#,
         post_class,
         post.id,
         post.id,
@@ -857,10 +976,36 @@ fn post_card_with_options(
         timestamp,
         text,
         media,
+        quote,
         post.like_count,
         post.repost_count,
         post.reply_count,
         controls
+    )
+}
+
+fn repost_action_with_quote(
+    action: &str,
+    quote_href: &str,
+    csrf: &str,
+    label: &str,
+    active: bool,
+) -> String {
+    let menu_id = format!("quote-menu-{}", action.trim_matches('/').replace('/', "-"));
+    format!(
+        r#"<div class="repost-control" data-repost-control><form method="post" action="{}" data-enhance="post-action"><input type="hidden" name="csrf" value="{}"><button class="icon-button{}" type="submit" data-action-kind="repost" data-repost-menu-button aria-haspopup="menu" aria-expanded="false" aria-controls="{}" aria-pressed="{}" aria-label="{}" title="{}">{}<span class="sr-only" data-button-label>{}</span></button></form><div class="repost-menu" id="{}" role="menu" data-repost-menu hidden><a role="menuitem" href="{}">Quote post</a></div><a class="quote-fallback" href="{}">Quote</a></div>"#,
+        html_escape::encode_double_quoted_attribute(action),
+        html_escape::encode_double_quoted_attribute(csrf),
+        if active { " active" } else { "" },
+        html_escape::encode_double_quoted_attribute(&menu_id),
+        if active { "true" } else { "false" },
+        html_escape::encode_double_quoted_attribute(label),
+        html_escape::encode_double_quoted_attribute(label),
+        icon_svg("repost"),
+        html_escape::encode_text(label),
+        html_escape::encode_double_quoted_attribute(&menu_id),
+        html_escape::encode_double_quoted_attribute(quote_href),
+        html_escape::encode_double_quoted_attribute(quote_href)
     )
 }
 
@@ -904,6 +1049,30 @@ fn disabled_icon_button(label: &str, icon: &str) -> String {
         html_escape::encode_double_quoted_attribute(label),
         icon_svg(icon),
         html_escape::encode_text(label)
+    )
+}
+
+fn quote_preview_card(quote: &QuotePreview) -> String {
+    if quote.unavailable {
+        return r#"<aside class="quote-preview unavailable" aria-label="Quoted post"><p>Quoted post is no longer available.</p></aside>"#
+            .to_owned();
+    }
+    let author = match (&quote.username, &quote.anonymous_label) {
+        (Some(username), _) => format!(
+            r#"<a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span>"#,
+            html_escape::encode_double_quoted_attribute(username),
+            html_escape::encode_text(quote.display_name.as_deref().unwrap_or(username)),
+            html_escape::encode_text(username)
+        ),
+        (None, Some(label)) => html_escape::encode_text(label).to_string(),
+        _ => "Deleted user".to_owned(),
+    };
+    format!(
+        r#"<aside class="quote-preview" aria-label="Quoted post"><a class="quote-link" href="/posts/{}"><span class="quote-author">{}</span><span class="quote-text">{}</span><span class="quote-time">{}</span></a></aside>"#,
+        quote.id,
+        author,
+        linkify(&quote.text),
+        html_escape::encode_text(&quote.created_at)
     )
 }
 
@@ -1027,13 +1196,13 @@ main{padding:1.25rem}.content-shell{max-width:1120px;margin:0 auto;display:grid;
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.panel h1+table,.panel h1+form,.panel h1+p,.panel h1+dl{margin-top:.85rem}.page-header p,.muted,.empty-state p{color:var(--muted);margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
 label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button,select{font:inherit}input[type=text],input[type=search],input[type=password],input[type=url],input:not([type]),textarea,select{width:100%;padding:.72rem .8rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text)}textarea{resize:vertical;min-height:7rem}::placeholder{color:var(--muted)}
 input[type=checkbox]{accent-color:var(--brand)}.check-row,.theme-toggle{display:flex;align-items:center;gap:.55rem;font-weight:700;color:var(--text)}.theme-toggle{padding:.65rem .75rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle)}.theme-toggle input{width:auto}
-input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{background:var(--surface);color:var(--link-strong);border-color:var(--border);min-width:4.5rem}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}
+input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{background:var(--surface);color:var(--link-strong);border-color:var(--border);min-width:4.5rem}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}.auth-form .field-help{margin:.15rem 0 .4rem;color:var(--muted-strong)}
 .search-panel h1{margin-bottom:.75rem}.search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center}.search-form input{min-width:0}.search-results{display:grid;gap:.65rem}.section-title{margin:.2rem 0 .65rem;font-size:1.05rem;color:var(--text)}.search-users{margin-bottom:0}.search-users .section-title{margin-top:0}.search-account{grid-template-columns:auto minmax(0,1fr)}
 input:focus,textarea:focus,select:focus,button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}button,.primary{border:1px solid var(--brand);background:var(--brand);color:var(--brand-text);border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:var(--brand-hover);text-decoration:none}
 .composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:var(--link-strong);font-weight:700}.file-control input{max-width:15rem}
 .thread-nav{display:flex;margin:0 0 .45rem .85rem}.thread-back{width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:var(--link-strong)}.thread-back svg{width:1.2rem;height:1.2rem;fill:currentColor}.thread-back:hover{background:var(--hover);text-decoration:none}
 .timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.post[data-card-href]{cursor:pointer}.post[data-card-href]:hover{border-color:var(--border-strong)}.post[data-card-href]:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.reply-post{margin-left:1.1rem;border-left:4px solid var(--reply-border);background:var(--surface-subtle)}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid var(--reply-border)}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid var(--border);background:var(--avatar-bg);flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:var(--muted-strong);font-weight:800}.author-name{font-weight:800;color:var(--text-strong)}.username,.post-time,.counts{color:var(--muted);font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-top:.5rem;background:var(--media-bg)}.post img.post-avatar{display:block;margin:0;border-radius:999px}
-.counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.actions{display:flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}
+.counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.actions{display:flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.repost-control{position:relative;display:inline-flex;align-items:center;gap:.25rem}.repost-menu{position:absolute;z-index:8;left:0;top:calc(100% + .25rem);min-width:8.5rem;padding:.3rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 6px 18px var(--shadow)}.repost-menu a,.quote-fallback{display:inline-flex;align-items:center;min-height:2rem;border-radius:6px;padding:.32rem .55rem;color:var(--link-strong);font-weight:700}.repost-menu a{width:100%}.repost-menu a:hover,.quote-fallback:hover{background:var(--hover);text-decoration:none}.quote-fallback{font-size:.88rem}.quote-preview{display:block;margin:.6rem 0 .25rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);overflow:hidden}.quote-preview p{margin:.65rem;color:var(--muted-strong)}.quote-link{display:grid;gap:.2rem;padding:.6rem;color:var(--text)}.quote-link:hover{background:var(--hover);text-decoration:none}.quote-author{font-weight:800}.quote-text{white-space:pre-wrap;overflow-wrap:anywhere}.quote-time{color:var(--muted);font-size:.86rem}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}
 .profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid var(--border);background:var(--surface-muted)}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:999px;border:3px solid var(--surface);background:var(--avatar-bg);flex:0 0 auto}.profile-meta{color:var(--muted-strong);margin:.45rem 0 0}.settings-profile-editor{padding:0;overflow:hidden}.settings-editor-bar{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.85rem;border-bottom:1px solid var(--border)}.settings-editor-bar h1{margin:0}.settings-editor-bar .primary{flex:0 0 auto}.settings-profile-form{padding:0 .85rem .85rem}.settings-profile-media{margin:0 -.85rem .85rem}.settings-banner-wrap{background:var(--media-bg)}.settings-banner-preview{display:block;width:100%;height:220px;object-fit:cover;background:linear-gradient(135deg,var(--surface-muted),var(--hover));border:0;border-radius:0}.settings-banner-preview.placeholder::before{content:"";display:block;width:100%;height:100%}.settings-picture-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:1rem;align-items:end;padding:0 .85rem .85rem;margin-top:-48px}.settings-picture-preview{width:112px;height:112px;object-fit:cover;border-radius:999px;border:5px solid var(--surface);background:var(--avatar-bg);box-shadow:0 1px 4px var(--shadow)}.settings-picture-preview.placeholder{display:block}.settings-media-controls{display:grid;gap:.5rem;align-content:end;padding-top:3.25rem}.media-control-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}.settings-fields{display:grid;gap:.25rem}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-panel{padding:0;overflow:hidden}.deep-settings-form{padding:.85rem;display:grid;gap:.85rem}.deep-settings-group{border:1px solid var(--border);border-radius:8px;padding:.8rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-group legend{font-weight:800;padding:0 .35rem}.deep-settings-field{display:grid;gap:.25rem;align-content:start}.deep-settings-field label{font-weight:800}.deep-settings-field input,.deep-settings-field select{min-width:0}.field-help{font-size:.88rem}.deep-settings-confirm .settings-item-list li{display:block}.compact-panel h2,.danger-panel h2{margin:0 0 .65rem;font-size:1.1rem}.inline-settings-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center;margin:.2rem 0 .75rem}.inline-settings-form input{min-width:0}.settings-password-form button[type=submit]{margin-top:.9rem}.settings-item-list{list-style:none;margin:.25rem 0 0;padding:0;display:grid;gap:.45rem}.settings-item-list li{display:flex;justify-content:space-between;align-items:center;gap:.75rem;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle)}.settings-item-list form{flex:0 0 auto}.settings-item-list button{padding:.32rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border)}.compact-empty{border:1px dashed var(--border);border-radius:7px;padding:.75rem;background:var(--surface-subtle);color:var(--muted-strong)}.compact-empty p{margin:.25rem 0 0}.danger-panel{border-color:var(--danger-border);background:var(--danger-bg)}.danger,.danger-link{border-color:var(--danger-border);background:var(--danger);color:var(--brand-text)}.danger:hover,.danger-link:hover{background:var(--danger-strong);color:var(--brand-text);text-decoration:none}.delete-account-panel p{max-width:62ch}.favicon-preview{width:32px;height:32px;object-fit:contain;border:1px solid var(--border);border-radius:6px;background:var(--surface)}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--border);text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
 @media (max-width:900px){.content-shell{grid-template-columns:1fr}.side-panel{position:static;display:none}}
 @media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-item-list li{align-items:stretch;flex-direction:column}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1{font-size:1.25rem}}
@@ -1074,6 +1243,35 @@ mod tests {
         let body = layout(Some(&user), "Home Feed", "<p>body</p>", "My Microblog");
 
         assert!(body.contains(r#"<html lang="en" data-theme="dark">"#));
+    }
+
+    #[test]
+    fn register_form_uses_configured_password_length() {
+        let body = register_form(None, 5);
+
+        assert!(body.contains(r#"minlength="5" required"#));
+        assert!(body.contains("Password must be at least 5 characters."));
+        assert!(body.contains(r#"aria-describedby="password-requirement""#));
+        assert!(body.contains(r#"aria-describedby="confirm-password-requirement""#));
+        assert!(!body.contains(r#"minlength="10""#));
+    }
+
+    #[test]
+    fn login_form_shows_configured_password_requirement() {
+        let body = login_form(None, 12);
+
+        assert!(body.contains("Password must be at least 12 characters."));
+        assert!(body.contains(r#"minlength="12" required"#));
+        assert!(body.contains(r#"aria-describedby="password-requirement""#));
+    }
+
+    #[test]
+    fn password_fields_allow_empty_when_minimum_is_zero() {
+        let body = register_form(None, 0);
+
+        assert!(!body.contains("minlength="));
+        assert!(!body.contains(r#"autocomplete="new-password" required"#));
+        assert!(body.contains("No minimum password length is currently required."));
     }
 
     #[test]
@@ -1142,9 +1340,10 @@ mod tests {
 
     #[test]
     fn composer_has_live_remaining_counter_without_placeholder() {
-        let body = composer(Some("csrf"), Some(10));
-        assert!(body.contains("280 remaining"));
-        assert!(body.contains("data-character-limit=\"280\""));
+        let body = composer(Some("csrf"), Some(10), 512);
+        assert!(body.contains("512 remaining"));
+        assert!(body.contains("data-character-limit=\"512\""));
+        assert!(body.contains("maxlength=\"512\""));
         assert!(body.contains("What is happening?"));
         assert!(!body.contains("placeholder="));
     }
@@ -1290,6 +1489,69 @@ mod tests {
         assert!(reply < bookmark);
     }
 
+    #[test]
+    fn repost_action_exposes_quote_menu_and_fallback() {
+        let user = CurrentUser {
+            id: 1,
+            username: "ada".to_owned(),
+            display_name: "Ada".to_owned(),
+            is_admin: false,
+            is_suspended: false,
+            theme: Theme::Light,
+        };
+        let mut post = test_post();
+        post.user_id = Some(2);
+        post.viewer_can_repost = true;
+
+        let body = post_card(&post, Some(&user), Some("csrf"));
+
+        assert!(body.contains("data-repost-menu-button"));
+        assert!(body.contains(r#"aria-haspopup="menu""#));
+        assert!(body.contains(r#"role="menu""#));
+        assert!(body.contains(r#"href="/posts/42/quote">Quote post</a>"#));
+        assert!(body.contains(r#"class="quote-fallback" href="/posts/42/quote">Quote</a>"#));
+    }
+
+    #[test]
+    fn quote_repost_renders_embedded_original_preview() {
+        let mut post = test_post();
+        post.text = "my quote".to_owned();
+        post.quote = Some(QuotePreview {
+            id: 7,
+            username: Some("bob".to_owned()),
+            display_name: Some("Bob".to_owned()),
+            anonymous_label: None,
+            text: "original post".to_owned(),
+            created_at: "2026-05-18 10:00".to_owned(),
+            unavailable: false,
+        });
+
+        let body = post_card(&post, None, None);
+
+        assert!(body.contains(r#"class="quote-preview""#));
+        assert!(body.contains(r#"href="/posts/7""#));
+        assert!(body.contains("original post"));
+        assert!(body.contains("@bob"));
+    }
+
+    #[test]
+    fn quote_repost_renders_unavailable_original_preview() {
+        let mut post = test_post();
+        post.quote = Some(QuotePreview {
+            id: 7,
+            username: None,
+            display_name: None,
+            anonymous_label: None,
+            text: String::new(),
+            created_at: String::new(),
+            unavailable: true,
+        });
+
+        let body = post_card(&post, None, None);
+
+        assert!(body.contains("Quoted post is no longer available."));
+    }
+
     fn test_post() -> PostView {
         PostView {
             event_id: "p:42".to_owned(),
@@ -1316,6 +1578,7 @@ mod tests {
             reposted_by_username: None,
             reposted_by_display_name: None,
             reposted_at: None,
+            quote: None,
             media: Vec::new(),
         }
     }

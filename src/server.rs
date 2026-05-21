@@ -69,6 +69,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/posts/{id}/like", post(toggle_like))
         .route("/posts/{id}/bookmark", post(toggle_bookmark))
         .route("/posts/{id}/repost", post(repost))
+        .route("/posts/{id}/quote", get(quote_form).post(quote_post))
         .route("/posts/{id}/reply", post(reply_redirect))
         .route("/users/{username}", get(profile))
         .route("/users/{id}/follow", post(follow))
@@ -169,6 +170,12 @@ struct RegisterForm {
 #[derive(Deserialize)]
 struct CsrfForm {
     csrf: String,
+}
+
+#[derive(Deserialize)]
+struct QuoteForm {
+    csrf: String,
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -294,7 +301,7 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
     let posts = social::timeline(&state.pool, user.as_ref().map(|u| u.id), "local", None).await?;
     let csrf = form_csrf(&state, &headers).await;
     let composer = if user.is_some() || state.settings.accounts.anonymous_mode_enabled {
-        render::composer(csrf.as_deref(), None)
+        render::composer(csrf.as_deref(), None, state.settings.posts.max_text_chars)
     } else {
         String::new()
     };
@@ -346,7 +353,7 @@ async fn page_layout(
 }
 
 async fn login_form(State(state): State<Arc<AppState>>) -> Html<String> {
-    let body = render::login_form(None);
+    let body = render::login_form(None, state.settings.accounts.min_password_length);
     let context = layout_context(&state, None).await.unwrap_or_default();
     Html(render::layout_with_context(
         None,
@@ -373,6 +380,10 @@ async fn login(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
+    if let Err(err) = crate::validation::validate_password(&form.password, &state.settings) {
+        rate_limit::record(&state.pool, rate_limit::Scope::FailedLogin, &actor).await?;
+        return auth_form_response(&state, StatusCode::BAD_REQUEST, &err.to_string()).await;
+    }
     let session = match auth::login(&state.pool, &form.username, &form.password).await? {
         Ok(session) => session,
         Err(failure) => {
@@ -401,8 +412,9 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
     if !state.settings.accounts.registration_enabled {
         return Err(AppError::Forbidden);
     }
+    let body = render::register_form(None, state.settings.accounts.min_password_length);
     Ok(Html(
-        page_layout(&state, None, None, "Register", &render::register_form(None)).await?,
+        page_layout(&state, None, None, "Register", &body).await?,
     ))
 }
 
@@ -453,6 +465,11 @@ async fn register(
                 )
                 .await;
             }
+            if message == "password is too short"
+                || message == "password contains control characters"
+            {
+                return register_form_response(&state, StatusCode::BAD_REQUEST, &message).await;
+            }
             return Err(AppError::BadRequest(message));
         }
     };
@@ -474,7 +491,7 @@ async fn auth_form_response(
     status: StatusCode,
     message: &str,
 ) -> AppResult<Response> {
-    let body = render::login_form(Some(message));
+    let body = render::login_form(Some(message), state.settings.accounts.min_password_length);
     Ok((
         status,
         Html(page_layout(state, None, None, "Login", &body).await?),
@@ -487,7 +504,7 @@ async fn register_form_response(
     status: StatusCode,
     message: &str,
 ) -> AppResult<Response> {
-    let body = render::register_form(Some(message));
+    let body = render::register_form(Some(message), state.settings.accounts.min_password_length);
     Ok((
         status,
         Html(page_layout(state, None, None, "Register", &body).await?),
@@ -713,7 +730,11 @@ async fn thread(
     }
     let csrf = form_csrf(&state, &headers).await;
     let composer = if user.is_some() || state.settings.accounts.anonymous_mode_enabled {
-        render::composer(csrf.as_deref(), Some(id))
+        render::composer(
+            csrf.as_deref(),
+            Some(id),
+            state.settings.posts.max_text_chars,
+        )
     } else {
         String::new()
     };
@@ -865,6 +886,52 @@ async fn repost(
         return Ok(Json(post_action_response(&state.pool, user.id, id).await?).into_response());
     }
     Ok(redirect_to_post_anchor(&headers, id, is_reply).into_response())
+}
+
+async fn quote_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    let user = require_active_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let preview = social::quote_target_preview(&state.pool, Some(user.id), id)
+        .await
+        .map_err(|_err| AppError::NotFound)?;
+    if preview.unavailable {
+        return Err(AppError::NotFound);
+    }
+    let body = format!(
+        "{}{}",
+        render::thread_back_control(),
+        render::quote_composer(&csrf, &preview, state.settings.posts.max_text_chars)
+    );
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Quote post", &body).await?,
+    ))
+}
+
+async fn quote_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<QuoteForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    rate_limit::check_and_record(
+        &state.pool,
+        rate_limit::Scope::Repost,
+        &user_actor(user.id),
+        state.settings.moderation.reposts_per_minute,
+        60,
+    )
+    .await
+    .map_err(|err| AppError::RateLimited(err.to_string()))?;
+    let outcome = social::create_quote_post(&state.pool, &state.settings, user.id, id, &form.text)
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    Ok(Redirect::to(&format!("/home#post-{}", outcome.post_id)).into_response())
 }
 
 async fn reply_redirect(Path(id): Path<i64>) -> Redirect {
@@ -1318,6 +1385,22 @@ async fn settings_page(
     };
     let notice_html =
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
+    let password_hint = if state.settings.accounts.min_password_length == 0 {
+        "No minimum password length is currently required.".to_owned()
+    } else {
+        format!(
+            "Password must be at least {} characters.",
+            state.settings.accounts.min_password_length
+        )
+    };
+    let new_password_attrs = render::password_length_attrs(
+        state.settings.accounts.min_password_length,
+        "new-password-requirement",
+    );
+    let confirm_new_password_attrs = render::password_length_attrs(
+        state.settings.accounts.min_password_length,
+        "confirm-new-password-requirement",
+    );
     let profile_media = settings_profile_media(
         picture_path.as_deref(),
         banner_path.as_deref(),
@@ -1325,7 +1408,7 @@ async fn settings_page(
         state.settings.accounts.allow_profile_banners,
     );
     let body = format!(
-        r#"{notice_html}<section class="panel settings-profile-editor"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel compact-panel"><h2>Blocked users</h2>{}</section><section class="panel compact-panel"><h2>Muted users</h2>{}</section></div><section class="panel compact-panel"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel compact-panel"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password" minlength="{}" required><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password" minlength="{}" required><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel danger-panel"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
+        r#"{notice_html}<section class="panel settings-profile-editor"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel compact-panel"><h2>Blocked users</h2>{}</section><section class="panel compact-panel"><h2>Muted users</h2>{}</section></div><section class="panel compact-panel"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel compact-panel"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel danger-panel"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         profile_media,
         dark_checked,
@@ -1352,8 +1435,10 @@ async fn settings_page(
         html_escape::encode_double_quoted_attribute(&csrf),
         settings_muted_word_list(&muted_words, csrf),
         html_escape::encode_double_quoted_attribute(&csrf),
-        state.settings.accounts.min_password_length,
-        state.settings.accounts.min_password_length,
+        html_escape::encode_text(&password_hint),
+        new_password_attrs,
+        html_escape::encode_text(&password_hint),
+        confirm_new_password_attrs,
     );
     page_layout(state, Some(user), Some(csrf), "Settings", &body).await
 }
@@ -1699,7 +1784,7 @@ fn render_delete_account_final_warning(
 ) -> String {
     let notice = error.map_or_else(String::new, |message| render::notice("error", message));
     format!(
-        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="delete_intent" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
+        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="delete_intent" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
         html_escape::encode_double_quoted_attribute(csrf),
         html_escape::encode_double_quoted_attribute(delete_intent)
     )
@@ -1953,7 +2038,8 @@ async fn post_action_response(
                 r#"
                 SELECT
                   (SELECT COUNT(*) FROM likes WHERE post_id = p.id),
-                  (SELECT COUNT(*) FROM reposts WHERE post_id = p.id),
+                  ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
+                   (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0)),
                   (SELECT COUNT(*) FROM posts replies WHERE replies.parent_post_id = p.id AND replies.is_deleted = 0),
                   EXISTS(SELECT 1 FROM likes WHERE user_id = ? AND post_id = p.id),
                   EXISTS(SELECT 1 FROM bookmarks WHERE user_id = ? AND post_id = p.id),
@@ -3079,6 +3165,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_forms_show_password_minimum_and_short_passwords_return_forms() {
+        let server = spawn_test_server().await;
+
+        let login = request(&server.base_url, "GET", "/login", &[], Vec::new()).await;
+        assert_eq!(login.status, 200);
+        assert!(
+            login
+                .body
+                .contains("Password must be at least 10 characters.")
+        );
+        assert!(
+            login
+                .body
+                .contains(r#"aria-describedby="password-requirement""#)
+        );
+
+        let register = request(&server.base_url, "GET", "/register", &[], Vec::new()).await;
+        assert_eq!(register.status, 200);
+        assert!(
+            register
+                .body
+                .contains("Password must be at least 10 characters.")
+        );
+        assert!(
+            register
+                .body
+                .contains(r#"aria-describedby="confirm-password-requirement""#)
+        );
+
+        let short_login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=short".to_vec(),
+        )
+        .await;
+        assert_eq!(short_login.status, 400);
+        assert!(short_login.body.contains("<h1>Log in</h1>"));
+        assert!(short_login.body.contains("password is too short"));
+
+        let short_register = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=short&confirm_password=short".to_vec(),
+        )
+        .await;
+        assert_eq!(short_register.status, 400);
+        assert!(short_register.body.contains("<h1>Create account</h1>"));
+        assert!(short_register.body.contains("password is too short"));
+    }
+
+    #[tokio::test]
     async fn duplicate_registration_renders_register_form_message() {
         let server = spawn_test_server().await;
         let first = request(
@@ -3419,6 +3560,77 @@ mod tests {
         assert_eq!(self_repost.status, 400);
         assert!(self_repost.body.contains("cannot repost your own post"));
         assert!(!self_repost.body.contains("internal server error"));
+    }
+
+    #[tokio::test]
+    async fn quote_repost_can_be_created_once_and_renders_original_preview() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "original quote target").await;
+
+        let bob_cookie = register_test_user(&server, "bob").await;
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        assert!(
+            bob_home
+                .body
+                .contains(r#"class="quote-fallback" href="/posts/1/quote""#)
+        );
+        assert!(bob_home.body.contains("data-repost-menu-button"));
+
+        let quote_form = get_with_cookie(&server, "/posts/1/quote", &bob_cookie).await;
+        assert_eq!(quote_form.status, 200);
+        assert!(
+            quote_form
+                .body
+                .contains("<h1 id=\"composer-title\">Quote post</h1>")
+        );
+        assert!(quote_form.body.contains("original quote target"));
+
+        let quote_body = quote_form_body(&quote_form, "bob adds context");
+        let quote =
+            post_form_with_cookie(&server, "/posts/1/quote", &bob_cookie, &quote_body).await;
+        assert_eq!(quote.status, 303);
+        assert_eq!(location(&quote), "/home#post-2");
+
+        let duplicate =
+            post_form_with_cookie(&server, "/posts/1/quote", &bob_cookie, &quote_body).await;
+        assert_eq!(duplicate.status, 303);
+        assert_eq!(location(&duplicate), "/home#post-2");
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        assert!(bob_home.body.contains("bob adds context"));
+        assert!(bob_home.body.contains(r#"class="quote-preview""#));
+        assert!(bob_home.body.contains("original quote target"));
+        assert_eq!(bob_home.body.matches("bob adds context").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn quote_repost_handles_deleted_original_gracefully() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "soon deleted original").await;
+
+        let bob_cookie = register_test_user(&server, "bob").await;
+        let quote_form = get_with_cookie(&server, "/posts/1/quote", &bob_cookie).await;
+        let quote_body = quote_form_body(&quote_form, "quote survives deletion");
+        let quote =
+            post_form_with_cookie(&server, "/posts/1/quote", &bob_cookie, &quote_body).await;
+        assert_eq!(quote.status, 303);
+
+        let alice_home = get_with_cookie(&server, "/home", &alice_cookie).await;
+        let delete_csrf = csrf_token(&alice_home.body);
+        let deleted_body = format!("csrf={delete_csrf}&return_to=/home%23post-1");
+        let deleted =
+            post_form_with_cookie(&server, "/posts/1/delete", &alice_cookie, &deleted_body).await;
+        assert_eq!(deleted.status, 303);
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        assert!(bob_home.body.contains("quote survives deletion"));
+        assert!(
+            bob_home
+                .body
+                .contains("Quoted post is no longer available.")
+        );
     }
 
     #[tokio::test]
@@ -4258,7 +4470,7 @@ mod tests {
                 ("cookie", &cookie),
                 ("content-type", "application/x-www-form-urlencoded"),
             ],
-            deep_settings_form_body(&csrf, "preview", &[("min_password_length", "5")]),
+            deep_settings_form_body(&csrf, "preview", &[("min_password_length", "-1")]),
         )
         .await;
         let after =
@@ -4269,7 +4481,7 @@ mod tests {
         assert!(
             response
                 .body
-                .contains("accounts.min_password_length must be at least 10")
+                .contains("Minimum password length must not be negative")
         );
     }
 
@@ -4706,6 +4918,82 @@ mod tests {
             0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x04, 0x00, 0x01, 0xfe, 0xa7, 0x69, 0x9d,
             0x16, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
         ]
+    }
+
+    async fn register_test_user(server: &TestServer, username: &str) -> String {
+        let body = format!(
+            "username={}&password=very%20secure%20password&confirm_password=very%20secure%20password",
+            form_encode(username)
+        );
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            body.into_bytes(),
+        )
+        .await;
+        assert_eq!(response.status, 303);
+        session_cookie(&response)
+    }
+
+    async fn get_with_cookie(server: &TestServer, path: &str, cookie: &str) -> TestResponse {
+        request(
+            &server.base_url,
+            "GET",
+            path,
+            &[("cookie", cookie)],
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn post_form_with_cookie(
+        server: &TestServer,
+        path: &str,
+        cookie: &str,
+        body: &str,
+    ) -> TestResponse {
+        request(
+            &server.base_url,
+            "POST",
+            path,
+            &[
+                ("cookie", cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            body.as_bytes().to_vec(),
+        )
+        .await
+    }
+
+    async fn create_text_post(server: &TestServer, cookie: &str, text: &str) {
+        let home = get_with_cookie(server, "/home", cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", text)],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+    }
+
+    fn quote_form_body(response: &TestResponse, text: &str) -> String {
+        let csrf = csrf_token(&response.body);
+        format!("csrf={}&text={}", form_encode(&csrf), form_encode(text))
     }
 
     async fn spawn_test_server() -> TestServer {

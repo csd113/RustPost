@@ -112,6 +112,10 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_7)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (7)", [])?;
         }
+        if applied.unwrap_or(0) < 8 {
+            tx.execute_batch(MIGRATION_8)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (8)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -330,6 +334,15 @@ ALTER TABLE sessions ADD COLUMN delete_account_token_hash TEXT;
 ALTER TABLE sessions ADD COLUMN delete_account_token_expires_at TEXT;
 "#;
 
+const MIGRATION_8: &str = r#"
+ALTER TABLE posts ADD COLUMN quote_post_id INTEGER REFERENCES posts(id) ON DELETE SET NULL;
+
+CREATE INDEX idx_posts_quote ON posts(quote_post_id, created_at DESC, id DESC);
+CREATE UNIQUE INDEX idx_posts_quote_dedupe
+    ON posts(user_id, quote_post_id, text)
+    WHERE quote_post_id IS NOT NULL AND is_deleted = 0;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,7 +384,7 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 7);
+        assert_eq!(versions, 8);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);
@@ -437,5 +450,31 @@ mod tests {
             .expect("location");
 
         assert_eq!(location, "");
+    }
+
+    #[tokio::test]
+    async fn posts_support_quote_repost_references() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        let quote_count: i64 = pool
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO posts (text, quote_post_id) VALUES ('quote', 1)",
+                    [],
+                )?;
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM posts WHERE quote_post_id = 1",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("quote count");
+
+        assert_eq!(quote_count, 1);
     }
 }

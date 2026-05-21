@@ -40,7 +40,19 @@ pub struct PostView {
     pub reposted_by_username: Option<String>,
     pub reposted_by_display_name: Option<String>,
     pub reposted_at: Option<String>,
+    pub quote: Option<QuotePreview>,
     pub media: Vec<MediaView>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuotePreview {
+    pub id: i64,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub anonymous_label: Option<String>,
+    pub text: String,
+    pub created_at: String,
+    pub unavailable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +97,13 @@ struct PostRow {
     like_count: i64,
     repost_count: i64,
     reply_count: i64,
+    quote_post_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotePostOutcome {
+    pub post_id: i64,
+    pub created: bool,
 }
 
 pub async fn create_post(
@@ -249,6 +268,64 @@ pub async fn repost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Re
         Ok(true)
     })
     .await
+}
+
+pub async fn create_quote_post(
+    pool: &SqlitePool,
+    settings: &Settings,
+    user_id: i64,
+    quote_post_id: i64,
+    text: &str,
+) -> anyhow::Result<QuotePostOutcome> {
+    let text = clean_post_text(text, settings.posts.max_text_chars, 0)?;
+    pool.call(move |conn| {
+        let tx = conn.transaction()?;
+        ensure_quote_target_accessible_tx(&tx, user_id, quote_post_id)?;
+        let changed = tx.execute(
+            "INSERT OR IGNORE INTO posts (user_id, text, quote_post_id) VALUES (?, ?, ?)",
+            params![user_id, text, quote_post_id],
+        )?;
+        let post_id = if changed > 0 {
+            tx.last_insert_rowid()
+        } else {
+            tx.query_row(
+                r#"
+                SELECT id FROM posts
+                WHERE user_id = ? AND quote_post_id = ? AND text = ? AND is_deleted = 0
+                ORDER BY id DESC LIMIT 1
+                "#,
+                params![user_id, quote_post_id, text],
+                |row| row.get(0),
+            )?
+        };
+        if changed > 0 {
+            notify_post_owner_tx(
+                &tx,
+                quote_post_id,
+                user_id,
+                post_id,
+                "quote",
+                "quoted your post",
+            )?;
+        }
+        tx.commit()?;
+        Ok(QuotePostOutcome {
+            post_id,
+            created: changed > 0,
+        })
+    })
+    .await
+}
+
+pub async fn quote_target_preview(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    post_id: i64,
+) -> anyhow::Result<QuotePreview> {
+    let preview = quote_preview_for_post(pool, Some(post_id), viewer_id)
+        .await?
+        .filter(|preview| !preview.unavailable);
+    preview.ok_or_else(|| anyhow::anyhow!("post not found"))
 }
 
 pub async fn unrepost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<bool> {
@@ -764,8 +841,10 @@ fn base_post_query() -> String {
       COALESCE(pic.thumbnail_public_path, pic.public_path) AS profile_picture_path,
       p.anonymous_label, p.text, p.parent_post_id, p.created_at,
       (SELECT COUNT(*) FROM likes WHERE post_id = p.id) AS like_count,
-      (SELECT COUNT(*) FROM reposts WHERE post_id = p.id) AS repost_count,
-      (SELECT COUNT(*) FROM posts r WHERE r.parent_post_id = p.id AND r.is_deleted = 0) AS reply_count
+      ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
+       (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0)) AS repost_count,
+      (SELECT COUNT(*) FROM posts r WHERE r.parent_post_id = p.id AND r.is_deleted = 0) AS reply_count,
+      p.quote_post_id
     FROM posts p
     LEFT JOIN users u ON u.id = p.user_id
     LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
@@ -782,8 +861,12 @@ fn base_repost_query() -> String {
       COALESCE(pic.thumbnail_public_path, pic.public_path) AS profile_picture_path, p.anonymous_label,
       COALESCE(p.text, '') AS text, p.parent_post_id, COALESCE(p.created_at, r.created_at) AS created_at,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM likes WHERE post_id = p.id) END AS like_count,
-      CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM reposts WHERE post_id = p.id) END AS repost_count,
-      CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM posts replies WHERE replies.parent_post_id = p.id AND replies.is_deleted = 0) END AS reply_count
+      CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE
+        ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
+         (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0))
+      END AS repost_count,
+      CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM posts replies WHERE replies.parent_post_id = p.id AND replies.is_deleted = 0) END AS reply_count,
+      p.quote_post_id
     FROM reposts r
     JOIN users ru ON ru.id = r.user_id
     LEFT JOIN posts p ON p.id = r.post_id
@@ -942,6 +1025,7 @@ fn map_post_row(row: &Row<'_>) -> rusqlite::Result<PostRow> {
         like_count: row.get(17)?,
         repost_count: row.get(18)?,
         reply_count: row.get(19)?,
+        quote_post_id: row.get(20)?,
     })
 }
 
@@ -976,6 +1060,7 @@ async fn rows_to_posts(
         };
         let viewer_can_repost =
             viewer_id.is_some_and(|user_id| !original_unavailable && row.user_id != Some(user_id));
+        let quote = quote_preview_for_post(pool, row.quote_post_id, viewer_id).await?;
         posts.push(PostView {
             event_id: row.event_id,
             event_kind: if row.event_kind == "repost" {
@@ -1005,10 +1090,122 @@ async fn rows_to_posts(
             reposted_by_username: row.repost_username,
             reposted_by_display_name: row.repost_display_name,
             reposted_at: row.repost_created_at,
+            quote,
             media,
         });
     }
     Ok(posts)
+}
+
+async fn quote_preview_for_post(
+    pool: &SqlitePool,
+    quote_post_id: Option<i64>,
+    viewer_id: Option<i64>,
+) -> anyhow::Result<Option<QuotePreview>> {
+    let Some(quote_post_id) = quote_post_id else {
+        return Ok(None);
+    };
+    pool.call(move |conn| {
+        let mut sql = r#"
+            SELECT q.id, q.user_id, u.username, u.display_name, q.anonymous_label, q.text, q.created_at
+            FROM posts q
+            LEFT JOIN users u ON u.id = q.user_id
+            WHERE q.id = ? AND q.is_deleted = 0
+        "#
+        .to_owned();
+        if viewer_id.is_some() {
+            sql.push_str(
+                " AND (q.user_id IS NULL OR q.user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?))",
+            );
+            sql.push_str(
+                " AND (q.user_id IS NULL OR q.user_id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?))",
+            );
+            sql.push_str(
+                " AND (q.user_id IS NULL OR NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = q.user_id AND blocked_id = ?))",
+            );
+            sql.push_str(
+                " AND NOT EXISTS (SELECT 1 FROM muted_words mw WHERE mw.user_id = ? AND instr(lower(q.text), mw.normalized_term) > 0)",
+            );
+        }
+        let preview = if let Some(viewer_id) = viewer_id {
+            conn.query_row(
+                &sql,
+                params![quote_post_id, viewer_id, viewer_id, viewer_id, viewer_id],
+                map_quote_preview_row,
+            )
+            .optional()?
+        } else {
+            conn.query_row(&sql, params![quote_post_id], map_quote_preview_row)
+                .optional()?
+        };
+        Ok(Some(preview.unwrap_or_else(|| QuotePreview {
+            id: quote_post_id,
+            username: None,
+            display_name: None,
+            anonymous_label: None,
+            text: String::new(),
+            created_at: String::new(),
+            unavailable: true,
+        })))
+    })
+    .await
+}
+
+fn map_quote_preview_row(row: &Row<'_>) -> rusqlite::Result<QuotePreview> {
+    Ok(QuotePreview {
+        id: row.get(0)?,
+        username: row.get(2)?,
+        display_name: row.get(3)?,
+        anonymous_label: row.get(4)?,
+        text: row.get(5)?,
+        created_at: row.get(6)?,
+        unavailable: false,
+    })
+}
+
+fn ensure_quote_target_accessible_tx(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: i64,
+    post_id: i64,
+) -> anyhow::Result<()> {
+    let owner: Option<i64> = tx
+        .query_row(
+            "SELECT user_id FROM posts WHERE id = ? AND is_deleted = 0",
+            [post_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(owner) = owner else {
+        anyhow::bail!("post not found");
+    };
+    if owner == user_id {
+        anyhow::bail!("cannot quote repost your own post");
+    }
+    if user_relation_exists_tx(tx, "blocks", user_id, owner)?
+        || user_relation_exists_tx(tx, "mutes", user_id, owner)?
+        || user_relation_exists_tx(tx, "blocks", owner, user_id)?
+    {
+        anyhow::bail!("post not found");
+    }
+    Ok(())
+}
+
+fn user_relation_exists_tx(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    left_id: i64,
+    right_id: i64,
+) -> anyhow::Result<bool> {
+    let (left_column, right_column) = match table {
+        "blocks" => ("blocker_id", "blocked_id"),
+        "mutes" => ("muter_id", "muted_id"),
+        _ => anyhow::bail!("unsupported relation table"),
+    };
+    let sql = format!("SELECT 1 FROM {table} WHERE {left_column} = ? AND {right_column} = ?");
+    Ok(tx
+        .query_row(&sql, params![left_id, right_id], |_| Ok(()))
+        .optional()?
+        .is_some())
 }
 
 async fn relation_exists(
@@ -1436,6 +1633,97 @@ mod tests {
             .find(|event| event.event_kind == TimelineEventKind::Post && event.id == post)
             .expect("original post");
         assert_eq!(original.repost_count, 1);
+    }
+
+    #[tokio::test]
+    async fn quote_repost_appears_as_post_with_original_preview_and_counts_once() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(&pool, &settings, Some(alice), "original", None, &[])
+            .await
+            .expect("original");
+
+        let quote = create_quote_post(&pool, &settings, bob, original, "my comment")
+            .await
+            .expect("quote");
+        let duplicate = create_quote_post(&pool, &settings, bob, original, "my comment")
+            .await
+            .expect("duplicate quote");
+
+        assert!(quote.created);
+        assert!(!duplicate.created);
+        assert_eq!(duplicate.post_id, quote.post_id);
+
+        let local = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("timeline");
+        let quote_post = local
+            .iter()
+            .find(|event| event.id == quote.post_id)
+            .expect("quote post");
+        assert_eq!(quote_post.text, "my comment");
+        assert_eq!(
+            quote_post
+                .quote
+                .as_ref()
+                .map(|preview| preview.text.as_str()),
+            Some("original")
+        );
+        let original_post = local
+            .iter()
+            .find(|event| event.event_kind == TimelineEventKind::Post && event.id == original)
+            .expect("original post");
+        assert_eq!(original_post.repost_count, 1);
+    }
+
+    #[tokio::test]
+    async fn quote_repost_original_becomes_unavailable_after_delete() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(&pool, &settings, Some(alice), "original", None, &[])
+            .await
+            .expect("original");
+        let quote = create_quote_post(&pool, &settings, bob, original, "my comment")
+            .await
+            .expect("quote");
+        delete_post(&pool, alice, original, false)
+            .await
+            .expect("delete original");
+
+        let local = timeline(&pool, Some(bob), "local", None)
+            .await
+            .expect("timeline");
+        let quote_post = local
+            .iter()
+            .find(|event| event.id == quote.post_id)
+            .expect("quote post");
+
+        assert!(
+            quote_post
+                .quote
+                .as_ref()
+                .is_some_and(|preview| preview.unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn quote_repost_respects_block_and_mute_rules() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(&pool, &settings, Some(alice), "original", None, &[])
+            .await
+            .expect("original");
+
+        block(&pool, alice, bob).await.expect("block");
+        assert!(
+            create_quote_post(&pool, &settings, bob, original, "blocked quote")
+                .await
+                .is_err()
+        );
+        unblock(&pool, alice, bob).await.expect("unblock");
+        mute(&pool, bob, alice).await.expect("mute");
+        assert!(
+            create_quote_post(&pool, &settings, bob, original, "muted quote")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
