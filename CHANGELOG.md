@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.1.4 - Layout Foundation
+
+### Core UI Layout
+- Rebuilt the shared page shell around a centered three-column layout for desktop with a stable primary reading column.
+- Collapsed smaller screens to a single readable column with reachable navigation and no horizontal drift.
+- Standardized feed, thread, profile, search, settings, form, and admin surfaces around shared card and column primitives.
+- Added objective Playwright layout coverage for Chromium and WebKit across mobile, tablet, and desktop viewports.
+
+### Navigation and Screenshots
+- Added matching icons to the main navigation links, including home, following, search, notifications, bookmarks, profile, admin, login, register, and logout.
+- Refreshed the README/changelog screenshots from the updated local demo layout.
+
+| Home feed | Profile |
+|---|---|
+| ![RustPost home feed with centered layout and navigation icons](docs/screenshots/home-feed.png) | ![RustPost profile page with centered layout and navigation icons](docs/screenshots/profile.png) |
+
+| Threaded replies | Media posts |
+|---|---|
+| ![RustPost post thread using the centered reading column](docs/screenshots/post-thread.png) | ![RustPost media post thread with updated card layout](docs/screenshots/media-posts.png) |
+
+| Mobile layout |
+|---|
+| ![RustPost mobile feed with compact navigation icons](docs/screenshots/mobile.png) |
+
 ## v0.1.3 - Control Room
 
 ### Admin Control Room

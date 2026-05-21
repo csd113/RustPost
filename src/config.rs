@@ -205,54 +205,11 @@ impl Settings {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         let site_name = self.site.name.trim();
-        if site_name.is_empty() || site_name.len() > 80 {
-            anyhow::bail!("site.name must be between 1 and 80 bytes");
-        }
         if site_name != self.site.name {
             anyhow::bail!("site.name must not contain surrounding whitespace");
         }
         if self.site.name.chars().any(char::is_control) {
             anyhow::bail!("site.name must not contain control characters");
-        }
-        if self.accounts.min_password_length < 10 {
-            anyhow::bail!("accounts.min_password_length must be at least 10");
-        }
-        if self.accounts.max_username_len == 0 || self.accounts.max_username_len > 64 {
-            anyhow::bail!("accounts.max_username_len must be between 1 and 64");
-        }
-        if self.posts.max_text_chars == 0 || self.posts.max_text_chars > 280 {
-            anyhow::bail!("posts.max_text_chars must be between 1 and 280");
-        }
-        if self.posts.max_media_per_post > 4 {
-            anyhow::bail!("posts.max_media_per_post must be at most 4");
-        }
-        if self.posts.max_images_per_post > self.posts.max_media_per_post {
-            anyhow::bail!("posts.max_images_per_post cannot exceed max_media_per_post");
-        }
-        if self.media.max_image_size > 52_428_800 {
-            anyhow::bail!("media.max_image_size cannot exceed 50 MiB");
-        }
-        if self.media.max_video_size > 157_286_400 {
-            anyhow::bail!("media.max_video_size cannot exceed 150 MiB");
-        }
-        if self.media.webp_quality > 100 {
-            anyhow::bail!("media.webp_quality must be 0..=100");
-        }
-        if self.media.vp9_crf > 63 {
-            anyhow::bail!("media.vp9_crf must be 0..=63");
-        }
-        if [
-            self.moderation.posts_per_minute,
-            self.moderation.replies_per_minute,
-            self.moderation.reposts_per_minute,
-            self.moderation.account_creations_per_ip_per_day,
-            self.moderation.failed_login_attempts_per_15m,
-            self.moderation.anonymous_posts_per_ip_per_hour,
-        ]
-        .iter()
-        .any(|limit| *limit <= 0)
-        {
-            anyhow::bail!("moderation rate limits must be positive");
         }
         validate_relative_path(&self.tor.data_dir, "tor.data_dir")?;
         validate_relative_path(&self.backup.backup_dir, "backup.backup_dir")?;
@@ -260,12 +217,6 @@ impl Settings {
             anyhow::bail!("tor.tor_only requires tor.enabled");
         }
         validate_onion_service_name(&self.tor.onion_service_name)?;
-        if !(5..=600).contains(&self.tor.bootstrap_timeout_secs) {
-            anyhow::bail!("tor.bootstrap_timeout_secs must be between 5 and 600");
-        }
-        if self.tor.max_concurrent_streams == 0 || self.tor.max_concurrent_streams > 65_535 {
-            anyhow::bail!("tor.max_concurrent_streams must be between 1 and 65535");
-        }
         Ok(())
     }
 }
@@ -331,7 +282,7 @@ registration_enabled = {registration_enabled}
 # Allow posting without accounts. Rate limits are keyed by client IP.
 anonymous_mode_enabled = {anonymous_mode_enabled}
 
-# Minimum account password length. Values below 10 are rejected.
+# Minimum account password length. Recommended default is 10.
 min_password_length = {min_password_length}
 
 # Maximum username length in bytes. Usernames are also format-validated.
@@ -416,10 +367,10 @@ allowed_image_mime_types = {allowed_image_mime_types}
 # SECURITY: Accepted video MIME types after content sniffing.
 allowed_video_mime_types = {allowed_video_mime_types}
 
-# WebP image quality, 0 to 100. Higher means larger files.
+# WebP image quality. Recommended default is 82.
 webp_quality = {webp_quality}
 
-# VP9 quality, 0 to 63. Lower means higher quality and larger files.
+# VP9 quality. Recommended default is 32; lower means higher quality and larger files.
 vp9_crf = {vp9_crf}
 
 # VP9 encoder deadline. Typical values are "good", "best", or "realtime".
@@ -582,9 +533,6 @@ pub fn validate_relative_path(value: &str, field: &str) -> anyhow::Result<()> {
 
 fn validate_onion_service_name(value: &str) -> anyhow::Result<()> {
     let name = value.trim();
-    if name.is_empty() || name.len() > 63 {
-        anyhow::bail!("tor.onion_service_name must be between 1 and 63 characters");
-    }
     if name != value {
         anyhow::bail!("tor.onion_service_name must not contain surrounding whitespace");
     }
@@ -640,14 +588,25 @@ mod tests {
         let mut settings = Settings::default();
         settings.tor.onion_service_name = "bad/name".to_owned();
         assert!(settings.validate().is_err());
+    }
 
+    #[test]
+    fn allows_operator_chosen_numeric_limits() {
         let mut settings = Settings::default();
+        settings.accounts.min_password_length = 0;
+        settings.accounts.max_username_len = 0;
+        settings.posts.max_text_chars = 0;
+        settings.posts.max_media_per_post = 99;
+        settings.posts.max_images_per_post = 99;
+        settings.media.max_image_size = 0;
+        settings.media.max_video_size = 0;
+        settings.moderation.posts_per_minute = 0;
         settings.tor.bootstrap_timeout_secs = 0;
-        assert!(settings.validate().is_err());
-
-        let mut settings = Settings::default();
         settings.tor.max_concurrent_streams = 0;
-        assert!(settings.validate().is_err());
+
+        settings
+            .validate()
+            .expect("operator-chosen limits validate");
     }
 
     #[test]

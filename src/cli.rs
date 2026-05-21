@@ -573,12 +573,10 @@ fn validate_first_admin_credentials(
     if username.is_empty() {
         anyhow::bail!("username cannot be empty");
     }
-    if password.is_empty() {
-        anyhow::bail!("password cannot be empty");
-    }
     if password != confirm {
         anyhow::bail!("passwords do not match");
     }
+    crate::validation::validate_password(&password, settings)?;
     let display_name = display_name.trim().to_owned();
     if !display_name.is_empty() {
         crate::validation::validate_profile_text(&display_name, "", settings)?;
@@ -688,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn first_admin_credentials_reject_empty_password() {
+    fn first_admin_credentials_validate_password_policy() {
         let result = validate_first_admin_credentials(
             &config::Settings::default(),
             "admin-user",
@@ -699,9 +697,20 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(
-            result.expect_err("empty password").to_string(),
-            "password cannot be empty"
+            result.expect_err("short password").to_string(),
+            "password is too short"
         );
+    }
+
+    #[test]
+    fn first_admin_credentials_allow_empty_password_when_configured() {
+        let mut settings = config::Settings::default();
+        settings.accounts.min_password_length = 0;
+        let credentials =
+            validate_first_admin_credentials(&settings, "admin-user", "", String::new(), "")
+                .expect("valid credentials");
+
+        assert_eq!(credentials.password, "");
     }
 
     #[test]

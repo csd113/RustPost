@@ -69,8 +69,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/posts/{id}/like", post(toggle_like))
         .route("/posts/{id}/bookmark", post(toggle_bookmark))
         .route("/posts/{id}/repost", post(repost))
+        .route("/posts/{id}/quote", get(quote_form).post(quote_post))
         .route("/posts/{id}/reply", post(reply_redirect))
         .route("/users/{username}", get(profile))
+        .route("/users/{username}/followers", get(profile_followers))
+        .route("/users/{username}/following", get(profile_following))
         .route("/users/{id}/follow", post(follow))
         .route("/users/{id}/unfollow", post(unfollow))
         .route("/users/{id}/block", post(block))
@@ -169,6 +172,12 @@ struct RegisterForm {
 #[derive(Deserialize)]
 struct CsrfForm {
     csrf: String,
+}
+
+#[derive(Deserialize)]
+struct QuoteForm {
+    csrf: String,
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -294,7 +303,7 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
     let posts = social::timeline(&state.pool, user.as_ref().map(|u| u.id), "local", None).await?;
     let csrf = form_csrf(&state, &headers).await;
     let composer = if user.is_some() || state.settings.accounts.anonymous_mode_enabled {
-        render::composer(csrf.as_deref(), None)
+        render::composer(csrf.as_deref(), None, state.settings.posts.max_text_chars)
     } else {
         String::new()
     };
@@ -313,16 +322,20 @@ async fn layout_context(
     state: &AppState,
     user: Option<&CurrentUser>,
 ) -> AppResult<render::LayoutContext> {
-    let counts = if let Some(user) = user {
-        Some(social::follow_counts(&state.pool, user.id).await?)
+    let (counts, notification_unread_count) = if let Some(user) = user {
+        (
+            Some(social::follow_counts(&state.pool, user.id).await?),
+            Some(social::unread_notification_count(&state.pool, user.id).await?),
+        )
     } else {
-        None
+        (None, None)
     };
     Ok(render::LayoutContext {
         anonymous_mode_enabled: state.settings.accounts.anonymous_mode_enabled,
         tor_onion_address: state.tor.onion_address(),
         follower_count: counts.map(|(followers, _following)| followers),
         following_count: counts.map(|(_followers, following)| following),
+        notification_unread_count,
         favicon_content_type: favicon::current(&state.paths).content_type(),
     })
 }
@@ -346,7 +359,7 @@ async fn page_layout(
 }
 
 async fn login_form(State(state): State<Arc<AppState>>) -> Html<String> {
-    let body = render::login_form(None);
+    let body = render::login_form(None, state.settings.accounts.min_password_length);
     let context = layout_context(&state, None).await.unwrap_or_default();
     Html(render::layout_with_context(
         None,
@@ -373,6 +386,10 @@ async fn login(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
+    if let Err(err) = crate::validation::validate_password(&form.password, &state.settings) {
+        rate_limit::record(&state.pool, rate_limit::Scope::FailedLogin, &actor).await?;
+        return auth_form_response(&state, StatusCode::BAD_REQUEST, &err.to_string()).await;
+    }
     let session = match auth::login(&state.pool, &form.username, &form.password).await? {
         Ok(session) => session,
         Err(failure) => {
@@ -401,8 +418,9 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
     if !state.settings.accounts.registration_enabled {
         return Err(AppError::Forbidden);
     }
+    let body = render::register_form(None, state.settings.accounts.min_password_length);
     Ok(Html(
-        page_layout(&state, None, None, "Register", &render::register_form(None)).await?,
+        page_layout(&state, None, None, "Register", &body).await?,
     ))
 }
 
@@ -453,6 +471,11 @@ async fn register(
                 )
                 .await;
             }
+            if message == "password is too short"
+                || message == "password contains control characters"
+            {
+                return register_form_response(&state, StatusCode::BAD_REQUEST, &message).await;
+            }
             return Err(AppError::BadRequest(message));
         }
     };
@@ -474,7 +497,7 @@ async fn auth_form_response(
     status: StatusCode,
     message: &str,
 ) -> AppResult<Response> {
-    let body = render::login_form(Some(message));
+    let body = render::login_form(Some(message), state.settings.accounts.min_password_length);
     Ok((
         status,
         Html(page_layout(state, None, None, "Login", &body).await?),
@@ -487,7 +510,7 @@ async fn register_form_response(
     status: StatusCode,
     message: &str,
 ) -> AppResult<Response> {
-    let body = render::register_form(Some(message));
+    let body = render::register_form(Some(message), state.settings.accounts.min_password_length);
     Ok((
         status,
         Html(page_layout(state, None, None, "Register", &body).await?),
@@ -713,7 +736,11 @@ async fn thread(
     }
     let csrf = form_csrf(&state, &headers).await;
     let composer = if user.is_some() || state.settings.accounts.anonymous_mode_enabled {
-        render::composer(csrf.as_deref(), Some(id))
+        render::composer(
+            csrf.as_deref(),
+            Some(id),
+            state.settings.posts.max_text_chars,
+        )
     } else {
         String::new()
     };
@@ -867,6 +894,52 @@ async fn repost(
     Ok(redirect_to_post_anchor(&headers, id, is_reply).into_response())
 }
 
+async fn quote_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    let user = require_active_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let preview = social::quote_target_preview(&state.pool, Some(user.id), id)
+        .await
+        .map_err(|_err| AppError::NotFound)?;
+    if preview.unavailable {
+        return Err(AppError::NotFound);
+    }
+    let body = format!(
+        "{}{}",
+        render::thread_back_control(),
+        render::quote_composer(&csrf, &preview, state.settings.posts.max_text_chars)
+    );
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Quote post", &body).await?,
+    ))
+}
+
+async fn quote_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<QuoteForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    rate_limit::check_and_record(
+        &state.pool,
+        rate_limit::Scope::Repost,
+        &user_actor(user.id),
+        state.settings.moderation.reposts_per_minute,
+        60,
+    )
+    .await
+    .map_err(|err| AppError::RateLimited(err.to_string()))?;
+    let outcome = social::create_quote_post(&state.pool, &state.settings, user.id, id, &form.text)
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    Ok(Redirect::to(&format!("/home#post-{}", outcome.post_id)).into_response())
+}
+
 async fn reply_redirect(Path(id): Path<i64>) -> Redirect {
     Redirect::to(&format!("/posts/{id}"))
 }
@@ -987,6 +1060,100 @@ async fn profile(
             user.as_ref(),
             csrf.as_deref(),
             &profile_username,
+            &body,
+        )
+        .await?,
+    ))
+}
+
+async fn profile_identity(
+    pool: &SqlitePool,
+    username: &str,
+) -> anyhow::Result<Option<(i64, String, String)>> {
+    let normalized_username = username.to_ascii_lowercase();
+    pool.call(move |conn| {
+        conn.query_row(
+            r#"
+            SELECT id, username, display_name
+            FROM users
+            WHERE normalized_username = ? AND is_deleted = 0
+            "#,
+            [normalized_username],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    })
+    .await
+}
+
+async fn profile_followers(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> AppResult<Html<String>> {
+    let user = current(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await;
+    let Some((profile_id, profile_username, display_name)) =
+        profile_identity(&state.pool, &username).await?
+    else {
+        return Err(AppError::NotFound);
+    };
+    let accounts =
+        social::followers_accounts(&state.pool, profile_id, user.as_ref().map(|user| user.id))
+            .await?;
+    let body = format!(
+        "{}{}",
+        render::page_header(
+            &format!("{display_name} followers"),
+            &format!("Users who follow @{profile_username}.")
+        ),
+        render::account_links(&accounts, "No followers yet.")
+    );
+    Ok(Html(
+        page_layout(
+            &state,
+            user.as_ref(),
+            csrf.as_deref(),
+            &format!("{display_name} followers"),
+            &body,
+        )
+        .await?,
+    ))
+}
+
+async fn profile_following(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> AppResult<Html<String>> {
+    let user = current(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await;
+    let Some((profile_id, profile_username, display_name)) =
+        profile_identity(&state.pool, &username).await?
+    else {
+        return Err(AppError::NotFound);
+    };
+    let accounts = social::following_accounts_for_profile(
+        &state.pool,
+        profile_id,
+        user.as_ref().map(|user| user.id),
+    )
+    .await?;
+    let body = format!(
+        "{}{}",
+        render::page_header(
+            &format!("{display_name} following"),
+            &format!("Users @{profile_username} follows.")
+        ),
+        render::account_links(&accounts, "Not following anyone yet.")
+    );
+    Ok(Html(
+        page_layout(
+            &state,
+            user.as_ref(),
+            csrf.as_deref(),
+            &format!("{display_name} following"),
             &body,
         )
         .await?,
@@ -1318,6 +1485,22 @@ async fn settings_page(
     };
     let notice_html =
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
+    let password_hint = if state.settings.accounts.min_password_length == 0 {
+        "No minimum password length is currently required.".to_owned()
+    } else {
+        format!(
+            "Password must be at least {} characters.",
+            state.settings.accounts.min_password_length
+        )
+    };
+    let new_password_attrs = render::password_length_attrs(
+        state.settings.accounts.min_password_length,
+        "new-password-requirement",
+    );
+    let confirm_new_password_attrs = render::password_length_attrs(
+        state.settings.accounts.min_password_length,
+        "confirm-new-password-requirement",
+    );
     let profile_media = settings_profile_media(
         picture_path.as_deref(),
         banner_path.as_deref(),
@@ -1325,7 +1508,7 @@ async fn settings_page(
         state.settings.accounts.allow_profile_banners,
     );
     let body = format!(
-        r#"{notice_html}<section class="panel settings-profile-editor"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel compact-panel"><h2>Blocked users</h2>{}</section><section class="panel compact-panel"><h2>Muted users</h2>{}</section></div><section class="panel compact-panel"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel compact-panel"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password" minlength="{}" required><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password" minlength="{}" required><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel danger-panel"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
+        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Blocked users</h2>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted users</h2>{}</section></div><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         profile_media,
         dark_checked,
@@ -1352,8 +1535,10 @@ async fn settings_page(
         html_escape::encode_double_quoted_attribute(&csrf),
         settings_muted_word_list(&muted_words, csrf),
         html_escape::encode_double_quoted_attribute(&csrf),
-        state.settings.accounts.min_password_length,
-        state.settings.accounts.min_password_length,
+        html_escape::encode_text(&password_hint),
+        new_password_attrs,
+        html_escape::encode_text(&password_hint),
+        confirm_new_password_attrs,
     );
     page_layout(state, Some(user), Some(csrf), "Settings", &body).await
 }
@@ -1699,7 +1884,7 @@ fn render_delete_account_final_warning(
 ) -> String {
     let notice = error.map_or_else(String::new, |message| render::notice("error", message));
     format!(
-        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="delete_intent" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
+        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="delete_intent" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
         html_escape::encode_double_quoted_attribute(csrf),
         html_escape::encode_double_quoted_attribute(delete_intent)
     )
@@ -1953,7 +2138,8 @@ async fn post_action_response(
                 r#"
                 SELECT
                   (SELECT COUNT(*) FROM likes WHERE post_id = p.id),
-                  (SELECT COUNT(*) FROM reposts WHERE post_id = p.id),
+                  ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
+                   (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0)),
                   (SELECT COUNT(*) FROM posts replies WHERE replies.parent_post_id = p.id AND replies.is_deleted = 0),
                   EXISTS(SELECT 1 FROM likes WHERE user_id = ? AND post_id = p.id),
                   EXISTS(SELECT 1 FROM bookmarks WHERE user_id = ? AND post_id = p.id),
@@ -2137,35 +2323,8 @@ async fn notifications(
     let user = require_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let items = social::notifications(&state.pool, user.id).await?;
-    let list = items
-        .into_iter()
-        .map(|(_, kind, message, post_id, created)| {
-            let link = post_id.map_or_else(String::new, |id| {
-                format!(r#"<a href="/posts/{id}">Open</a>"#)
-            });
-            format!(
-                r#"<li><strong>{}</strong> {} <span>{}</span> {}</li>"#,
-                html_escape::encode_text(&kind),
-                html_escape::encode_text(&message),
-                html_escape::encode_text(&created),
-                link
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let list = if list.is_empty() {
-        render::empty_state(
-            "No notifications",
-            "Likes, replies, reposts, and follows will appear here.",
-        )
-    } else {
-        format!(r#"<ul class="item-list">{list}</ul>"#)
-    };
-    let body = format!(
-        r#"<section class="panel"><div class="section-heading"><h1>Notifications</h1><form method="post" action="/notifications/read"><input type="hidden" name="csrf" value="{}"><button type="submit">Mark all read</button></form></div>{}</section>"#,
-        html_escape::encode_double_quoted_attribute(&csrf),
-        list
-    );
+    let unread_count = social::unread_notification_count(&state.pool, user.id).await?;
+    let body = render::notifications_page(&items, unread_count, &csrf);
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Notifications", &body).await?,
     ))
@@ -2245,7 +2404,7 @@ async fn admin_dashboard(
         String::new()
     };
     let favicon_panel = format!(
-        r#"<section class="panel"><h2>Favicon</h2><p class="muted">{}</p><p><img class="favicon-preview" src="/favicon.ico" alt="Current favicon"></p><form method="post" action="/admin/favicon" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="favicon">Upload favicon</label><input id="favicon" name="favicon" type="file" accept=".ico,image/png,image/svg+xml"><p class="muted">Accepted: .ico, .png, .svg. Maximum size: 256 KiB.</p><button type="submit">Save favicon</button></form><div class="actions">{}</div></section>"#,
+        r#"<section class="panel admin-card" data-testid="admin-card"><h2>Favicon</h2><p class="muted">{}</p><p><img class="favicon-preview" src="/favicon.ico" alt="Current favicon"></p><form method="post" action="/admin/favicon" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="favicon">Upload favicon</label><input id="favicon" name="favicon" type="file" accept=".ico,image/png,image/svg+xml"><p class="muted">Accepted: .ico, .png, .svg. Maximum size: 256 KiB.</p><button type="submit">Save favicon</button></form><div class="actions">{}</div></section>"#,
         html_escape::encode_text(favicon_asset.state_label()),
         html_escape::encode_double_quoted_attribute(&csrf),
         remove_form
@@ -2256,7 +2415,7 @@ async fn admin_dashboard(
             "Admin",
             "Manage site health, users, media jobs, settings, and backups."
         ),
-        r#"<section class="grid"><a class="panel" href="/admin/health">Site health</a><a class="panel" href="/admin/users">Users</a><a class="panel" href="/admin/media">Media jobs</a><a class="panel" href="/admin/deep-settings">Deep server settings</a><a class="panel" href="/admin/backups">Backups</a></section>"#,
+        r#"<section class="grid"><a class="panel admin-card" data-testid="admin-card" href="/admin/health">Site health</a><a class="panel admin-card" data-testid="admin-card" href="/admin/users">Users</a><a class="panel admin-card" data-testid="admin-card" href="/admin/media">Media jobs</a><a class="panel admin-card" data-testid="admin-card" href="/admin/deep-settings">Deep server settings</a><a class="panel admin-card" data-testid="admin-card" href="/admin/backups">Backups</a></section>"#,
         favicon_panel
     );
     Ok(Html(
@@ -2356,7 +2515,7 @@ async fn admin_health(
         .bootstrap_status()
         .unwrap_or_else(|| "unavailable".to_owned());
     let body = format!(
-        r#"<section class="panel"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
+        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
         html_escape::encode_text(&state.paths.database_path.display().to_string()),
         html_escape::encode_text(&state.paths.uploads_originals.display().to_string()),
         html_escape::encode_text(&state.paths.uploads_images.display().to_string()),
@@ -2411,7 +2570,7 @@ async fn admin_users(
         .collect::<Vec<_>>()
         .join("");
     let body = format!(
-        r#"<section class="panel"><h1>Users</h1><table><thead><tr><th>ID</th><th>Username</th><th>Admin</th><th>Suspended</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>"#,
+        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Users</h1><table><thead><tr><th>ID</th><th>Username</th><th>Admin</th><th>Suspended</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>"#,
         list
     );
     Ok(Html(
@@ -2462,7 +2621,7 @@ async fn admin_media(
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let jobs = admin::media_jobs_report(&state.pool).await?;
     let body = format!(
-        r#"<section class="panel"><h1>Media jobs</h1>{}</section>"#,
+        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Media jobs</h1>{}</section>"#,
         render_media_jobs_report(&jobs)
     );
     Ok(Html(
@@ -2583,7 +2742,7 @@ fn render_deep_settings_form(
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
     let fields = render_deep_settings_groups(values);
     format!(
-        r#"{notice_html}<section class="panel deep-settings-panel"><div class="settings-editor-bar"><div><h1>Deep server settings</h1><p class="muted">Durable settings from settings.toml. Saved changes require a RustPost restart before this running server uses them.</p></div><button class="primary" type="submit" form="deep-settings-form">Save</button></div><form id="deep-settings-form" method="post" action="/admin/deep-settings" class="deep-settings-form"><input type="hidden" name="csrf" value="{}">{fields}<input type="hidden" name="intent" value="preview"></form></section>"#,
+        r#"{notice_html}<section class="panel admin-card deep-settings-panel" data-testid="admin-card"><div class="settings-editor-bar"><div><h1>Deep server settings</h1><p class="muted">Durable settings from settings.toml. Saved changes require a RustPost restart before this running server uses them.</p></div><button class="primary" type="submit" form="deep-settings-form">Save</button></div><form id="deep-settings-form" method="post" action="/admin/deep-settings" class="deep-settings-form"><input type="hidden" name="csrf" value="{}">{fields}<input type="hidden" name="intent" value="preview"></form></section>"#,
         html_escape::encode_double_quoted_attribute(csrf),
     )
 }
@@ -2669,7 +2828,7 @@ fn render_deep_settings_confirmation(
         .join("");
     let hidden = render_deep_settings_hidden_fields(values);
     format!(
-        r#"{notice_html}<section class="panel deep-settings-confirm"><h1>These settings are about to be changed</h1><p class="muted">Review the changed values before writing settings.toml. Saved changes require a RustPost restart before this running server uses them.</p><ul class="settings-item-list">{rows}</ul><div class="actions"><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="confirm">{hidden}<button class="primary" type="submit">Confirm/Save</button></form><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="discard">{hidden}<button type="submit">Discard Changes</button></form></div></section>"#,
+        r#"{notice_html}<section class="panel admin-card deep-settings-confirm" data-testid="admin-card"><h1>These settings are about to be changed</h1><p class="muted">Review the changed values before writing settings.toml. Saved changes require a RustPost restart before this running server uses them.</p><ul class="settings-item-list">{rows}</ul><div class="actions"><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="confirm">{hidden}<button class="primary" type="submit">Confirm/Save</button></form><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="discard">{hidden}<button type="submit">Discard Changes</button></form></div></section>"#,
         html_escape::encode_double_quoted_attribute(csrf),
         html_escape::encode_double_quoted_attribute(csrf),
     )
@@ -2791,7 +2950,7 @@ async fn admin_backups(
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let body = format!(
-        r#"<section class="panel"><h1>Backups</h1><form method="post"><input type="hidden" name="csrf" value="{}"><label><input type="checkbox" name="include_tor_keys" value="true"> Include Tor onion-service keys</label><button>Create backup</button></form></section>"#,
+        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Backups</h1><form method="post"><input type="hidden" name="csrf" value="{}"><label><input type="checkbox" name="include_tor_keys" value="true"> Include Tor onion-service keys</label><button>Create backup</button></form></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf)
     );
     Ok(Html(
@@ -3076,6 +3235,61 @@ mod tests {
                 .contains(r#"<button class="auth-submit" type="submit">Log in</button>"#)
         );
         assert!(!response.body.contains("Authentication required"));
+    }
+
+    #[tokio::test]
+    async fn auth_forms_show_password_minimum_and_short_passwords_return_forms() {
+        let server = spawn_test_server().await;
+
+        let login = request(&server.base_url, "GET", "/login", &[], Vec::new()).await;
+        assert_eq!(login.status, 200);
+        assert!(
+            login
+                .body
+                .contains("Password must be at least 10 characters.")
+        );
+        assert!(
+            login
+                .body
+                .contains(r#"aria-describedby="password-requirement""#)
+        );
+
+        let register = request(&server.base_url, "GET", "/register", &[], Vec::new()).await;
+        assert_eq!(register.status, 200);
+        assert!(
+            register
+                .body
+                .contains("Password must be at least 10 characters.")
+        );
+        assert!(
+            register
+                .body
+                .contains(r#"aria-describedby="confirm-password-requirement""#)
+        );
+
+        let short_login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=short".to_vec(),
+        )
+        .await;
+        assert_eq!(short_login.status, 400);
+        assert!(short_login.body.contains("<h1>Log in</h1>"));
+        assert!(short_login.body.contains("password is too short"));
+
+        let short_register = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=short&confirm_password=short".to_vec(),
+        )
+        .await;
+        assert_eq!(short_register.status, 400);
+        assert!(short_register.body.contains("<h1>Create account</h1>"));
+        assert!(short_register.body.contains("password is too short"));
     }
 
     #[tokio::test]
@@ -3419,6 +3633,77 @@ mod tests {
         assert_eq!(self_repost.status, 400);
         assert!(self_repost.body.contains("cannot repost your own post"));
         assert!(!self_repost.body.contains("internal server error"));
+    }
+
+    #[tokio::test]
+    async fn quote_repost_can_be_created_once_and_renders_original_preview() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "original quote target").await;
+
+        let bob_cookie = register_test_user(&server, "bob").await;
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        assert!(
+            bob_home
+                .body
+                .contains(r#"class="quote-fallback" href="/posts/1/quote""#)
+        );
+        assert!(bob_home.body.contains("data-repost-menu-button"));
+
+        let quote_form = get_with_cookie(&server, "/posts/1/quote", &bob_cookie).await;
+        assert_eq!(quote_form.status, 200);
+        assert!(
+            quote_form
+                .body
+                .contains("<h1 id=\"composer-title\">Quote post</h1>")
+        );
+        assert!(quote_form.body.contains("original quote target"));
+
+        let quote_body = quote_form_body(&quote_form, "bob adds context");
+        let quote =
+            post_form_with_cookie(&server, "/posts/1/quote", &bob_cookie, &quote_body).await;
+        assert_eq!(quote.status, 303);
+        assert_eq!(location(&quote), "/home#post-2");
+
+        let duplicate =
+            post_form_with_cookie(&server, "/posts/1/quote", &bob_cookie, &quote_body).await;
+        assert_eq!(duplicate.status, 303);
+        assert_eq!(location(&duplicate), "/home#post-2");
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        assert!(bob_home.body.contains("bob adds context"));
+        assert!(bob_home.body.contains(r#"class="quote-preview""#));
+        assert!(bob_home.body.contains("original quote target"));
+        assert_eq!(bob_home.body.matches("bob adds context").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn quote_repost_handles_deleted_original_gracefully() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "soon deleted original").await;
+
+        let bob_cookie = register_test_user(&server, "bob").await;
+        let quote_form = get_with_cookie(&server, "/posts/1/quote", &bob_cookie).await;
+        let quote_body = quote_form_body(&quote_form, "quote survives deletion");
+        let quote =
+            post_form_with_cookie(&server, "/posts/1/quote", &bob_cookie, &quote_body).await;
+        assert_eq!(quote.status, 303);
+
+        let alice_home = get_with_cookie(&server, "/home", &alice_cookie).await;
+        let delete_csrf = csrf_token(&alice_home.body);
+        let deleted_body = format!("csrf={delete_csrf}&return_to=/home%23post-1");
+        let deleted =
+            post_form_with_cookie(&server, "/posts/1/delete", &alice_cookie, &deleted_body).await;
+        assert_eq!(deleted.status, 303);
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        assert!(bob_home.body.contains("quote survives deletion"));
+        assert!(
+            bob_home
+                .body
+                .contains("Quoted post is no longer available.")
+        );
     }
 
     #[tokio::test]
@@ -3901,6 +4186,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notifications_page_renders_unread_badges_and_mark_all_read() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "alice original post").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+
+        let thread = get_with_cookie(&server, "/posts/1", &bob_cookie).await;
+        let csrf = csrf_token(&thread.body);
+        let reply = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &bob_cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("parent_post_id", "1"),
+                    ("text", "bob reply"),
+                ],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, 303);
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let csrf = csrf_token(&bob_home.body);
+        let liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(liked.status, 303);
+        let reposted = post_form_with_cookie(
+            &server,
+            "/posts/1/repost",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(reposted.status, 303);
+        let followed = post_form_with_cookie(
+            &server,
+            "/users/1/follow",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(followed.status, 303);
+
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert_eq!(notifications.status, 200);
+        assert_populated_notifications_page(&notifications.body);
+
+        let csrf = csrf_token(&notifications.body);
+        let read = post_form_with_cookie(
+            &server,
+            "/notifications/read",
+            &alice_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(read.status, 303);
+        assert_eq!(location(&read), "/notifications");
+
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert!(notifications.body.contains("No unread notifications"));
+        assert!(
+            notifications
+                .body
+                .contains("All caught up. Everything here has been read.")
+        );
+        assert!(!notifications.body.contains(r#"<span class="nav-badge""#));
+        assert!(
+            !notifications
+                .body
+                .contains(r#"class="notification-row unread""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_page_has_polished_empty_state() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+
+        let notifications = get_with_cookie(&server, "/notifications", &cookie).await;
+
+        assert_eq!(notifications.status, 200);
+        assert!(notifications.body.contains(r#"class="notifications-hero""#));
+        assert!(notifications.body.contains("No unread notifications"));
+        assert!(notifications.body.contains("No notifications yet"));
+        assert!(
+            notifications
+                .body
+                .contains("Replies, likes, reposts, follows, and mentions will appear here.")
+        );
+    }
+
+    #[tokio::test]
     async fn default_favicon_route_and_html_link_are_present() {
         let server = spawn_test_server().await;
 
@@ -4258,7 +4651,7 @@ mod tests {
                 ("cookie", &cookie),
                 ("content-type", "application/x-www-form-urlencoded"),
             ],
-            deep_settings_form_body(&csrf, "preview", &[("min_password_length", "5")]),
+            deep_settings_form_body(&csrf, "preview", &[("min_password_length", "-1")]),
         )
         .await;
         let after =
@@ -4269,7 +4662,7 @@ mod tests {
         assert!(
             response
                 .body
-                .contains("accounts.min_password_length must be at least 10")
+                .contains("Minimum password length must not be negative")
         );
     }
 
@@ -4706,6 +5099,105 @@ mod tests {
             0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x04, 0x00, 0x01, 0xfe, 0xa7, 0x69, 0x9d,
             0x16, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
         ]
+    }
+
+    async fn register_test_user(server: &TestServer, username: &str) -> String {
+        let body = format!(
+            "username={}&password=very%20secure%20password&confirm_password=very%20secure%20password",
+            form_encode(username)
+        );
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            body.into_bytes(),
+        )
+        .await;
+        assert_eq!(response.status, 303);
+        session_cookie(&response)
+    }
+
+    async fn get_with_cookie(server: &TestServer, path: &str, cookie: &str) -> TestResponse {
+        request(
+            &server.base_url,
+            "GET",
+            path,
+            &[("cookie", cookie)],
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn post_form_with_cookie(
+        server: &TestServer,
+        path: &str,
+        cookie: &str,
+        body: &str,
+    ) -> TestResponse {
+        request(
+            &server.base_url,
+            "POST",
+            path,
+            &[
+                ("cookie", cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            body.as_bytes().to_vec(),
+        )
+        .await
+    }
+
+    async fn create_text_post(server: &TestServer, cookie: &str, text: &str) {
+        let home = get_with_cookie(server, "/home", cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", text)],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+    }
+
+    fn assert_populated_notifications_page(body: &str) {
+        assert!(body.contains("4 unread notifications"));
+        assert!(
+            body.contains(
+                r#"<span class="nav-badge" aria-label="4 unread notifications">4</span>"#
+            )
+        );
+        assert!(body.contains(r#"<h2 class="notification-group">New</h2>"#));
+        assert_eq!(
+            body.matches(r#"class="notification-row unread""#).count(),
+            4
+        );
+        assert!(body.contains(">bob</a> <span class=\"username\">@bob</span>"));
+        assert!(body.contains("replied to your post"));
+        assert!(body.contains("liked your post"));
+        assert!(body.contains("reposted your post"));
+        assert!(body.contains("followed you"));
+        assert!(body.contains("alice original post"));
+        assert!(body.contains(r#"data-card-href="/posts/1""#));
+        assert!(body.contains(r#"data-card-href="/posts/2""#));
+        assert!(body.contains(r#"data-card-href="/users/bob""#));
+    }
+
+    fn quote_form_body(response: &TestResponse, text: &str) -> String {
+        let csrf = csrf_token(&response.body);
+        format!("csrf={}&text={}", form_encode(&csrf), form_encode(text))
     }
 
     async fn spawn_test_server() -> TestServer {

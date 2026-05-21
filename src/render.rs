@@ -1,6 +1,9 @@
 use crate::auth::{CurrentUser, Theme};
-use crate::social::{AccountView, MediaView, PostView, TimelineEventKind};
+use crate::social::{
+    AccountView, MediaView, NotificationView, PostView, QuotePreview, TimelineEventKind,
+};
 use axum::http::StatusCode;
+use chrono::{DateTime, NaiveDateTime, Utc};
 
 #[derive(Debug, Clone)]
 pub struct LayoutContext {
@@ -8,6 +11,7 @@ pub struct LayoutContext {
     pub tor_onion_address: Option<String>,
     pub follower_count: Option<i64>,
     pub following_count: Option<i64>,
+    pub notification_unread_count: Option<i64>,
     pub favicon_content_type: &'static str,
 }
 
@@ -18,6 +22,7 @@ impl Default for LayoutContext {
             tor_onion_address: None,
             follower_count: None,
             following_count: None,
+            notification_unread_count: None,
             favicon_content_type: "image/x-icon",
         }
     }
@@ -76,25 +81,38 @@ pub fn layout_with_context(
 ) -> String {
     let auth_nav = if let Some(user) = user {
         let admin = if user.is_admin {
-            r#"<a href="/admin">Admin</a>"#
+            nav_link("/admin", "Admin", "admin")
         } else {
-            ""
+            String::new()
         };
+        let notifications = notification_nav_link(context.notification_unread_count.unwrap_or(0));
         let logout = csrf.map_or_else(String::new, |token| {
             format!(
-                r#"<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button>Log out</button></form>"#,
-                html_escape::encode_double_quoted_attribute(token)
+                r#"<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button>{}<span>Log out</span></button></form>"#,
+                html_escape::encode_double_quoted_attribute(token),
+                icon_svg("log-out")
             )
         });
+        let profile = nav_link(&format!("/users/{}", user.username), "Profile", "profile");
         format!(
-            r#"<a href="/home">Home Feed</a><a href="/following">Following</a><a href="/search">Search</a><a href="/notifications">Notifications</a><a href="/bookmarks">Bookmarks</a><a href="/users/{}">Profile</a>{admin}{logout}"#,
-            html_escape::encode_double_quoted_attribute(&user.username)
+            "{}{}{}{notifications}{}{}{admin}{logout}",
+            nav_link("/home", "Home Feed", "home"),
+            nav_link("/following", "Following", "users"),
+            nav_link("/search", "Search", "search"),
+            nav_link("/bookmarks", "Bookmarks", "bookmark"),
+            profile,
         )
     } else {
-        r#"<a href="/home">Home Feed</a><a href="/search">Search</a><a href="/login">Log in</a><a href="/register">Register</a>"#
-            .to_owned()
+        format!(
+            "{}{}{}{}",
+            nav_link("/home", "Home Feed", "home"),
+            nav_link("/search", "Search", "search"),
+            nav_link("/login", "Log in", "log-in"),
+            nav_link("/register", "Register", "user-plus")
+        )
     };
     let brand_mark = site_name.chars().next().unwrap_or('R');
+    let left_rail = left_rail(user, &auth_nav);
     let side_panel = dashboard_panel(user, context);
     let theme = user.map_or(Theme::Light, |user| user.theme).as_str();
     let footer_onion = context
@@ -121,8 +139,8 @@ pub fn layout_with_context(
 <script src="/assets/rustpost.js" defer></script>
 </head>
 <body>
-<header class="site-header"><div class="header-inner"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a><nav>{}</nav></div></header>
-<main><div class="content-shell"><section class="content-column">{} </section>{}</div></main>
+<header class="site-header"><div class="header-inner"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
+<main><div class="app-shell" data-testid="app-shell">{}<section class="primary-column" data-testid="primary-column">{} </section>{}</div></main>
 <footer class="site-footer">{} alpha{}</footer>
 </body>
 </html>"#,
@@ -134,11 +152,38 @@ pub fn layout_with_context(
         html_escape::encode_text(&brand_mark.to_string()),
         html_escape::encode_text(site_name),
         auth_nav,
+        left_rail,
         body,
         side_panel,
         html_escape::encode_text(site_name),
         footer_onion
     )
+}
+
+fn nav_link(href: &str, label: &str, icon: &str) -> String {
+    format!(
+        r#"<a href="{}">{}<span>{}</span></a>"#,
+        html_escape::encode_double_quoted_attribute(href),
+        icon_svg(icon),
+        html_escape::encode_text(label)
+    )
+}
+
+fn left_rail(_user: Option<&CurrentUser>, nav: &str) -> String {
+    format!(
+        r#"<aside class="left-rail" data-testid="left-rail"><nav class="rail-nav" aria-label="Primary">{nav}</nav></aside>"#
+    )
+}
+
+fn notification_nav_link(unread_count: i64) -> String {
+    if unread_count > 0 {
+        format!(
+            r#"<a href="/notifications">{}<span>Notifications</span> <span class="nav-badge" aria-label="{unread_count} unread notifications">{unread_count}</span></a>"#,
+            icon_svg("bell")
+        )
+    } else {
+        nav_link("/notifications", "Notifications", "bell")
+    }
 }
 
 fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> String {
@@ -162,14 +207,15 @@ fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> Strin
     );
     let social = match (context.follower_count, context.following_count) {
         (Some(followers), Some(following)) => {
-            format!(r#"<dt>Social</dt><dd>{followers} followers<br>{following} following</dd>"#)
+            user.map_or_else(String::new, |user| {
+                let username = html_escape::encode_double_quoted_attribute(&user.username);
+                let display_name = html_escape::encode_double_quoted_attribute(&user.display_name);
+                format!(
+                    r#"<dt>Social</dt><dd><a data-testid="dashboard-followers-link" href="/users/{username}/followers" aria-label="View followers for {display_name}">{followers} followers</a><br><a data-testid="dashboard-following-link" href="/users/{username}/following" aria-label="View users {display_name} follows">{following} following</a></dd>"#
+                )
+            })
         }
         _ => String::new(),
-    };
-    let admin = if user.is_some_and(|user| user.is_admin) {
-        r#"<a class="button-link" href="/admin">Admin</a>"#
-    } else {
-        ""
     };
     let settings = if user.is_some() {
         r#"<a class="button-link" href="/settings">Settings</a>"#
@@ -177,23 +223,47 @@ fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> Strin
         ""
     };
     format!(
-        r#"<aside class="side-panel"><h2>Dashboard</h2><dl class="dashboard-list">{}<dt>Posting</dt><dd>{}</dd>{}</dl><div class="quick-links">{settings}{admin}</div></aside>"#,
+        r#"<aside class="right-rail" data-testid="right-rail"><section class="side-rail-card"><h2>Dashboard</h2><dl class="dashboard-list">{}<dt>Posting</dt><dd>{}</dd>{}</dl><div class="dashboard-actions">{settings}</div></section></aside>"#,
         account, posting, social
     )
 }
 
-pub fn login_form(message: Option<&str>) -> String {
+pub fn login_form(message: Option<&str>, min_password_length: usize) -> String {
     let notice = message.map_or_else(String::new, |message| notice("error", message));
+    let hint = password_requirement_hint(min_password_length);
+    let attrs = password_length_attrs(min_password_length, "password-requirement");
     format!(
-        r#"<section class="panel auth-panel"><h1>Log in</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><div class="password-control"><input id="password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><button class="auth-submit" type="submit">Log in</button></form></section>"#
+        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Log in</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="current-password"{attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><button class="auth-submit" type="submit">Log in</button></form></section>"#
     )
 }
 
-pub fn register_form(message: Option<&str>) -> String {
+pub fn register_form(message: Option<&str>, min_password_length: usize) -> String {
     let notice = message.map_or_else(String::new, |message| notice("error", message));
+    let hint = password_requirement_hint(min_password_length);
+    let password_attrs = password_length_attrs(min_password_length, "password-requirement");
+    let confirm_attrs = password_length_attrs(min_password_length, "confirm-password-requirement");
     format!(
-        r#"<section class="panel auth-panel"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><div class="password-control"><input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" minlength="10" autocomplete="new-password" required><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div><button class="auth-submit" type="submit">Create account</button></form></section>"#
+        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="new-password"{password_attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><p class="field-help" id="confirm-password-requirement">{hint}</p><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"{confirm_attrs}><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div><button class="auth-submit" type="submit">Create account</button></form></section>"#
     )
+}
+
+pub fn password_length_attrs(min_password_length: usize, described_by: &str) -> String {
+    let described_by = html_escape::encode_double_quoted_attribute(described_by);
+    if min_password_length == 0 {
+        format!(r#" aria-describedby="{described_by}""#)
+    } else {
+        format!(r#" minlength="{min_password_length}" required aria-describedby="{described_by}""#)
+    }
+}
+
+fn password_requirement_hint(min_password_length: usize) -> String {
+    if min_password_length == 0 {
+        "No minimum password length is currently required.".to_owned()
+    } else if min_password_length == 1 {
+        "Password must be at least 1 character.".to_owned()
+    } else {
+        format!("Password must be at least {min_password_length} characters.")
+    }
 }
 
 const CLIENT_SCRIPT: &str = r#"function cardInteractiveTarget(target) {
@@ -251,12 +321,85 @@ document.addEventListener("click", (event) => {
   button.setAttribute("aria-label", show ? "Hide password" : "Show password");
 });
 
+function closeRepostMenus(except) {
+  document.querySelectorAll("[data-repost-menu]").forEach((menu) => {
+    if (menu === except) {
+      return;
+    }
+    menu.hidden = true;
+    const button = document.querySelector(`[aria-controls="${menu.id}"]`);
+    if (button) {
+      button.setAttribute("aria-expanded", "false");
+    }
+  });
+}
+
+function openRepostMenu(button) {
+  const menu = document.getElementById(button.getAttribute("aria-controls"));
+  if (!menu) {
+    return;
+  }
+  closeRepostMenus(menu);
+  menu.hidden = false;
+  button.setAttribute("aria-expanded", "true");
+  const firstItem = menu.querySelector('[role="menuitem"]');
+  if (firstItem) {
+    firstItem.focus();
+  }
+}
+
+document.addEventListener("pointerdown", (event) => {
+  const button = event.target.closest("[data-repost-menu-button]");
+  if (!button) {
+    return;
+  }
+  const timer = window.setTimeout(() => {
+    button.dataset.longPressOpen = "true";
+    openRepostMenu(button);
+  }, 450);
+  button.dataset.longPressTimer = String(timer);
+});
+
+document.addEventListener("pointerup", (event) => {
+  const button = event.target.closest("[data-repost-menu-button]");
+  if (!button || !button.dataset.longPressTimer) {
+    return;
+  }
+  window.clearTimeout(Number.parseInt(button.dataset.longPressTimer, 10));
+  delete button.dataset.longPressTimer;
+});
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-repost-menu-button]");
+  if (button && button.dataset.longPressOpen === "true") {
+    event.preventDefault();
+    event.stopPropagation();
+    delete button.dataset.longPressOpen;
+    return;
+  }
+  if (!event.target.closest("[data-repost-control]")) {
+    closeRepostMenus(null);
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  const button = event.target.closest("[data-repost-menu-button]");
+  if (button && (event.key === "ArrowDown" || event.key === "F10")) {
+    event.preventDefault();
+    openRepostMenu(button);
+    return;
+  }
+  if (event.key === "Escape") {
+    closeRepostMenus(null);
+  }
+});
+
 function updateComposerCount(textarea) {
   const counter = document.querySelector(`[data-character-counter="${textarea.id}"]`);
   if (!counter) {
     return;
   }
-  const max = Number.parseInt(textarea.getAttribute("maxlength") || "280", 10);
+  const max = Number.parseInt(textarea.getAttribute("data-character-limit") || "0", 10);
   const length = Array.from(textarea.value).length;
   counter.textContent = `${Math.max(0, max - length)} remaining`;
 }
@@ -430,17 +573,17 @@ pub fn client_script() -> &'static str {
     CLIENT_SCRIPT
 }
 
-pub fn composer(csrf: Option<&str>, parent: Option<i64>) -> String {
+pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) -> String {
     let parent_input = parent.map_or_else(String::new, |id| {
         format!(r#"<input type="hidden" name="parent_post_id" value="{id}">"#)
     });
     let csrf = csrf.unwrap_or_default();
     let input_id = parent.map_or_else(|| "post-text".to_owned(), |id| format!("reply-text-{id}"));
     format!(
-        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted" data-character-counter="{}">280 remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
+        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted" data-character-counter="{}">{} remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
 <input type="hidden" name="csrf" value="{}">{}
 <label class="sr-only" for="{}">What is happening?</label>
-<textarea id="{}" name="text" maxlength="280" rows="4" data-character-limit="280"></textarea>
+<textarea id="{}" name="text" maxlength="{}" rows="4" data-character-limit="{}"></textarea>
 <div class="composer-tools"><label class="file-control" for="media">Attach media<input id="media" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime"></label><button class="primary" type="submit">Post</button></div>
 </form></section>"#,
         if parent.is_some() {
@@ -449,10 +592,29 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>) -> String {
             "New post"
         },
         html_escape::encode_double_quoted_attribute(&input_id),
+        max_text_chars,
         html_escape::encode_double_quoted_attribute(csrf),
         parent_input,
         html_escape::encode_double_quoted_attribute(&input_id),
-        html_escape::encode_double_quoted_attribute(&input_id)
+        html_escape::encode_double_quoted_attribute(&input_id),
+        max_text_chars,
+        max_text_chars
+    )
+}
+
+pub fn quote_composer(csrf: &str, quote: &QuotePreview, max_text_chars: usize) -> String {
+    let preview = quote_preview_card(quote);
+    format!(
+        r#"<section class="composer quote-composer" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">Quote post</h1><span class="muted" data-character-counter="quote-text">{max_text_chars} remaining</span></div>{preview}<form method="post" action="/posts/{}/quote" class="quote-form">
+<input type="hidden" name="csrf" value="{}">
+<label class="sr-only" for="quote-text">Add your comment</label>
+<textarea id="quote-text" name="text" maxlength="{}" rows="4" data-character-limit="{}" required></textarea>
+<div class="composer-tools"><span></span><button class="primary" type="submit">Post quote</button></div>
+</form></section>"#,
+        quote.id,
+        html_escape::encode_double_quoted_attribute(csrf),
+        max_text_chars,
+        max_text_chars
     )
 }
 
@@ -499,6 +661,41 @@ pub fn accounts(accounts: &[AccountView], csrf: &str) -> String {
         .collect::<Vec<_>>()
         .join("");
     format!(r#"<section class="account-list">{rows}</section>"#)
+}
+
+pub fn account_links(accounts: &[AccountView], empty_message: &str) -> String {
+    if accounts.is_empty() {
+        return empty_state(empty_message, "");
+    }
+    let rows = accounts
+        .iter()
+        .map(|account| {
+            let avatar = account.profile_picture_path.as_ref().map_or_else(
+                || {
+                    let initial = account.display_name.chars().next().unwrap_or('R');
+                    format!(
+                        r#"<span class="post-avatar placeholder" aria-hidden="true">{}</span>"#,
+                        html_escape::encode_text(&initial.to_string())
+                    )
+                },
+                |path| {
+                    format!(
+                        r#"<img class="post-avatar" src="{}" alt="" loading="lazy">"#,
+                        html_escape::encode_double_quoted_attribute(path)
+                    )
+                },
+            );
+            format!(
+                r#"<article class="account-row" data-testid="account-row">{}<div><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span></div></article>"#,
+                avatar,
+                html_escape::encode_double_quoted_attribute(&account.username),
+                html_escape::encode_text(&account.display_name),
+                html_escape::encode_text(&account.username)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<section class="account-list" data-testid="account-list">{rows}</section>"#)
 }
 
 pub fn search_page(
@@ -719,7 +916,7 @@ fn post_card_with_options(
     };
     if post.original_unavailable {
         return format!(
-            r#"<article class="post unavailable" id="post-{}" data-event-id="{}">{}<div class="text">This post is no longer available.</div></article>"#,
+            r#"<article class="post unavailable" data-testid="post-card" id="post-{}" data-event-id="{}">{}<div class="text">This post is no longer available.</div></article>"#,
             post.id,
             html_escape::encode_double_quoted_attribute(&post.event_id),
             repost_banner
@@ -771,7 +968,7 @@ fn post_card_with_options(
         };
         let reply_link = icon_link(&format!("/posts/{}#reply", post.id), "Reply", "reply");
         format!(
-            r#"<div class="actions">{}{}{}{}{}</div>"#,
+            r#"<div class="actions" data-testid="post-actions">{}{}{}{}{}</div>"#,
             icon_action_form(
                 &format!("/posts/{}/like", post.id),
                 csrf,
@@ -781,16 +978,15 @@ fn post_card_with_options(
                 post.viewer_liked
             ),
             if post.viewer_can_repost {
-                icon_action_form(
+                repost_action_with_quote(
                     &format!("/posts/{}/repost", post.id),
+                    &format!("/posts/{}/quote", post.id),
                     csrf,
                     if post.viewer_reposted {
                         "Unrepost"
                     } else {
                         "Repost"
                     },
-                    "repost",
-                    "repost",
                     post.viewer_reposted,
                 )
             } else {
@@ -843,8 +1039,12 @@ fn post_card_with_options(
     } else {
         String::new()
     };
+    let quote = post
+        .quote
+        .as_ref()
+        .map_or_else(String::new, quote_preview_card);
     format!(
-        r#"<article class="{}" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}<div class="counts"><span data-count="likes">{} likes</span><span data-count="reposts">{} reposts</span><span data-count="replies">{} replies</span></div>{}</article>"#,
+        r#"<article class="{}" data-testid="post-card" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}{}<div class="counts"><span data-count="likes">{} likes</span><span data-count="reposts">{} reposts</span><span data-count="replies">{} replies</span></div>{}</article>"#,
         post_class,
         post.id,
         post.id,
@@ -857,10 +1057,36 @@ fn post_card_with_options(
         timestamp,
         text,
         media,
+        quote,
         post.like_count,
         post.repost_count,
         post.reply_count,
         controls
+    )
+}
+
+fn repost_action_with_quote(
+    action: &str,
+    quote_href: &str,
+    csrf: &str,
+    label: &str,
+    active: bool,
+) -> String {
+    let menu_id = format!("quote-menu-{}", action.trim_matches('/').replace('/', "-"));
+    format!(
+        r#"<div class="repost-control" data-repost-control><form method="post" action="{}" data-enhance="post-action"><input type="hidden" name="csrf" value="{}"><button class="icon-button{}" type="submit" data-action-kind="repost" data-repost-menu-button aria-haspopup="menu" aria-expanded="false" aria-controls="{}" aria-pressed="{}" aria-label="{}" title="{}">{}<span class="sr-only" data-button-label>{}</span></button></form><div class="repost-menu" id="{}" role="menu" data-repost-menu hidden><a role="menuitem" href="{}">Quote post</a></div><a class="quote-fallback" href="{}">Quote</a></div>"#,
+        html_escape::encode_double_quoted_attribute(action),
+        html_escape::encode_double_quoted_attribute(csrf),
+        if active { " active" } else { "" },
+        html_escape::encode_double_quoted_attribute(&menu_id),
+        if active { "true" } else { "false" },
+        html_escape::encode_double_quoted_attribute(label),
+        html_escape::encode_double_quoted_attribute(label),
+        icon_svg("repost"),
+        html_escape::encode_text(label),
+        html_escape::encode_double_quoted_attribute(&menu_id),
+        html_escape::encode_double_quoted_attribute(quote_href),
+        html_escape::encode_double_quoted_attribute(quote_href)
     )
 }
 
@@ -907,8 +1133,59 @@ fn disabled_icon_button(label: &str, icon: &str) -> String {
     )
 }
 
+fn quote_preview_card(quote: &QuotePreview) -> String {
+    if quote.unavailable {
+        return r#"<aside class="quote-preview unavailable" aria-label="Quoted post"><p>Quoted post is no longer available.</p></aside>"#
+            .to_owned();
+    }
+    let author = match (&quote.username, &quote.anonymous_label) {
+        (Some(username), _) => format!(
+            r#"<a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span>"#,
+            html_escape::encode_double_quoted_attribute(username),
+            html_escape::encode_text(quote.display_name.as_deref().unwrap_or(username)),
+            html_escape::encode_text(username)
+        ),
+        (None, Some(label)) => html_escape::encode_text(label).to_string(),
+        _ => "Deleted user".to_owned(),
+    };
+    format!(
+        r#"<aside class="quote-preview" aria-label="Quoted post"><a class="quote-link" href="/posts/{}"><span class="quote-author">{}</span><span class="quote-text">{}</span><span class="quote-time">{}</span></a></aside>"#,
+        quote.id,
+        author,
+        linkify(&quote.text),
+        html_escape::encode_text(&quote.created_at)
+    )
+}
+
 fn icon_svg(icon: &str) -> &'static str {
     match icon {
+        "home" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 11.3 12 3l9 8.3-2 2.1-1.1-1V20h-4.6v-5.2h-2.6V20H6.1v-7.6l-1.1 1-2-2.1z"/></svg>"#
+        }
+        "users" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 11.5a4 4 0 1 1 0-8 4 4 0 0 1 0 8zm-7 8.2c.4-4.3 3.1-6.5 7-6.5s6.6 2.2 7 6.5V21H2v-1.3zm14.5-7.3a3.4 3.4 0 1 0 0-6.8 3.4 3.4 0 0 0-.9.1 5.8 5.8 0 0 1-1.3 6.4c.7.1 1.5.2 2.2.3zm.2 1.7c2.9.4 4.9 2.3 5.3 5.6V21h-3.9v-1.6a8.7 8.7 0 0 0-1.4-5.3z"/></svg>"#
+        }
+        "search" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M10.5 4a6.5 6.5 0 0 1 5.1 10.5l4.4 4.4-2.1 2.1-4.4-4.4A6.5 6.5 0 1 1 10.5 4zm0 3a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z"/></svg>"#
+        }
+        "bell" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 22a2.8 2.8 0 0 0 2.7-2h-5.4A2.8 2.8 0 0 0 12 22zm7-6.5-1.8-2.1V9a5.2 5.2 0 0 0-3.7-5V2h-3v2A5.2 5.2 0 0 0 6.8 9v4.4L5 15.5V18h14v-2.5z"/></svg>"#
+        }
+        "profile" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 12a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9zm-8 8.2c.5-4.6 3.6-7 8-7s7.5 2.4 8 7V22H4v-1.8z"/></svg>"#
+        }
+        "admin" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 2 20 5v6c0 5.1-3.2 8.7-8 11-4.8-2.3-8-5.9-8-11V5l8-3zm0 4-4 1.5V11c0 3.1 1.5 5.4 4 7 2.5-1.6 4-3.9 4-7V7.5L12 6z"/></svg>"#
+        }
+        "log-in" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 4h8v3H7v10h5v3H4V4zm10.5 3.2L20.3 12l-5.8 4.8-1.9-2.3 1.8-1.5H9v-3h5.4l-1.8-1.5 1.9-2.3z"/></svg>"#
+        }
+        "log-out" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 4h8v3H7v10h5v3H4V4zm12.5 3.2 1.9 2.3-1.8 1.5H11v3h5.6l-1.8 1.5 1.9 2.3 5.8-4.8-6-4.8z"/></svg>"#
+        }
+        "user-plus" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9.5 12a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9zM2 20.5c.5-4.4 3.3-6.7 7.5-6.7 1.7 0 3.1.4 4.2 1.1A6.8 6.8 0 0 0 12.5 21H2v-.5zM18 14v3h3v3h-3v3h-3v-3h-3v-3h3v-3h3z"/></svg>"#
+        }
         "heart" => {
             r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 21s-7-4.4-9.4-8.8C.6 8.5 2.7 4.5 6.7 4.5c2 0 3.5 1.1 4.3 2.4.8-1.3 2.3-2.4 4.3-2.4 4 0 6.1 4 4.1 7.7C19 16.6 12 21 12 21z"/></svg>"#
         }
@@ -978,6 +1255,234 @@ pub fn page_header(title: &str, subtitle: &str) -> String {
     )
 }
 
+pub fn notifications_page(
+    notifications: &[NotificationView],
+    unread_count: i64,
+    csrf: &str,
+) -> String {
+    let status = if unread_count == 0 {
+        "No unread notifications".to_owned()
+    } else if unread_count == 1 {
+        "1 unread notification".to_owned()
+    } else {
+        format!("{unread_count} unread notifications")
+    };
+    let mark_read = if unread_count > 0 {
+        format!(
+            r#"<form method="post" action="/notifications/read"><input type="hidden" name="csrf" value="{}"><button type="submit">Mark all as read</button></form>"#,
+            html_escape::encode_double_quoted_attribute(csrf)
+        )
+    } else {
+        r#"<span class="caught-up-pill">All caught up</span>"#.to_owned()
+    };
+    let header = format!(
+        r#"<section class="notifications-hero"><div><p class="eyebrow">Inbox</p><h1>Notifications</h1><p>{}</p></div>{}</section>"#,
+        html_escape::encode_text(&status),
+        mark_read
+    );
+    if notifications.is_empty() {
+        return format!(
+            "{}{}",
+            header,
+            empty_state(
+                "No notifications yet",
+                "Replies, likes, reposts, follows, and mentions will appear here."
+            )
+        );
+    }
+    let caught_up = if unread_count == 0 {
+        r#"<section class="notice success caught-up"><p>All caught up. Everything here has been read.</p></section>"#
+    } else {
+        ""
+    };
+    format!(
+        "{}{}<section class=\"notifications-list\" aria-label=\"Notifications\">{}</section>",
+        header,
+        caught_up,
+        grouped_notification_rows(notifications)
+    )
+}
+
+fn grouped_notification_rows(notifications: &[NotificationView]) -> String {
+    let mut current_group = "";
+    let mut html = String::new();
+    for notification in notifications {
+        let group = notification_group(notification);
+        if group != current_group {
+            current_group = group;
+            html.push_str(&format!(
+                r#"<h2 class="notification-group">{}</h2>"#,
+                html_escape::encode_text(group)
+            ));
+        }
+        html.push_str(&notification_row(notification));
+    }
+    html
+}
+
+fn notification_group(notification: &NotificationView) -> &'static str {
+    if notification.read_at.is_none() {
+        "New"
+    } else if is_today(&notification.created_at) {
+        "Today"
+    } else {
+        "Earlier"
+    }
+}
+
+fn notification_row(notification: &NotificationView) -> String {
+    let unread = notification.read_at.is_none();
+    let target = notification_target(notification);
+    let target_attrs = target.as_ref().map_or_else(String::new, |href| {
+        format!(
+            r#" data-card-href="{}" tabindex="0""#,
+            html_escape::encode_double_quoted_attribute(href)
+        )
+    });
+    let preview = notification_preview(notification, target.as_deref());
+    let unread_marker = if unread {
+        r#"<span class="unread-dot" aria-label="Unread"></span>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<article class="notification-row{}"{}><div class="notification-kind" aria-hidden="true">{}</div><div class="notification-body"><p class="notification-line">{} <span>{}</span></p>{}<p class="notification-meta"><time datetime="{}">{}</time></p></div>{}</article>"#,
+        if unread { " unread" } else { "" },
+        target_attrs,
+        html_escape::encode_text(notification_kind_label(&notification.kind)),
+        notification_actor(notification),
+        html_escape::encode_text(notification_action_text(&notification.kind)),
+        preview,
+        html_escape::encode_double_quoted_attribute(&notification.created_at),
+        html_escape::encode_text(&relative_time(&notification.created_at)),
+        unread_marker
+    )
+}
+
+fn notification_actor(notification: &NotificationView) -> String {
+    match (
+        notification.actor_username.as_deref(),
+        notification.actor_display_name.as_deref(),
+    ) {
+        (Some(username), display_name) => format!(
+            r#"<a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span>"#,
+            html_escape::encode_double_quoted_attribute(username),
+            html_escape::encode_text(display_name.unwrap_or(username)),
+            html_escape::encode_text(username)
+        ),
+        (None, _) if notification.actor_user_id.is_some() => "Deleted account".to_owned(),
+        _ => "Someone".to_owned(),
+    }
+}
+
+fn notification_preview(notification: &NotificationView, target: Option<&str>) -> String {
+    if notification.kind == "follow" {
+        return String::new();
+    }
+    let text = if notification.post_available {
+        notification
+            .post_text
+            .as_deref()
+            .map_or_else(|| "Post preview unavailable".to_owned(), snippet)
+    } else {
+        "Post is no longer available.".to_owned()
+    };
+    if notification.post_available
+        && let Some(target) = target
+    {
+        format!(
+            r#"<a class="notification-preview" href="{}">{}</a>"#,
+            html_escape::encode_double_quoted_attribute(target),
+            html_escape::encode_text(&text)
+        )
+    } else {
+        format!(
+            r#"<p class="notification-preview unavailable">{}</p>"#,
+            html_escape::encode_text(&text)
+        )
+    }
+}
+
+fn notification_target(notification: &NotificationView) -> Option<String> {
+    if notification.kind == "follow" {
+        return notification
+            .actor_username
+            .as_ref()
+            .map(|username| format!("/users/{username}"));
+    }
+    notification
+        .post_available
+        .then_some(notification.post_id)
+        .flatten()
+        .map(|post_id| format!("/posts/{post_id}"))
+}
+
+fn notification_action_text(kind: &str) -> &'static str {
+    match kind {
+        "reply" => "replied to your post",
+        "like" => "liked your post",
+        "repost" => "reposted your post",
+        "quote" => "quoted your post",
+        "follow" => "followed you",
+        "mention" => "mentioned you in a post",
+        _ => "sent you a notification",
+    }
+}
+
+fn notification_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "reply" => "R",
+        "like" => "L",
+        "repost" => "Re",
+        "quote" => "Q",
+        "follow" => "F",
+        "mention" => "@",
+        _ => "N",
+    }
+}
+
+fn snippet(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let limit = 160;
+    if compact.chars().count() <= limit {
+        compact
+    } else {
+        let mut value = compact.chars().take(limit).collect::<String>();
+        value.push_str("...");
+        value
+    }
+}
+
+fn is_today(created_at: &str) -> bool {
+    parse_timestamp(created_at)
+        .is_some_and(|created| created.date_naive() == Utc::now().date_naive())
+}
+
+fn relative_time(created_at: &str) -> String {
+    let Some(created) = parse_timestamp(created_at) else {
+        return created_at.to_owned();
+    };
+    let elapsed = Utc::now().signed_duration_since(created);
+    if elapsed.num_minutes() < 1 {
+        "just now".to_owned()
+    } else if elapsed.num_hours() < 1 {
+        let minutes = elapsed.num_minutes();
+        format!("{minutes}m ago")
+    } else if elapsed.num_days() < 1 {
+        let hours = elapsed.num_hours();
+        format!("{hours}h ago")
+    } else {
+        let days = elapsed.num_days();
+        format!("{days}d ago")
+    }
+}
+
+fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|timestamp| DateTime::from_naive_utc_and_offset(timestamp, Utc))
+}
+
 pub fn thread_back_control() -> String {
     r##"<div class="thread-nav"><a class="thread-back" href="/home" data-history-back aria-label="Back" title="Back"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M11 5 4 12l7 7 1.8-1.8L8.9 13H20v-2H8.9l3.9-4.2L11 5z"/></svg><span class="sr-only">Back</span></a></div>"##
         .to_owned()
@@ -1018,25 +1523,30 @@ const CSS: &str = r#"
 :root[data-theme="dark"]{color-scheme:dark;--bg:#111827;--surface:#182231;--surface-subtle:#1d2939;--surface-muted:#233044;--header-bg:rgba(17,24,39,.96);--text:#eef4fb;--text-strong:#f8fafc;--muted:#c3cfdd;--muted-strong:#d4deea;--border:#344256;--border-strong:#596b83;--link:#8fc7ff;--link-strong:#badcff;--brand:#4f8fc7;--brand-hover:#6aa8df;--brand-text:#06111f;--hover:#243349;--focus:#fbbf24;--shadow:rgba(0,0,0,.26);--reply-border:#4f6680;--avatar-bg:#243349;--danger:#ffb4a2;--danger-strong:#ffd2c7;--danger-bg:#3a2020;--danger-border:#8f4d43;--success-bg:#163321;--success-border:#4c8a61;--media-bg:#0f172a}
 *{box-sizing:border-box}body{margin:0;min-width:320px;color:var(--text);background:var(--bg)}a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
 .site-header{position:sticky;top:0;z-index:10;background:var(--header-bg);border-bottom:1px solid var(--border);backdrop-filter:blur(8px)}
-.header-inner{max-width:1120px;margin:0 auto;padding:.8rem 1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.header-inner{max-width:1180px;margin:0 auto;padding:.8rem 1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
 .brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:var(--text-strong)}.brand-mark{display:inline-grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--brand);color:var(--brand-text)}
-nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}nav a,nav button,.button-link{display:inline-flex;align-items:center;min-height:2.15rem;border-radius:7px;padding:.42rem .65rem;color:var(--link-strong);border:1px solid transparent;background:transparent}
-nav a:hover,.button-link:hover{background:var(--hover);text-decoration:none}nav form,.actions form{display:inline}
-main{padding:1.25rem}.content-shell{max-width:1120px;margin:0 auto;display:grid;grid-template-columns:minmax(0,720px) 280px;gap:1.25rem;align-items:start}.content-column{min-width:0}.side-panel{position:sticky;top:5rem;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem;color:var(--muted-strong)}.side-panel h2{margin:.1rem 0 .6rem;font-size:1rem;color:var(--text)}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:var(--text)}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:var(--text)}.dashboard-account:hover{text-decoration:none}.quick-links{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:1120px;margin:0 auto;padding:1rem;color:var(--muted);font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
+nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}nav a,nav button,.button-link{display:inline-flex;align-items:center;gap:.35rem;min-height:2.15rem;border-radius:7px;padding:.42rem .65rem;color:var(--link-strong);border:1px solid transparent;background:transparent}
+nav a:hover,nav button:hover,.button-link:hover{background:var(--hover);text-decoration:none}nav form,.actions form{display:inline}
+nav svg{width:1.05rem;height:1.05rem;fill:currentColor;flex:0 0 auto}
+.nav-badge{display:inline-grid;place-items:center;min-width:1.25rem;height:1.25rem;border-radius:999px;padding:0 .35rem;background:var(--brand);color:var(--brand-text);font-size:.78rem;font-weight:800;line-height:1}
+main{padding:1.25rem}.app-shell{width:min(100%,1180px);margin:0 auto;display:grid;grid-template-columns:220px minmax(0,640px) 260px;gap:1.25rem;align-items:start;justify-content:center}.primary-column{min-width:0;width:100%}.left-rail,.right-rail{min-width:0;position:sticky;top:5rem;display:grid;gap:.75rem}.side-rail-card,.rail-nav{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem;color:var(--muted-strong);box-shadow:0 1px 2px var(--shadow)}.side-rail-card h2{margin:.1rem 0 .6rem;font-size:1rem;color:var(--text)}.rail-nav{display:grid;gap:.25rem}.rail-nav a,.rail-nav button{width:100%;justify-content:flex-start}.rail-nav form{display:block}.mobile-nav{display:none}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:var(--text)}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:var(--text)}.dashboard-account:hover{text-decoration:none}.dashboard-actions{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:1180px;margin:0 auto;padding:1rem;color:var(--muted);font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:.85rem;box-shadow:0 1px 2px var(--shadow)}
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.panel h1+table,.panel h1+form,.panel h1+p,.panel h1+dl{margin-top:.85rem}.page-header p,.muted,.empty-state p{color:var(--muted);margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
+.notifications-hero{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:1rem;box-shadow:0 1px 2px var(--shadow);display:flex;align-items:center;justify-content:space-between;gap:1rem}.notifications-hero h1{margin:0;font-size:1.55rem;line-height:1.15}.notifications-hero p:not(.eyebrow){margin:.35rem 0 0;color:var(--muted-strong)}.caught-up-pill{display:inline-flex;align-items:center;min-height:2rem;border:1px solid var(--success-border);border-radius:999px;background:var(--success-bg);color:var(--text-strong);padding:.32rem .75rem;font-weight:800}.caught-up{padding:.75rem .85rem}.caught-up p{margin:0}.notifications-list{display:grid;gap:.5rem}.notification-group{margin:.8rem .15rem .2rem;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.notification-row{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:start;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.8rem;box-shadow:0 1px 2px var(--shadow)}.notification-row.unread{border-color:var(--border-strong);background:var(--surface-subtle)}.notification-row[data-card-href]{cursor:pointer}.notification-row[data-card-href]:hover{border-color:var(--border-strong);background:var(--hover)}.notification-kind{display:grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--surface-muted);color:var(--link-strong);font-weight:900;font-size:.8rem}.notification-row.unread .notification-kind{background:var(--brand);color:var(--brand-text)}.notification-body{min-width:0}.notification-line{margin:0;overflow-wrap:anywhere}.notification-meta{margin:.35rem 0 0;color:var(--muted);font-size:.88rem}.notification-preview{display:block;margin:.5rem 0 0;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle);color:var(--muted-strong);overflow-wrap:anywhere}.notification-preview:hover{background:var(--surface);text-decoration:none}.notification-preview.unavailable{border-style:dashed}.unread-dot{width:.65rem;height:.65rem;border-radius:999px;background:var(--brand);margin-top:.7rem}
 label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button,select{font:inherit}input[type=text],input[type=search],input[type=password],input[type=url],input:not([type]),textarea,select{width:100%;padding:.72rem .8rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text)}textarea{resize:vertical;min-height:7rem}::placeholder{color:var(--muted)}
 input[type=checkbox]{accent-color:var(--brand)}.check-row,.theme-toggle{display:flex;align-items:center;gap:.55rem;font-weight:700;color:var(--text)}.theme-toggle{padding:.65rem .75rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle)}.theme-toggle input{width:auto}
-input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{background:var(--surface);color:var(--link-strong);border-color:var(--border);min-width:4.5rem}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}
+input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{background:var(--surface);color:var(--link-strong);border-color:var(--border);min-width:4.5rem}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}.auth-form .field-help{margin:.15rem 0 .4rem;color:var(--muted-strong)}
 .search-panel h1{margin-bottom:.75rem}.search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center}.search-form input{min-width:0}.search-results{display:grid;gap:.65rem}.section-title{margin:.2rem 0 .65rem;font-size:1.05rem;color:var(--text)}.search-users{margin-bottom:0}.search-users .section-title{margin-top:0}.search-account{grid-template-columns:auto minmax(0,1fr)}
 input:focus,textarea:focus,select:focus,button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}button,.primary{border:1px solid var(--brand);background:var(--brand);color:var(--brand-text);border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:var(--brand-hover);text-decoration:none}
+nav button,.rail-nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.42rem .65rem}.rail-nav button:hover,.mobile-nav button:hover{background:var(--hover);color:var(--link-strong)}
 .composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:var(--link-strong);font-weight:700}.file-control input{max-width:15rem}
 .thread-nav{display:flex;margin:0 0 .45rem .85rem}.thread-back{width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:var(--link-strong)}.thread-back svg{width:1.2rem;height:1.2rem;fill:currentColor}.thread-back:hover{background:var(--hover);text-decoration:none}
 .timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.post[data-card-href]{cursor:pointer}.post[data-card-href]:hover{border-color:var(--border-strong)}.post[data-card-href]:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.reply-post{margin-left:1.1rem;border-left:4px solid var(--reply-border);background:var(--surface-subtle)}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid var(--reply-border)}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid var(--border);background:var(--avatar-bg);flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:var(--muted-strong);font-weight:800}.author-name{font-weight:800;color:var(--text-strong)}.username,.post-time,.counts{color:var(--muted);font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-top:.5rem;background:var(--media-bg)}.post img.post-avatar{display:block;margin:0;border-radius:999px}
-.counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.actions{display:flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}
+.counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.actions{display:inline-flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem;max-width:100%}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.repost-control{position:relative;display:inline-flex;align-items:center;gap:.25rem}.repost-menu{position:absolute;z-index:8;left:0;top:calc(100% + .25rem);min-width:8.5rem;padding:.3rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 6px 18px var(--shadow)}.repost-menu a,.quote-fallback{display:inline-flex;align-items:center;min-height:2rem;border-radius:6px;padding:.32rem .55rem;color:var(--link-strong);font-weight:700}.repost-menu a{width:100%}.repost-menu a:hover,.quote-fallback:hover{background:var(--hover);text-decoration:none}.quote-fallback{font-size:.88rem}.quote-preview{display:block;margin:.6rem 0 .25rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);overflow:hidden}.quote-preview p{margin:.65rem;color:var(--muted-strong)}.quote-link{display:grid;gap:.2rem;padding:.6rem;color:var(--text)}.quote-link:hover{background:var(--hover);text-decoration:none}.quote-author{font-weight:800}.quote-text{white-space:pre-wrap;overflow-wrap:anywhere}.quote-time{color:var(--muted);font-size:.86rem}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}
 .profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid var(--border);background:var(--surface-muted)}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:999px;border:3px solid var(--surface);background:var(--avatar-bg);flex:0 0 auto}.profile-meta{color:var(--muted-strong);margin:.45rem 0 0}.settings-profile-editor{padding:0;overflow:hidden}.settings-editor-bar{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.85rem;border-bottom:1px solid var(--border)}.settings-editor-bar h1{margin:0}.settings-editor-bar .primary{flex:0 0 auto}.settings-profile-form{padding:0 .85rem .85rem}.settings-profile-media{margin:0 -.85rem .85rem}.settings-banner-wrap{background:var(--media-bg)}.settings-banner-preview{display:block;width:100%;height:220px;object-fit:cover;background:linear-gradient(135deg,var(--surface-muted),var(--hover));border:0;border-radius:0}.settings-banner-preview.placeholder::before{content:"";display:block;width:100%;height:100%}.settings-picture-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:1rem;align-items:end;padding:0 .85rem .85rem;margin-top:-48px}.settings-picture-preview{width:112px;height:112px;object-fit:cover;border-radius:999px;border:5px solid var(--surface);background:var(--avatar-bg);box-shadow:0 1px 4px var(--shadow)}.settings-picture-preview.placeholder{display:block}.settings-media-controls{display:grid;gap:.5rem;align-content:end;padding-top:3.25rem}.media-control-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}.settings-fields{display:grid;gap:.25rem}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-panel{padding:0;overflow:hidden}.deep-settings-form{padding:.85rem;display:grid;gap:.85rem}.deep-settings-group{border:1px solid var(--border);border-radius:8px;padding:.8rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-group legend{font-weight:800;padding:0 .35rem}.deep-settings-field{display:grid;gap:.25rem;align-content:start}.deep-settings-field label{font-weight:800}.deep-settings-field input,.deep-settings-field select{min-width:0}.field-help{font-size:.88rem}.deep-settings-confirm .settings-item-list li{display:block}.compact-panel h2,.danger-panel h2{margin:0 0 .65rem;font-size:1.1rem}.inline-settings-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center;margin:.2rem 0 .75rem}.inline-settings-form input{min-width:0}.settings-password-form button[type=submit]{margin-top:.9rem}.settings-item-list{list-style:none;margin:.25rem 0 0;padding:0;display:grid;gap:.45rem}.settings-item-list li{display:flex;justify-content:space-between;align-items:center;gap:.75rem;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle)}.settings-item-list form{flex:0 0 auto}.settings-item-list button{padding:.32rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border)}.compact-empty{border:1px dashed var(--border);border-radius:7px;padding:.75rem;background:var(--surface-subtle);color:var(--muted-strong)}.compact-empty p{margin:.25rem 0 0}.danger-panel{border-color:var(--danger-border);background:var(--danger-bg)}.danger,.danger-link{border-color:var(--danger-border);background:var(--danger);color:var(--brand-text)}.danger:hover,.danger-link:hover{background:var(--danger-strong);color:var(--brand-text);text-decoration:none}.delete-account-panel p{max-width:62ch}.favicon-preview{width:32px;height:32px;object-fit:contain;border:1px solid var(--border);border-radius:6px;background:var(--surface)}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--border);text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
-@media (max-width:900px){.content-shell{grid-template-columns:1fr}.side-panel{position:static;display:none}}
-@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-item-list li{align-items:stretch;flex-direction:column}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1{font-size:1.25rem}}
+@media (max-width:1100px){.app-shell{grid-template-columns:200px minmax(0,640px)}.right-rail{display:none}}
+@media (max-width:820px){.app-shell{grid-template-columns:minmax(0,680px)}.left-rail,.right-rail{display:none}.mobile-nav{display:flex}}
+@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.mobile-nav{width:100%}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar,.notifications-hero{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-item-list li{align-items:stretch;flex-direction:column}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1,.notifications-hero h1{font-size:1.25rem}.notification-row{grid-template-columns:auto minmax(0,1fr);gap:.6rem}.unread-dot{position:absolute;right:.75rem;top:.75rem;margin:0}.notification-preview{padding:.5rem}}
 "#;
 
 #[cfg(test)]
@@ -1077,6 +1587,70 @@ mod tests {
     }
 
     #[test]
+    fn register_form_uses_configured_password_length() {
+        let body = register_form(None, 5);
+
+        assert!(body.contains(r#"minlength="5" required"#));
+        assert!(body.contains("Password must be at least 5 characters."));
+        assert!(body.contains(r#"aria-describedby="password-requirement""#));
+        assert!(body.contains(r#"aria-describedby="confirm-password-requirement""#));
+        assert!(!body.contains(r#"minlength="10""#));
+    }
+
+    #[test]
+    fn login_form_shows_configured_password_requirement() {
+        let body = login_form(None, 12);
+
+        assert!(body.contains("Password must be at least 12 characters."));
+        assert!(body.contains(r#"minlength="12" required"#));
+        assert!(body.contains(r#"aria-describedby="password-requirement""#));
+    }
+
+    #[test]
+    fn password_fields_allow_empty_when_minimum_is_zero() {
+        let body = register_form(None, 0);
+
+        assert!(!body.contains("minlength="));
+        assert!(!body.contains(r#"autocomplete="new-password" required"#));
+        assert!(body.contains("No minimum password length is currently required."));
+    }
+
+    #[test]
+    fn signed_in_left_rail_contains_navigation_only() {
+        let user = CurrentUser {
+            id: 1,
+            username: "ada".to_owned(),
+            display_name: "Ada Lovelace".to_owned(),
+            is_admin: false,
+            is_suspended: false,
+            theme: Theme::Light,
+        };
+        let body = layout_with_csrf(
+            Some(&user),
+            Some("csrf"),
+            "Home Feed",
+            "<p>body</p>",
+            "RustPost",
+        );
+        let left_rail = body
+            .split_once(r#"<aside class="left-rail" data-testid="left-rail">"#)
+            .and_then(|(_, rest)| rest.split_once("</aside>"))
+            .map(|(panel, _)| panel)
+            .expect("left rail");
+
+        assert!(left_rail.contains("Home Feed"));
+        assert!(left_rail.contains("Following"));
+        assert!(left_rail.contains("Search"));
+        assert!(left_rail.contains("Notifications"));
+        assert!(left_rail.contains("Bookmarks"));
+        assert!(left_rail.contains("Profile"));
+        assert!(left_rail.contains("Log out"));
+        assert!(!left_rail.contains("Signed in"));
+        assert!(!left_rail.contains("Ada Lovelace"));
+        assert!(!left_rail.contains("rail-account"));
+    }
+
+    #[test]
     fn dashboard_uses_account_link_without_duplicate_feed_links_or_onion() {
         let user = CurrentUser {
             id: 1,
@@ -1101,14 +1675,22 @@ mod tests {
         );
 
         let dashboard = body
-            .split_once(r#"<aside class="side-panel">"#)
+            .split_once(r#"<aside class="right-rail" data-testid="right-rail">"#)
             .and_then(|(_, rest)| rest.split_once("</aside>"))
             .map(|(panel, _)| panel)
             .expect("dashboard panel");
         assert!(dashboard.contains(r#"href="/users/ada""#));
         assert!(dashboard.contains("Ada Lovelace"));
+        assert!(dashboard.contains(r#"href="/users/ada/followers""#));
+        assert!(dashboard.contains(r#"aria-label="View followers for Ada Lovelace""#));
+        assert!(dashboard.contains(">2 followers</a>"));
+        assert!(dashboard.contains(r#"href="/users/ada/following""#));
+        assert!(dashboard.contains(r#"aria-label="View users Ada Lovelace follows""#));
+        assert!(dashboard.contains(">3 following</a>"));
+        assert!(dashboard.contains(r#"<a class="button-link" href="/settings">Settings</a>"#));
         assert!(!dashboard.contains(r#"href="/home">Home Feed"#));
         assert!(!dashboard.contains(r#"href="/following">Following"#));
+        assert!(!dashboard.contains("quick-links"));
         assert!(!dashboard.contains("examplehiddenservice.onion"));
     }
 
@@ -1142,9 +1724,10 @@ mod tests {
 
     #[test]
     fn composer_has_live_remaining_counter_without_placeholder() {
-        let body = composer(Some("csrf"), Some(10));
-        assert!(body.contains("280 remaining"));
-        assert!(body.contains("data-character-limit=\"280\""));
+        let body = composer(Some("csrf"), Some(10), 512);
+        assert!(body.contains("512 remaining"));
+        assert!(body.contains("data-character-limit=\"512\""));
+        assert!(body.contains("maxlength=\"512\""));
         assert!(body.contains("What is happening?"));
         assert!(!body.contains("placeholder="));
     }
@@ -1272,9 +1855,9 @@ mod tests {
         post.viewer_can_repost = true;
         let body = post_card(&post, Some(&user), Some("csrf"));
 
-        assert!(
-            body.contains(r#"<div class="actions"><form method="post" action="/posts/42/like""#)
-        );
+        assert!(body.contains(
+            r#"<div class="actions" data-testid="post-actions"><form method="post" action="/posts/42/like""#
+        ));
         let like = body
             .find(r#"data-action-kind="like""#)
             .expect("like action");
@@ -1288,6 +1871,69 @@ mod tests {
         assert!(like < repost);
         assert!(repost < reply);
         assert!(reply < bookmark);
+    }
+
+    #[test]
+    fn repost_action_exposes_quote_menu_and_fallback() {
+        let user = CurrentUser {
+            id: 1,
+            username: "ada".to_owned(),
+            display_name: "Ada".to_owned(),
+            is_admin: false,
+            is_suspended: false,
+            theme: Theme::Light,
+        };
+        let mut post = test_post();
+        post.user_id = Some(2);
+        post.viewer_can_repost = true;
+
+        let body = post_card(&post, Some(&user), Some("csrf"));
+
+        assert!(body.contains("data-repost-menu-button"));
+        assert!(body.contains(r#"aria-haspopup="menu""#));
+        assert!(body.contains(r#"role="menu""#));
+        assert!(body.contains(r#"href="/posts/42/quote">Quote post</a>"#));
+        assert!(body.contains(r#"class="quote-fallback" href="/posts/42/quote">Quote</a>"#));
+    }
+
+    #[test]
+    fn quote_repost_renders_embedded_original_preview() {
+        let mut post = test_post();
+        post.text = "my quote".to_owned();
+        post.quote = Some(QuotePreview {
+            id: 7,
+            username: Some("bob".to_owned()),
+            display_name: Some("Bob".to_owned()),
+            anonymous_label: None,
+            text: "original post".to_owned(),
+            created_at: "2026-05-18 10:00".to_owned(),
+            unavailable: false,
+        });
+
+        let body = post_card(&post, None, None);
+
+        assert!(body.contains(r#"class="quote-preview""#));
+        assert!(body.contains(r#"href="/posts/7""#));
+        assert!(body.contains("original post"));
+        assert!(body.contains("@bob"));
+    }
+
+    #[test]
+    fn quote_repost_renders_unavailable_original_preview() {
+        let mut post = test_post();
+        post.quote = Some(QuotePreview {
+            id: 7,
+            username: None,
+            display_name: None,
+            anonymous_label: None,
+            text: String::new(),
+            created_at: String::new(),
+            unavailable: true,
+        });
+
+        let body = post_card(&post, None, None);
+
+        assert!(body.contains("Quoted post is no longer available."));
     }
 
     fn test_post() -> PostView {
@@ -1316,6 +1962,7 @@ mod tests {
             reposted_by_username: None,
             reposted_by_display_name: None,
             reposted_at: None,
+            quote: None,
             media: Vec::new(),
         }
     }
