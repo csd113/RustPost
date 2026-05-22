@@ -238,13 +238,29 @@ pub fn login_form(message: Option<&str>, min_password_length: usize) -> String {
     )
 }
 
-pub fn register_form(message: Option<&str>, min_password_length: usize) -> String {
+pub fn register_form(
+    message: Option<&str>,
+    min_password_length: usize,
+    captcha: Option<&crate::registration_captcha::RegistrationCaptchaChallenge>,
+) -> String {
     let notice = message.map_or_else(String::new, |message| notice("error", message));
     let hint = password_requirement_hint(min_password_length);
     let password_attrs = password_length_attrs(min_password_length, "password-requirement");
     let confirm_attrs = password_length_attrs(min_password_length, "confirm-password-requirement");
+    let captcha_html = captcha.map_or_else(String::new, register_captcha_fields);
     format!(
-        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="new-password"{password_attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><p class="field-help" id="confirm-password-requirement">{hint}</p><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"{confirm_attrs}><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div><button class="auth-submit" type="submit">Create account</button></form></section>"#
+        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="new-password"{password_attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><p class="field-help" id="confirm-password-requirement">{hint}</p><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"{confirm_attrs}><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div>{captcha_html}<button class="auth-submit" type="submit">Create account</button></form></section>"#
+    )
+}
+
+fn register_captcha_fields(
+    captcha: &crate::registration_captcha::RegistrationCaptchaChallenge,
+) -> String {
+    format!(
+        r#"<fieldset class="captcha-challenge"><legend>Registration CAPTCHA</legend><input type="hidden" name="captcha_token" value="{}"><img class="captcha-image" src="{}" alt="CAPTCHA challenge image"><label for="captcha_answer">CAPTCHA answer</label><p class="field-help" id="captcha-help">Enter the characters shown in the image. The challenge expires in {} minutes. If it is hard to read, reload this page for a new challenge.</p><input id="captcha_answer" name="captcha_answer" autocomplete="off" autocapitalize="characters" spellcheck="false" required aria-describedby="captcha-help"></fieldset>"#,
+        html_escape::encode_double_quoted_attribute(&captcha.token),
+        html_escape::encode_double_quoted_attribute(&captcha.image_data_uri),
+        captcha.expires_minutes,
     )
 }
 
@@ -1622,7 +1638,7 @@ mod tests {
 
     #[test]
     fn register_form_uses_configured_password_length() {
-        let body = register_form(None, 5);
+        let body = register_form(None, 5, None);
 
         assert!(body.contains(r#"minlength="5" required"#));
         assert!(body.contains("Password must be at least 5 characters."));
@@ -1642,11 +1658,28 @@ mod tests {
 
     #[test]
     fn password_fields_allow_empty_when_minimum_is_zero() {
-        let body = register_form(None, 0);
+        let body = register_form(None, 0, None);
 
         assert!(!body.contains("minlength="));
         assert!(!body.contains(r#"autocomplete="new-password" required"#));
         assert!(body.contains("No minimum password length is currently required."));
+    }
+
+    #[test]
+    fn register_form_renders_optional_captcha_fields() {
+        let captcha = crate::registration_captcha::RegistrationCaptchaChallenge {
+            token: "token-1".to_owned(),
+            image_data_uri: "data:image/png;base64,abc".to_owned(),
+            expires_minutes: 10,
+            answer: "ABCDE".to_owned(),
+        };
+
+        let body = register_form(None, 10, Some(&captcha));
+
+        assert!(body.contains("<legend>Registration CAPTCHA</legend>"));
+        assert!(body.contains(r#"name="captcha_token" value="token-1""#));
+        assert!(body.contains(r#"id="captcha_answer" name="captcha_answer""#));
+        assert!(body.contains("The challenge expires in 10 minutes."));
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub mod ffmpeg;
 pub mod logging;
 pub mod media;
 pub mod rate_limit;
+pub mod registration_captcha;
 pub mod render;
 pub mod runtime;
 pub mod server;

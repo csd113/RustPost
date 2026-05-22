@@ -219,6 +219,16 @@ name = "RustPost"
 
 Changing `site.name` updates the rendered browser title, header brand, footer, and user-facing site copy. Binary names, package names, cookie names, and data paths remain `rustpost` for compatibility.
 
+### Account creation
+
+```toml
+[accounts]
+registration_enabled = true
+registration_captcha_enabled = false
+```
+
+`registration_captcha_enabled` adds a single-use CAPTCHA challenge to registration only. Login is unchanged.
+
 ### Clearnet only (default)
 
 ```toml

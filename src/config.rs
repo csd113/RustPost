@@ -42,6 +42,8 @@ pub struct ServerSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSettings {
     pub registration_enabled: bool,
+    #[serde(default)]
+    pub registration_captcha_enabled: bool,
     pub anonymous_mode_enabled: bool,
     pub min_password_length: usize,
     pub max_username_len: usize,
@@ -126,6 +128,7 @@ impl Default for Settings {
             },
             accounts: AccountSettings {
                 registration_enabled: true,
+                registration_captcha_enabled: false,
                 anonymous_mode_enabled: false,
                 min_password_length: 10,
                 max_username_len: 32,
@@ -278,6 +281,9 @@ trusted_proxy_cidrs = {trusted_proxy_cidrs}
 [accounts]
 # Allow visitors to create accounts from the web UI.
 registration_enabled = {registration_enabled}
+
+# Require a CAPTCHA challenge on account creation. Login is not affected.
+registration_captcha_enabled = {registration_captcha_enabled}
 
 # Allow posting without accounts. Rate limits are keyed by client IP.
 anonymous_mode_enabled = {anonymous_mode_enabled}
@@ -449,6 +455,7 @@ backup_dir = {backup_dir}
         cookie_secure = settings.server.cookie_secure,
         trusted_proxy_cidrs = toml_string_array(&settings.server.trusted_proxy_cidrs),
         registration_enabled = settings.accounts.registration_enabled,
+        registration_captcha_enabled = settings.accounts.registration_captcha_enabled,
         anonymous_mode_enabled = settings.accounts.anonymous_mode_enabled,
         min_password_length = settings.accounts.min_password_length,
         max_username_len = settings.accounts.max_username_len,
@@ -622,6 +629,7 @@ mod tests {
 
             [accounts]
             registration_enabled = true
+            registration_captcha_enabled = false
             anonymous_mode_enabled = false
             min_password_length = 10
             max_username_len = 32
@@ -683,9 +691,27 @@ mod tests {
         )
         .expect("settings without site");
         assert_eq!(settings.site.name, "RustPost");
+        assert!(!settings.accounts.registration_captcha_enabled);
 
         let mut settings = Settings::default();
         settings.site.name = " Custom".to_owned();
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn registration_captcha_defaults_disabled_when_missing() {
+        let generated = default_settings_toml();
+        let without_captcha = generated
+            .lines()
+            .filter(|line| {
+                !line
+                    .trim_start()
+                    .starts_with("registration_captcha_enabled")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let settings: Settings = toml::from_str(&without_captcha).expect("legacy settings parse");
+
+        assert!(!settings.accounts.registration_captcha_enabled);
     }
 }

@@ -28,6 +28,7 @@ pub struct DeepSettingsForm {
     pub allow_hashtags: String,
     pub allow_mentions: String,
     pub registration_enabled: String,
+    pub registration_captcha_enabled: String,
     pub anonymous_mode_enabled: String,
     pub min_password_length: String,
     pub max_username_len: String,
@@ -53,6 +54,7 @@ pub enum DeepSettingsField {
     AllowHashtags,
     AllowMentions,
     RegistrationEnabled,
+    RegistrationCaptchaEnabled,
     AnonymousModeEnabled,
     MinPasswordLength,
     MaxUsernameLen,
@@ -85,6 +87,7 @@ pub struct DeepSettingsValues {
     pub allow_hashtags: bool,
     pub allow_mentions: bool,
     pub registration_enabled: bool,
+    pub registration_captcha_enabled: bool,
     pub anonymous_mode_enabled: bool,
     pub min_password_length: usize,
     pub max_username_len: usize,
@@ -104,7 +107,7 @@ pub struct DeepSettingsChange {
 }
 
 impl DeepSettingsField {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::SiteName,
         Self::MaxTextChars,
         Self::MaxImagesPerPost,
@@ -117,6 +120,7 @@ impl DeepSettingsField {
         Self::AllowHashtags,
         Self::AllowMentions,
         Self::RegistrationEnabled,
+        Self::RegistrationCaptchaEnabled,
         Self::AnonymousModeEnabled,
         Self::MinPasswordLength,
         Self::MaxUsernameLen,
@@ -143,6 +147,7 @@ impl DeepSettingsField {
             | Self::AllowHashtags
             | Self::AllowMentions => "Posts",
             Self::RegistrationEnabled
+            | Self::RegistrationCaptchaEnabled
             | Self::AnonymousModeEnabled
             | Self::MinPasswordLength
             | Self::MaxUsernameLen
@@ -169,6 +174,7 @@ impl DeepSettingsField {
             | Self::AllowHashtags
             | Self::AllowMentions => "posts",
             Self::RegistrationEnabled
+            | Self::RegistrationCaptchaEnabled
             | Self::AnonymousModeEnabled
             | Self::MinPasswordLength
             | Self::MaxUsernameLen
@@ -195,6 +201,7 @@ impl DeepSettingsField {
             Self::AllowHashtags => "allow_hashtags",
             Self::AllowMentions => "allow_mentions",
             Self::RegistrationEnabled => "registration_enabled",
+            Self::RegistrationCaptchaEnabled => "registration_captcha_enabled",
             Self::AnonymousModeEnabled => "anonymous_mode_enabled",
             Self::MinPasswordLength => "min_password_length",
             Self::MaxUsernameLen => "max_username_len",
@@ -222,6 +229,7 @@ impl DeepSettingsField {
             Self::AllowHashtags => "allow_hashtags",
             Self::AllowMentions => "allow_mentions",
             Self::RegistrationEnabled => "registration_enabled",
+            Self::RegistrationCaptchaEnabled => "registration_captcha_enabled",
             Self::AnonymousModeEnabled => "anonymous_mode_enabled",
             Self::MinPasswordLength => "min_password_length",
             Self::MaxUsernameLen => "max_username_len",
@@ -249,6 +257,7 @@ impl DeepSettingsField {
             Self::AllowHashtags => "Allow hashtags",
             Self::AllowMentions => "Allow mentions",
             Self::RegistrationEnabled => "Registration enabled",
+            Self::RegistrationCaptchaEnabled => "Registration CAPTCHA enabled",
             Self::AnonymousModeEnabled => "Anonymous posting enabled",
             Self::MinPasswordLength => "Minimum password length",
             Self::MaxUsernameLen => "Maximum username length",
@@ -273,6 +282,7 @@ impl DeepSettingsField {
                 Some("Attachments per post.")
             }
             Self::MinPasswordLength => Some("Characters. Recommended default is 10."),
+            Self::RegistrationCaptchaEnabled => Some("Requires a CAPTCHA on registration only."),
             Self::MaxImageSizeMb | Self::MaxVideoSizeMb => Some("MB."),
             _ => None,
         }
@@ -289,6 +299,7 @@ impl DeepSettingsField {
             | Self::AllowHashtags
             | Self::AllowMentions
             | Self::RegistrationEnabled
+            | Self::RegistrationCaptchaEnabled
             | Self::AnonymousModeEnabled
             | Self::AllowProfileBanners
             | Self::AllowProfilePictures => DeepSettingsInputKind::Boolean,
@@ -313,6 +324,7 @@ impl DeepSettingsValues {
             allow_hashtags: settings.posts.allow_hashtags,
             allow_mentions: settings.posts.allow_mentions,
             registration_enabled: settings.accounts.registration_enabled,
+            registration_captcha_enabled: settings.accounts.registration_captcha_enabled,
             anonymous_mode_enabled: settings.accounts.anonymous_mode_enabled,
             min_password_length: settings.accounts.min_password_length,
             max_username_len: settings.accounts.max_username_len,
@@ -340,6 +352,9 @@ impl DeepSettingsValues {
             DeepSettingsField::AllowHashtags => self.allow_hashtags.to_string(),
             DeepSettingsField::AllowMentions => self.allow_mentions.to_string(),
             DeepSettingsField::RegistrationEnabled => self.registration_enabled.to_string(),
+            DeepSettingsField::RegistrationCaptchaEnabled => {
+                self.registration_captcha_enabled.to_string()
+            }
             DeepSettingsField::AnonymousModeEnabled => self.anonymous_mode_enabled.to_string(),
             DeepSettingsField::MinPasswordLength => self.min_password_length.to_string(),
             DeepSettingsField::MaxUsernameLen => self.max_username_len.to_string(),
@@ -383,6 +398,7 @@ impl DeepSettingsValues {
         updated.posts.allow_hashtags = self.allow_hashtags;
         updated.posts.allow_mentions = self.allow_mentions;
         updated.accounts.registration_enabled = self.registration_enabled;
+        updated.accounts.registration_captcha_enabled = self.registration_captcha_enabled;
         updated.accounts.anonymous_mode_enabled = self.anonymous_mode_enabled;
         updated.accounts.min_password_length = self.min_password_length;
         updated.accounts.max_username_len = self.max_username_len;
@@ -424,6 +440,10 @@ pub fn parse_deep_settings_form(
         registration_enabled: parse_bool(
             &form.registration_enabled,
             DeepSettingsField::RegistrationEnabled,
+        )?,
+        registration_captcha_enabled: parse_bool(
+            &form.registration_captcha_enabled,
+            DeepSettingsField::RegistrationCaptchaEnabled,
         )?,
         anonymous_mode_enabled: parse_bool(
             &form.anonymous_mode_enabled,
@@ -643,6 +663,9 @@ fn toml_value(field: DeepSettingsField, settings: &Settings) -> String {
         DeepSettingsField::AllowMentions => settings.posts.allow_mentions.to_string(),
         DeepSettingsField::RegistrationEnabled => {
             settings.accounts.registration_enabled.to_string()
+        }
+        DeepSettingsField::RegistrationCaptchaEnabled => {
+            settings.accounts.registration_captcha_enabled.to_string()
         }
         DeepSettingsField::AnonymousModeEnabled => {
             settings.accounts.anonymous_mode_enabled.to_string()
@@ -1272,6 +1295,7 @@ mod tests {
             allow_hashtags: values.allow_hashtags.to_string(),
             allow_mentions: values.allow_mentions.to_string(),
             registration_enabled: values.registration_enabled.to_string(),
+            registration_captcha_enabled: values.registration_captcha_enabled.to_string(),
             anonymous_mode_enabled: values.anonymous_mode_enabled.to_string(),
             min_password_length: values.min_password_length.to_string(),
             max_username_len: values.max_username_len.to_string(),

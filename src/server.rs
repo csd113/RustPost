@@ -20,6 +20,7 @@ use crate::config::Settings;
 use crate::db::SqlitePool;
 use crate::errors::{AppError, AppResult};
 use crate::ffmpeg::FfmpegStatus;
+use crate::registration_captcha::RegistrationCaptchaStore;
 use crate::runtime::RuntimePaths;
 use crate::{account, admin, backup, csrf, favicon, media, rate_limit, render, social};
 
@@ -32,6 +33,7 @@ pub struct AppState {
     pub paths: RuntimePaths,
     pub ffmpeg: FfmpegStatus,
     pub tor: crate::tor::TorStatus,
+    pub registration_captcha: RegistrationCaptchaStore,
 }
 
 impl AppState {
@@ -49,6 +51,7 @@ impl AppState {
             paths,
             ffmpeg,
             tor,
+            registration_captcha: RegistrationCaptchaStore::default(),
         })
     }
 }
@@ -171,6 +174,8 @@ struct RegisterForm {
     username: String,
     password: String,
     confirm_password: Option<String>,
+    captcha_token: Option<String>,
+    captcha_answer: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -428,7 +433,7 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
     if !state.settings.accounts.registration_enabled {
         return Err(AppError::Forbidden);
     }
-    let body = render::register_form(None, state.settings.accounts.min_password_length);
+    let body = register_form_body(&state, None).await?;
     Ok(Html(
         page_layout(&state, None, None, "Register", &body).await?,
     ))
@@ -461,6 +466,17 @@ async fn register(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
+    if state.settings.accounts.registration_captcha_enabled
+        && let Err(err) = state
+            .registration_captcha
+            .validate(
+                form.captcha_token.as_deref(),
+                form.captcha_answer.as_deref(),
+            )
+            .await
+    {
+        return register_form_response(&state, StatusCode::BAD_REQUEST, err.message()).await;
+    }
     let user_id = match auth::register_user(
         &state.pool,
         &state.settings,
@@ -520,12 +536,25 @@ async fn register_form_response(
     status: StatusCode,
     message: &str,
 ) -> AppResult<Response> {
-    let body = render::register_form(Some(message), state.settings.accounts.min_password_length);
+    let body = register_form_body(state, Some(message)).await?;
     Ok((
         status,
         Html(page_layout(state, None, None, "Register", &body).await?),
     )
         .into_response())
+}
+
+async fn register_form_body(state: &AppState, message: Option<&str>) -> AppResult<String> {
+    let captcha = if state.settings.accounts.registration_captcha_enabled {
+        Some(state.registration_captcha.create_challenge().await?)
+    } else {
+        None
+    };
+    Ok(render::register_form(
+        message,
+        state.settings.accounts.min_password_length,
+        captcha.as_ref(),
+    ))
 }
 
 async fn logout(
@@ -3246,6 +3275,7 @@ mod tests {
         base_url: String,
         data_dir: PathBuf,
         pool: SqlitePool,
+        registration_captcha: RegistrationCaptchaStore,
         _task: tokio::task::JoinHandle<()>,
         _temp: tempfile::TempDir,
     }
@@ -3908,6 +3938,155 @@ mod tests {
         .await;
         assert_eq!(missing.status, 400);
         assert!(missing.body.contains("please confirm your password"));
+    }
+
+    #[tokio::test]
+    async fn registration_captcha_disabled_by_default_preserves_registration_flow() {
+        let server = spawn_test_server().await;
+
+        let page = request(&server.base_url, "GET", "/register", &[], Vec::new()).await;
+        assert_eq!(page.status, 200);
+        assert!(!page.body.contains("Registration CAPTCHA"));
+        assert!(!page.body.contains(r#"name="captcha_answer""#));
+
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=no-captcha&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+    }
+
+    #[tokio::test]
+    async fn registration_captcha_rejects_missing_wrong_expired_and_reused_answers() {
+        let mut settings = Settings::default();
+        settings.accounts.registration_captcha_enabled = true;
+        settings.moderation.account_creations_per_ip_per_day = 20;
+        let server = spawn_test_server_with_settings(settings).await;
+
+        let page = request(&server.base_url, "GET", "/register", &[], Vec::new()).await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("Registration CAPTCHA"));
+        assert!(page.body.contains(r#"name="captcha_token""#));
+        assert!(page.body.contains(r#"name="captcha_answer""#));
+        assert!(page.body.contains("data:image/png;base64,"));
+
+        let missing = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=missing-captcha&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(missing.status, 400);
+        assert!(missing.body.contains("CAPTCHA challenge is missing"));
+        assert!(missing.body.contains("Registration CAPTCHA"));
+
+        let wrong_challenge = server
+            .registration_captcha
+            .create_challenge()
+            .await
+            .expect("captcha");
+        let wrong = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            registration_body("wrong-captcha", Some(&wrong_challenge.token), Some("WRONG")),
+        )
+        .await;
+        assert_eq!(wrong.status, 400);
+        assert!(wrong.body.contains("CAPTCHA answer was incorrect"));
+        assert!(!wrong.body.contains(&wrong_challenge.answer));
+
+        let reused_after_wrong = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            registration_body(
+                "reused-after-wrong",
+                Some(&wrong_challenge.token),
+                Some(&wrong_challenge.answer),
+            ),
+        )
+        .await;
+        assert_eq!(reused_after_wrong.status, 400);
+        assert!(
+            reused_after_wrong
+                .body
+                .contains("expired or was already used")
+        );
+
+        let expired_challenge = server
+            .registration_captcha
+            .create_challenge()
+            .await
+            .expect("captcha");
+        server
+            .registration_captcha
+            .expire_for_test(&expired_challenge.token)
+            .await;
+        let expired = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            registration_body(
+                "expired-captcha",
+                Some(&expired_challenge.token),
+                Some(&expired_challenge.answer),
+            ),
+        )
+        .await;
+        assert_eq!(expired.status, 400);
+        assert!(expired.body.contains("expired or was already used"));
+    }
+
+    #[tokio::test]
+    async fn registration_captcha_accepts_correct_answer_once() {
+        let mut settings = Settings::default();
+        settings.accounts.registration_captcha_enabled = true;
+        settings.moderation.account_creations_per_ip_per_day = 20;
+        let server = spawn_test_server_with_settings(settings).await;
+        let challenge = server
+            .registration_captcha
+            .create_challenge()
+            .await
+            .expect("captcha");
+
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            registration_body(
+                "captcha-ok",
+                Some(&challenge.token),
+                Some(&challenge.answer.to_lowercase()),
+            ),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+
+        let reused = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            registration_body(
+                "captcha-reused",
+                Some(&challenge.token),
+                Some(&challenge.answer),
+            ),
+        )
+        .await;
+        assert_eq!(reused.status, 400);
+        assert!(reused.body.contains("expired or was already used"));
     }
 
     #[tokio::test]
@@ -4991,6 +5170,11 @@ mod tests {
         assert!(response.body.contains("<legend>Accounts</legend>"));
         assert!(response.body.contains("<legend>Media limits</legend>"));
         assert!(response.body.contains(r#"name="allow_reposts""#));
+        assert!(
+            response
+                .body
+                .contains(r#"name="registration_captcha_enabled""#)
+        );
         assert!(response.body.contains("<select"));
         assert!(response.body.contains(r#"name="max_bio_len" type="text""#));
     }
@@ -5126,7 +5310,11 @@ mod tests {
             deep_settings_form_body(
                 &csrf,
                 "confirm",
-                &[("max_bio_len", "300"), ("allow_profile_pictures", "false")],
+                &[
+                    ("max_bio_len", "300"),
+                    ("allow_profile_pictures", "false"),
+                    ("registration_captcha_enabled", "true"),
+                ],
             ),
         )
         .await;
@@ -5136,6 +5324,7 @@ mod tests {
         assert!(response.body.contains("Settings saved successfully"));
         assert_eq!(saved.accounts.max_bio_len, 300);
         assert!(!saved.accounts.allow_profile_pictures);
+        assert!(saved.accounts.registration_captcha_enabled);
 
         let fresh = request(
             &server.base_url,
@@ -5729,14 +5918,18 @@ mod tests {
     }
 
     async fn spawn_test_server() -> TestServer {
-        spawn_test_server_inner(false).await
+        spawn_test_server_inner(false, Settings::default()).await
     }
 
     async fn spawn_test_server_with_admin() -> TestServer {
-        spawn_test_server_inner(true).await
+        spawn_test_server_inner(true, Settings::default()).await
     }
 
-    async fn spawn_test_server_inner(create_admin: bool) -> TestServer {
+    async fn spawn_test_server_with_settings(settings: Settings) -> TestServer {
+        spawn_test_server_inner(false, settings).await
+    }
+
+    async fn spawn_test_server_inner(create_admin: bool, settings: Settings) -> TestServer {
         let temp = tempfile::tempdir().expect("temp dir");
         let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf());
         paths.ensure().expect("paths");
@@ -5746,7 +5939,6 @@ mod tests {
             .await
             .expect("connect");
         crate::db::migrate(&pool).await.expect("migrate");
-        let settings = Settings::default();
         if create_admin {
             crate::admin::create_admin(&pool, &settings, "siteowner", "very secure password")
                 .await
@@ -5760,7 +5952,9 @@ mod tests {
             error: Some("disabled in tests".to_owned()),
         };
         let tor = crate::tor::validate_startup(&settings.tor);
-        let app = router(AppState::new(pool.clone(), settings, paths, ffmpeg, tor));
+        let state = AppState::new(pool.clone(), settings, paths, ffmpeg, tor);
+        let registration_captcha = state.registration_captcha.clone();
+        let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -5777,6 +5971,7 @@ mod tests {
             base_url: format!("127.0.0.1:{}", addr.port()),
             data_dir,
             pool,
+            registration_captcha,
             _task: task,
             _temp: temp,
         }
@@ -5923,6 +6118,30 @@ mod tests {
                     |(_, value)| (*value).to_owned(),
                 );
             pairs.push((field.form_name().to_owned(), value));
+        }
+        pairs
+            .iter()
+            .map(|(name, value)| format!("{}={}", form_encode(name), form_encode(value)))
+            .collect::<Vec<_>>()
+            .join("&")
+            .into_bytes()
+    }
+
+    fn registration_body(
+        username: &str,
+        captcha_token: Option<&str>,
+        captcha_answer: Option<&str>,
+    ) -> Vec<u8> {
+        let mut pairs = vec![
+            ("username", username),
+            ("password", "very secure password"),
+            ("confirm_password", "very secure password"),
+        ];
+        if let Some(token) = captcha_token {
+            pairs.push(("captcha_token", token));
+        }
+        if let Some(answer) = captcha_answer {
+            pairs.push(("captcha_answer", answer));
         }
         pairs
             .iter()
