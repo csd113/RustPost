@@ -3144,6 +3144,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "flate2",
  "futures-util",
  "html-escape",
  "http-body-util",

@@ -74,6 +74,7 @@ This repository is a **production-oriented MVP** — not a toy, but not overengi
 | Backups | Tar archive of DB + settings + media + optional Tor keys |
 | Restore | Path validation rejects traversal, symlinks, absolute paths, and Unicode bypass attempts |
 | Admin dashboard | Site health, users, media jobs, conversion state, and backup management |
+| HTTP compression | Browser text responses use gzip when requested; media and binary uploads are intentionally left uncompressed |
 | Tor / Arti | Embedded onion-service startup — clearnet-only, Tor-only, or dual mode |
 
 ---
@@ -438,6 +439,7 @@ Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and op
 | `argon2` | Argon2id password hashing |
 | `rand_core` + `uuid` | Secure salts and opaque generated tokens/filenames |
 | `infer` | Content-based media type detection |
+| `flate2` | Gzip response compression for browser text responses |
 | `tower-http` | Static upload serving and HTTP tracing |
 | `clap` | CLI argument parsing |
 | `toml` + `serde` | Config load/save |

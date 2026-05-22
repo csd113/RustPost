@@ -7,6 +7,7 @@ use axum::Router;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{DefaultBodyLimit, Form, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::middleware;
 use axum::response::{Html, IntoResponse as _, Redirect, Response};
 use axum::routing::{get, post};
 use rusqlite::{OptionalExtension as _, params};
@@ -129,6 +130,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             ServeDir::new(state.paths.uploads_thumbs.clone()),
         )
         .layer(DefaultBodyLimit::max(upload_body_limit))
+        .layer(middleware::from_fn(
+            crate::compression::response_compression,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -3104,6 +3108,8 @@ fn user_actor(user_id: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::read::GzDecoder;
+    use std::io::Read as _;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -3117,6 +3123,7 @@ mod tests {
     struct TestResponse {
         status: u16,
         headers: Vec<(String, String)>,
+        body_bytes: Vec<u8>,
         body: String,
     }
 
@@ -4311,6 +4318,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn html_response_with_gzip_accept_encoding_is_compressed() {
+        let server = spawn_test_server().await;
+
+        let response = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("accept-encoding", "gzip")],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert_header(&response, "content-encoding", "gzip");
+        assert_vary_contains_accept_encoding(&response);
+        assert_eq!(
+            content_length(&response),
+            Some(response.body_bytes.len()),
+            "compressed content-length should match wire body length"
+        );
+        let body = gzip_decode(&response.body_bytes);
+        assert!(body.contains("<title>Home Feed - RustPost</title>"));
+    }
+
+    #[tokio::test]
+    async fn html_response_without_accept_encoding_is_not_compressed() {
+        let server = spawn_test_server().await;
+
+        let response = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+
+        assert_eq!(response.status, 200);
+        assert_no_header(&response, "content-encoding");
+        assert!(
+            response
+                .body
+                .contains("<title>Home Feed - RustPost</title>")
+        );
+    }
+
+    #[tokio::test]
+    async fn uploaded_media_response_is_not_compressed() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "image post")],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let conn = rusqlite::Connection::open(server.data_dir.join("db/rustpost.sqlite3"))
+            .expect("open database");
+        let public_path: String = conn
+            .query_row("SELECT public_path FROM media LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("media path");
+        drop(conn);
+
+        let media = request(
+            &server.base_url,
+            "GET",
+            &public_path,
+            &[("accept-encoding", "gzip")],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(media.status, 200);
+        assert_no_header(&media, "content-encoding");
+        assert!(media.body_bytes.starts_with(&tiny_png_bytes()[..8]));
+    }
+
+    #[tokio::test]
+    async fn head_response_uses_compression_headers_without_body() {
+        let server = spawn_test_server().await;
+
+        let response = request(
+            &server.base_url,
+            "HEAD",
+            "/home",
+            &[("accept-encoding", "gzip")],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert_header(&response, "content-encoding", "gzip");
+        assert_vary_contains_accept_encoding(&response);
+        assert_eq!(response.body_bytes.len(), 0);
+        assert!(
+            content_length(&response).is_some_and(|len| len > 0),
+            "compressed HEAD response should keep the GET content length"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_response_without_accept_encoding_keeps_get_length_without_body() {
+        let server = spawn_test_server().await;
+        let get = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        let head = request(&server.base_url, "HEAD", "/home", &[], Vec::new()).await;
+
+        assert_eq!(head.status, 200);
+        assert_no_header(&head, "content-encoding");
+        assert_eq!(head.body_bytes.len(), 0);
+        assert_eq!(content_length(&head), Some(get.body_bytes.len()));
+    }
+
+    #[tokio::test]
+    async fn head_response_for_skipped_favicon_keeps_length_without_compression() {
+        let server = spawn_test_server().await;
+        let get = request(
+            &server.base_url,
+            "GET",
+            "/favicon.ico",
+            &[("accept-encoding", "gzip")],
+            Vec::new(),
+        )
+        .await;
+        let head = request(
+            &server.base_url,
+            "HEAD",
+            "/favicon.ico",
+            &[("accept-encoding", "gzip")],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(head.status, 200);
+        assert_no_header(&head, "content-encoding");
+        assert_eq!(head.body_bytes.len(), 0);
+        assert_eq!(content_length(&head), Some(get.body_bytes.len()));
+    }
+
+    #[tokio::test]
     async fn admin_can_upload_replace_and_remove_png_favicon() {
         let server = spawn_test_server_with_admin().await;
         let cookie = admin_session_cookie(&server).await;
@@ -5298,8 +5458,13 @@ mod tests {
     }
 
     fn parse_response(bytes: &[u8]) -> TestResponse {
-        let raw = String::from_utf8_lossy(bytes);
-        let (head, body) = raw.split_once("\r\n\r\n").expect("response split");
+        let split = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response split");
+        let head = String::from_utf8_lossy(&bytes[..split]);
+        let body_bytes = bytes[split + 4..].to_vec();
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
         let mut lines = head.lines();
         let status = lines
             .next()
@@ -5315,7 +5480,8 @@ mod tests {
         TestResponse {
             status,
             headers,
-            body: body.to_owned(),
+            body_bytes,
+            body,
         }
     }
 
@@ -5338,14 +5504,39 @@ mod tests {
     }
 
     fn assert_header(response: &TestResponse, name: &str, expected: &str) {
-        assert_eq!(
-            response
-                .headers
-                .iter()
-                .find(|(header_name, _)| header_name == name)
-                .map(|(_, value)| value.as_str()),
-            Some(expected)
+        assert_eq!(header_value(response, name), Some(expected));
+    }
+
+    fn assert_no_header(response: &TestResponse, name: &str) {
+        assert_eq!(header_value(response, name), None);
+    }
+
+    fn assert_vary_contains_accept_encoding(response: &TestResponse) {
+        let vary = header_value(response, "vary").expect("vary header");
+        assert!(
+            vary.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("accept-encoding")),
+            "Vary header should include Accept-Encoding: {vary}"
         );
+    }
+
+    fn header_value<'a>(response: &'a TestResponse, name: &str) -> Option<&'a str> {
+        response
+            .headers
+            .iter()
+            .find(|(header_name, _)| header_name == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn content_length(response: &TestResponse) -> Option<usize> {
+        header_value(response, "content-length")?.parse().ok()
+    }
+
+    fn gzip_decode(bytes: &[u8]) -> String {
+        let mut decoder = GzDecoder::new(bytes);
+        let mut output = String::new();
+        decoder.read_to_string(&mut output).expect("gzip body");
+        output
     }
 
     fn deep_settings_form_body(csrf: &str, intent: &str, overrides: &[(&str, &str)]) -> Vec<u8> {
