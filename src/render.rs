@@ -579,11 +579,16 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
     });
     let csrf = csrf.unwrap_or_default();
     let input_id = parent.map_or_else(|| "post-text".to_owned(), |id| format!("reply-text-{id}"));
+    let placeholder = if parent.is_some() {
+        "Write a reply..."
+    } else {
+        "What's happening?"
+    };
     format!(
         r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted" data-character-counter="{}">{} remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
 <input type="hidden" name="csrf" value="{}">{}
 <label class="sr-only" for="{}">What is happening?</label>
-<textarea id="{}" name="text" maxlength="{}" rows="4" data-character-limit="{}"></textarea>
+<textarea id="{}" name="text" maxlength="{}" rows="4" data-character-limit="{}" placeholder="{}"></textarea>
 <div class="composer-tools"><label class="file-control" for="media">Attach media<input id="media" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime"></label><button class="primary" type="submit">Post</button></div>
 </form></section>"#,
         if parent.is_some() {
@@ -598,7 +603,8 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
         html_escape::encode_double_quoted_attribute(&input_id),
         html_escape::encode_double_quoted_attribute(&input_id),
         max_text_chars,
-        max_text_chars
+        max_text_chars,
+        html_escape::encode_double_quoted_attribute(placeholder)
     )
 }
 
@@ -608,7 +614,7 @@ pub fn quote_composer(csrf: &str, quote: &QuotePreview, max_text_chars: usize) -
         r#"<section class="composer quote-composer" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">Quote post</h1><span class="muted" data-character-counter="quote-text">{max_text_chars} remaining</span></div>{preview}<form method="post" action="/posts/{}/quote" class="quote-form">
 <input type="hidden" name="csrf" value="{}">
 <label class="sr-only" for="quote-text">Add your comment</label>
-<textarea id="quote-text" name="text" maxlength="{}" rows="4" data-character-limit="{}" required></textarea>
+<textarea id="quote-text" name="text" maxlength="{}" rows="4" data-character-limit="{}" placeholder="Add your thoughts..." required></textarea>
 <div class="composer-tools"><span></span><button class="primary" type="submit">Post quote</button></div>
 </form></section>"#,
         quote.id,
@@ -1524,17 +1530,17 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
 }
 
 const CSS: &str = r#"
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;line-height:1.5;--bg:#f5f6f1;--surface:#fff;--surface-subtle:#fbfcfa;--surface-muted:#f4f5f2;--header-bg:rgba(255,255,255,.96);--text:#202124;--text-strong:#172017;--muted:#667064;--muted-strong:#59625a;--border:#dfe4dc;--border-strong:#b9c2b8;--link:#1f5f8b;--link-strong:#24445f;--brand:#163b2f;--brand-hover:#235544;--brand-text:#fff;--hover:#eef3f0;--focus:#93c5fd;--shadow:rgba(20,35,30,.04);--reply-border:#c8d8d0;--avatar-bg:#eef3f0;--danger:#8a3d2d;--danger-strong:#6f2f22;--danger-bg:#fff8f5;--danger-border:#e6b8a8;--success-bg:#f4fbf5;--success-border:#add7b4;--media-bg:#f6f7f4;--shell-side:240px;--shell-primary:640px;--shell-gap:1.25rem;--shell-max:1160px}
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;line-height:1.5;--bg:#f5f6f1;--surface:#fff;--surface-subtle:#fbfcfa;--surface-muted:#f4f5f2;--header-bg:rgba(255,255,255,.96);--text:#202124;--text-strong:#172017;--muted:#667064;--muted-strong:#59625a;--border:#dfe4dc;--border-strong:#b9c2b8;--link:#1f5f8b;--link-strong:#24445f;--brand:#163b2f;--brand-hover:#235544;--brand-text:#fff;--hover:#eef3f0;--focus:#93c5fd;--shadow:rgba(20,35,30,.04);--reply-border:#c8d8d0;--avatar-bg:#eef3f0;--danger:#8a3d2d;--danger-strong:#6f2f22;--danger-bg:#fff8f5;--danger-border:#e6b8a8;--success-bg:#f4fbf5;--success-border:#add7b4;--media-bg:#f6f7f4;--shell-side:240px;--shell-primary:640px;--shell-gap:1.25rem;--shell-max:1160px;--header-padding-y:.8rem;--header-brand-size:2rem;--hairline:1px;--rail-sticky-top:calc(var(--header-brand-size) + var(--header-padding-y) + var(--header-padding-y) + var(--shell-gap) + var(--hairline))}
 :root[data-theme="dark"]{color-scheme:dark;--bg:#111827;--surface:#182231;--surface-subtle:#1d2939;--surface-muted:#233044;--header-bg:rgba(17,24,39,.96);--text:#eef4fb;--text-strong:#f8fafc;--muted:#c3cfdd;--muted-strong:#d4deea;--border:#344256;--border-strong:#596b83;--link:#8fc7ff;--link-strong:#badcff;--brand:#4f8fc7;--brand-hover:#6aa8df;--brand-text:#06111f;--hover:#243349;--focus:#fbbf24;--shadow:rgba(0,0,0,.26);--reply-border:#4f6680;--avatar-bg:#243349;--danger:#ffb4a2;--danger-strong:#ffd2c7;--danger-bg:#3a2020;--danger-border:#8f4d43;--success-bg:#163321;--success-border:#4c8a61;--media-bg:#0f172a}
 *{box-sizing:border-box}body{margin:0;min-width:320px;color:var(--text);background:var(--bg)}a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
 .site-header{position:sticky;top:0;z-index:10;background:var(--header-bg);border-bottom:1px solid var(--border);backdrop-filter:blur(8px)}
-.header-inner{max-width:var(--shell-max);margin:0 auto;padding:.8rem 1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
-.brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:var(--text-strong)}.brand-mark{display:inline-grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--brand);color:var(--brand-text)}
+.header-inner{max-width:var(--shell-max);margin:0 auto;padding:var(--header-padding-y) 1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:var(--text-strong)}.brand-mark{display:inline-grid;place-items:center;width:var(--header-brand-size);height:var(--header-brand-size);border-radius:7px;background:var(--brand);color:var(--brand-text)}
 nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}nav a,nav button,.button-link{display:inline-flex;align-items:center;gap:.35rem;min-height:2.15rem;border-radius:7px;padding:.42rem .65rem;color:var(--link-strong);border:1px solid transparent;background:transparent}
 nav a:hover,nav button:hover,.button-link:hover{background:var(--hover);text-decoration:none}nav form,.actions form{display:inline}
 nav svg{width:1.05rem;height:1.05rem;fill:currentColor;flex:0 0 auto}
 .nav-badge{display:inline-grid;place-items:center;min-width:1.25rem;height:1.25rem;border-radius:999px;padding:0 .35rem;background:var(--brand);color:var(--brand-text);font-size:.78rem;font-weight:800;line-height:1}
-main{padding:var(--shell-gap)}.app-shell{width:min(100%,var(--shell-max));margin:0 auto;display:grid;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary)) var(--shell-side);gap:var(--shell-gap);align-items:start;justify-content:center}.primary-column{min-width:0;width:100%}.left-rail,.right-rail{min-width:0;position:sticky;top:5rem;display:grid;gap:.75rem;align-items:start}.side-rail-card,.rail-nav{background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--muted-strong);box-shadow:0 1px 2px var(--shadow)}.side-rail-card{padding:.85rem}.side-rail-card h2{margin:.1rem 0 .6rem;font-size:1rem;color:var(--text)}.rail-nav{display:grid;grid-template-columns:minmax(0,1fr);gap:.2rem;width:100%;padding:.35rem;justify-content:stretch}.rail-nav a,.rail-nav button{width:100%;min-height:2.35rem;justify-content:flex-start;padding:.5rem .65rem}.rail-nav form{display:block}.mobile-nav{display:none}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:var(--text)}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:var(--text)}.dashboard-account:hover{text-decoration:none}.dashboard-actions{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:var(--shell-max);margin:0 auto;padding:1rem;color:var(--muted);font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
+main{padding:var(--shell-gap)}.app-shell{width:min(100%,var(--shell-max));margin:0 auto;display:grid;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary)) var(--shell-side);gap:var(--shell-gap);align-items:start;justify-content:center}.primary-column{min-width:0;width:100%}.left-rail,.right-rail{min-width:0;position:sticky;top:var(--rail-sticky-top);display:grid;gap:.75rem;align-items:start}.side-rail-card,.rail-nav{background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--muted-strong);box-shadow:0 1px 2px var(--shadow)}.side-rail-card{padding:.85rem}.side-rail-card h2{margin:.1rem 0 .6rem;font-size:1rem;color:var(--text)}.rail-nav{display:grid;grid-template-columns:minmax(0,1fr);gap:.2rem;width:100%;padding:.35rem;justify-content:stretch}.rail-nav a,.rail-nav button{width:100%;min-height:2.35rem;justify-content:flex-start;padding:.5rem .65rem}.rail-nav form{display:block}.mobile-nav{display:none}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:var(--text)}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:var(--text)}.dashboard-account:hover{text-decoration:none}.dashboard-actions{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:var(--shell-max);margin:0 auto;padding:1rem;color:var(--muted);font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:.85rem;box-shadow:0 1px 2px var(--shadow)}
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.panel h1+table,.panel h1+form,.panel h1+p,.panel h1+dl{margin-top:.85rem}.page-header p,.muted,.empty-state p{color:var(--muted);margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
 .notifications-hero{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:1rem;box-shadow:0 1px 2px var(--shadow);display:flex;align-items:center;justify-content:space-between;gap:1rem}.notifications-hero h1{margin:0;font-size:1.55rem;line-height:1.15}.notifications-hero p:not(.eyebrow){margin:.35rem 0 0;color:var(--muted-strong)}.caught-up-pill{display:inline-flex;align-items:center;min-height:2rem;border:1px solid var(--success-border);border-radius:999px;background:var(--success-bg);color:var(--text-strong);padding:.32rem .75rem;font-weight:800}.caught-up{padding:.75rem .85rem}.caught-up p{margin:0}.notifications-list{display:grid;gap:.5rem}.notification-group{margin:.8rem .15rem .2rem;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.notification-row{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:start;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.8rem;box-shadow:0 1px 2px var(--shadow)}.notification-row.unread{border-color:var(--border-strong);background:var(--surface-subtle)}.notification-row[data-card-href]{cursor:pointer}.notification-row[data-card-href]:hover{border-color:var(--border-strong);background:var(--hover)}.notification-kind{display:grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--surface-muted);color:var(--link-strong);font-weight:900;font-size:.8rem}.notification-row.unread .notification-kind{background:var(--brand);color:var(--brand-text)}.notification-body{min-width:0}.notification-line{margin:0;overflow-wrap:anywhere}.notification-meta{margin:.35rem 0 0;color:var(--muted);font-size:.88rem}.notification-preview{display:block;margin:.5rem 0 0;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle);color:var(--muted-strong);overflow-wrap:anywhere}.notification-preview:hover{background:var(--surface);text-decoration:none}.notification-preview.unavailable{border-style:dashed}.unread-dot{width:.65rem;height:.65rem;border-radius:999px;background:var(--brand);margin-top:.7rem}
@@ -1728,13 +1734,36 @@ mod tests {
     }
 
     #[test]
-    fn composer_has_live_remaining_counter_without_placeholder() {
-        let body = composer(Some("csrf"), Some(10), 512);
-        assert!(body.contains("512 remaining"));
+    fn composer_has_live_remaining_counter_and_contextual_placeholder() {
+        let post = composer(Some("csrf"), None, 512);
+        assert!(post.contains("512 remaining"));
+        assert!(post.contains("data-character-limit=\"512\""));
+        assert!(post.contains("maxlength=\"512\""));
+        assert!(post.contains("What is happening?"));
+        assert!(post.contains(r#"placeholder="What's happening?""#));
+
+        let reply = composer(Some("csrf"), Some(10), 512);
+        assert!(reply.contains(r#"id="reply-text-10""#));
+        assert!(reply.contains(r#"placeholder="Write a reply...""#));
+    }
+
+    #[test]
+    fn quote_composer_has_contextual_placeholder() {
+        let quote = QuotePreview {
+            id: 42,
+            username: Some("ada".to_owned()),
+            display_name: Some("Ada".to_owned()),
+            anonymous_label: None,
+            text: "quoted post".to_owned(),
+            created_at: "2026-05-18 10:30".to_owned(),
+            unavailable: false,
+        };
+        let body = quote_composer("csrf", &quote, 512);
+
+        assert!(body.contains(r#"id="quote-text""#));
+        assert!(body.contains(r#"placeholder="Add your thoughts...""#));
         assert!(body.contains("data-character-limit=\"512\""));
         assert!(body.contains("maxlength=\"512\""));
-        assert!(body.contains("What is happening?"));
-        assert!(!body.contains("placeholder="));
     }
 
     #[test]
