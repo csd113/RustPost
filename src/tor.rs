@@ -35,7 +35,7 @@ struct TorStatusSnapshot {
 }
 
 struct TorRuntime {
-    _client: TorClient<tor_rtcompat::PreferredRuntime>,
+    _client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
     _service: Arc<RunningOnionService>,
     stream_task: tokio::task::JoinHandle<()>,
 }
@@ -254,6 +254,7 @@ async fn start_inner(
         )
     })?
     .context("bootstrap Arti client")?;
+    let client = Arc::new(client);
     let bootstrap_status = Some(format!("{:?}", client.bootstrap_status()));
 
     let nickname = HsNickname::new(settings.onion_service_name.clone())
