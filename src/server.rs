@@ -201,6 +201,12 @@ struct SearchQuery {
 }
 
 #[derive(Deserialize)]
+struct AdminUsersQuery {
+    user_q: Option<String>,
+    post_q: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SettingsQuery {
     saved: Option<String>,
 }
@@ -2546,40 +2552,163 @@ async fn admin_health(
 async fn admin_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<AdminUsersQuery>,
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let rows = admin::users(&state.pool).await?;
-    let list = rows
-        .into_iter()
-        .map(|(id, username, is_admin, suspended)| {
-            format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
-                id,
-                html_escape::encode_text(&username),
-                is_admin,
-                suspended,
-                small_form(
-                    &format!("/admin/users/{id}/suspend"),
-                    &csrf,
-                    if suspended { "Unsuspend" } else { "Suspend" },
-                    if suspended {
-                        "Unsuspend this account"
-                    } else {
-                        "Suspend this account"
-                    },
-                )
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let user_query = query.user_q.unwrap_or_default();
+    let post_query = query.post_q.unwrap_or_default();
+    let search = admin::AdminUserSearch::new(&user_query, &post_query);
+    let malformed_quotes = search.post_search.malformed_quotes;
+    let has_filter = search.has_filter();
+    let rows = admin::users(&state.pool, search).await?;
+    let quote_notice = if malformed_quotes {
+        r#"<p class="notice error">Post search had unmatched quotes, so it was treated as plain keyword search.</p>"#
+    } else {
+        ""
+    };
+    let list = admin_user_rows(&rows, &csrf, has_filter);
     let body = format!(
-        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Users</h1><table><thead><tr><th>ID</th><th>Username</th><th>Admin</th><th>Suspended</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>"#,
+        r#"<section class="panel admin-card admin-users-panel" data-testid="admin-card"><h1>Users</h1><form method="get" action="/admin/users" class="admin-user-search"><div><label for="admin-user-q">Username, display name, or handle</label><input id="admin-user-q" name="user_q" type="search" value="{}" autocomplete="off" placeholder="alice or @alice"></div><div><label for="admin-post-q">Post keywords</label><input id="admin-post-q" name="post_q" type="search" value="{}" autocomplete="off" placeholder="keyword or &quot;exact phrase&quot;"></div><div class="admin-user-search-actions"><button type="submit">Search</button><a class="button-link" href="/admin/users">Reset</a></div></form>{}{}</section>"#,
+        html_escape::encode_double_quoted_attribute(&user_query),
+        html_escape::encode_double_quoted_attribute(&post_query),
+        quote_notice,
         list
     );
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Admin users", &body).await?,
     ))
+}
+
+fn admin_user_rows(rows: &[admin::AdminUserInvestigation], csrf: &str, searched: bool) -> String {
+    if rows.is_empty() {
+        let message = if searched {
+            "No users matched those filters."
+        } else {
+            "No users found."
+        };
+        return format!(
+            r#"<div class="compact-empty admin-users-empty"><strong>{}</strong><p>Try a different username, handle, display name, or post keyword.</p></div>"#,
+            html_escape::encode_text(message)
+        );
+    }
+
+    rows.iter()
+        .map(|row| admin_user_row(row, csrf, searched))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn admin_user_row(row: &admin::AdminUserInvestigation, csrf: &str, searched: bool) -> String {
+    let display_name = if row.display_name.trim().is_empty() {
+        row.username.as_str()
+    } else {
+        row.display_name.as_str()
+    };
+    let statuses = [
+        if row.is_admin { "Admin" } else { "Member" },
+        if row.is_suspended {
+            "Suspended"
+        } else {
+            "Active"
+        },
+        if row.is_deleted {
+            "Deleted"
+        } else {
+            "Not deleted"
+        },
+    ]
+    .iter()
+    .map(|status| {
+        format!(
+            r#"<span class="admin-user-pill">{}</span>"#,
+            html_escape::encode_text(status)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("");
+    let match_labels = admin_user_match_labels(row, searched);
+    let preview = row
+        .post_match_preview
+        .as_ref()
+        .map_or_else(String::new, |text| {
+            format!(
+                r#"<p class="admin-post-preview"><strong>Post match preview:</strong> {}</p>"#,
+                html_escape::encode_text(&short_preview(text))
+            )
+        });
+    let action = small_form(
+        &format!("/admin/users/{}/suspend", row.id),
+        csrf,
+        if row.is_suspended {
+            "Unsuspend"
+        } else {
+            "Suspend"
+        },
+        if row.is_suspended {
+            "Unsuspend this account"
+        } else {
+            "Suspend this account"
+        },
+    );
+    format!(
+        r#"<article class="admin-user-row"><div class="admin-user-main"><div class="admin-user-heading"><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span> <span class="muted">#{}</span></div><div class="admin-user-statuses">{}</div>{}<dl class="admin-user-meta"><dt>Created</dt><dd>{}</dd><dt>Updated</dt><dd>{}</dd><dt>Last session</dt><dd>{}</dd><dt>Last post</dt><dd>{}</dd><dt>Total posts</dt><dd>{}</dd><dt>Uploaded media</dt><dd>{}</dd><dt>Reports on posts</dt><dd>{}</dd><dt>Moderation actions</dt><dd>{}</dd><dt>Matching posts</dt><dd>{}</dd></dl>{}</div><div class="admin-user-actions">{}</div></article>"#,
+        html_escape::encode_double_quoted_attribute(&row.username),
+        html_escape::encode_text(display_name),
+        html_escape::encode_text(&row.username),
+        row.id,
+        statuses,
+        match_labels,
+        html_escape::encode_text(&row.created_at),
+        html_escape::encode_text(&row.updated_at),
+        html_escape::encode_text(row.last_session_at.as_deref().unwrap_or("No session")),
+        html_escape::encode_text(row.last_post_at.as_deref().unwrap_or("No posts")),
+        row.total_posts,
+        row.uploaded_media_count,
+        row.reports_on_posts_count,
+        row.moderation_action_count,
+        row.matching_post_count,
+        preview,
+        action
+    )
+}
+
+fn admin_user_match_labels(row: &admin::AdminUserInvestigation, searched: bool) -> String {
+    if !searched {
+        return String::new();
+    }
+
+    let mut labels = Vec::new();
+    if row.matched_name {
+        labels.push("Matched name".to_owned());
+    }
+    if row.matching_post_count > 0 {
+        labels.push(format!("Matched post content: {}", row.matching_post_count));
+    }
+    if labels.is_empty() {
+        return String::new();
+    }
+    let labels = labels
+        .iter()
+        .map(|label| {
+            format!(
+                r#"<span class="admin-user-match">{}</span>"#,
+                html_escape::encode_text(label)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<div class="admin-user-matches">{labels}</div>"#)
+}
+
+fn short_preview(text: &str) -> String {
+    const LIMIT: usize = 140;
+    let trimmed = text.trim();
+    let mut preview = trimmed.chars().take(LIMIT).collect::<String>();
+    if trimmed.chars().count() > LIMIT {
+        preview.push_str("...");
+    }
+    preview
 }
 
 async fn admin_suspend(
@@ -3116,6 +3245,7 @@ mod tests {
     struct TestServer {
         base_url: String,
         data_dir: PathBuf,
+        pool: SqlitePool,
         _task: tokio::task::JoinHandle<()>,
         _temp: tempfile::TempDir,
     }
@@ -3218,6 +3348,244 @@ mod tests {
             safe_delete_return_target("/home#post-42", 42),
             Some("/home#post-42".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_access_admin_users() {
+        let server = spawn_test_server_with_admin().await;
+        let member_cookie = register_test_user(&server, "member").await;
+
+        let response = get_with_cookie(&server, "/admin/users", &member_cookie).await;
+
+        assert_eq!(response.status, 403);
+    }
+
+    #[tokio::test]
+    async fn admin_users_page_shows_expanded_user_details() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let settings = Settings::default();
+        let alice = auth::register_user(
+            &server.pool,
+            &settings,
+            "alice",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("alice");
+        let reporter = auth::register_user(
+            &server.pool,
+            &settings,
+            "reporter",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("reporter");
+        let post = social::create_post(
+            &server.pool,
+            &settings,
+            Some(alice),
+            "expanded admin detail post",
+            None,
+            &[],
+        )
+        .await
+        .expect("post");
+        server
+            .pool
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET display_name = 'Alice Admin' WHERE id = ?",
+                    [alice],
+                )?;
+                conn.execute(
+                    "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'alice.png', '/tmp/alice.png', '/uploads/images/alice.png', 'image/png', 'image', 12)",
+                    [alice],
+                )?;
+                conn.execute(
+                    "INSERT INTO reports (reporter_user_id, post_id, reason) VALUES (?, ?, 'spam')",
+                    params![reporter, post],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed details");
+
+        let response = get_with_cookie(&server, "/admin/users", &admin_cookie).await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("Alice Admin"));
+        assert!(response.body.contains("@alice"));
+        assert!(response.body.contains("Created"));
+        assert!(response.body.contains("Last post"));
+        assert!(response.body.contains("Total posts"));
+        assert!(response.body.contains("Uploaded media"));
+        assert!(response.body.contains("Reports on posts"));
+        assert!(response.body.contains("Moderation actions"));
+        assert!(response.body.contains(">1</dd>"));
+    }
+
+    #[tokio::test]
+    async fn admin_users_username_search_returns_expected_users() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let settings = Settings::default();
+        auth::register_user(
+            &server.pool,
+            &settings,
+            "alice",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("alice");
+        auth::register_user(
+            &server.pool,
+            &settings,
+            "bob",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("bob");
+
+        let response = get_with_cookie(&server, "/admin/users?user_q=ali", &admin_cookie).await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("@alice"));
+        assert!(!response.body.contains("@bob"));
+        assert!(response.body.contains("Matched name"));
+    }
+
+    #[tokio::test]
+    async fn admin_users_post_keyword_search_returns_matching_accounts() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let settings = Settings::default();
+        let alice = auth::register_user(
+            &server.pool,
+            &settings,
+            "alice",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("alice");
+        let bob = auth::register_user(
+            &server.pool,
+            &settings,
+            "bob",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("bob");
+        social::create_post(
+            &server.pool,
+            &settings,
+            Some(alice),
+            "admin keyword needle <script>",
+            None,
+            &[],
+        )
+        .await
+        .expect("alice post");
+        social::create_post(
+            &server.pool,
+            &settings,
+            Some(bob),
+            "ordinary post",
+            None,
+            &[],
+        )
+        .await
+        .expect("bob post");
+
+        let response = get_with_cookie(&server, "/admin/users?post_q=needle", &admin_cookie).await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("@alice"));
+        assert!(!response.body.contains("@bob"));
+        assert!(response.body.contains("Matched post content: 1"));
+        assert!(
+            response
+                .body
+                .contains("admin keyword needle &lt;script&gt;")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_users_quoted_phrase_search_requires_exact_post_substring() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let settings = Settings::default();
+        let alice = auth::register_user(
+            &server.pool,
+            &settings,
+            "alice",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("alice");
+        let bob = auth::register_user(
+            &server.pool,
+            &settings,
+            "bob",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("bob");
+        social::create_post(
+            &server.pool,
+            &settings,
+            Some(alice),
+            "hello world exact",
+            None,
+            &[],
+        )
+        .await
+        .expect("alice post");
+        social::create_post(
+            &server.pool,
+            &settings,
+            Some(bob),
+            "hello careful world",
+            None,
+            &[],
+        )
+        .await
+        .expect("bob post");
+
+        let response = get_with_cookie(
+            &server,
+            "/admin/users?post_q=%22hello%20world%22",
+            &admin_cookie,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("@alice"));
+        assert!(!response.body.contains("@bob"));
+    }
+
+    #[tokio::test]
+    async fn admin_users_search_has_empty_state_for_no_matches() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+
+        let response = get_with_cookie(
+            &server,
+            "/admin/users?user_q=missing&post_q=absent",
+            &admin_cookie,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("No users matched those filters."));
     }
 
     #[tokio::test]
@@ -5392,7 +5760,7 @@ mod tests {
             error: Some("disabled in tests".to_owned()),
         };
         let tor = crate::tor::validate_startup(&settings.tor);
-        let app = router(AppState::new(pool, settings, paths, ffmpeg, tor));
+        let app = router(AppState::new(pool.clone(), settings, paths, ffmpeg, tor));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -5408,6 +5776,7 @@ mod tests {
         TestServer {
             base_url: format!("127.0.0.1:{}", addr.port()),
             data_dir,
+            pool,
             _task: task,
             _temp: temp,
         }
