@@ -3396,7 +3396,7 @@ mod tests {
         assert!(home.body.contains("hello from the browser-shaped form"));
         assert!(home.body.contains(r#"class="post""#));
         assert!(home.body.contains(r#"data-card-href="/posts/1""#));
-        assert!(!home.body.contains(r#">Open post</a>"#));
+        assert!(home.body.contains(r#"href="/posts/1">Open post</a>"#));
         assert!(!home.body.contains("Open thread"));
         assert!(!home.body.contains(r#"class="post-time""#));
 
