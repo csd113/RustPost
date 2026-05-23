@@ -28,9 +28,9 @@ trace.zip
 *.trace
 *.har
 tests/*
-!tests/playwright/
+tests/playwright/
 tests/playwright/*
-!tests/playwright/nsfw-media.mjs
+tests/playwright/nsfw-media.mjs
 package-lock.json
 package.json
 playwright.config.ts
