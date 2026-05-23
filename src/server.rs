@@ -361,7 +361,10 @@ async fn layout_context(
     };
     Ok(render::LayoutContext {
         anonymous_mode_enabled: state.settings.accounts.anonymous_mode_enabled,
-        tor_onion_address: state.tor.onion_address(),
+        tor_onion_address: state.tor.onion_address().or_else(|| {
+            (!state.settings.tor.display_onion_address.is_empty())
+                .then(|| state.settings.tor.display_onion_address.clone())
+        }),
         follower_count: counts.map(|(followers, _following)| followers),
         following_count: counts.map(|(_followers, following)| following),
         notification_unread_count,

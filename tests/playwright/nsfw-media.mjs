@@ -7,6 +7,7 @@ import net from "node:net";
 import { chromium, firefox, webkit } from "playwright";
 
 const PASSWORD = "very secure password";
+const TEST_ONION_ADDRESS = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion";
 const tinyPng = Buffer.from(
   "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63f8cfc00000040001fea7699d160000000049454e44ae426082",
   "hex",
@@ -28,7 +29,10 @@ async function startRustPost() {
   const port = await freePort();
   runCargo(["run", "--quiet", "--bin", "rustpost-cli", "--", "--data-dir", dataDir, "init"]);
   const settingsPath = path.join(dataDir, "settings.toml");
-  const settings = fs.readFileSync(settingsPath, "utf8").replace("port = 8080", `port = ${port}`);
+  const settings = fs
+    .readFileSync(settingsPath, "utf8")
+    .replace("port = 8080", `port = ${port}`)
+    .replace('display_onion_address = ""', `display_onion_address = "${TEST_ONION_ADDRESS}"`);
   fs.writeFileSync(settingsPath, settings);
   runCargo([
     "run",
@@ -63,7 +67,9 @@ async function jsChromiumFlow(baseUrl) {
   try {
     const user = await browser.newContext();
     const page = await user.newPage();
+    await installClipboardProbe(page);
     await register(page, baseUrl, "alicepw");
+    await expectOnionHeaderWithJs(page, baseUrl);
     await createMediaPost(page, "alice flagged media", true);
     await expectBlurred(page);
     await page.locator(".nsfw-show").first().click();
@@ -98,9 +104,18 @@ async function jsChromiumFlow(baseUrl) {
     await anonPage.goto(`${baseUrl}/home`);
     await expectBlurred(anonPage);
 
+    const mobile = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      isMobile: true,
+    });
+    const mobilePage = await mobile.newPage();
+    await mobilePage.goto(`${baseUrl}/home`);
+    await expectMobileOnionLayout(mobilePage);
+
     await user.close();
     await admin.close();
     await anonymous.close();
+    await mobile.close();
   } finally {
     await browser.close();
   }
@@ -112,6 +127,7 @@ async function noJsFirefoxFlow(baseUrl) {
     const context = await browser.newContext({ javaScriptEnabled: false });
     const page = await context.newPage();
     await register(page, baseUrl, "toruserpw");
+    await expectOnionHeaderWithoutJs(page, baseUrl);
     await createMediaPost(page, "no js flagged media", true);
     await expectBlurred(page);
     await page.locator(".nsfw-show").first().click();
@@ -138,7 +154,9 @@ async function webKitFlow(baseUrl) {
   try {
     const context = await browser.newContext();
     const page = await context.newPage();
+    await installClipboardProbe(page);
     await register(page, baseUrl, "webkitpw");
+    await expectOnionHeaderWithJs(page, baseUrl);
     await createMediaPost(page, "webkit flagged media", true);
     await expectBlurred(page);
     await page.locator(".nsfw-show").first().click();
@@ -147,6 +165,66 @@ async function webKitFlow(baseUrl) {
   } finally {
     await browser.close();
   }
+}
+
+async function installClipboardProbe(page) {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        async writeText(text) {
+          window.__rustpostCopiedText = text;
+        },
+      },
+    });
+  });
+}
+
+async function expectOnionHeaderWithJs(page, baseUrl) {
+  await page.goto(`${baseUrl}/home`);
+  const indicator = page.getByTestId("tor-header-indicator");
+  await indicator.waitFor();
+  const box = await indicator.boundingBox();
+  assert.ok(box, "Tor header indicator should have a visible box");
+  assert.ok(box.y < 180, `Tor header indicator should be near the top, got y=${box.y}`);
+  await indicator.locator("summary").click();
+  await expectFullOnionAddress(page);
+  await page.getByTestId("tor-copy-button").click();
+  assert.equal(await page.evaluate(() => window.__rustpostCopiedText), TEST_ONION_ADDRESS);
+  await page.getByRole("button", { name: "Copied" }).waitFor();
+}
+
+async function expectOnionHeaderWithoutJs(page, baseUrl) {
+  await page.goto(`${baseUrl}/home`);
+  const indicator = page.getByTestId("tor-header-indicator");
+  await indicator.waitFor();
+  await indicator.locator("summary").click();
+  await expectFullOnionAddress(page);
+  assert.equal(await page.getByTestId("tor-copy-button").innerText(), "Copy");
+}
+
+async function expectFullOnionAddress(page) {
+  const fullAddress = page.getByTestId("tor-full-address");
+  await fullAddress.waitFor();
+  assert.equal(await fullAddress.innerText(), TEST_ONION_ADDRESS);
+}
+
+async function expectMobileOnionLayout(page) {
+  const indicator = page.getByTestId("tor-header-indicator");
+  await indicator.waitFor();
+  const viewport = page.viewportSize();
+  const box = await indicator.boundingBox();
+  assert.ok(box, "mobile Tor header indicator should have a visible box");
+  assert.ok(box.y < 180, `mobile Tor header indicator should be near the top, got y=${box.y}`);
+  assert.ok(box.x >= 0, `mobile Tor header indicator should not overflow left, got x=${box.x}`);
+  assert.ok(
+    box.x + box.width <= viewport.width,
+    `mobile Tor header indicator should fit viewport, got right=${box.x + box.width}`,
+  );
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  assert.ok(overflow <= 1, `mobile layout should not overflow horizontally, got ${overflow}px`);
+  await indicator.locator("summary").click();
+  await expectFullOnionAddress(page);
 }
 
 async function register(page, baseUrl, username) {

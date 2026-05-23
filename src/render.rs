@@ -118,12 +118,13 @@ pub fn layout_with_context(
     let left_rail = left_rail(user, &auth_nav);
     let side_panel = dashboard_panel(user, context);
     let theme = user.map_or(Theme::Light, |user| user.theme).as_str();
+    let header_tor = tor_header_indicator(context.tor_onion_address.as_deref());
     let footer_onion = context
         .tor_onion_address
         .as_deref()
         .map_or_else(String::new, |onion| {
             format!(
-                r#" <span class="footer-onion">Onion: <code>{}</code></span>"#,
+                r#" <span class="footer-onion">Tor mirror: <code>{}</code></span>"#,
                 html_escape::encode_text(onion)
             )
         });
@@ -142,7 +143,7 @@ pub fn layout_with_context(
 <script src="/assets/rustpost.js" defer></script>
 </head>
 <body>
-<header class="site-header"><div class="header-inner"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
+<header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}</div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
 <section class="noscript-banner" role="status"><strong>JavaScript is disabled.</strong> RustPost will use standard links and forms.</section>
 <main><div class="app-shell" data-testid="app-shell">{}<section class="primary-column" data-testid="primary-column">{} </section>{}</div></main>
 <footer class="site-footer">{} alpha{}</footer>
@@ -155,6 +156,7 @@ pub fn layout_with_context(
         CSS,
         html_escape::encode_text(&brand_mark.to_string()),
         html_escape::encode_text(site_name),
+        header_tor,
         auth_nav,
         left_rail,
         body,
@@ -162,6 +164,40 @@ pub fn layout_with_context(
         html_escape::encode_text(site_name),
         footer_onion
     )
+}
+
+fn tor_header_indicator(onion: Option<&str>) -> String {
+    onion.map_or_else(String::new, |onion| {
+        let escaped_onion = html_escape::encode_text(onion);
+        let attr_onion = html_escape::encode_double_quoted_attribute(onion);
+        let short = short_onion_address(onion);
+        format!(
+            r#"<details class="tor-indicator" data-testid="tor-header-indicator"><summary aria-label="Show Tor mirror address"><span class="tor-dot" aria-hidden="true">T</span><span class="tor-label">Tor mirror</span><span class="tor-short">{}</span></summary><div class="tor-details"><code data-testid="tor-full-address">{}</code><button type="button" data-copy-text="{}" data-copy-label="Copy" data-copied-label="Copied" data-testid="tor-copy-button">Copy</button></div></details>"#,
+            html_escape::encode_text(&short),
+            escaped_onion,
+            attr_onion,
+        )
+    })
+}
+
+fn short_onion_address(onion: &str) -> String {
+    let (service_id, suffix_label) = onion
+        .strip_suffix(".onion")
+        .map_or((onion, ""), |service_id| (service_id, ".onion"));
+    let prefix: String = service_id.chars().take(6).collect();
+    let suffix = service_id
+        .chars()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    if prefix.is_empty() || suffix.is_empty() || service_id.len() <= prefix.len() + suffix.len() {
+        onion.to_owned()
+    } else {
+        format!("{prefix}...{suffix}{suffix_label}")
+    }
 }
 
 fn nav_link(href: &str, label: &str, icon: &str) -> String {
@@ -588,6 +624,39 @@ document.addEventListener("submit", (event) => {
   const submitter = event.submitter || form.querySelector("button[type=submit]");
   if (submitter) {
     submitter.disabled = true;
+  }
+});
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-1000px";
+  document.body.append(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
+}
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-copy-text]");
+  if (!button) {
+    return;
+  }
+  try {
+    await copyTextToClipboard(button.getAttribute("data-copy-text") || "");
+    const original = button.getAttribute("data-copy-label") || button.textContent;
+    button.textContent = button.getAttribute("data-copied-label") || "Copied";
+    window.setTimeout(() => {
+      button.textContent = original;
+    }, 1600);
+  } catch (_err) {
+    button.textContent = "Copy failed";
   }
 });"#;
 
@@ -1679,7 +1748,8 @@ const CSS: &str = r#"
 *{box-sizing:border-box}body{margin:0;min-width:320px;color:var(--text);background:var(--bg)}a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
 .site-header{position:sticky;top:0;z-index:10;background:var(--header-bg);border-bottom:1px solid var(--border);backdrop-filter:blur(8px)}
 .header-inner{max-width:var(--shell-max);margin:0 auto;padding:var(--header-padding-y) 1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
-.brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:var(--text-strong)}.brand-mark{display:inline-grid;place-items:center;width:var(--header-brand-size);height:var(--header-brand-size);border-radius:7px;background:var(--brand);color:var(--brand-text)}
+.header-brand-row{display:flex;align-items:center;gap:.75rem;min-width:0;max-width:100%}.brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:var(--text-strong);min-width:0}.brand span:last-child{overflow-wrap:anywhere}.brand-mark{display:inline-grid;place-items:center;width:var(--header-brand-size);height:var(--header-brand-size);border-radius:7px;background:var(--brand);color:var(--brand-text);flex:0 0 auto}
+.tor-indicator{position:relative;min-width:0}.tor-indicator summary{display:inline-flex;align-items:center;gap:.4rem;min-height:2.15rem;border:1px solid var(--border);border-radius:999px;padding:.25rem .55rem;background:var(--surface-subtle);color:var(--link-strong);font-weight:800;cursor:pointer;list-style:none;max-width:100%}.tor-indicator summary::-webkit-details-marker{display:none}.tor-indicator summary:hover{background:var(--hover);text-decoration:none}.tor-dot{display:inline-grid;place-items:center;width:1.35rem;height:1.35rem;border-radius:999px;background:var(--brand);color:var(--brand-text);font-size:.75rem;font-weight:900;flex:0 0 auto}.tor-label,.tor-short{white-space:nowrap}.tor-short{color:var(--muted-strong);font-weight:700;font-size:.9rem}.tor-details{position:absolute;z-index:12;left:0;top:calc(100% + .35rem);display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.5rem;align-items:center;width:min(32rem,calc(100vw - 2rem));padding:.6rem;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface);box-shadow:0 8px 24px var(--shadow)}.tor-details code{min-width:0;overflow-wrap:anywhere;word-break:break-all;color:var(--text-strong);font-size:.88rem}.tor-details button{min-height:2rem;padding:.35rem .65rem}
 nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}nav a,nav button,.button-link{display:inline-flex;align-items:center;gap:.35rem;min-height:2.15rem;border-radius:7px;padding:.42rem .65rem;color:var(--link-strong);border:1px solid transparent;background:transparent}
 nav a:hover,nav button:hover,.button-link:hover{background:var(--hover);text-decoration:none}nav form,.actions form{display:inline}
 nav svg{width:1.05rem;height:1.05rem;fill:currentColor;flex:0 0 auto}
@@ -1701,7 +1771,7 @@ nav button{border-color:transparent;background:transparent;color:var(--link-stro
 .profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid var(--border);background:var(--surface-muted)}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:999px;border:3px solid var(--surface);background:var(--avatar-bg);flex:0 0 auto}.profile-meta{color:var(--muted-strong);margin:.45rem 0 0}.settings-profile-editor{padding:0;overflow:hidden}.settings-editor-bar{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.85rem;border-bottom:1px solid var(--border)}.settings-editor-bar h1{margin:0}.settings-editor-bar .primary{flex:0 0 auto}.settings-profile-form{padding:0 .85rem .85rem}.settings-profile-media{margin:0 -.85rem .85rem}.settings-banner-wrap{background:var(--media-bg)}.settings-banner-preview{display:block;width:100%;height:220px;object-fit:cover;background:linear-gradient(135deg,var(--surface-muted),var(--hover));border:0;border-radius:0}.settings-banner-preview.placeholder::before{content:"";display:block;width:100%;height:100%}.settings-picture-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:1rem;align-items:end;padding:0 .85rem .85rem;margin-top:-48px}.settings-picture-preview{width:112px;height:112px;object-fit:cover;border-radius:999px;border:5px solid var(--surface);background:var(--avatar-bg);box-shadow:0 1px 4px var(--shadow)}.settings-picture-preview.placeholder{display:block}.settings-media-controls{display:grid;gap:.5rem;align-content:end;padding-top:3.25rem}.media-control-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}.settings-fields{display:grid;gap:.25rem}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-panel{padding:0;overflow:hidden}.deep-settings-form{padding:.85rem;display:grid;gap:.85rem}.deep-settings-group{border:1px solid var(--border);border-radius:8px;padding:.8rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-group legend{font-weight:800;padding:0 .35rem}.deep-settings-field{display:grid;gap:.25rem;align-content:start}.deep-settings-field label{font-weight:800}.deep-settings-field input,.deep-settings-field select{min-width:0}.field-help{font-size:.88rem}.deep-settings-confirm .settings-item-list li{display:block}.compact-panel h2,.danger-panel h2{margin:0 0 .65rem;font-size:1.1rem}.inline-settings-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center;margin:.2rem 0 .75rem}.inline-settings-form input{min-width:0}.settings-password-form button[type=submit]{margin-top:.9rem}.settings-item-list{list-style:none;margin:.25rem 0 0;padding:0;display:grid;gap:.45rem}.settings-item-list li{display:flex;justify-content:space-between;align-items:center;gap:.75rem;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle)}.settings-item-list form{flex:0 0 auto}.settings-item-list button{padding:.32rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border)}.compact-empty{border:1px dashed var(--border);border-radius:7px;padding:.75rem;background:var(--surface-subtle);color:var(--muted-strong)}.compact-empty p{margin:.25rem 0 0}.danger-panel{border-color:var(--danger-border);background:var(--danger-bg)}.danger,.danger-link{border-color:var(--danger-border);background:var(--danger);color:var(--brand-text)}.danger:hover,.danger-link:hover{background:var(--danger-strong);color:var(--brand-text);text-decoration:none}.delete-account-panel p{max-width:62ch}.favicon-preview{width:32px;height:32px;object-fit:contain;border:1px solid var(--border);border-radius:6px;background:var(--surface)}.admin-user-search{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:.65rem;align-items:end;margin-top:.75rem}.admin-user-search label{margin-top:0}.admin-user-search-actions{display:flex;gap:.4rem;align-items:center;margin-bottom:.05rem}.admin-user-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.75rem;border:1px solid var(--border);border-radius:8px;padding:.75rem;margin-top:.65rem;background:var(--surface-subtle)}.admin-user-heading{overflow-wrap:anywhere}.admin-user-statuses,.admin-user-matches{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.45rem}.admin-user-pill,.admin-user-match{display:inline-flex;align-items:center;min-height:1.55rem;border:1px solid var(--border);border-radius:999px;padding:.15rem .5rem;background:var(--surface);font-size:.82rem;font-weight:800;color:var(--muted-strong)}.admin-user-match{border-color:var(--success-border);background:var(--success-bg);color:var(--text)}.admin-user-meta{margin:.6rem 0 0}.admin-post-preview{margin:.55rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.admin-user-actions{display:flex;align-items:flex-start}.admin-users-empty{margin-top:.75rem}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--border);text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
 @media (max-width:1100px){.app-shell{--shell-side:220px;--shell-max:880px;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary))}.right-rail{display:none}}
 @media (max-width:820px){.app-shell{grid-template-columns:minmax(0,680px)}.left-rail,.right-rail{display:none}.mobile-nav{display:flex}}
-@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.mobile-nav{width:100%}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group,.admin-user-search,.admin-user-row{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar,.notifications-hero{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-item-list li{align-items:stretch;flex-direction:column}.admin-user-search-actions,.admin-user-actions{align-items:stretch;flex-direction:column}.admin-user-search-actions button,.admin-user-search-actions .button-link,.admin-user-actions button{width:100%;justify-content:center}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1,.notifications-hero h1{font-size:1.25rem}.notification-row{grid-template-columns:auto minmax(0,1fr);gap:.6rem}.unread-dot{position:absolute;right:.75rem;top:.75rem;margin:0}.notification-preview{padding:.5rem}}
+@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.header-brand-row{align-items:flex-start;flex-direction:column;width:100%;gap:.55rem}.tor-indicator,.tor-indicator summary{width:100%}.tor-indicator summary{justify-content:flex-start}.tor-details{position:static;width:100%;margin-top:.4rem;grid-template-columns:1fr}.tor-details button{width:100%;justify-content:center}.site-header{position:static}nav{justify-content:flex-start}.mobile-nav{width:100%}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group,.admin-user-search,.admin-user-row{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar,.notifications-hero{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-item-list li{align-items:stretch;flex-direction:column}.admin-user-search-actions,.admin-user-actions{align-items:stretch;flex-direction:column}.admin-user-search-actions button,.admin-user-search-actions .button-link,.admin-user-actions button{width:100%;justify-content:center}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1,.notifications-hero h1{font-size:1.25rem}.notification-row{grid-template-columns:auto minmax(0,1fr);gap:.6rem}.unread-dot{position:absolute;right:.75rem;top:.75rem;margin:0}.notification-preview{padding:.5rem}}
 "#;
 
 #[cfg(test)]
@@ -1895,6 +1965,7 @@ mod tests {
         );
         assert!(!without_tor.contains("examplehiddenservice.onion"));
         assert!(!without_tor.contains("Onion: <code>"));
+        assert!(!without_tor.contains("tor-header-indicator"));
 
         let with_tor = layout_with_context(
             None,
@@ -1908,7 +1979,25 @@ mod tests {
             },
         );
         assert!(with_tor.contains("examplehiddenservice.onion"));
+        assert!(with_tor.contains("tor-header-indicator"));
+        assert!(with_tor.contains("exampl...ice.onion"));
+        assert!(with_tor.contains(r#"data-copy-text="examplehiddenservice.onion""#));
         assert!(with_tor.contains("footer-onion"));
+        assert!(with_tor.contains("Tor mirror: <code>"));
+        assert!(!with_tor.contains("Onion: <code>"));
+    }
+
+    #[test]
+    fn short_onion_address_preserves_short_values() {
+        assert_eq!(
+            short_onion_address("abc.onion"),
+            "abc.onion",
+            "short or unusual values should remain readable"
+        );
+        assert_eq!(
+            short_onion_address("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion"),
+            "abcdef...vwx.onion"
+        );
     }
 
     #[test]

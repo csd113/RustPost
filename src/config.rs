@@ -91,6 +91,8 @@ pub struct TorSettings {
     pub tor_only: bool,
     pub data_dir: String,
     pub onion_service_name: String,
+    #[serde(default)]
+    pub display_onion_address: String,
     pub bootstrap_timeout_secs: u64,
     pub max_concurrent_streams: usize,
     pub include_tor_keys_in_backups_by_default: bool,
@@ -180,6 +182,7 @@ impl Default for Settings {
                 tor_only: false,
                 data_dir: "tor".to_owned(),
                 onion_service_name: "microblog".to_owned(),
+                display_onion_address: String::new(),
                 bootstrap_timeout_secs: 120,
                 max_concurrent_streams: 512,
                 include_tor_keys_in_backups_by_default: false,
@@ -223,6 +226,7 @@ impl Settings {
             anyhow::bail!("tor.tor_only requires tor.enabled");
         }
         validate_onion_service_name(&self.tor.onion_service_name)?;
+        validate_display_onion_address(&self.tor.display_onion_address)?;
         Ok(())
     }
 }
@@ -404,6 +408,10 @@ data_dir = {tor_data_dir}
 # Local name for the onion service state directory.
 onion_service_name = {onion_service_name}
 
+# Optional stable onion address to show in the site header before Arti has
+# reported the active service address. Leave blank to use the runtime address.
+display_onion_address = {display_onion_address}
+
 # Seconds to wait for Tor bootstrap during Tor-only startup.
 bootstrap_timeout_secs = {bootstrap_timeout_secs}
 
@@ -496,6 +504,7 @@ backup_dir = {backup_dir}
         tor_only = settings.tor.tor_only,
         tor_data_dir = toml_string(&settings.tor.data_dir),
         onion_service_name = toml_string(&settings.tor.onion_service_name),
+        display_onion_address = toml_string(&settings.tor.display_onion_address),
         bootstrap_timeout_secs = settings.tor.bootstrap_timeout_secs,
         max_concurrent_streams = settings.tor.max_concurrent_streams,
         include_tor_keys_in_backups_by_default =
@@ -561,6 +570,28 @@ fn validate_onion_service_name(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_display_onion_address(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.trim() != value {
+        anyhow::bail!("tor.display_onion_address must not contain surrounding whitespace");
+    }
+    let Some(service_id) = value.strip_suffix(".onion") else {
+        anyhow::bail!("tor.display_onion_address must end with .onion");
+    };
+    if service_id.len() != 56 {
+        anyhow::bail!("tor.display_onion_address must be a v3 onion address");
+    }
+    if !service_id
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+    {
+        anyhow::bail!("tor.display_onion_address must contain only lowercase base32 characters");
+    }
+    Ok(())
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -600,6 +631,19 @@ mod tests {
     }
 
     #[test]
+    fn missing_display_onion_address_defaults_to_blank() {
+        let raw = toml::to_string(&Settings::default())
+            .expect("settings toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("display_onion_address"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
+
+        assert!(parsed.tor.display_onion_address.is_empty());
+    }
+
+    #[test]
     fn tor_only_requires_tor_enabled() {
         let mut settings = Settings::default();
         settings.tor.tor_only = true;
@@ -618,6 +662,21 @@ mod tests {
     fn rejects_invalid_tor_settings() {
         let mut settings = Settings::default();
         settings.tor.onion_service_name = "bad/name".to_owned();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn validates_display_onion_address() {
+        let mut settings = Settings::default();
+        settings.tor.display_onion_address =
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion".to_owned();
+        settings.validate().expect("valid display onion address");
+
+        settings.tor.display_onion_address = "examplehiddenservice.onion".to_owned();
+        assert!(settings.validate().is_err());
+
+        settings.tor.display_onion_address =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWX.onion".to_owned();
         assert!(settings.validate().is_err());
     }
 
