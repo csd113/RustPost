@@ -337,6 +337,32 @@ pub async fn delete_media(pool: &SqlitePool, media_id: i64) -> anyhow::Result<()
     Ok(())
 }
 
+pub async fn set_media_nsfw(
+    pool: &SqlitePool,
+    media_ids: &[i64],
+    is_nsfw: bool,
+) -> anyhow::Result<()> {
+    if media_ids.is_empty() {
+        return Ok(());
+    }
+    let media_ids = media_ids.to_vec();
+    pool.call(move |conn| {
+        let tx = conn.transaction()?;
+        for media_id in media_ids {
+            let changed = tx.execute(
+                "UPDATE media SET is_nsfw = ? WHERE id = ?",
+                params![i64::from(is_nsfw), media_id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("media attachment not found");
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 fn classify(settings: &Settings, mime: &str, bytes: u64) -> anyhow::Result<MediaKind> {
     if settings
         .media

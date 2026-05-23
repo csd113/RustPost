@@ -36,6 +36,7 @@ pub struct DeepSettingsForm {
     pub max_bio_len: String,
     pub allow_profile_banners: String,
     pub allow_profile_pictures: String,
+    pub nsfw_blur_enabled: String,
     pub max_image_size_mb: String,
     pub max_video_size_mb: String,
 }
@@ -62,6 +63,7 @@ pub enum DeepSettingsField {
     MaxBioLen,
     AllowProfileBanners,
     AllowProfilePictures,
+    NsfwBlurEnabled,
     MaxImageSizeMb,
     MaxVideoSizeMb,
 }
@@ -95,6 +97,7 @@ pub struct DeepSettingsValues {
     pub max_bio_len: usize,
     pub allow_profile_banners: bool,
     pub allow_profile_pictures: bool,
+    pub nsfw_blur_enabled: bool,
     pub max_image_size_mb: u64,
     pub max_video_size_mb: u64,
 }
@@ -107,7 +110,7 @@ pub struct DeepSettingsChange {
 }
 
 impl DeepSettingsField {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::SiteName,
         Self::MaxTextChars,
         Self::MaxImagesPerPost,
@@ -128,6 +131,7 @@ impl DeepSettingsField {
         Self::MaxBioLen,
         Self::AllowProfileBanners,
         Self::AllowProfilePictures,
+        Self::NsfwBlurEnabled,
         Self::MaxImageSizeMb,
         Self::MaxVideoSizeMb,
     ];
@@ -155,7 +159,7 @@ impl DeepSettingsField {
             | Self::MaxBioLen
             | Self::AllowProfileBanners
             | Self::AllowProfilePictures => "Accounts",
-            Self::MaxImageSizeMb | Self::MaxVideoSizeMb => "Media limits",
+            Self::NsfwBlurEnabled | Self::MaxImageSizeMb | Self::MaxVideoSizeMb => "Media",
         }
     }
 
@@ -182,7 +186,7 @@ impl DeepSettingsField {
             | Self::MaxBioLen
             | Self::AllowProfileBanners
             | Self::AllowProfilePictures => "accounts",
-            Self::MaxImageSizeMb | Self::MaxVideoSizeMb => "media",
+            Self::NsfwBlurEnabled | Self::MaxImageSizeMb | Self::MaxVideoSizeMb => "media",
         }
     }
 
@@ -209,6 +213,7 @@ impl DeepSettingsField {
             Self::MaxBioLen => "max_bio_len",
             Self::AllowProfileBanners => "allow_profile_banners",
             Self::AllowProfilePictures => "allow_profile_pictures",
+            Self::NsfwBlurEnabled => "nsfw_blur_enabled",
             Self::MaxImageSizeMb => "max_image_size",
             Self::MaxVideoSizeMb => "max_video_size",
         }
@@ -237,6 +242,7 @@ impl DeepSettingsField {
             Self::MaxBioLen => "max_bio_len",
             Self::AllowProfileBanners => "allow_profile_banners",
             Self::AllowProfilePictures => "allow_profile_pictures",
+            Self::NsfwBlurEnabled => "nsfw_blur_enabled",
             Self::MaxImageSizeMb => "max_image_size_mb",
             Self::MaxVideoSizeMb => "max_video_size_mb",
         }
@@ -265,6 +271,7 @@ impl DeepSettingsField {
             Self::MaxBioLen => "Maximum bio length",
             Self::AllowProfileBanners => "Allow profile banners",
             Self::AllowProfilePictures => "Allow profile pictures",
+            Self::NsfwBlurEnabled => "Blur NSFW media",
             Self::MaxImageSizeMb => "Maximum image size",
             Self::MaxVideoSizeMb => "Maximum video size",
         }
@@ -283,6 +290,9 @@ impl DeepSettingsField {
             }
             Self::MinPasswordLength => Some("Characters. Recommended default is 10."),
             Self::RegistrationCaptchaEnabled => Some("Requires a CAPTCHA on registration only."),
+            Self::NsfwBlurEnabled => Some(
+                "When true, flagged media is blurred unless a user disables their own blur setting.",
+            ),
             Self::MaxImageSizeMb | Self::MaxVideoSizeMb => Some("MB."),
             _ => None,
         }
@@ -302,7 +312,8 @@ impl DeepSettingsField {
             | Self::RegistrationCaptchaEnabled
             | Self::AnonymousModeEnabled
             | Self::AllowProfileBanners
-            | Self::AllowProfilePictures => DeepSettingsInputKind::Boolean,
+            | Self::AllowProfilePictures
+            | Self::NsfwBlurEnabled => DeepSettingsInputKind::Boolean,
             _ => DeepSettingsInputKind::Number,
         }
     }
@@ -332,6 +343,7 @@ impl DeepSettingsValues {
             max_bio_len: settings.accounts.max_bio_len,
             allow_profile_banners: settings.accounts.allow_profile_banners,
             allow_profile_pictures: settings.accounts.allow_profile_pictures,
+            nsfw_blur_enabled: settings.media.nsfw_blur_enabled,
             max_image_size_mb: bytes_to_mb(settings.media.max_image_size),
             max_video_size_mb: bytes_to_mb(settings.media.max_video_size),
         }
@@ -362,6 +374,7 @@ impl DeepSettingsValues {
             DeepSettingsField::MaxBioLen => self.max_bio_len.to_string(),
             DeepSettingsField::AllowProfileBanners => self.allow_profile_banners.to_string(),
             DeepSettingsField::AllowProfilePictures => self.allow_profile_pictures.to_string(),
+            DeepSettingsField::NsfwBlurEnabled => self.nsfw_blur_enabled.to_string(),
             DeepSettingsField::MaxImageSizeMb => self.max_image_size_mb.to_string(),
             DeepSettingsField::MaxVideoSizeMb => self.max_video_size_mb.to_string(),
         }
@@ -406,6 +419,7 @@ impl DeepSettingsValues {
         updated.accounts.max_bio_len = self.max_bio_len;
         updated.accounts.allow_profile_banners = self.allow_profile_banners;
         updated.accounts.allow_profile_pictures = self.allow_profile_pictures;
+        updated.media.nsfw_blur_enabled = self.nsfw_blur_enabled;
         updated.media.max_image_size = self.max_image_size_mb * MIB;
         updated.media.max_video_size = self.max_video_size_mb * MIB;
         updated
@@ -467,6 +481,7 @@ pub fn parse_deep_settings_form(
             &form.allow_profile_pictures,
             DeepSettingsField::AllowProfilePictures,
         )?,
+        nsfw_blur_enabled: parse_bool(&form.nsfw_blur_enabled, DeepSettingsField::NsfwBlurEnabled)?,
         max_image_size_mb: parse_mb(&form.max_image_size_mb, DeepSettingsField::MaxImageSizeMb)?,
         max_video_size_mb: parse_mb(&form.max_video_size_mb, DeepSettingsField::MaxVideoSizeMb)?,
     };
@@ -680,6 +695,7 @@ fn toml_value(field: DeepSettingsField, settings: &Settings) -> String {
         DeepSettingsField::AllowProfilePictures => {
             settings.accounts.allow_profile_pictures.to_string()
         }
+        DeepSettingsField::NsfwBlurEnabled => settings.media.nsfw_blur_enabled.to_string(),
         DeepSettingsField::MaxImageSizeMb => settings.media.max_image_size.to_string(),
         DeepSettingsField::MaxVideoSizeMb => settings.media.max_video_size.to_string(),
     }
@@ -1303,6 +1319,7 @@ mod tests {
             max_bio_len: values.max_bio_len.to_string(),
             allow_profile_banners: values.allow_profile_banners.to_string(),
             allow_profile_pictures: values.allow_profile_pictures.to_string(),
+            nsfw_blur_enabled: values.nsfw_blur_enabled.to_string(),
             max_image_size_mb: values.max_image_size_mb.to_string(),
             max_video_size_mb: values.max_video_size_mb.to_string(),
         }
@@ -1423,12 +1440,14 @@ mod tests {
         form.site_name = "Custom Site".to_owned();
         form.max_bio_len = "300".to_owned();
         form.allow_profile_pictures = "false".to_owned();
+        form.nsfw_blur_enabled = "false".to_owned();
 
         let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
 
         assert_eq!(parsed.site_name, "Custom Site");
         assert_eq!(parsed.max_bio_len, 300);
         assert!(!parsed.allow_profile_pictures);
+        assert!(!parsed.nsfw_blur_enabled);
     }
 
     #[test]
@@ -1476,6 +1495,7 @@ mod tests {
         let mut form = form_from_settings(&settings);
         form.max_bio_len = "300".to_owned();
         form.allow_profile_pictures = "false".to_owned();
+        form.nsfw_blur_enabled = "false".to_owned();
         let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
 
         let diff = diff_deep_settings(&settings, &parsed);
@@ -1490,6 +1510,11 @@ mod tests {
                 },
                 DeepSettingsChange {
                     label: "Allow profile pictures",
+                    old_value: "true".to_owned(),
+                    new_value: "false".to_owned(),
+                },
+                DeepSettingsChange {
+                    label: "Blur NSFW media",
                     old_value: "true".to_owned(),
                     new_value: "false".to_owned(),
                 },
@@ -1530,6 +1555,7 @@ mod tests {
         let mut settings = Settings::load(&path).expect("load settings");
         settings.site.name = "Written Site".to_owned();
         settings.accounts.max_bio_len = 300;
+        settings.media.nsfw_blur_enabled = false;
         settings.media.max_image_size = 8 * MIB;
 
         write_deep_settings(&path, &settings).expect("write settings");
@@ -1539,6 +1565,7 @@ mod tests {
         assert!(raw.contains("# RustPost settings"));
         assert_eq!(parsed.site.name, "Written Site");
         assert_eq!(parsed.accounts.max_bio_len, 300);
+        assert!(!parsed.media.nsfw_blur_enabled);
         assert_eq!(parsed.media.max_image_size, 8 * MIB);
         assert_eq!(parsed.server.port, Settings::default().server.port);
         assert_eq!(

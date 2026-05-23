@@ -73,6 +73,8 @@ pub struct MediaSettings {
     pub convert_images_to_webp: bool,
     pub convert_videos_to_webm: bool,
     pub keep_original_uploads: bool,
+    #[serde(default = "default_true")]
+    pub nsfw_blur_enabled: bool,
     pub max_image_size: u64,
     pub max_video_size: u64,
     pub generate_video_thumbnails: bool,
@@ -154,6 +156,7 @@ impl Default for Settings {
                 convert_images_to_webp: true,
                 convert_videos_to_webm: true,
                 keep_original_uploads: false,
+                nsfw_blur_enabled: true,
                 max_image_size: 52_428_800,
                 max_video_size: 157_286_400,
                 generate_video_thumbnails: true,
@@ -357,6 +360,9 @@ convert_videos_to_webm = {convert_videos_to_webm}
 # false reduces stored untrusted file formats.
 keep_original_uploads = {keep_original_uploads}
 
+# Blur media that users or admins mark as NSFW. Safe default is true.
+nsfw_blur_enabled = {nsfw_blur_enabled}
+
 # SECURITY: Maximum accepted image upload size in bytes. Default is 50 MiB.
 max_image_size = {max_image_size}
 
@@ -477,6 +483,7 @@ backup_dir = {backup_dir}
         convert_images_to_webp = settings.media.convert_images_to_webp,
         convert_videos_to_webm = settings.media.convert_videos_to_webm,
         keep_original_uploads = settings.media.keep_original_uploads,
+        nsfw_blur_enabled = settings.media.nsfw_blur_enabled,
         max_image_size = settings.media.max_image_size,
         max_video_size = settings.media.max_video_size,
         generate_video_thumbnails = settings.media.generate_video_thumbnails,
@@ -554,6 +561,10 @@ fn validate_onion_service_name(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +584,19 @@ mod tests {
             toml::to_string(&Settings::default()).expect("default settings serialize")
         );
         parsed.validate().expect("generated config validates");
+    }
+
+    #[test]
+    fn missing_nsfw_blur_setting_defaults_to_safe_enabled() {
+        let raw = toml::to_string(&Settings::default())
+            .expect("settings toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("nsfw_blur_enabled"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
+
+        assert!(parsed.media.nsfw_blur_enabled);
     }
 
     #[test]

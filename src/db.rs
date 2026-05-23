@@ -120,6 +120,10 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_9)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (9)", [])?;
         }
+        if applied.unwrap_or(0) < 10 {
+            tx.execute_batch(MIGRATION_10)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (10)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -352,6 +356,13 @@ CREATE INDEX IF NOT EXISTS idx_notifications_user_id_desc ON notifications(user_
 CREATE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user_id, actor_user_id, post_id, kind);
 "#;
 
+const MIGRATION_10: &str = r#"
+ALTER TABLE media ADD COLUMN is_nsfw INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN nsfw_blur_enabled INTEGER NOT NULL DEFAULT 1;
+
+CREATE INDEX IF NOT EXISTS idx_media_is_nsfw ON media(is_nsfw);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,7 +404,7 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 9);
+        assert_eq!(versions, 10);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);
@@ -459,6 +470,42 @@ mod tests {
             .expect("location");
 
         assert_eq!(location, "");
+    }
+
+    #[tokio::test]
+    async fn nsfw_defaults_are_safe_for_users_and_media() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        let (blur_enabled, is_nsfw): (i64, i64) = pool
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO users (username, normalized_username, password_hash, display_name) VALUES ('Alice', 'alice', 'hash', 'Alice')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (1, 'x.png', '/tmp/x.png', '/uploads/images/x.png', 'image/png', 'image', 1)",
+                    [],
+                )?;
+                Ok((
+                    conn.query_row(
+                        "SELECT nsfw_blur_enabled FROM users WHERE normalized_username = 'alice'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row("SELECT is_nsfw FROM media WHERE id = 1", [], |row| {
+                        row.get(0)
+                    })?,
+                ))
+            })
+            .await
+            .expect("defaults");
+
+        assert_eq!(blur_enabled, 1);
+        assert_eq!(is_nsfw, 0);
     }
 
     #[tokio::test]

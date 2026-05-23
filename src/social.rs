@@ -67,6 +67,7 @@ pub struct MediaView {
     pub mime_type: String,
     pub media_kind: String,
     pub alt_text: String,
+    pub is_nsfw: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -821,6 +822,31 @@ pub async fn delete_post(
     .await
 }
 
+pub async fn set_post_media_nsfw(
+    pool: &SqlitePool,
+    post_id: i64,
+    is_nsfw: bool,
+) -> anyhow::Result<usize> {
+    pool.call(move |conn| {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM posts WHERE id = ? AND is_deleted = 0",
+                [post_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            anyhow::bail!("post not found");
+        }
+        Ok(conn.execute(
+            "UPDATE media SET is_nsfw = ? WHERE id IN (SELECT media_id FROM post_media WHERE post_id = ?)",
+            params![i64::from(is_nsfw), post_id],
+        )?)
+    })
+    .await
+}
+
 pub async fn search(
     pool: &SqlitePool,
     viewer_id: Option<i64>,
@@ -1381,7 +1407,7 @@ async fn media_for_post(pool: &SqlitePool, post_id: i64) -> anyhow::Result<Vec<M
     pool.call(move |conn| {
         let mut stmt = conn.prepare(
             r#"
-        SELECT m.public_path, m.mime_type, m.media_kind, m.alt_text
+        SELECT m.public_path, m.mime_type, m.media_kind, m.alt_text, m.is_nsfw
         FROM post_media pm JOIN media m ON m.id = pm.media_id
         WHERE pm.post_id = ? ORDER BY pm.position ASC
         "#,
@@ -1393,6 +1419,7 @@ async fn media_for_post(pool: &SqlitePool, post_id: i64) -> anyhow::Result<Vec<M
                     mime_type: row.get(1)?,
                     media_kind: row.get(2)?,
                     alt_text: row.get(3)?,
+                    is_nsfw: row.get::<_, i64>(4)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

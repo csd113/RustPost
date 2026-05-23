@@ -32,6 +32,7 @@ impl Default for LayoutContext {
 pub struct PostRenderOptions {
     pub show_timestamp: bool,
     pub clickable_card: bool,
+    pub blur_nsfw_media: bool,
 }
 
 impl PostRenderOptions {
@@ -39,6 +40,7 @@ impl PostRenderOptions {
         Self {
             show_timestamp: false,
             clickable_card: true,
+            blur_nsfw_media: true,
         }
     }
 
@@ -46,6 +48,7 @@ impl PostRenderOptions {
         Self {
             show_timestamp: true,
             clickable_card: true,
+            blur_nsfw_media: true,
         }
     }
 }
@@ -608,7 +611,7 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
 <input type="hidden" name="csrf" value="{}">{}
 <label class="sr-only" for="{}">What is happening?</label>
 <textarea id="{}" name="text" maxlength="{}" rows="4" data-character-limit="{}" placeholder="{}"></textarea>
-<div class="composer-tools"><label class="file-control" for="media">Attach media<input id="media" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime"></label><button class="primary" type="submit">Post</button></div>
+<div class="composer-tools"><span class="composer-media-controls"><label class="file-control" for="media">Attach media<input id="media" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime"></label><label class="check-row composer-nsfw" for="post-nsfw"><input id="post-nsfw" name="nsfw" type="checkbox" value="true"> Mark media as NSFW</label></span><button class="primary" type="submit">Post</button></div>
 </form></section>"#,
         if parent.is_some() {
             "Reply"
@@ -730,6 +733,7 @@ pub fn search_page(
     posts: &[PostView],
     user: Option<&CurrentUser>,
     csrf: Option<&str>,
+    blur_nsfw_media: bool,
 ) -> String {
     let form = search_form(site_name, query);
     let state = if query.is_empty() {
@@ -740,7 +744,7 @@ pub fn search_page(
     } else if users.is_empty() && posts.is_empty() {
         empty_state("No results found", &format!(r#"No matches for "{query}"."#))
     } else {
-        search_results(query, users, posts, user, csrf)
+        search_results(query, users, posts, user, csrf, blur_nsfw_media)
     };
     format!("{form}{state}")
 }
@@ -759,6 +763,7 @@ fn search_results(
     posts: &[PostView],
     user: Option<&CurrentUser>,
     csrf: Option<&str>,
+    blur_nsfw_media: bool,
 ) -> String {
     let total = users.len() + posts.len();
     let plural = if total == 1 { "result" } else { "results" };
@@ -773,7 +778,15 @@ fn search_results(
     } else {
         format!(
             "{posts_heading}{}",
-            posts_with_options(posts, user, csrf, PostRenderOptions::timeline())
+            posts_with_options(
+                posts,
+                user,
+                csrf,
+                PostRenderOptions {
+                    blur_nsfw_media,
+                    ..PostRenderOptions::timeline()
+                }
+            )
         )
     };
     format!(
@@ -860,7 +873,50 @@ pub fn posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option<&str>)
     posts_with_options(posts, user, csrf, PostRenderOptions::timeline())
 }
 
+pub fn posts_with_nsfw_blur(
+    posts: &[PostView],
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    blur_nsfw_media: bool,
+) -> String {
+    posts_with_options(
+        posts,
+        user,
+        csrf,
+        PostRenderOptions {
+            blur_nsfw_media,
+            ..PostRenderOptions::timeline()
+        },
+    )
+}
+
 pub fn thread_posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option<&str>) -> String {
+    thread_posts_with_options(posts, user, csrf, PostRenderOptions::thread())
+}
+
+pub fn thread_posts_with_nsfw_blur(
+    posts: &[PostView],
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    blur_nsfw_media: bool,
+) -> String {
+    thread_posts_with_options(
+        posts,
+        user,
+        csrf,
+        PostRenderOptions {
+            blur_nsfw_media,
+            ..PostRenderOptions::thread()
+        },
+    )
+}
+
+fn thread_posts_with_options(
+    posts: &[PostView],
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    options: PostRenderOptions,
+) -> String {
     if posts.is_empty() {
         return empty_state(
             "No posts yet",
@@ -873,11 +929,11 @@ pub fn thread_posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option
             .iter()
             .enumerate()
             .map(|(index, post)| {
-                let mut options = PostRenderOptions::thread();
+                let mut card_options = options;
                 if index == 0 {
-                    options.clickable_card = false;
+                    card_options.clickable_card = false;
                 }
-                post_card_with_options(post, user, csrf, options)
+                post_card_with_options(post, user, csrf, card_options)
             })
             .collect::<Vec<_>>()
             .join("")
@@ -910,8 +966,42 @@ pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>
     post_card_with_options(post, user, csrf, PostRenderOptions::timeline())
 }
 
+pub fn post_card_with_nsfw_blur(
+    post: &PostView,
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    blur_nsfw_media: bool,
+) -> String {
+    post_card_with_options(
+        post,
+        user,
+        csrf,
+        PostRenderOptions {
+            blur_nsfw_media,
+            ..PostRenderOptions::timeline()
+        },
+    )
+}
+
 pub fn thread_post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>) -> String {
     post_card_with_options(post, user, csrf, PostRenderOptions::thread())
+}
+
+pub fn thread_post_card_with_nsfw_blur(
+    post: &PostView,
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    blur_nsfw_media: bool,
+) -> String {
+    post_card_with_options(
+        post,
+        user,
+        csrf,
+        PostRenderOptions {
+            blur_nsfw_media,
+            ..PostRenderOptions::thread()
+        },
+    )
 }
 
 // Rendering a post card stays centralized because the markup, counts, media,
@@ -982,7 +1072,8 @@ fn post_card_with_options(
     let media = post
         .media
         .iter()
-        .map(render_media)
+        .enumerate()
+        .map(|(index, media)| render_media(media, post.id, index, options.blur_nsfw_media))
         .collect::<Vec<_>>()
         .join("");
     let controls = if let (Some(user), Some(csrf)) = (user, csrf) {
@@ -991,9 +1082,14 @@ fn post_card_with_options(
         } else {
             String::new()
         };
+        let nsfw = if user.is_admin && !post.media.is_empty() {
+            admin_nsfw_form(post, csrf)
+        } else {
+            String::new()
+        };
         let reply_link = icon_link(&format!("/posts/{}#reply", post.id), "Reply", "reply");
         format!(
-            r#"<div class="actions" data-testid="post-actions">{}{}{}{}{}</div>"#,
+            r#"<div class="actions" data-testid="post-actions">{}{}{}{}{}{}</div>"#,
             icon_action_form(
                 &format!("/posts/{}/like", post.id),
                 csrf,
@@ -1031,6 +1127,7 @@ fn post_card_with_options(
                 post.viewer_bookmarked
             ),
             delete,
+            nsfw,
         )
     } else {
         String::new()
@@ -1166,6 +1263,21 @@ fn disabled_icon_button(label: &str, icon: &str) -> String {
     )
 }
 
+fn admin_nsfw_form(post: &PostView, csrf: &str) -> String {
+    let flagged = post.media.iter().any(|media| media.is_nsfw);
+    let (value, label) = if flagged {
+        ("false", "Unmark NSFW")
+    } else {
+        ("true", "Mark NSFW")
+    };
+    format!(
+        r#"<form method="post" action="/admin/posts/{}/nsfw" class="admin-nsfw-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="nsfw" value="{value}"><button class="admin-nsfw-button" type="submit">{}</button></form>"#,
+        post.id,
+        html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_text(label),
+    )
+}
+
 fn quote_preview_card(quote: &QuotePreview) -> String {
     if quote.unavailable {
         return r#"<aside class="quote-preview unavailable" aria-label="Quoted post"><p>Quoted post is no longer available.</p></aside>"#
@@ -1241,14 +1353,21 @@ fn icon_svg(icon: &str) -> &'static str {
     }
 }
 
-fn render_media(media: &MediaView) -> String {
+fn render_media(media: &MediaView, post_id: i64, index: usize, blur_nsfw_media: bool) -> String {
     let path = html_escape::encode_double_quoted_attribute(&media.public_path);
     let alt = html_escape::encode_double_quoted_attribute(&media.alt_text);
-    if media.media_kind == "video" {
+    let item = if media.media_kind == "video" {
         format!(r#"<video controls preload="metadata" src="{path}"></video>"#)
     } else {
         format!(r#"<img src="{path}" alt="{alt}" loading="lazy">"#)
+    };
+    if !media.is_nsfw || !blur_nsfw_media {
+        return item;
     }
+    let toggle_id = format!("nsfw-media-{post_id}-{index}");
+    format!(
+        r#"<div class="nsfw-media" data-testid="nsfw-media"><input class="nsfw-toggle sr-only" id="{toggle_id}" type="checkbox" aria-label="Show NSFW media"><div class="nsfw-media-frame">{item}<span class="nsfw-badge">NSFW</span></div><label class="nsfw-show" for="{toggle_id}">Show<span class="sr-only"> NSFW media</span></label><a class="nsfw-open" href="{path}">Open media</a></div>"#
+    )
 }
 
 pub fn linkify(text: &str) -> String {
@@ -1575,10 +1694,10 @@ input[type=text].password-visible{padding-right:.8rem}.password-control{display:
 .search-panel h1{margin-bottom:.75rem}.search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center}.search-form input{min-width:0}.search-results{display:grid;gap:.65rem}.section-title{margin:.2rem 0 .65rem;font-size:1.05rem;color:var(--text)}.search-users{margin-bottom:0}.search-users .section-title{margin-top:0}.search-account{grid-template-columns:auto minmax(0,1fr)}
 input:focus,textarea:focus,select:focus,button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}button,.primary{border:1px solid var(--brand);background:var(--brand);color:var(--brand-text);border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:var(--brand-hover);text-decoration:none}
 nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.42rem .65rem}.rail-nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.5rem .65rem}.rail-nav button:hover,.mobile-nav button:hover{background:var(--hover);color:var(--link-strong)}
-.composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:var(--link-strong);font-weight:700}.file-control input{max-width:15rem}
+.composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.composer-media-controls{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap}.composer-nsfw{margin:0}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:var(--link-strong);font-weight:700}.file-control input{max-width:15rem}
 .thread-nav{display:flex;margin:0 0 .45rem .85rem}.thread-back{width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:var(--link-strong)}.thread-back svg{width:1.2rem;height:1.2rem;fill:currentColor}.thread-back:hover{background:var(--hover);text-decoration:none}
-.timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.js-enabled .post[data-card-href]{cursor:pointer}.js-enabled .post[data-card-href]:hover{border-color:var(--border-strong)}.reply-post{margin-left:1.1rem;border-left:4px solid var(--reply-border);background:var(--surface-subtle)}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid var(--reply-border)}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid var(--border);background:var(--avatar-bg);flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:var(--muted-strong);font-weight:800}.author-name{font-weight:800;color:var(--text-strong)}.username,.post-time,.counts{color:var(--muted);font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-top:.5rem;background:var(--media-bg)}.post img.post-avatar{display:block;margin:0;border-radius:999px}
-.counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.post-permalink{font-weight:700;color:var(--link-strong)}.actions{display:inline-flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem;max-width:100%}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.repost-control{position:relative;display:inline-flex;align-items:center;gap:.25rem}.repost-menu{position:absolute;z-index:8;left:0;top:calc(100% + .25rem);min-width:8.5rem;padding:.3rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 6px 18px var(--shadow)}.repost-menu a{display:inline-flex;align-items:center;gap:.35rem;width:100%;min-height:2rem;border-radius:6px;padding:.32rem .55rem;color:var(--link-strong);font-weight:700}.repost-menu a svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.repost-menu a:hover,.quote-fallback:hover{background:var(--hover);text-decoration:none}.quote-preview{display:block;margin:.6rem 0 .25rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);overflow:hidden}.quote-preview p{margin:.65rem;color:var(--muted-strong)}.quote-link{display:grid;gap:.2rem;padding:.6rem;color:var(--text)}.quote-link:hover{background:var(--hover);text-decoration:none}.quote-author{font-weight:800}.quote-text{white-space:pre-wrap;overflow-wrap:anywhere}.quote-time{color:var(--muted);font-size:.86rem}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}.noscript-banner{max-width:1100px;margin:.7rem auto 0;padding:.65rem .85rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle);color:var(--muted-strong)}.js-enabled .noscript-banner{display:none}
+.timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.js-enabled .post[data-card-href]{cursor:pointer}.js-enabled .post[data-card-href]:hover{border-color:var(--border-strong)}.reply-post{margin-left:1.1rem;border-left:4px solid var(--reply-border);background:var(--surface-subtle)}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid var(--reply-border)}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid var(--border);background:var(--avatar-bg);flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:var(--muted-strong);font-weight:800}.author-name{font-weight:800;color:var(--text-strong)}.username,.post-time,.counts{color:var(--muted);font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-top:.5rem;background:var(--media-bg)}.post img.post-avatar{display:block;margin:0;border-radius:999px}.nsfw-media{position:relative;margin-top:.5rem}.nsfw-media .post img,.nsfw-media .post video{margin-top:0}.nsfw-media-frame{position:relative;display:block;overflow:hidden;border-radius:8px}.nsfw-media-frame img,.nsfw-media-frame video{margin-top:0;filter:blur(24px);transform:scale(1.02)}.nsfw-toggle:checked+.nsfw-media-frame img,.nsfw-toggle:checked+.nsfw-media-frame video{filter:none;transform:none}.nsfw-badge{position:absolute;left:.55rem;bottom:.55rem;border-radius:999px;padding:.18rem .5rem;background:rgba(0,0,0,.72);color:#fff;font-size:.78rem;font-weight:900;letter-spacing:.03em}.nsfw-show{position:absolute;right:.55rem;bottom:.55rem;margin:0;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text-strong);padding:.32rem .65rem;font-weight:900;box-shadow:0 1px 2px var(--shadow);cursor:pointer}.nsfw-show:hover{background:var(--hover)}.nsfw-toggle:focus-visible~.nsfw-show{outline:3px solid var(--focus);outline-offset:2px}.nsfw-toggle:checked~.nsfw-show,.nsfw-toggle:checked+.nsfw-media-frame .nsfw-badge{display:none}.nsfw-open{display:block;margin:.35rem 0 0;font-size:.9rem;font-weight:700}
+.counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.post-permalink{font-weight:700;color:var(--link-strong)}.actions{display:inline-flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem;max-width:100%}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.admin-nsfw-button{min-height:2.2rem;padding:.3rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border);font-size:.86rem}.admin-nsfw-button:hover{background:var(--hover);color:var(--text-strong)}.repost-control{position:relative;display:inline-flex;align-items:center;gap:.25rem}.repost-menu{position:absolute;z-index:8;left:0;top:calc(100% + .25rem);min-width:8.5rem;padding:.3rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 6px 18px var(--shadow)}.repost-menu a{display:inline-flex;align-items:center;gap:.35rem;width:100%;min-height:2rem;border-radius:6px;padding:.32rem .55rem;color:var(--link-strong);font-weight:700}.repost-menu a svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.repost-menu a:hover,.quote-fallback:hover{background:var(--hover);text-decoration:none}.quote-preview{display:block;margin:.6rem 0 .25rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);overflow:hidden}.quote-preview p{margin:.65rem;color:var(--muted-strong)}.quote-link{display:grid;gap:.2rem;padding:.6rem;color:var(--text)}.quote-link:hover{background:var(--hover);text-decoration:none}.quote-author{font-weight:800}.quote-text{white-space:pre-wrap;overflow-wrap:anywhere}.quote-time{color:var(--muted);font-size:.86rem}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}.noscript-banner{max-width:1100px;margin:.7rem auto 0;padding:.65rem .85rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle);color:var(--muted-strong)}.js-enabled .noscript-banner{display:none}
 .profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid var(--border);background:var(--surface-muted)}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:999px;border:3px solid var(--surface);background:var(--avatar-bg);flex:0 0 auto}.profile-meta{color:var(--muted-strong);margin:.45rem 0 0}.settings-profile-editor{padding:0;overflow:hidden}.settings-editor-bar{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.85rem;border-bottom:1px solid var(--border)}.settings-editor-bar h1{margin:0}.settings-editor-bar .primary{flex:0 0 auto}.settings-profile-form{padding:0 .85rem .85rem}.settings-profile-media{margin:0 -.85rem .85rem}.settings-banner-wrap{background:var(--media-bg)}.settings-banner-preview{display:block;width:100%;height:220px;object-fit:cover;background:linear-gradient(135deg,var(--surface-muted),var(--hover));border:0;border-radius:0}.settings-banner-preview.placeholder::before{content:"";display:block;width:100%;height:100%}.settings-picture-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:1rem;align-items:end;padding:0 .85rem .85rem;margin-top:-48px}.settings-picture-preview{width:112px;height:112px;object-fit:cover;border-radius:999px;border:5px solid var(--surface);background:var(--avatar-bg);box-shadow:0 1px 4px var(--shadow)}.settings-picture-preview.placeholder{display:block}.settings-media-controls{display:grid;gap:.5rem;align-content:end;padding-top:3.25rem}.media-control-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}.settings-fields{display:grid;gap:.25rem}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-panel{padding:0;overflow:hidden}.deep-settings-form{padding:.85rem;display:grid;gap:.85rem}.deep-settings-group{border:1px solid var(--border);border-radius:8px;padding:.8rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-group legend{font-weight:800;padding:0 .35rem}.deep-settings-field{display:grid;gap:.25rem;align-content:start}.deep-settings-field label{font-weight:800}.deep-settings-field input,.deep-settings-field select{min-width:0}.field-help{font-size:.88rem}.deep-settings-confirm .settings-item-list li{display:block}.compact-panel h2,.danger-panel h2{margin:0 0 .65rem;font-size:1.1rem}.inline-settings-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center;margin:.2rem 0 .75rem}.inline-settings-form input{min-width:0}.settings-password-form button[type=submit]{margin-top:.9rem}.settings-item-list{list-style:none;margin:.25rem 0 0;padding:0;display:grid;gap:.45rem}.settings-item-list li{display:flex;justify-content:space-between;align-items:center;gap:.75rem;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle)}.settings-item-list form{flex:0 0 auto}.settings-item-list button{padding:.32rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border)}.compact-empty{border:1px dashed var(--border);border-radius:7px;padding:.75rem;background:var(--surface-subtle);color:var(--muted-strong)}.compact-empty p{margin:.25rem 0 0}.danger-panel{border-color:var(--danger-border);background:var(--danger-bg)}.danger,.danger-link{border-color:var(--danger-border);background:var(--danger);color:var(--brand-text)}.danger:hover,.danger-link:hover{background:var(--danger-strong);color:var(--brand-text);text-decoration:none}.delete-account-panel p{max-width:62ch}.favicon-preview{width:32px;height:32px;object-fit:contain;border:1px solid var(--border);border-radius:6px;background:var(--surface)}.admin-user-search{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:.65rem;align-items:end;margin-top:.75rem}.admin-user-search label{margin-top:0}.admin-user-search-actions{display:flex;gap:.4rem;align-items:center;margin-bottom:.05rem}.admin-user-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.75rem;border:1px solid var(--border);border-radius:8px;padding:.75rem;margin-top:.65rem;background:var(--surface-subtle)}.admin-user-heading{overflow-wrap:anywhere}.admin-user-statuses,.admin-user-matches{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.45rem}.admin-user-pill,.admin-user-match{display:inline-flex;align-items:center;min-height:1.55rem;border:1px solid var(--border);border-radius:999px;padding:.15rem .5rem;background:var(--surface);font-size:.82rem;font-weight:800;color:var(--muted-strong)}.admin-user-match{border-color:var(--success-border);background:var(--success-bg);color:var(--text)}.admin-user-meta{margin:.6rem 0 0}.admin-post-preview{margin:.55rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.admin-user-actions{display:flex;align-items:flex-start}.admin-users-empty{margin-top:.75rem}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--border);text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
 @media (max-width:1100px){.app-shell{--shell-side:220px;--shell-max:880px;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary))}.right-rail{display:none}}
 @media (max-width:820px){.app-shell{grid-template-columns:minmax(0,680px)}.left-rail,.right-rail{display:none}.mobile-nav{display:flex}}
@@ -1616,6 +1735,7 @@ mod tests {
             is_admin: false,
             is_suspended: false,
             theme: Theme::Dark,
+            nsfw_blur_enabled: true,
         };
         let body = layout(Some(&user), "Home Feed", "<p>body</p>", "My Microblog");
 
@@ -1691,6 +1811,7 @@ mod tests {
             is_admin: false,
             is_suspended: false,
             theme: Theme::Light,
+            nsfw_blur_enabled: true,
         };
         let body = layout_with_csrf(
             Some(&user),
@@ -1726,6 +1847,7 @@ mod tests {
             is_admin: false,
             is_suspended: false,
             theme: Theme::Light,
+            nsfw_blur_enabled: true,
         };
         let body = layout_with_context(
             Some(&user),
@@ -1902,7 +2024,7 @@ mod tests {
 
     #[test]
     fn search_page_preserves_and_escapes_query() {
-        let body = search_page("RustPost", r#"<rust> "query""#, &[], &[], None, None);
+        let body = search_page("RustPost", r#"<rust> "query""#, &[], &[], None, None, true);
 
         assert!(body.contains(r#"value="&lt;rust&gt; &quot;query&quot;""#));
         assert!(body.contains("No results found"));
@@ -1924,7 +2046,7 @@ mod tests {
             viewer_following: false,
         };
 
-        let body = search_page("RustPost", "ada", &[account], &[post], None, None);
+        let body = search_page("RustPost", "ada", &[account], &[post], None, None, true);
 
         assert!(body.contains(r#"2 results for "ada""#));
         assert!(body.contains(r#"id="search-users-title">People"#));
@@ -1941,6 +2063,7 @@ mod tests {
             is_admin: false,
             is_suspended: false,
             theme: Theme::Light,
+            nsfw_blur_enabled: true,
         };
         let mut post = test_post();
         post.user_id = Some(2);
@@ -1974,6 +2097,7 @@ mod tests {
             is_admin: false,
             is_suspended: false,
             theme: Theme::Light,
+            nsfw_blur_enabled: true,
         };
         let mut post = test_post();
         post.user_id = Some(2);
@@ -2031,6 +2155,42 @@ mod tests {
         let body = post_card(&post, None, None);
 
         assert!(body.contains("Quoted post is no longer available."));
+    }
+
+    #[test]
+    fn nsfw_media_renders_blurred_with_accessible_reveal_control() {
+        let mut post = test_post();
+        post.media = vec![MediaView {
+            public_path: "/uploads/images/flagged.webp".to_owned(),
+            mime_type: "image/webp".to_owned(),
+            media_kind: "image".to_owned(),
+            alt_text: "Flagged image".to_owned(),
+            is_nsfw: true,
+        }];
+
+        let body = post_card(&post, None, None);
+
+        assert!(body.contains(r#"data-testid="nsfw-media""#));
+        assert!(body.contains(r#"aria-label="Show NSFW media""#));
+        assert!(body.contains(">Show<span"));
+        assert!(body.contains(r#"href="/uploads/images/flagged.webp">Open media</a>"#));
+    }
+
+    #[test]
+    fn nsfw_media_blur_can_be_disabled_for_rendering() {
+        let mut post = test_post();
+        post.media = vec![MediaView {
+            public_path: "/uploads/images/flagged.webp".to_owned(),
+            mime_type: "image/webp".to_owned(),
+            media_kind: "image".to_owned(),
+            alt_text: "Flagged image".to_owned(),
+            is_nsfw: true,
+        }];
+
+        let body = post_card_with_nsfw_blur(&post, None, None, false);
+
+        assert!(!body.contains(r#"data-testid="nsfw-media""#));
+        assert!(body.contains(r#"<img src="/uploads/images/flagged.webp""#));
     }
 
     fn test_post() -> PostView {

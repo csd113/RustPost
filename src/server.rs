@@ -104,6 +104,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/users", get(admin_users))
         .route("/admin/users/{id}/suspend", post(admin_suspend))
         .route("/admin/posts/{id}/delete", post(admin_delete_post))
+        .route("/admin/posts/{id}/nsfw", post(admin_toggle_post_nsfw))
         .route("/admin/health", get(admin_health))
         .route("/admin/media", get(admin_media))
         .route(
@@ -252,6 +253,7 @@ struct ParsedProfileUpdate {
     theme: Theme,
     delete_profile_picture: bool,
     delete_banner: bool,
+    nsfw_blur_enabled: bool,
     profile_picture_media_id: Option<i64>,
     banner_media_id: Option<i64>,
 }
@@ -265,6 +267,13 @@ struct ParsedPostCreate {
     text: String,
     parent_post_id: Option<i64>,
     media_ids: Vec<i64>,
+    is_nsfw: bool,
+}
+
+#[derive(Deserialize)]
+struct AdminNsfwForm {
+    csrf: String,
+    nsfw: String,
 }
 
 struct DeletePreview {
@@ -326,7 +335,12 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
         "{}{}{}",
         render::page_header("Home Feed", "All posts"),
         composer,
-        render::posts(&posts, user.as_ref(), csrf.as_deref())
+        render::posts_with_nsfw_blur(
+            &posts,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+        )
     );
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Home Feed", &body).await?,
@@ -371,6 +385,14 @@ async fn page_layout(
         &state.settings.site.name,
         &context,
     ))
+}
+
+fn blur_nsfw_media(state: &AppState, user: Option<&CurrentUser>) -> bool {
+    let global_blur = Settings::load(&state.paths.settings_path)
+        .map_or(state.settings.media.nsfw_blur_enabled, |settings| {
+            settings.media.nsfw_blur_enabled
+        });
+    global_blur && user.is_none_or(|user| user.nsfw_blur_enabled)
 }
 
 async fn login_form(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -605,6 +627,9 @@ async fn create_post(
     if user.is_some() {
         validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
     }
+    if form.is_nsfw {
+        media::set_media_nsfw(&state.pool, &form.media_ids, true).await?;
+    }
     let (scope, actor, max_events, window_secs) = if user.is_none() {
         (
             rate_limit::Scope::AnonymousPost,
@@ -656,16 +681,18 @@ async fn create_post(
             parent_post_id: form.parent_post_id,
             redirect,
             html: if form.parent_post_id.is_some() {
-                render::thread_post_card(
+                render::thread_post_card_with_nsfw_blur(
                     post,
                     user.as_ref(),
                     form_csrf(&state, &headers).await.as_deref(),
+                    blur_nsfw_media(&state, user.as_ref()),
                 )
             } else {
-                render::post_card(
+                render::post_card_with_nsfw_blur(
                     post,
                     user.as_ref(),
                     form_csrf(&state, &headers).await.as_deref(),
+                    blur_nsfw_media(&state, user.as_ref()),
                 )
             },
         })
@@ -684,6 +711,7 @@ async fn parse_post_create(
         text: String::new(),
         parent_post_id: None,
         media_ids: Vec::new(),
+        is_nsfw: false,
     };
     while let Some(field) = multipart
         .next_field()
@@ -722,6 +750,13 @@ async fn parse_post_create(
                         "reply target is invalid; open the post thread and try again".to_owned(),
                     )
                 })?);
+            }
+            "nsfw" => {
+                form.is_nsfw = true;
+                let _ignored = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
             }
             "media"
                 if field
@@ -786,7 +821,12 @@ async fn thread(
     let body = format!(
         "{}{}{}",
         render::thread_back_control(),
-        render::thread_posts(&posts, user.as_ref(), csrf.as_deref()),
+        render::thread_posts_with_nsfw_blur(
+            &posts,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+        ),
         composer
     );
     Ok(Html(
@@ -1091,7 +1131,12 @@ async fn profile(
         location_line,
         html_escape::encode_text(bio.as_str()),
         website_link,
-        render::posts(&posts, user.as_ref(), csrf.as_deref())
+        render::posts_with_nsfw_blur(
+            &posts,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+        )
     );
     Ok(Html(
         page_layout(
@@ -1489,7 +1534,7 @@ async fn settings_page(
         .call(move |conn| {
             conn.query_row(
                 r#"
-        SELECT u.display_name, u.bio, u.location, u.website, u.theme,
+        SELECT u.display_name, u.bio, u.location, u.website, u.theme, u.nsfw_blur_enabled,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path
         FROM users u
@@ -1505,15 +1550,17 @@ async fn settings_page(
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(5)? != 0,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
             .map_err(Into::into)
         })
         .await?;
-    let (display_name, bio, location, website, theme, picture_path, banner_path) = profile;
+    let (display_name, bio, location, website, theme, nsfw_blur_enabled, picture_path, banner_path) =
+        profile;
     let blocked = social::blocked_users(&state.pool, user.id).await?;
     let muted = social::muted_users(&state.pool, user.id).await?;
     let muted_words = social::muted_words(&state.pool, user.id).await?;
@@ -1522,6 +1569,7 @@ async fn settings_page(
     } else {
         ""
     };
+    let nsfw_checked = if nsfw_blur_enabled { " checked" } else { "" };
     let notice_html =
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
     let password_hint = if state.settings.accounts.min_password_length == 0 {
@@ -1547,10 +1595,11 @@ async fn settings_page(
         state.settings.accounts.allow_profile_banners,
     );
     let body = format!(
-        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Blocked users</h2>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted users</h2>{}</section></div><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
+        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><label class="theme-toggle" for="nsfw_blur_enabled"><input id="nsfw_blur_enabled" name="nsfw_blur_enabled" type="checkbox" value="true"{}> Blur NSFW media</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Blocked users</h2>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted users</h2>{}</section></div><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         profile_media,
         dark_checked,
+        nsfw_checked,
         html_escape::encode_double_quoted_attribute(display_name.as_str()),
         html_escape::encode_text(bio.as_str()),
         html_escape::encode_double_quoted_attribute(location.as_str()),
@@ -1597,12 +1646,13 @@ async fn settings_update(
     let location = form.location.trim().to_owned();
     let website = form.website.trim().to_owned();
     let theme = form.theme.as_str().to_owned();
+    let nsfw_blur_enabled = i64::from(form.nsfw_blur_enabled);
     state
         .pool
         .call(move |conn| {
             conn.execute(
-                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                params![display_name, bio, location, website, theme, user.id],
+                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, nsfw_blur_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                params![display_name, bio, location, website, theme, nsfw_blur_enabled, user.id],
             )?;
             Ok(())
         })
@@ -1949,6 +1999,7 @@ async fn parse_profile_update(
         theme: Theme::Light,
         delete_profile_picture: false,
         delete_banner: false,
+        nsfw_blur_enabled: false,
         profile_picture_media_id: None,
         banner_media_id: None,
     };
@@ -1993,6 +2044,9 @@ async fn parse_profile_update(
             }
             "dark_mode" => {
                 form.theme = Theme::Dark;
+            }
+            "nsfw_blur_enabled" => {
+                form.nsfw_blur_enabled = true;
             }
             "delete_profile_picture" => {
                 form.delete_profile_picture = true;
@@ -2331,7 +2385,12 @@ async fn bookmarks(
     let body = format!(
         "{}{}",
         render::page_header("Bookmarks", "Posts you saved for later."),
-        render::posts(&posts, Some(&user), csrf.as_deref())
+        render::posts_with_nsfw_blur(
+            &posts,
+            Some(&user),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, Some(&user)),
+        )
     );
     Ok(Html(
         page_layout(&state, Some(&user), csrf.as_deref(), "Bookmarks", &body).await?,
@@ -2400,6 +2459,7 @@ async fn search(
         &posts,
         user.as_ref(),
         csrf.as_deref(),
+        blur_nsfw_media(&state, user.as_ref()),
     );
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Search", &body).await?,
@@ -2773,6 +2833,39 @@ async fn admin_delete_post(
     social::delete_post(&state.pool, user.id, id, true).await?;
     admin::audit(&state.pool, user.id, "delete_post", &format!("post:{id}")).await?;
     Ok(Redirect::to("/admin").into_response())
+}
+
+async fn admin_toggle_post_nsfw(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<AdminNsfwForm>,
+) -> AppResult<Response> {
+    let user = require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let is_nsfw = match form.nsfw.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return Err(AppError::BadRequest("invalid NSFW setting".to_owned())),
+    };
+    let changed = social::set_post_media_nsfw(&state.pool, id, is_nsfw)
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    if changed == 0 {
+        return Err(AppError::BadRequest("post has no media".to_owned()));
+    }
+    admin::audit(
+        &state.pool,
+        user.id,
+        if is_nsfw {
+            "mark_post_nsfw"
+        } else {
+            "unmark_post_nsfw"
+        },
+        &format!("post:{id}"),
+    )
+    .await?;
+    Ok(redirect_to_post_anchor(&headers, id, false).into_response())
 }
 
 async fn admin_media(
@@ -4957,6 +5050,267 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_can_flag_uploaded_media_as_nsfw_and_blur_is_safe_by_default() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains("Mark media as NSFW"));
+        let csrf = csrf_token(&home.body);
+
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("text", "flagged image post"),
+                    ("nsfw", "true"),
+                ],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let is_nsfw: i64 = server
+            .pool
+            .call(|conn| {
+                Ok(conn.query_row("SELECT is_nsfw FROM media LIMIT 1", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("nsfw flag");
+        assert_eq!(is_nsfw, 1);
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains(r#"data-testid="nsfw-media""#));
+        assert!(home.body.contains(r#"aria-label="Show NSFW media""#));
+        assert!(home.body.contains(">Show<span"));
+        assert!(home.body.contains("Open media"));
+    }
+
+    #[tokio::test]
+    async fn user_nsfw_blur_setting_persists_and_controls_rendering() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("text", "preference test image"),
+                    ("nsfw", "true"),
+                ],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let settings = get_with_cookie(&server, "/settings", &cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let disabled = request(
+            &server.base_url,
+            "POST",
+            "/settings",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=settings-boundary",
+                ),
+            ],
+            multipart_body(
+                "settings-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("display_name", "alice"),
+                    ("bio", ""),
+                    ("location", ""),
+                    ("website", ""),
+                ],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(disabled.status, 303);
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(!home.body.contains(r#"data-testid="nsfw-media""#));
+
+        let settings = get_with_cookie(&server, "/settings", &cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let enabled = request(
+            &server.base_url,
+            "POST",
+            "/settings",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=settings-boundary",
+                ),
+            ],
+            multipart_body(
+                "settings-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("display_name", "alice"),
+                    ("bio", ""),
+                    ("location", ""),
+                    ("website", ""),
+                    ("nsfw_blur_enabled", "true"),
+                ],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(enabled.status, 303);
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains(r#"data-testid="nsfw-media""#));
+    }
+
+    #[tokio::test]
+    async fn admin_can_mark_and_unmark_existing_media_post_as_nsfw_without_js() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "admin toggle image")],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains("Mark NSFW"));
+        let csrf = csrf_token(&home.body);
+        let marked = post_form_with_cookie(
+            &server,
+            "/admin/posts/1/nsfw",
+            &cookie,
+            &format!("csrf={csrf}&nsfw=true"),
+        )
+        .await;
+        assert_eq!(marked.status, 303);
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains(r#"data-testid="nsfw-media""#));
+        assert!(home.body.contains("Unmark NSFW"));
+        let csrf = csrf_token(&home.body);
+        let unmarked = post_form_with_cookie(
+            &server,
+            "/admin/posts/1/nsfw",
+            &cookie,
+            &format!("csrf={csrf}&nsfw=false"),
+        )
+        .await;
+        assert_eq!(unmarked.status, 303);
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(!home.body.contains(r#"data-testid="nsfw-media""#));
+        assert!(home.body.contains("Mark NSFW"));
+    }
+
+    #[tokio::test]
+    async fn global_nsfw_blur_setting_controls_logged_out_safe_default() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("text", "logged out default image"),
+                    ("nsfw", "true"),
+                ],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let logged_out = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(logged_out.body.contains(r#"data-testid="nsfw-media""#));
+
+        let mut settings = Settings::load(&server.data_dir.join("settings.toml")).expect("load");
+        settings.media.nsfw_blur_enabled = false;
+        std::fs::write(
+            server.data_dir.join("settings.toml"),
+            toml::to_string(&settings).expect("settings toml"),
+        )
+        .expect("write settings");
+        let unblurred = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(!unblurred.body.contains(r#"data-testid="nsfw-media""#));
+
+        settings.media.nsfw_blur_enabled = true;
+        std::fs::write(
+            server.data_dir.join("settings.toml"),
+            toml::to_string(&settings).expect("settings toml"),
+        )
+        .expect("write settings");
+        let safe_again = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(safe_again.body.contains(r#"data-testid="nsfw-media""#));
+    }
+
+    #[tokio::test]
     async fn head_response_uses_compression_headers_without_body() {
         let server = spawn_test_server().await;
 
@@ -5168,7 +5522,7 @@ mod tests {
         assert!(response.body.contains("<legend>Site</legend>"));
         assert!(response.body.contains("<legend>Posts</legend>"));
         assert!(response.body.contains("<legend>Accounts</legend>"));
-        assert!(response.body.contains("<legend>Media limits</legend>"));
+        assert!(response.body.contains("<legend>Media</legend>"));
         assert!(response.body.contains(r#"name="allow_reposts""#));
         assert!(
             response
@@ -5313,6 +5667,7 @@ mod tests {
                 &[
                     ("max_bio_len", "300"),
                     ("allow_profile_pictures", "false"),
+                    ("nsfw_blur_enabled", "false"),
                     ("registration_captcha_enabled", "true"),
                 ],
             ),
@@ -5324,6 +5679,7 @@ mod tests {
         assert!(response.body.contains("Settings saved successfully"));
         assert_eq!(saved.accounts.max_bio_len, 300);
         assert!(!saved.accounts.allow_profile_pictures);
+        assert!(!saved.media.nsfw_blur_enabled);
         assert!(saved.accounts.registration_captcha_enabled);
 
         let fresh = request(
@@ -5934,6 +6290,11 @@ mod tests {
         let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf());
         paths.ensure().expect("paths");
         crate::config::write_default_if_missing(&paths.settings_path).expect("settings");
+        std::fs::write(
+            &paths.settings_path,
+            toml::to_string(&settings).expect("serialize settings"),
+        )
+        .expect("write test settings");
         let data_dir = paths.data_dir.clone();
         let pool = crate::db::connect(&paths.database_path)
             .await
