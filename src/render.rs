@@ -158,13 +158,16 @@ pub fn layout_with_context(
 
 fn tor_header_indicator(onion: Option<&str>) -> String {
     onion.map_or_else(String::new, |onion| {
-        let escaped_onion = html_escape::encode_text(onion);
         let attr_onion = html_escape::encode_double_quoted_attribute(onion);
+        let onion_url = format!("http://{onion}");
+        let attr_onion_url = html_escape::encode_double_quoted_attribute(&onion_url);
         let short = short_onion_address(onion);
         format!(
-            r#"<details class="tor-indicator" data-testid="tor-header-indicator"><summary aria-label="Show Tor mirror address"><span class="tor-summary-text">Tor mirror: {}</span></summary><div class="tor-details"><code data-testid="tor-full-address">{}</code><button type="button" data-copy-text="{}" data-copy-label="Copy" data-copied-label="Copied" data-testid="tor-copy-button">Copy</button></div></details>"#,
+            r#"<div class="tor-indicator" role="status" data-testid="tor-header-indicator"><span class="tor-label">Tor:</span><a class="tor-address-link" href="{}" title="Open Tor mirror: {}" aria-label="Open Tor mirror at {}" data-testid="tor-address-link"><span class="tor-summary-text">{}</span></a><button class="tor-copy-button" type="button" data-copy-text="{}" data-copy-label="Copy" data-copied-label="Copied" aria-label="Copy Tor onion address" title="Copy Tor onion address" data-testid="tor-copy-button">Copy</button></div>"#,
+            attr_onion_url,
+            attr_onion,
+            attr_onion,
             html_escape::encode_text(&short),
-            escaped_onion,
             attr_onion,
         )
     })
@@ -1739,7 +1742,7 @@ const CSS: &str = r#"
 .site-header{position:sticky;top:0;z-index:10;background:var(--header-bg);border-bottom:1px solid var(--border);backdrop-filter:blur(8px)}
 .header-inner{max-width:var(--shell-max);margin:0 auto;padding:var(--header-padding-y) 1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
 .header-brand-row{display:flex;align-items:center;gap:.75rem;min-width:0;max-width:100%}.brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:var(--text-strong);min-width:0}.brand span:last-child{overflow-wrap:anywhere}.brand-mark{display:inline-grid;place-items:center;width:var(--header-brand-size);height:var(--header-brand-size);border-radius:7px;background:var(--brand);color:var(--brand-text);flex:0 0 auto}
-.tor-indicator{position:relative;min-width:0;flex:0 1 auto}.tor-indicator summary{display:inline-flex;align-items:center;min-height:2.15rem;border:1px solid var(--border);border-radius:999px;padding:.25rem .6rem;background:var(--surface-subtle);color:var(--link-strong);font-weight:800;cursor:pointer;list-style:none;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tor-indicator summary::-webkit-details-marker{display:none}.tor-indicator summary:hover{background:var(--hover);text-decoration:none}.tor-summary-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tor-details{position:absolute;z-index:12;left:0;top:calc(100% + .35rem);display:flex;gap:.4rem;align-items:center;width:max-content;max-width:calc(100vw - 2rem);padding:.25rem .35rem;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface);box-shadow:0 8px 24px var(--shadow);white-space:nowrap}.tor-details code{min-width:0;max-width:min(28rem,calc(100vw - 7rem));overflow-x:auto;overflow-y:hidden;white-space:nowrap;color:var(--text-strong);font-size:.88rem;line-height:1.2}.tor-details button{flex:0 0 auto;min-height:1.6rem;padding:.12rem .45rem;line-height:1.2}
+.tor-indicator{display:inline-flex;align-items:center;gap:.28rem;min-width:0;max-width:min(28rem,100%);flex:1 1 14rem;min-height:2rem;border-left:1px solid var(--border);padding:.05rem 0 .05rem .7rem;color:var(--muted-strong);font-size:.86rem;line-height:1;white-space:nowrap;overflow:hidden}.tor-label{flex:0 0 auto;color:var(--muted);font-weight:800}.tor-address-link{display:inline-flex;align-items:center;min-width:0;max-width:100%;flex:1 1 auto;min-height:1.9rem;padding:0 .1rem;color:var(--link-strong);font-weight:750}.tor-address-link:hover{color:var(--text-strong);text-decoration:underline}.tor-summary-text{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}.tor-copy-button{display:none;flex:0 0 auto;min-width:2.55rem;min-height:1.9rem;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--muted-strong);padding:.18rem .35rem;font-size:.82rem;font-weight:800;line-height:1;box-shadow:none}.js-enabled .tor-copy-button{display:inline-flex;align-items:center;justify-content:center}.tor-copy-button:hover{background:var(--hover);color:var(--link-strong)}
 nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}nav a,nav button,.button-link{display:inline-flex;align-items:center;gap:.35rem;min-height:2.15rem;border-radius:7px;padding:.42rem .65rem;color:var(--link-strong);border:1px solid transparent;background:transparent}
 nav a:hover,nav button:hover,.button-link:hover{background:var(--hover);text-decoration:none}nav form,.actions form{display:inline}
 nav svg{width:1.05rem;height:1.05rem;fill:currentColor;flex:0 0 auto}
@@ -1972,9 +1975,16 @@ mod tests {
         assert!(with_tor.contains("examplehiddenservice.onion"));
         assert!(with_tor.contains("tor-header-indicator"));
         assert!(with_tor.contains("tor-summary-text"));
+        assert!(with_tor.contains(r#"<span class="tor-label">Tor:</span>"#));
+        assert!(with_tor.contains(r#"href="http://examplehiddenservice.onion""#));
+        assert!(with_tor.contains(r#"title="Open Tor mirror: examplehiddenservice.onion""#));
+        assert!(with_tor.contains(r#"aria-label="Open Tor mirror at examplehiddenservice.onion""#));
         assert!(with_tor.contains("exampl...ice.onion"));
         assert!(with_tor.contains(r#"data-copy-text="examplehiddenservice.onion""#));
+        assert!(with_tor.contains(r#"aria-label="Copy Tor onion address""#));
         assert!(!with_tor.contains("footer-onion"));
+        assert!(!with_tor.contains("<details"));
+        assert!(!with_tor.contains("<summary"));
         assert!(!with_tor.contains("Tor mirror: <code>"));
         assert!(!with_tor.contains("Onion: <code>"));
     }
