@@ -1522,11 +1522,10 @@ mod tests {
         assert_eq!(original_stem, stored_stem);
         assert!(original_stem.starts_with("my-photo-"));
         assert!(row.public_path.ends_with(&format!("{stored_stem}.webp")));
-        assert!(
-            row.original_public_path
-                .unwrap()
-                .ends_with(&format!("{original_stem}.png"))
-        );
+        assert!(matches!(
+            row.original_public_path.as_deref(),
+            Some(path) if path.ends_with(&format!("{original_stem}.png"))
+        ));
 
         let video_id = save_test_upload(
             &pool,
@@ -1551,12 +1550,10 @@ mod tests {
         assert_eq!(original_stem, stored_stem);
         assert!(original_stem.starts_with("my-clip-"));
         assert!(video.public_path.ends_with(&format!("{stored_stem}.webm")));
-        assert!(
-            video
-                .original_public_path
-                .unwrap()
-                .ends_with(&format!("{original_stem}.mp4"))
-        );
+        assert!(matches!(
+            video.original_public_path.as_deref(),
+            Some(path) if path.ends_with(&format!("{original_stem}.mp4"))
+        ));
     }
 
     #[tokio::test]

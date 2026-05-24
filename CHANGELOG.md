@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.1.5 - Safety, Media, and Link Previews
+
+### Posts and Composer
+- Added YouTube link previews for posts so shared video links render with richer inline context.
+- Polished the post composer UI and tightened the shared shell sidebar spacing.
+- Added a compact quote action icon while preserving the existing posting flow.
+- Added a no-JS banner and progressive enhancement fallback behavior for interactive page controls.
+
+### Media Safety and Storage
+- Added NSFW media marking, blur-by-default rendering, per-user NSFW blur preferences, and admin controls for marking existing media posts.
+- Added a migration and settings support for global NSFW blur defaults.
+- Added duplicate media detection with canonical media reuse and cleanup so repeated uploads can share stored variants safely.
+- Improved original upload handling so original and transcoded variants share stable basenames.
+
+### Account and Admin Controls
+- Added optional registration CAPTCHA support with single-use challenge validation.
+- Exposed CAPTCHA and NSFW blur settings through deep admin settings.
+- Expanded the admin users investigation panel with richer search and post-context tooling.
+
+### Privacy, Networking, and Performance
+- Added gzip compression for browser text responses while leaving media and binary uploads uncompressed.
+- Added configurable Tor mirror display in the header and refined the Tor header into a compact status link.
+- Kept the embedded Tor client alive through shared ownership for more reliable background onion service operation.
+
+### Release Prep
+- Bumped the crate version to `0.1.5` and refreshed `Cargo.lock`.
+- Preserved the ignored Playwright artifact policy while removing tracked Playwright test artifacts from the branch.
+- Fixed focused Clippy findings in the composer, CAPTCHA, media, and rendering paths.
+
 ## v0.1.4 - Layout Foundation
 
 ### Core UI Layout
