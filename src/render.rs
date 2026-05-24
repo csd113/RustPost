@@ -165,14 +165,16 @@ fn tor_header_indicator(onion: Option<&str>) -> String {
     onion.map_or_else(String::new, |onion| {
         let attr_onion = html_escape::encode_double_quoted_attribute(onion);
         let onion_url = format!("http://{onion}");
+        let escaped_onion_url = html_escape::encode_text(&onion_url);
         let attr_onion_url = html_escape::encode_double_quoted_attribute(&onion_url);
         let short = short_onion_address(onion);
         format!(
-            r#"<div class="tor-indicator" role="status" data-testid="tor-header-indicator"><span class="tor-label">Tor:</span><a class="tor-address-link" href="{}" title="Open Tor mirror: {}" aria-label="Open Tor mirror at {}" data-testid="tor-address-link"><span class="tor-summary-text">{}</span></a><button class="tor-copy-button" type="button" data-copy-text="{}" data-copy-label="Copy" data-copied-label="Copied" aria-label="Copy Tor onion address" title="Copy Tor onion address" data-testid="tor-copy-button">Copy</button></div>"#,
+            r#"<div class="tor-indicator" aria-label="Tor onion service" data-testid="tor-header-indicator"><details class="tor-disclosure"><summary class="tor-pill" aria-label="Show Tor onion address" title="Show Tor onion address" data-testid="tor-pill"><span class="tor-pill-label">Tor</span><span class="tor-summary-text">{}</span></summary><div class="tor-details" data-testid="tor-popover"><a class="tor-full-link" href="{}" title="Open Tor mirror: {}" aria-label="Open Tor mirror at {}" data-testid="tor-full-address">{}</a></div></details><button class="tor-copy-button" type="button" data-copy-text="{}" data-copy-label="Copy" data-copied-label="Copied" data-copy-failed-label="Failed" aria-label="Copy Tor onion address" title="Copy Tor onion address" data-testid="tor-copy-button"><span data-copy-feedback aria-live="polite">Copy</span></button></div>"#,
+            html_escape::encode_text(&short),
             attr_onion_url,
             attr_onion,
             attr_onion,
-            html_escape::encode_text(&short),
+            escaped_onion_url,
             attr_onion,
         )
     })
@@ -678,8 +680,13 @@ document.addEventListener("submit", (event) => {
 
 async function copyTextToClipboard(text) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch (_err) {
+      // Fall back to the selection-based path below for browsers that expose
+      // the Clipboard API but deny writes in this context.
+    }
   }
   const textarea = document.createElement("textarea");
   textarea.value = text;
@@ -688,8 +695,20 @@ async function copyTextToClipboard(text) {
   textarea.style.top = "-1000px";
   document.body.append(textarea);
   textarea.select();
-  document.execCommand("copy");
+  const copied = document.execCommand("copy");
   textarea.remove();
+  if (!copied) {
+    throw new Error("copy command failed");
+  }
+}
+
+function setCopyButtonLabel(button, label) {
+  const feedback = button.querySelector("[data-copy-feedback]");
+  if (feedback) {
+    feedback.textContent = label;
+    return;
+  }
+  button.textContent = label;
 }
 
 document.addEventListener("click", async (event) => {
@@ -697,16 +716,23 @@ document.addEventListener("click", async (event) => {
   if (!button) {
     return;
   }
+  event.preventDefault();
+  event.stopPropagation();
+  const original = button.getAttribute("data-copy-label") || button.textContent || "Copy";
+  if (button.dataset.copyTimer) {
+    window.clearTimeout(Number.parseInt(button.dataset.copyTimer, 10));
+    delete button.dataset.copyTimer;
+  }
   try {
     await copyTextToClipboard(button.getAttribute("data-copy-text") || "");
-    const original = button.getAttribute("data-copy-label") || button.textContent;
-    button.textContent = button.getAttribute("data-copied-label") || "Copied";
-    window.setTimeout(() => {
-      button.textContent = original;
-    }, 1600);
+    setCopyButtonLabel(button, button.getAttribute("data-copied-label") || "Copied");
   } catch (_err) {
-    button.textContent = "Copy failed";
+    setCopyButtonLabel(button, button.getAttribute("data-copy-failed-label") || "Failed");
   }
+  button.dataset.copyTimer = String(window.setTimeout(() => {
+    setCopyButtonLabel(button, original);
+    delete button.dataset.copyTimer;
+  }, 1600));
 });"#;
 
 pub fn client_script() -> &'static str {
@@ -1971,7 +1997,7 @@ const CSS: &str = r#"
 .site-header{position:sticky;top:0;z-index:10;background:var(--header-bg);border-bottom:1px solid var(--border);backdrop-filter:blur(8px)}
 .header-inner{max-width:var(--shell-max);margin:0 auto;padding:var(--header-padding-y) 1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
 .header-brand-row{display:flex;align-items:center;gap:.75rem;min-width:0;max-width:100%}.brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:var(--text-strong);min-width:0}.brand span:last-child{overflow-wrap:anywhere}.brand-mark{display:inline-grid;place-items:center;width:var(--header-brand-size);height:var(--header-brand-size);border-radius:7px;background:var(--brand);color:var(--brand-text);flex:0 0 auto}
-.tor-indicator{display:inline-flex;align-items:center;gap:.28rem;min-width:0;max-width:min(28rem,100%);flex:1 1 14rem;min-height:2rem;border-left:1px solid var(--border);padding:.05rem 0 .05rem .7rem;color:var(--muted-strong);font-size:.86rem;line-height:1;white-space:nowrap;overflow:hidden}.tor-label{flex:0 0 auto;color:var(--muted);font-weight:800}.tor-address-link{display:inline-flex;align-items:center;min-width:0;max-width:100%;flex:1 1 auto;min-height:1.9rem;padding:0 .1rem;color:var(--link-strong);font-weight:750}.tor-address-link:hover{color:var(--text-strong);text-decoration:underline}.tor-summary-text{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}.tor-copy-button{display:none;flex:0 0 auto;min-width:2.55rem;min-height:1.9rem;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--muted-strong);padding:.18rem .35rem;font-size:.82rem;font-weight:800;line-height:1;box-shadow:none}.js-enabled .tor-copy-button{display:inline-flex;align-items:center;justify-content:center}.tor-copy-button:hover{background:var(--hover);color:var(--link-strong)}
+.tor-indicator{position:relative;display:inline-flex;align-items:center;min-width:0;max-width:min(18rem,100%);flex:0 1 auto;color:var(--muted-strong);font-size:.84rem;line-height:1;white-space:nowrap}.tor-disclosure{position:relative;min-width:0;max-width:100%;flex:0 1 auto}.tor-pill{display:inline-flex;align-items:center;gap:.38rem;max-width:100%;min-height:2.15rem;border:1px solid var(--border);border-radius:999px;padding:.25rem .68rem;background:var(--surface-subtle);color:var(--link-strong);font-weight:800;cursor:pointer;list-style:none;overflow:hidden}.js-enabled .tor-pill{padding-right:3.85rem}.tor-pill::-webkit-details-marker{display:none}.tor-pill::marker{content:""}.tor-pill:hover{background:var(--hover);text-decoration:none}.tor-pill-label{flex:0 0 auto;color:var(--muted);font-weight:900}.tor-summary-text{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}.tor-details{position:absolute;z-index:12;left:0;top:calc(100% + .35rem);width:max-content;max-width:min(30rem,calc(100vw - 2rem));padding:.55rem .65rem;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface);box-shadow:0 8px 24px var(--shadow);white-space:normal}.tor-full-link{display:block;max-width:min(28rem,calc(100vw - 3.5rem));overflow-wrap:anywhere;color:var(--text-strong);font-weight:800;line-height:1.3}.tor-full-link:hover{color:var(--link-strong)}.tor-copy-button{display:none;position:absolute;z-index:13;right:.22rem;top:50%;transform:translateY(-50%);align-items:center;justify-content:center;width:3.25rem;min-height:1.65rem;border:1px solid var(--border);border-radius:999px;background:var(--surface);color:var(--link-strong);padding:.12rem .35rem;font-size:.78rem;font-weight:850;line-height:1;box-shadow:none}.js-enabled .tor-copy-button{display:inline-flex}.tor-copy-button:hover{background:var(--hover);color:var(--text-strong)}
 nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}nav a,nav button,.button-link{display:inline-flex;align-items:center;gap:.35rem;min-height:2.15rem;border-radius:7px;padding:.42rem .65rem;color:var(--link-strong);border:1px solid transparent;background:transparent}
 nav a:hover,nav button:hover,.button-link:hover{background:var(--hover);text-decoration:none}nav form,.actions form{display:inline}
 nav svg{width:1.05rem;height:1.05rem;fill:currentColor;flex:0 0 auto}
@@ -2203,17 +2229,23 @@ mod tests {
         );
         assert!(with_tor.contains("examplehiddenservice.onion"));
         assert!(with_tor.contains("tor-header-indicator"));
+        assert!(with_tor.contains(r#"<details class="tor-disclosure">"#));
+        assert!(with_tor.contains(r#"<summary class="tor-pill""#));
+        assert!(with_tor.contains(r#"data-testid="tor-pill""#));
+        assert!(with_tor.contains(r#"data-testid="tor-popover""#));
+        assert!(with_tor.contains(r#"data-testid="tor-full-address""#));
         assert!(with_tor.contains("tor-summary-text"));
-        assert!(with_tor.contains(r#"<span class="tor-label">Tor:</span>"#));
+        assert!(with_tor.contains(r#"<span class="tor-pill-label">Tor</span>"#));
         assert!(with_tor.contains(r#"href="http://examplehiddenservice.onion""#));
         assert!(with_tor.contains(r#"title="Open Tor mirror: examplehiddenservice.onion""#));
         assert!(with_tor.contains(r#"aria-label="Open Tor mirror at examplehiddenservice.onion""#));
         assert!(with_tor.contains("exampl...ice.onion"));
         assert!(with_tor.contains(r#"data-copy-text="examplehiddenservice.onion""#));
         assert!(with_tor.contains(r#"aria-label="Copy Tor onion address""#));
+        assert!(with_tor.contains(r#"</details><button class="tor-copy-button""#));
+        assert!(with_tor.contains(r#"<span data-copy-feedback aria-live="polite">Copy</span>"#));
         assert!(!with_tor.contains("footer-onion"));
-        assert!(!with_tor.contains("<details"));
-        assert!(!with_tor.contains("<summary"));
+        assert!(!with_tor.contains("tor-address-link"));
         assert!(!with_tor.contains("Tor mirror: <code>"));
         assert!(!with_tor.contains("Onion: <code>"));
     }
