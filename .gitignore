@@ -76,4 +76,3 @@ uploads/**/*
 !/tests/
 !/tests/playwright/
 /tests/playwright/*
-!/tests/playwright/nsfw-media.mjs

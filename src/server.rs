@@ -1356,6 +1356,49 @@ fn settings_query_notice(saved: Option<&str>) -> Option<(&'static str, &'static 
     }
 }
 
+struct SettingsProfile {
+    display_name: String,
+    bio: String,
+    location: String,
+    website: String,
+    theme: String,
+    nsfw_blur_enabled: bool,
+    picture_path: Option<String>,
+    banner_path: Option<String>,
+}
+
+async fn settings_profile(pool: &SqlitePool, user_id: i64) -> AppResult<SettingsProfile> {
+    pool.call(move |conn| {
+        conn.query_row(
+            r#"
+        SELECT u.display_name, u.bio, u.location, u.website, u.theme, u.nsfw_blur_enabled,
+          pic.public_path AS profile_picture_path,
+          banner.public_path AS banner_path
+        FROM users u
+        LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+        LEFT JOIN media banner ON banner.id = u.banner_media_id
+        WHERE u.id = ?
+        "#,
+            [user_id],
+            |row| {
+                Ok(SettingsProfile {
+                    display_name: row.get(0)?,
+                    bio: row.get(1)?,
+                    location: row.get(2)?,
+                    website: row.get(3)?,
+                    theme: row.get(4)?,
+                    nsfw_blur_enabled: row.get::<_, i64>(5)? != 0,
+                    picture_path: row.get(6)?,
+                    banner_path: row.get(7)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+    })
+    .await
+    .map_err(Into::into)
+}
+
 fn settings_profile_media(
     picture_path: Option<&str>,
     banner_path: Option<&str>,
@@ -1531,48 +1574,20 @@ async fn settings_page(
     csrf: &str,
     notice: Option<(&str, &str)>,
 ) -> AppResult<String> {
-    let user_id = user.id;
-    let profile = state
-        .pool
-        .call(move |conn| {
-            conn.query_row(
-                r#"
-        SELECT u.display_name, u.bio, u.location, u.website, u.theme, u.nsfw_blur_enabled,
-          pic.public_path AS profile_picture_path,
-          banner.public_path AS banner_path
-        FROM users u
-        LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
-        LEFT JOIN media banner ON banner.id = u.banner_media_id
-        WHERE u.id = ?
-        "#,
-                [user_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)? != 0,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                },
-            )
-            .map_err(Into::into)
-        })
-        .await?;
-    let (display_name, bio, location, website, theme, nsfw_blur_enabled, picture_path, banner_path) =
-        profile;
+    let profile = settings_profile(&state.pool, user.id).await?;
     let blocked = social::blocked_users(&state.pool, user.id).await?;
     let muted = social::muted_users(&state.pool, user.id).await?;
     let muted_words = social::muted_words(&state.pool, user.id).await?;
-    let dark_checked = if Theme::from(theme.as_str()) == Theme::Dark {
+    let dark_checked = if Theme::from(profile.theme.as_str()) == Theme::Dark {
         " checked"
     } else {
         ""
     };
-    let nsfw_checked = if nsfw_blur_enabled { " checked" } else { "" };
+    let nsfw_checked = if profile.nsfw_blur_enabled {
+        " checked"
+    } else {
+        ""
+    };
     let notice_html =
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
     let password_hint = if state.settings.accounts.min_password_length == 0 {
@@ -1592,8 +1607,8 @@ async fn settings_page(
         "confirm-new-password-requirement",
     );
     let profile_media = settings_profile_media(
-        picture_path.as_deref(),
-        banner_path.as_deref(),
+        profile.picture_path.as_deref(),
+        profile.banner_path.as_deref(),
         state.settings.accounts.allow_profile_pictures,
         state.settings.accounts.allow_profile_banners,
     );
@@ -1603,10 +1618,10 @@ async fn settings_page(
         profile_media,
         dark_checked,
         nsfw_checked,
-        html_escape::encode_double_quoted_attribute(display_name.as_str()),
-        html_escape::encode_text(bio.as_str()),
-        html_escape::encode_double_quoted_attribute(location.as_str()),
-        html_escape::encode_double_quoted_attribute(website.as_str()),
+        html_escape::encode_double_quoted_attribute(profile.display_name.as_str()),
+        html_escape::encode_text(profile.bio.as_str()),
+        html_escape::encode_double_quoted_attribute(profile.location.as_str()),
+        html_escape::encode_double_quoted_attribute(profile.website.as_str()),
         settings_user_list(
             &blocked,
             "/unblock",

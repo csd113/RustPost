@@ -101,10 +101,12 @@ impl RegistrationCaptchaStore {
             .filter(|value| !value.is_empty())
             .ok_or(RegistrationCaptchaError::MissingAnswer)?;
 
-        let mut challenges = self.challenges.lock().await;
         let now = Instant::now();
-        remove_expired(&mut challenges, now);
-        let Some(challenge) = challenges.remove(token) else {
+        let Some(challenge) = ({
+            let mut challenges = self.challenges.lock().await;
+            remove_expired(&mut challenges, now);
+            challenges.remove(token)
+        }) else {
             return Err(RegistrationCaptchaError::ExpiredOrUsed);
         };
         if challenge.expires_at <= now {
@@ -121,7 +123,8 @@ impl RegistrationCaptchaStore {
     pub async fn expire_for_test(&self, token: &str) {
         let mut challenges = self.challenges.lock().await;
         if let Some(challenge) = challenges.get_mut(token) {
-            challenge.expires_at = Instant::now() - Duration::from_secs(1);
+            let now = Instant::now();
+            challenge.expires_at = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
         }
     }
 }
