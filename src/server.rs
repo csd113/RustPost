@@ -1572,12 +1572,13 @@ async fn profile(
         html_escape::encode_text(bio.as_str()),
         website_link,
         pinned,
-        render::posts_with_controls(
+        render::posts_with_controls_empty_state(
             &posts,
             user.as_ref(),
             csrf.as_deref(),
             blur_nsfw_media(&state, user.as_ref()),
             state.settings.posts.post_edit_window_seconds,
+            render::EmptyState::new("No posts yet.", "This profile has not posted yet."),
         )
     );
     Ok(Html(
@@ -1634,7 +1635,10 @@ async fn profile_followers(
             &format!("{display_name} followers"),
             &format!("Users who follow @{profile_username}.")
         ),
-        render::account_links(&accounts, "No followers yet.")
+        render::account_links_with_empty_state(
+            &accounts,
+            render::EmptyState::new("No followers yet.", "Followers will appear here.",),
+        )
     );
     Ok(Html(
         page_layout(
@@ -1672,7 +1676,13 @@ async fn profile_following(
             &format!("{display_name} following"),
             &format!("Users @{profile_username} follows.")
         ),
-        render::account_links(&accounts, "Not following anyone yet.")
+        render::account_links_with_empty_state(
+            &accounts,
+            render::EmptyState::new(
+                "Not following anyone yet.",
+                "Followed accounts will appear here.",
+            ),
+        )
     );
     Ok(Html(
         page_layout(
@@ -1904,7 +1914,7 @@ fn settings_user_list(
     empty_message: &str,
 ) -> String {
     if users.is_empty() {
-        return compact_empty_state(empty_title, empty_message);
+        return render::compact_empty_state(empty_title, empty_message);
     }
     let rows = users
         .iter()
@@ -1923,7 +1933,7 @@ fn settings_user_list(
 
 fn settings_muted_word_list(words: &[social::MutedWord], csrf: &str) -> String {
     if words.is_empty() {
-        return compact_empty_state(
+        return render::compact_empty_state(
             "No muted words",
             "Posts containing muted words will be hidden.",
         );
@@ -1945,14 +1955,6 @@ fn settings_muted_word_list(words: &[social::MutedWord], csrf: &str) -> String {
         .collect::<Vec<_>>()
         .join("");
     format!(r#"<ul class="settings-item-list">{rows}</ul>"#)
-}
-
-fn compact_empty_state(title: &str, message: &str) -> String {
-    format!(
-        r#"<div class="compact-empty"><strong>{}</strong><p>{}</p></div>"#,
-        html_escape::encode_text(title),
-        html_escape::encode_text(message)
-    )
 }
 
 fn validate_profile_location(location: &str) -> AppResult<()> {
@@ -2978,12 +2980,13 @@ async fn bookmarks(
     let body = format!(
         "{}{}",
         render::page_header("Bookmarks", "Posts you saved for later."),
-        render::posts_with_controls(
+        render::posts_with_controls_empty_state(
             &posts,
             Some(&user),
             csrf.as_deref(),
             blur_nsfw_media(&state, Some(&user)),
             state.settings.posts.post_edit_window_seconds,
+            render::EmptyState::new("No bookmarks yet.", "Saved posts will appear here."),
         )
     );
     Ok(Html(
@@ -3314,9 +3317,10 @@ fn admin_user_rows(rows: &[admin::AdminUserInvestigation], csrf: &str, searched:
         } else {
             "No users found."
         };
-        return format!(
-            r#"<div class="compact-empty admin-users-empty"><strong>{}</strong><p>Try a different username, handle, display name, or post keyword.</p></div>"#,
-            html_escape::encode_text(message)
+        return render::compact_empty_state_with_class(
+            "admin-users-empty",
+            message,
+            "Try a different username, handle, display name, or post keyword.",
         );
     }
 
@@ -6119,6 +6123,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_states_render_for_empty_feeds_lists_and_search() {
+        let server = spawn_test_server().await;
+
+        let public_home = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert_eq!(public_home.status, 200);
+        assert_empty_state(
+            &public_home.body,
+            "No posts yet.",
+            "The timeline will fill in once people start posting.",
+        );
+
+        let alice_cookie = register_test_user(&server, "alice").await;
+
+        let home = get_with_cookie(&server, "/home", &alice_cookie).await;
+        assert_eq!(home.status, 200);
+        assert_empty_state(
+            &home.body,
+            "No posts yet.",
+            "The timeline will fill in once people start posting.",
+        );
+
+        let profile = get_with_cookie(&server, "/users/alice", &alice_cookie).await;
+        assert_eq!(profile.status, 200);
+        assert_empty_state(
+            &profile.body,
+            "No posts yet.",
+            "This profile has not posted yet.",
+        );
+
+        let following = get_with_cookie(&server, "/following", &alice_cookie).await;
+        assert_eq!(following.status, 200);
+        assert_empty_state(
+            &following.body,
+            "Follow people to build your feed.",
+            "Accounts you follow will appear here.",
+        );
+
+        let followers = request(
+            &server.base_url,
+            "GET",
+            "/users/alice/followers",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(followers.status, 200);
+        assert_empty_state(
+            &followers.body,
+            "No followers yet.",
+            "Followers will appear here.",
+        );
+
+        let profile_following = request(
+            &server.base_url,
+            "GET",
+            "/users/alice/following",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(profile_following.status, 200);
+        assert_empty_state(
+            &profile_following.body,
+            "Not following anyone yet.",
+            "Followed accounts will appear here.",
+        );
+
+        let bookmarks = get_with_cookie(&server, "/bookmarks", &alice_cookie).await;
+        assert_eq!(bookmarks.status, 200);
+        assert_empty_state(
+            &bookmarks.body,
+            "No bookmarks yet.",
+            "Saved posts will appear here.",
+        );
+
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert_eq!(notifications.status, 200);
+        assert_empty_state(
+            &notifications.body,
+            "No notifications.",
+            "New activity will appear here.",
+        );
+
+        let search = request(
+            &server.base_url,
+            "GET",
+            "/search?q=missing",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(search.status, 200);
+        assert_empty_state(
+            &search.body,
+            "No matching posts or users found.",
+            "Try another search.",
+        );
+    }
+
+    #[tokio::test]
     async fn enhanced_follow_returns_button_and_count_state() {
         let server = spawn_test_server().await;
         let bob = request(
@@ -6395,11 +6499,11 @@ mod tests {
         assert_eq!(notifications.status, 200);
         assert!(notifications.body.contains(r#"class="notifications-hero""#));
         assert!(notifications.body.contains("No unread notifications"));
-        assert!(notifications.body.contains("No notifications yet"));
+        assert!(notifications.body.contains("No notifications."));
         assert!(
             notifications
                 .body
-                .contains("Replies, likes, reposts, follows, and mentions will appear here.")
+                .contains("New activity will appear here.")
         );
     }
 
@@ -7823,6 +7927,16 @@ mod tests {
         assert!(body.contains(r#"name="return_to" value="/posts/1""#));
         assert!(body.contains(r#"name="return_to" value="/posts/2""#));
         assert!(body.contains(r#"name="return_to" value="/users/bob""#));
+    }
+
+    fn assert_empty_state(body: &str, title: &str, message: &str) {
+        assert!(body.contains(r#"class="empty-state" data-testid="empty-state""#));
+        assert!(body.contains(&format!("<h2>{title}</h2>")));
+        if message.is_empty() {
+            assert!(!body.contains(r#"<section class="empty-state" data-testid="empty-state"><h2></h2><p></p></section>"#));
+        } else {
+            assert!(body.contains(&format!("<p>{message}</p>")));
+        }
     }
 
     fn quote_form_body(response: &TestResponse, text: &str) -> String {

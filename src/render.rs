@@ -68,6 +68,25 @@ pub struct OnboardingPage<'a> {
     pub max_bio_len: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EmptyState<'a> {
+    pub title: &'a str,
+    pub message: &'a str,
+}
+
+impl<'a> EmptyState<'a> {
+    pub const fn new(title: &'a str, message: &'a str) -> Self {
+        Self { title, message }
+    }
+
+    const fn default_posts() -> Self {
+        Self {
+            title: "No posts yet.",
+            message: "The timeline will fill in once people start posting.",
+        }
+    }
+}
+
 impl PostRenderOptions {
     const fn timeline() -> Self {
         Self {
@@ -1177,8 +1196,8 @@ pub fn quote_composer(csrf: &str, quote: &QuotePreview, max_text_chars: usize) -
 pub fn accounts(accounts: &[AccountView], csrf: &str) -> String {
     if accounts.is_empty() {
         return empty_state(
-            "You are not following anyone yet.",
-            "Follow accounts to build your home feed.",
+            "Follow people to build your feed.",
+            "Accounts you follow will appear here.",
         );
     }
     let rows = accounts
@@ -1293,8 +1312,12 @@ pub fn onboarding_page(page: OnboardingPage<'_>) -> String {
 }
 
 pub fn account_links(accounts: &[AccountView], empty_message: &str) -> String {
+    account_links_with_empty_state(accounts, EmptyState::new(empty_message, ""))
+}
+
+pub fn account_links_with_empty_state(accounts: &[AccountView], empty: EmptyState<'_>) -> String {
     if accounts.is_empty() {
-        return empty_state(empty_message, "");
+        return empty_state(empty.title, empty.message);
     }
     let rows = accounts
         .iter()
@@ -1359,7 +1382,7 @@ pub fn search_page(
             "Search for posts, usernames, mentions, or hashtags.",
         )
     } else if users.is_empty() && posts.is_empty() {
-        empty_state("No results found", &format!(r#"No matches for "{query}"."#))
+        empty_state("No matching posts or users found.", "Try another search.")
     } else {
         search_results(query, users, posts, user, csrf, options)
     };
@@ -1403,7 +1426,8 @@ fn search_results(
                     blur_nsfw_media: options.blur_nsfw_media,
                     ..PostRenderOptions::timeline()
                         .with_edit_window(options.post_edit_window_seconds)
-                }
+                },
+                EmptyState::default_posts(),
             )
         )
     };
@@ -1488,7 +1512,13 @@ pub fn follow_form(user_id: i64, csrf: &str, following: bool) -> String {
 }
 
 pub fn posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option<&str>) -> String {
-    posts_with_options(posts, user, csrf, PostRenderOptions::timeline())
+    posts_with_options(
+        posts,
+        user,
+        csrf,
+        PostRenderOptions::timeline(),
+        EmptyState::default_posts(),
+    )
 }
 
 pub fn posts_with_nsfw_blur(
@@ -1505,6 +1535,7 @@ pub fn posts_with_nsfw_blur(
             blur_nsfw_media,
             ..PostRenderOptions::timeline()
         },
+        EmptyState::default_posts(),
     )
 }
 
@@ -1515,6 +1546,24 @@ pub fn posts_with_controls(
     blur_nsfw_media: bool,
     post_edit_window_seconds: u64,
 ) -> String {
+    posts_with_controls_empty_state(
+        posts,
+        user,
+        csrf,
+        blur_nsfw_media,
+        post_edit_window_seconds,
+        EmptyState::default_posts(),
+    )
+}
+
+pub fn posts_with_controls_empty_state(
+    posts: &[PostView],
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    blur_nsfw_media: bool,
+    post_edit_window_seconds: u64,
+    empty: EmptyState<'_>,
+) -> String {
     posts_with_options(
         posts,
         user,
@@ -1523,6 +1572,7 @@ pub fn posts_with_controls(
             blur_nsfw_media,
             ..PostRenderOptions::timeline().with_edit_window(post_edit_window_seconds)
         },
+        empty,
     )
 }
 
@@ -1593,10 +1643,8 @@ fn thread_posts_with_options(
     options: PostRenderOptions,
 ) -> String {
     if posts.is_empty() {
-        return empty_state(
-            "No posts yet",
-            "The timeline will fill in once people start posting.",
-        );
+        let empty = EmptyState::default_posts();
+        return empty_state(empty.title, empty.message);
     }
     format!(
         r#"<section class="timeline" aria-label="Posts">{}</section>"#,
@@ -1620,12 +1668,10 @@ fn posts_with_options(
     user: Option<&CurrentUser>,
     csrf: Option<&str>,
     options: PostRenderOptions,
+    empty: EmptyState<'_>,
 ) -> String {
     if posts.is_empty() {
-        return empty_state(
-            "No posts yet",
-            "The timeline will fill in once people start posting.",
-        );
+        return empty_state(empty.title, empty.message);
     }
     format!(
         r#"<section class="timeline" aria-label="Posts">{}</section>"#,
@@ -2329,11 +2375,37 @@ pub fn linkify(text: &str) -> String {
 }
 
 pub fn empty_state(title: &str, message: &str) -> String {
+    let message = empty_state_message(message);
     format!(
-        r#"<section class="empty-state"><h2>{}</h2><p>{}</p></section>"#,
+        r#"<section class="empty-state" data-testid="empty-state"><h2>{}</h2>{message}</section>"#,
         html_escape::encode_text(title),
-        html_escape::encode_text(message)
     )
+}
+
+pub fn compact_empty_state(title: &str, message: &str) -> String {
+    compact_empty_state_with_class("", title, message)
+}
+
+pub fn compact_empty_state_with_class(extra_class: &str, title: &str, message: &str) -> String {
+    let class = if extra_class.trim().is_empty() {
+        "compact-empty".to_owned()
+    } else {
+        format!("compact-empty {}", extra_class.trim())
+    };
+    let message = empty_state_message(message);
+    format!(
+        r#"<div class="{}"><strong>{}</strong>{message}</div>"#,
+        html_escape::encode_double_quoted_attribute(&class),
+        html_escape::encode_text(title),
+    )
+}
+
+fn empty_state_message(message: &str) -> String {
+    if message.trim().is_empty() {
+        String::new()
+    } else {
+        format!(r#"<p>{}</p>"#, html_escape::encode_text(message))
+    }
 }
 
 pub fn page_header(title: &str, subtitle: &str) -> String {
@@ -2373,10 +2445,7 @@ pub fn notifications_page(
         return format!(
             "{}{}",
             header,
-            empty_state(
-                "No notifications yet",
-                "Replies, likes, reposts, follows, and mentions will appear here."
-            )
+            empty_state("No notifications.", "New activity will appear here.")
         );
     }
     let caught_up = if unread_count == 0 {
@@ -3172,6 +3241,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_state_escapes_text_and_omits_empty_description() {
+        let body = empty_state(r#"<missing>"#, "");
+
+        assert!(body.contains("&lt;missing&gt;"));
+        assert!(!body.contains("<missing>"));
+        assert!(!body.contains("<p></p>"));
+    }
+
+    #[test]
     fn search_page_preserves_and_escapes_query() {
         let body = search_page(
             "RustPost",
@@ -3184,8 +3262,8 @@ mod tests {
         );
 
         assert!(body.contains(r#"value="&lt;rust&gt; &quot;query&quot;""#));
-        assert!(body.contains("No results found"));
-        assert!(body.contains("No matches for"));
+        assert!(body.contains("No matching posts or users found."));
+        assert!(body.contains("Try another search."));
         assert!(body.contains("&lt;rust&gt;"));
         assert!(body.contains("&quot;query&quot;"));
         assert!(!body.contains(r#"<rust> "query""#));
