@@ -28,8 +28,9 @@ trace.zip
 *.trace
 *.har
 tests/*
-!tests/playwright/
-!tests/playwright/**
+tests/playwright/
+tests/playwright/*
+tests/playwright/nsfw-media.mjs
 package-lock.json
 package.json
 playwright.config.ts
@@ -72,3 +73,6 @@ uploads/**/*
 .DS_Store
 **/.DS_Store
 /tests
+!/tests/
+!/tests/playwright/
+/tests/playwright/*

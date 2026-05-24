@@ -35,7 +35,7 @@ struct TorStatusSnapshot {
 }
 
 struct TorRuntime {
-    _client: TorClient<tor_rtcompat::PreferredRuntime>,
+    _client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
     _service: Arc<RunningOnionService>,
     stream_task: tokio::task::JoinHandle<()>,
 }
@@ -254,6 +254,7 @@ async fn start_inner(
         )
     })?
     .context("bootstrap Arti client")?;
+    let client = Arc::new(client);
     let bootstrap_status = Some(format!("{:?}", client.bootstrap_status()));
 
     let nickname = HsNickname::new(settings.onion_service_name.clone())
@@ -401,6 +402,7 @@ mod tests {
             tor_only,
             data_dir: "tor".to_owned(),
             onion_service_name: "microblog".to_owned(),
+            display_onion_address: String::new(),
             bootstrap_timeout_secs: 120,
             max_concurrent_streams: 512,
             include_tor_keys_in_backups_by_default: false,

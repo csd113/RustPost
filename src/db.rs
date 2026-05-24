@@ -120,6 +120,14 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_9)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (9)", [])?;
         }
+        if applied.unwrap_or(0) < 10 {
+            tx.execute_batch(MIGRATION_10)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (10)", [])?;
+        }
+        if applied.unwrap_or(0) < 11 {
+            tx.execute_batch(MIGRATION_11)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (11)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -352,6 +360,76 @@ CREATE INDEX IF NOT EXISTS idx_notifications_user_id_desc ON notifications(user_
 CREATE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user_id, actor_user_id, post_id, kind);
 "#;
 
+const MIGRATION_10: &str = r#"
+ALTER TABLE media ADD COLUMN is_nsfw INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN nsfw_blur_enabled INTEGER NOT NULL DEFAULT 1;
+
+CREATE INDEX IF NOT EXISTS idx_media_is_nsfw ON media(is_nsfw);
+"#;
+
+const MIGRATION_11: &str = r#"
+ALTER TABLE media ADD COLUMN original_path TEXT;
+ALTER TABLE media ADD COLUMN original_public_path TEXT;
+ALTER TABLE media ADD COLUMN original_sha256 TEXT NOT NULL DEFAULT '';
+ALTER TABLE media ADD COLUMN normalized_sha256 TEXT;
+ALTER TABLE media ADD COLUMN canonical_media_id INTEGER REFERENCES media(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_media_original_sha256
+    ON media(media_kind, original_sha256)
+    WHERE original_sha256 != '';
+CREATE INDEX IF NOT EXISTS idx_media_normalized_sha256
+    ON media(media_kind, normalized_sha256)
+    WHERE normalized_sha256 IS NOT NULL AND normalized_sha256 != '';
+CREATE INDEX IF NOT EXISTS idx_media_canonical_media_id ON media(canonical_media_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_media_unique_canonical_original_sha256
+    ON media(media_kind, original_sha256)
+    WHERE canonical_media_id IS NULL AND original_sha256 != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_media_unique_canonical_normalized_sha256
+    ON media(media_kind, normalized_sha256)
+    WHERE canonical_media_id IS NULL AND normalized_sha256 IS NOT NULL AND normalized_sha256 != '';
+
+CREATE TRIGGER IF NOT EXISTS media_canonical_ref_insert
+BEFORE INSERT ON media
+WHEN NEW.canonical_media_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN NEW.id = NEW.canonical_media_id
+        THEN RAISE(ABORT, 'media cannot reference itself as canonical')
+    END;
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM media canonical
+            WHERE canonical.id = NEW.canonical_media_id
+              AND canonical.canonical_media_id IS NULL
+              AND canonical.media_kind = NEW.media_kind
+        )
+        THEN RAISE(ABORT, 'media canonical reference must point to same-kind canonical media')
+    END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS media_canonical_ref_update
+BEFORE UPDATE OF canonical_media_id, media_kind ON media
+WHEN NEW.canonical_media_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN NEW.id = NEW.canonical_media_id
+        THEN RAISE(ABORT, 'media cannot reference itself as canonical')
+    END;
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM media canonical
+            WHERE canonical.id = NEW.canonical_media_id
+              AND canonical.canonical_media_id IS NULL
+              AND canonical.media_kind = NEW.media_kind
+        )
+        THEN RAISE(ABORT, 'media canonical reference must point to same-kind canonical media')
+    END;
+END;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,10 +471,46 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 9);
+        assert_eq!(versions, 11);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);
+    }
+
+    #[tokio::test]
+    async fn canonical_media_constraints_reject_unsafe_references() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        pool.call(|conn| {
+            conn.execute(
+                "INSERT INTO media (id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, original_sha256, normalized_sha256) VALUES (10, 'image.webp', '/tmp/image.webp', '/uploads/images/image.webp', 'image/webp', 'image', 1, 'raw', 'norm')",
+                [],
+            )?;
+            let duplicate_canonical = conn.execute(
+                "INSERT INTO media (original_filename, stored_path, public_path, mime_type, media_kind, byte_len, original_sha256) VALUES ('copy.webp', '/tmp/copy.webp', '/uploads/images/copy.webp', 'image/webp', 'image', 1, 'raw')",
+                [],
+            );
+            assert!(duplicate_canonical.is_err());
+
+            let cross_kind = conn.execute(
+                "INSERT INTO media (original_filename, stored_path, public_path, mime_type, media_kind, byte_len, canonical_media_id) VALUES ('clip.webm', '/tmp/clip.webm', '/uploads/videos/clip.webm', 'video/webm', 'video', 1, 10)",
+                [],
+            );
+            assert!(cross_kind.is_err());
+
+            let self_reference = conn.execute(
+                "INSERT INTO media (id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, canonical_media_id) VALUES (11, 'self.webp', '/tmp/self.webp', '/uploads/images/self.webp', 'image/webp', 'image', 1, 11)",
+                [],
+            );
+            assert!(self_reference.is_err());
+            Ok(())
+        })
+        .await
+        .expect("constraint checks");
     }
 
     #[tokio::test]
@@ -459,6 +573,42 @@ mod tests {
             .expect("location");
 
         assert_eq!(location, "");
+    }
+
+    #[tokio::test]
+    async fn nsfw_defaults_are_safe_for_users_and_media() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        let (blur_enabled, is_nsfw): (i64, i64) = pool
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO users (username, normalized_username, password_hash, display_name) VALUES ('Alice', 'alice', 'hash', 'Alice')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (1, 'x.png', '/tmp/x.png', '/uploads/images/x.png', 'image/png', 'image', 1)",
+                    [],
+                )?;
+                Ok((
+                    conn.query_row(
+                        "SELECT nsfw_blur_enabled FROM users WHERE normalized_username = 'alice'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row("SELECT is_nsfw FROM media WHERE id = 1", [], |row| {
+                        row.get(0)
+                    })?,
+                ))
+            })
+            .await
+            .expect("defaults");
+
+        assert_eq!(blur_enabled, 1);
+        assert_eq!(is_nsfw, 0);
     }
 
     #[tokio::test]

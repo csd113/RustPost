@@ -42,6 +42,8 @@ pub struct ServerSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSettings {
     pub registration_enabled: bool,
+    #[serde(default)]
+    pub registration_captcha_enabled: bool,
     pub anonymous_mode_enabled: bool,
     pub min_password_length: usize,
     pub max_username_len: usize,
@@ -71,6 +73,8 @@ pub struct MediaSettings {
     pub convert_images_to_webp: bool,
     pub convert_videos_to_webm: bool,
     pub keep_original_uploads: bool,
+    #[serde(default = "default_true")]
+    pub nsfw_blur_enabled: bool,
     pub max_image_size: u64,
     pub max_video_size: u64,
     pub generate_video_thumbnails: bool,
@@ -87,6 +91,8 @@ pub struct TorSettings {
     pub tor_only: bool,
     pub data_dir: String,
     pub onion_service_name: String,
+    #[serde(default)]
+    pub display_onion_address: String,
     pub bootstrap_timeout_secs: u64,
     pub max_concurrent_streams: usize,
     pub include_tor_keys_in_backups_by_default: bool,
@@ -126,6 +132,7 @@ impl Default for Settings {
             },
             accounts: AccountSettings {
                 registration_enabled: true,
+                registration_captcha_enabled: false,
                 anonymous_mode_enabled: false,
                 min_password_length: 10,
                 max_username_len: 32,
@@ -151,6 +158,7 @@ impl Default for Settings {
                 convert_images_to_webp: true,
                 convert_videos_to_webm: true,
                 keep_original_uploads: false,
+                nsfw_blur_enabled: true,
                 max_image_size: 52_428_800,
                 max_video_size: 157_286_400,
                 generate_video_thumbnails: true,
@@ -174,6 +182,7 @@ impl Default for Settings {
                 tor_only: false,
                 data_dir: "tor".to_owned(),
                 onion_service_name: "microblog".to_owned(),
+                display_onion_address: String::new(),
                 bootstrap_timeout_secs: 120,
                 max_concurrent_streams: 512,
                 include_tor_keys_in_backups_by_default: false,
@@ -217,6 +226,7 @@ impl Settings {
             anyhow::bail!("tor.tor_only requires tor.enabled");
         }
         validate_onion_service_name(&self.tor.onion_service_name)?;
+        validate_display_onion_address(&self.tor.display_onion_address)?;
         Ok(())
     }
 }
@@ -278,6 +288,9 @@ trusted_proxy_cidrs = {trusted_proxy_cidrs}
 [accounts]
 # Allow visitors to create accounts from the web UI.
 registration_enabled = {registration_enabled}
+
+# Require a CAPTCHA challenge on account creation. Login is not affected.
+registration_captcha_enabled = {registration_captcha_enabled}
 
 # Allow posting without accounts. Rate limits are keyed by client IP.
 anonymous_mode_enabled = {anonymous_mode_enabled}
@@ -351,6 +364,9 @@ convert_videos_to_webm = {convert_videos_to_webm}
 # false reduces stored untrusted file formats.
 keep_original_uploads = {keep_original_uploads}
 
+# Blur media that users or admins mark as NSFW. Safe default is true.
+nsfw_blur_enabled = {nsfw_blur_enabled}
+
 # SECURITY: Maximum accepted image upload size in bytes. Default is 50 MiB.
 max_image_size = {max_image_size}
 
@@ -391,6 +407,10 @@ data_dir = {tor_data_dir}
 
 # Local name for the onion service state directory.
 onion_service_name = {onion_service_name}
+
+# Optional stable onion address to show in the site header before Arti has
+# reported the active service address. Leave blank to use the runtime address.
+display_onion_address = {display_onion_address}
 
 # Seconds to wait for Tor bootstrap during Tor-only startup.
 bootstrap_timeout_secs = {bootstrap_timeout_secs}
@@ -449,6 +469,7 @@ backup_dir = {backup_dir}
         cookie_secure = settings.server.cookie_secure,
         trusted_proxy_cidrs = toml_string_array(&settings.server.trusted_proxy_cidrs),
         registration_enabled = settings.accounts.registration_enabled,
+        registration_captcha_enabled = settings.accounts.registration_captcha_enabled,
         anonymous_mode_enabled = settings.accounts.anonymous_mode_enabled,
         min_password_length = settings.accounts.min_password_length,
         max_username_len = settings.accounts.max_username_len,
@@ -470,6 +491,7 @@ backup_dir = {backup_dir}
         convert_images_to_webp = settings.media.convert_images_to_webp,
         convert_videos_to_webm = settings.media.convert_videos_to_webm,
         keep_original_uploads = settings.media.keep_original_uploads,
+        nsfw_blur_enabled = settings.media.nsfw_blur_enabled,
         max_image_size = settings.media.max_image_size,
         max_video_size = settings.media.max_video_size,
         generate_video_thumbnails = settings.media.generate_video_thumbnails,
@@ -482,6 +504,7 @@ backup_dir = {backup_dir}
         tor_only = settings.tor.tor_only,
         tor_data_dir = toml_string(&settings.tor.data_dir),
         onion_service_name = toml_string(&settings.tor.onion_service_name),
+        display_onion_address = toml_string(&settings.tor.display_onion_address),
         bootstrap_timeout_secs = settings.tor.bootstrap_timeout_secs,
         max_concurrent_streams = settings.tor.max_concurrent_streams,
         include_tor_keys_in_backups_by_default =
@@ -547,6 +570,32 @@ fn validate_onion_service_name(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_display_onion_address(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.trim() != value {
+        anyhow::bail!("tor.display_onion_address must not contain surrounding whitespace");
+    }
+    let Some(service_id) = value.strip_suffix(".onion") else {
+        anyhow::bail!("tor.display_onion_address must end with .onion");
+    };
+    if service_id.len() != 56 {
+        anyhow::bail!("tor.display_onion_address must be a v3 onion address");
+    }
+    if !service_id
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+    {
+        anyhow::bail!("tor.display_onion_address must contain only lowercase base32 characters");
+    }
+    Ok(())
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +618,32 @@ mod tests {
     }
 
     #[test]
+    fn missing_nsfw_blur_setting_defaults_to_safe_enabled() {
+        let raw = toml::to_string(&Settings::default())
+            .expect("settings toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("nsfw_blur_enabled"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
+
+        assert!(parsed.media.nsfw_blur_enabled);
+    }
+
+    #[test]
+    fn missing_display_onion_address_defaults_to_blank() {
+        let raw = toml::to_string(&Settings::default())
+            .expect("settings toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("display_onion_address"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
+
+        assert!(parsed.tor.display_onion_address.is_empty());
+    }
+
+    #[test]
     fn tor_only_requires_tor_enabled() {
         let mut settings = Settings::default();
         settings.tor.tor_only = true;
@@ -587,6 +662,21 @@ mod tests {
     fn rejects_invalid_tor_settings() {
         let mut settings = Settings::default();
         settings.tor.onion_service_name = "bad/name".to_owned();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn validates_display_onion_address() {
+        let mut settings = Settings::default();
+        settings.tor.display_onion_address =
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion".to_owned();
+        settings.validate().expect("valid display onion address");
+
+        settings.tor.display_onion_address = "examplehiddenservice.onion".to_owned();
+        assert!(settings.validate().is_err());
+
+        settings.tor.display_onion_address =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWX.onion".to_owned();
         assert!(settings.validate().is_err());
     }
 
@@ -622,6 +712,7 @@ mod tests {
 
             [accounts]
             registration_enabled = true
+            registration_captcha_enabled = false
             anonymous_mode_enabled = false
             min_password_length = 10
             max_username_len = 32
@@ -683,9 +774,27 @@ mod tests {
         )
         .expect("settings without site");
         assert_eq!(settings.site.name, "RustPost");
+        assert!(!settings.accounts.registration_captcha_enabled);
 
         let mut settings = Settings::default();
         settings.site.name = " Custom".to_owned();
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn registration_captcha_defaults_disabled_when_missing() {
+        let generated = default_settings_toml();
+        let without_captcha = generated
+            .lines()
+            .filter(|line| {
+                !line
+                    .trim_start()
+                    .starts_with("registration_captcha_enabled")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let settings: Settings = toml::from_str(&without_captcha).expect("legacy settings parse");
+
+        assert!(!settings.accounts.registration_captcha_enabled);
     }
 }

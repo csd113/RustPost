@@ -2,8 +2,13 @@ use crate::auth::{CurrentUser, Theme};
 use crate::social::{
     AccountView, MediaView, NotificationView, PostView, QuotePreview, TimelineEventKind,
 };
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri};
 use chrono::{DateTime, NaiveDateTime, Utc};
+
+const YOUTUBE_VIDEO_ID_LEN: usize = 11;
+// Keep link-heavy posts compact in timelines while still showing useful context.
+const MAX_YOUTUBE_PREVIEWS_PER_POST: usize = 3;
+const YOUTUBE_PREVIEW_TITLE: &str = "YouTube video";
 
 #[derive(Debug, Clone)]
 pub struct LayoutContext {
@@ -32,6 +37,7 @@ impl Default for LayoutContext {
 pub struct PostRenderOptions {
     pub show_timestamp: bool,
     pub clickable_card: bool,
+    pub blur_nsfw_media: bool,
 }
 
 impl PostRenderOptions {
@@ -39,6 +45,7 @@ impl PostRenderOptions {
         Self {
             show_timestamp: false,
             clickable_card: true,
+            blur_nsfw_media: true,
         }
     }
 
@@ -46,6 +53,7 @@ impl PostRenderOptions {
         Self {
             show_timestamp: true,
             clickable_card: true,
+            blur_nsfw_media: true,
         }
     }
 }
@@ -115,22 +123,14 @@ pub fn layout_with_context(
     let left_rail = left_rail(user, &auth_nav);
     let side_panel = dashboard_panel(user, context);
     let theme = user.map_or(Theme::Light, |user| user.theme).as_str();
-    let footer_onion = context
-        .tor_onion_address
-        .as_deref()
-        .map_or_else(String::new, |onion| {
-            format!(
-                r#" <span class="footer-onion">Onion: <code>{}</code></span>"#,
-                html_escape::encode_text(onion)
-            )
-        });
+    let header_tor = tor_header_indicator(context.tor_onion_address.as_deref());
     format!(
         r#"<!doctype html>
 <html lang="en" data-theme="{}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https://i.ytimg.com; media-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta name="referrer" content="same-origin">
 <link rel="icon" href="/favicon.ico" type="{}">
@@ -139,9 +139,10 @@ pub fn layout_with_context(
 <script src="/assets/rustpost.js" defer></script>
 </head>
 <body>
-<header class="site-header"><div class="header-inner"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
+<header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}</div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
+<section class="noscript-banner" role="status"><strong>JavaScript is disabled.</strong> RustPost will use standard links and forms.</section>
 <main><div class="app-shell" data-testid="app-shell">{}<section class="primary-column" data-testid="primary-column">{} </section>{}</div></main>
-<footer class="site-footer">{} alpha{}</footer>
+<footer class="site-footer">{} alpha</footer>
 </body>
 </html>"#,
         html_escape::encode_double_quoted_attribute(theme),
@@ -151,13 +152,50 @@ pub fn layout_with_context(
         CSS,
         html_escape::encode_text(&brand_mark.to_string()),
         html_escape::encode_text(site_name),
+        header_tor,
         auth_nav,
         left_rail,
         body,
         side_panel,
         html_escape::encode_text(site_name),
-        footer_onion
     )
+}
+
+fn tor_header_indicator(onion: Option<&str>) -> String {
+    onion.map_or_else(String::new, |onion| {
+        let attr_onion = html_escape::encode_double_quoted_attribute(onion);
+        let onion_url = format!("http://{onion}");
+        let attr_onion_url = html_escape::encode_double_quoted_attribute(&onion_url);
+        let short = short_onion_address(onion);
+        format!(
+            r#"<div class="tor-indicator" role="status" data-testid="tor-header-indicator"><span class="tor-label">Tor:</span><a class="tor-address-link" href="{}" title="Open Tor mirror: {}" aria-label="Open Tor mirror at {}" data-testid="tor-address-link"><span class="tor-summary-text">{}</span></a><button class="tor-copy-button" type="button" data-copy-text="{}" data-copy-label="Copy" data-copied-label="Copied" aria-label="Copy Tor onion address" title="Copy Tor onion address" data-testid="tor-copy-button">Copy</button></div>"#,
+            attr_onion_url,
+            attr_onion,
+            attr_onion,
+            html_escape::encode_text(&short),
+            attr_onion,
+        )
+    })
+}
+
+fn short_onion_address(onion: &str) -> String {
+    let (service_id, suffix_label) = onion
+        .strip_suffix(".onion")
+        .map_or((onion, ""), |service_id| (service_id, ".onion"));
+    let prefix: String = service_id.chars().take(6).collect();
+    let suffix = service_id
+        .chars()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    if prefix.is_empty() || suffix.is_empty() || service_id.len() <= prefix.len() + suffix.len() {
+        onion.to_owned()
+    } else {
+        format!("{prefix}...{suffix}{suffix_label}")
+    }
 }
 
 fn nav_link(href: &str, label: &str, icon: &str) -> String {
@@ -237,13 +275,29 @@ pub fn login_form(message: Option<&str>, min_password_length: usize) -> String {
     )
 }
 
-pub fn register_form(message: Option<&str>, min_password_length: usize) -> String {
+pub fn register_form(
+    message: Option<&str>,
+    min_password_length: usize,
+    captcha: Option<&crate::registration_captcha::RegistrationCaptchaChallenge>,
+) -> String {
     let notice = message.map_or_else(String::new, |message| notice("error", message));
     let hint = password_requirement_hint(min_password_length);
     let password_attrs = password_length_attrs(min_password_length, "password-requirement");
     let confirm_attrs = password_length_attrs(min_password_length, "confirm-password-requirement");
+    let captcha_html = captcha.map_or_else(String::new, register_captcha_fields);
     format!(
-        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="new-password"{password_attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><p class="field-help" id="confirm-password-requirement">{hint}</p><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"{confirm_attrs}><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div><button class="auth-submit" type="submit">Create account</button></form></section>"#
+        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="new-password"{password_attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><p class="field-help" id="confirm-password-requirement">{hint}</p><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"{confirm_attrs}><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div>{captcha_html}<button class="auth-submit" type="submit">Create account</button></form></section>"#
+    )
+}
+
+fn register_captcha_fields(
+    captcha: &crate::registration_captcha::RegistrationCaptchaChallenge,
+) -> String {
+    format!(
+        r#"<fieldset class="captcha-challenge"><legend>Registration CAPTCHA</legend><input type="hidden" name="captcha_token" value="{}"><img class="captcha-image" src="{}" alt="CAPTCHA challenge image"><label for="captcha_answer">CAPTCHA answer</label><p class="field-help" id="captcha-help">Enter the characters shown in the image. The challenge expires in {} minutes. If it is hard to read, reload this page for a new challenge.</p><input id="captcha_answer" name="captcha_answer" autocomplete="off" autocapitalize="characters" spellcheck="false" required aria-describedby="captcha-help"></fieldset>"#,
+        html_escape::encode_double_quoted_attribute(&captcha.token),
+        html_escape::encode_double_quoted_attribute(&captcha.image_data_uri),
+        captcha.expires_minutes,
     )
 }
 
@@ -266,7 +320,9 @@ fn password_requirement_hint(min_password_length: usize) -> String {
     }
 }
 
-const CLIENT_SCRIPT: &str = r#"function cardInteractiveTarget(target) {
+const CLIENT_SCRIPT: &str = r#"document.documentElement.classList.add("js-enabled");
+
+function cardInteractiveTarget(target) {
   if (!(target instanceof Element)) {
     return null;
   }
@@ -409,6 +465,56 @@ document.querySelectorAll("textarea[data-character-limit]").forEach((textarea) =
   textarea.addEventListener("input", () => updateComposerCount(textarea));
 });
 
+function mediaSummary(input) {
+  if (!input.files || input.files.length === 0) {
+    return "";
+  }
+  if (input.files.length === 1) {
+    return input.files[0].name || "1 media file selected";
+  }
+  return `${input.files.length} media files selected`;
+}
+
+function updateComposerMedia(input) {
+  const form = input.closest("form");
+  if (!form) {
+    return;
+  }
+  const hasMedia = !!(input.files && input.files.length > 0);
+  const selection = form.querySelector("[data-composer-media-selection]");
+  const summary = form.querySelector("[data-composer-media-summary]");
+  const nsfw = form.querySelector("[data-composer-nsfw]");
+  if (summary) {
+    summary.textContent = mediaSummary(input);
+  }
+  if (selection) {
+    selection.hidden = !hasMedia;
+  }
+  if (nsfw && !hasMedia) {
+    nsfw.checked = false;
+  }
+}
+
+document.querySelectorAll("input[type=file][data-composer-media]").forEach((input) => {
+  updateComposerMedia(input);
+  input.addEventListener("change", () => updateComposerMedia(input));
+});
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-composer-clear-media]");
+  if (!button) {
+    return;
+  }
+  const form = button.closest("form");
+  const input = form ? form.querySelector("input[type=file][data-composer-media]") : null;
+  if (!input) {
+    return;
+  }
+  input.value = "";
+  updateComposerMedia(input);
+  input.focus();
+});
+
 function resetSubmittingForms() {
   document.querySelectorAll('form[data-submitting="true"]').forEach((form) => {
     delete form.dataset.submitting;
@@ -539,6 +645,7 @@ document.addEventListener("submit", async (event) => {
       }
       form.reset();
       form.querySelectorAll("textarea[data-character-limit]").forEach(updateComposerCount);
+      form.querySelectorAll("input[type=file][data-composer-media]").forEach(updateComposerMedia);
     }
   } catch (_err) {
     form.submit();
@@ -567,6 +674,39 @@ document.addEventListener("submit", (event) => {
   if (submitter) {
     submitter.disabled = true;
   }
+});
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-1000px";
+  document.body.append(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
+}
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-copy-text]");
+  if (!button) {
+    return;
+  }
+  try {
+    await copyTextToClipboard(button.getAttribute("data-copy-text") || "");
+    const original = button.getAttribute("data-copy-label") || button.textContent;
+    button.textContent = button.getAttribute("data-copied-label") || "Copied";
+    window.setTimeout(() => {
+      button.textContent = original;
+    }, 1600);
+  } catch (_err) {
+    button.textContent = "Copy failed";
+  }
 });"#;
 
 pub fn client_script() -> &'static str {
@@ -579,12 +719,23 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
     });
     let csrf = csrf.unwrap_or_default();
     let input_id = parent.map_or_else(|| "post-text".to_owned(), |id| format!("reply-text-{id}"));
+    let media_id = parent.map_or_else(|| "post-media".to_owned(), |id| format!("reply-media-{id}"));
+    let nsfw_id = parent.map_or_else(|| "post-nsfw".to_owned(), |id| format!("reply-nsfw-{id}"));
+    let placeholder = if parent.is_some() {
+        "Write a reply..."
+    } else {
+        "What's happening?"
+    };
     format!(
         r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted" data-character-counter="{}">{} remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
 <input type="hidden" name="csrf" value="{}">{}
 <label class="sr-only" for="{}">What is happening?</label>
-<textarea id="{}" name="text" maxlength="{}" rows="4" data-character-limit="{}"></textarea>
-<div class="composer-tools"><label class="file-control" for="media">Attach media<input id="media" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime"></label><button class="primary" type="submit">Post</button></div>
+<div class="composer-surface">
+<textarea id="{}" name="text" maxlength="{}" rows="4" data-character-limit="{}" placeholder="{}"></textarea>
+<div class="composer-footer"><label class="composer-file-control" for="{}"><input class="composer-file-input" id="{}" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime" aria-label="Attach media" data-composer-media><span class="composer-file-button" aria-hidden="true">{}<span>Attach media</span></span></label></div>
+<div class="composer-media-selection" data-composer-media-selection hidden><span class="composer-media-summary" data-composer-media-summary></span><label class="check-row composer-nsfw" for="{}"><input id="{}" name="nsfw" type="checkbox" value="true" data-composer-nsfw> Mark media as NSFW</label><button class="composer-clear-media" type="button" data-composer-clear-media>Clear</button></div>
+</div>
+<div class="composer-tools"><span></span><button class="primary" type="submit">Post</button></div>
 </form></section>"#,
         if parent.is_some() {
             "Reply"
@@ -598,7 +749,13 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
         html_escape::encode_double_quoted_attribute(&input_id),
         html_escape::encode_double_quoted_attribute(&input_id),
         max_text_chars,
-        max_text_chars
+        max_text_chars,
+        html_escape::encode_double_quoted_attribute(placeholder),
+        html_escape::encode_double_quoted_attribute(&media_id),
+        html_escape::encode_double_quoted_attribute(&media_id),
+        icon_svg("paperclip"),
+        html_escape::encode_double_quoted_attribute(&nsfw_id),
+        html_escape::encode_double_quoted_attribute(&nsfw_id),
     )
 }
 
@@ -608,7 +765,7 @@ pub fn quote_composer(csrf: &str, quote: &QuotePreview, max_text_chars: usize) -
         r#"<section class="composer quote-composer" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">Quote post</h1><span class="muted" data-character-counter="quote-text">{max_text_chars} remaining</span></div>{preview}<form method="post" action="/posts/{}/quote" class="quote-form">
 <input type="hidden" name="csrf" value="{}">
 <label class="sr-only" for="quote-text">Add your comment</label>
-<textarea id="quote-text" name="text" maxlength="{}" rows="4" data-character-limit="{}" required></textarea>
+<textarea id="quote-text" name="text" maxlength="{}" rows="4" data-character-limit="{}" placeholder="Add your thoughts..." required></textarea>
 <div class="composer-tools"><span></span><button class="primary" type="submit">Post quote</button></div>
 </form></section>"#,
         quote.id,
@@ -705,6 +862,7 @@ pub fn search_page(
     posts: &[PostView],
     user: Option<&CurrentUser>,
     csrf: Option<&str>,
+    blur_nsfw_media: bool,
 ) -> String {
     let form = search_form(site_name, query);
     let state = if query.is_empty() {
@@ -715,7 +873,7 @@ pub fn search_page(
     } else if users.is_empty() && posts.is_empty() {
         empty_state("No results found", &format!(r#"No matches for "{query}"."#))
     } else {
-        search_results(query, users, posts, user, csrf)
+        search_results(query, users, posts, user, csrf, blur_nsfw_media)
     };
     format!("{form}{state}")
 }
@@ -734,6 +892,7 @@ fn search_results(
     posts: &[PostView],
     user: Option<&CurrentUser>,
     csrf: Option<&str>,
+    blur_nsfw_media: bool,
 ) -> String {
     let total = users.len() + posts.len();
     let plural = if total == 1 { "result" } else { "results" };
@@ -748,7 +907,15 @@ fn search_results(
     } else {
         format!(
             "{posts_heading}{}",
-            posts_with_options(posts, user, csrf, PostRenderOptions::timeline())
+            posts_with_options(
+                posts,
+                user,
+                csrf,
+                PostRenderOptions {
+                    blur_nsfw_media,
+                    ..PostRenderOptions::timeline()
+                }
+            )
         )
     };
     format!(
@@ -835,7 +1002,50 @@ pub fn posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option<&str>)
     posts_with_options(posts, user, csrf, PostRenderOptions::timeline())
 }
 
+pub fn posts_with_nsfw_blur(
+    posts: &[PostView],
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    blur_nsfw_media: bool,
+) -> String {
+    posts_with_options(
+        posts,
+        user,
+        csrf,
+        PostRenderOptions {
+            blur_nsfw_media,
+            ..PostRenderOptions::timeline()
+        },
+    )
+}
+
 pub fn thread_posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option<&str>) -> String {
+    thread_posts_with_options(posts, user, csrf, PostRenderOptions::thread())
+}
+
+pub fn thread_posts_with_nsfw_blur(
+    posts: &[PostView],
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    blur_nsfw_media: bool,
+) -> String {
+    thread_posts_with_options(
+        posts,
+        user,
+        csrf,
+        PostRenderOptions {
+            blur_nsfw_media,
+            ..PostRenderOptions::thread()
+        },
+    )
+}
+
+fn thread_posts_with_options(
+    posts: &[PostView],
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    options: PostRenderOptions,
+) -> String {
     if posts.is_empty() {
         return empty_state(
             "No posts yet",
@@ -848,11 +1058,11 @@ pub fn thread_posts(posts: &[PostView], user: Option<&CurrentUser>, csrf: Option
             .iter()
             .enumerate()
             .map(|(index, post)| {
-                let mut options = PostRenderOptions::thread();
+                let mut card_options = options;
                 if index == 0 {
-                    options.clickable_card = false;
+                    card_options.clickable_card = false;
                 }
-                post_card_with_options(post, user, csrf, options)
+                post_card_with_options(post, user, csrf, card_options)
             })
             .collect::<Vec<_>>()
             .join("")
@@ -885,8 +1095,42 @@ pub fn post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>
     post_card_with_options(post, user, csrf, PostRenderOptions::timeline())
 }
 
+pub fn post_card_with_nsfw_blur(
+    post: &PostView,
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    blur_nsfw_media: bool,
+) -> String {
+    post_card_with_options(
+        post,
+        user,
+        csrf,
+        PostRenderOptions {
+            blur_nsfw_media,
+            ..PostRenderOptions::timeline()
+        },
+    )
+}
+
 pub fn thread_post_card(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>) -> String {
     post_card_with_options(post, user, csrf, PostRenderOptions::thread())
+}
+
+pub fn thread_post_card_with_nsfw_blur(
+    post: &PostView,
+    user: Option<&CurrentUser>,
+    csrf: Option<&str>,
+    blur_nsfw_media: bool,
+) -> String {
+    post_card_with_options(
+        post,
+        user,
+        csrf,
+        PostRenderOptions {
+            blur_nsfw_media,
+            ..PostRenderOptions::thread()
+        },
+    )
 }
 
 // Rendering a post card stays centralized because the markup, counts, media,
@@ -954,10 +1198,12 @@ fn post_card_with_options(
         },
     );
     let text = linkify(&post.text);
+    let youtube_previews = render_youtube_previews(&post.text);
     let media = post
         .media
         .iter()
-        .map(render_media)
+        .enumerate()
+        .map(|(index, media)| render_media(media, post.id, index, options.blur_nsfw_media))
         .collect::<Vec<_>>()
         .join("");
     let controls = if let (Some(user), Some(csrf)) = (user, csrf) {
@@ -966,9 +1212,14 @@ fn post_card_with_options(
         } else {
             String::new()
         };
+        let nsfw = if user.is_admin && !post.media.is_empty() {
+            admin_nsfw_form(post, csrf)
+        } else {
+            String::new()
+        };
         let reply_link = icon_link(&format!("/posts/{}#reply", post.id), "Reply", "reply");
         format!(
-            r#"<div class="actions" data-testid="post-actions">{}{}{}{}{}</div>"#,
+            r#"<div class="actions" data-testid="post-actions">{}{}{}{}{}{}</div>"#,
             icon_action_form(
                 &format!("/posts/{}/like", post.id),
                 csrf,
@@ -1006,6 +1257,7 @@ fn post_card_with_options(
                 post.viewer_bookmarked
             ),
             delete,
+            nsfw,
         )
     } else {
         String::new()
@@ -1024,9 +1276,14 @@ fn post_card_with_options(
         String::new()
     };
     let card_attrs = if options.clickable_card {
+        format!(r#" data-card-href="/posts/{}""#, post.id)
+    } else {
+        String::new()
+    };
+    let permalink = if options.clickable_card {
         format!(
-            r#" data-card-href="/posts/{}" tabindex="0" aria-label="Open post {}""#,
-            post.id, post.id
+            r#"<a class="post-permalink" href="/posts/{}">Open post</a>"#,
+            post.id
         )
     } else {
         String::new()
@@ -1044,7 +1301,7 @@ fn post_card_with_options(
         .as_ref()
         .map_or_else(String::new, quote_preview_card);
     format!(
-        r#"<article class="{}" data-testid="post-card" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}{}<div class="counts"><span data-count="likes">{} likes</span><span data-count="reposts">{} reposts</span><span data-count="replies">{} replies</span></div>{}</article>"#,
+        r#"<article class="{}" data-testid="post-card" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}{}{}<div class="counts"><span data-count="likes">{} likes</span><span data-count="reposts">{} reposts</span><span data-count="replies">{} replies</span>{}</div>{}</article>"#,
         post_class,
         post.id,
         post.id,
@@ -1056,11 +1313,13 @@ fn post_card_with_options(
         author,
         timestamp,
         text,
+        youtube_previews,
         media,
         quote,
         post.like_count,
         post.repost_count,
         post.reply_count,
+        permalink,
         controls
     )
 }
@@ -1074,7 +1333,7 @@ fn repost_action_with_quote(
 ) -> String {
     let menu_id = format!("quote-menu-{}", action.trim_matches('/').replace('/', "-"));
     format!(
-        r#"<div class="repost-control" data-repost-control><form method="post" action="{}" data-enhance="post-action"><input type="hidden" name="csrf" value="{}"><button class="icon-button{}" type="submit" data-action-kind="repost" data-repost-menu-button aria-haspopup="menu" aria-expanded="false" aria-controls="{}" aria-pressed="{}" aria-label="{}" title="{}">{}<span class="sr-only" data-button-label>{}</span></button></form><div class="repost-menu" id="{}" role="menu" data-repost-menu hidden><a role="menuitem" href="{}">Quote post</a></div><a class="quote-fallback" href="{}">Quote</a></div>"#,
+        r#"<div class="repost-control" data-repost-control><form method="post" action="{}" data-enhance="post-action"><input type="hidden" name="csrf" value="{}"><button class="icon-button{}" type="submit" data-action-kind="repost" data-repost-menu-button aria-haspopup="menu" aria-expanded="false" aria-controls="{}" aria-pressed="{}" aria-label="{}" title="{}">{}<span class="sr-only" data-button-label>{}</span></button></form><div class="repost-menu" id="{}" role="menu" data-repost-menu hidden><a role="menuitem" href="{}">{}<span>Quote post</span></a></div><a class="icon-button quote-fallback" href="{}" aria-label="Quote post" title="Quote post">{}<span class="sr-only">Quote post</span></a></div>"#,
         html_escape::encode_double_quoted_attribute(action),
         html_escape::encode_double_quoted_attribute(csrf),
         if active { " active" } else { "" },
@@ -1086,7 +1345,9 @@ fn repost_action_with_quote(
         html_escape::encode_text(label),
         html_escape::encode_double_quoted_attribute(&menu_id),
         html_escape::encode_double_quoted_attribute(quote_href),
-        html_escape::encode_double_quoted_attribute(quote_href)
+        icon_svg("quote-post"),
+        html_escape::encode_double_quoted_attribute(quote_href),
+        icon_svg("quote-post")
     )
 }
 
@@ -1130,6 +1391,21 @@ fn disabled_icon_button(label: &str, icon: &str) -> String {
         html_escape::encode_double_quoted_attribute(label),
         icon_svg(icon),
         html_escape::encode_text(label)
+    )
+}
+
+fn admin_nsfw_form(post: &PostView, csrf: &str) -> String {
+    let flagged = post.media.iter().any(|media| media.is_nsfw);
+    let (value, label) = if flagged {
+        ("false", "Unmark NSFW")
+    } else {
+        ("true", "Mark NSFW")
+    };
+    format!(
+        r#"<form method="post" action="/admin/posts/{}/nsfw" class="admin-nsfw-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="nsfw" value="{value}"><button class="admin-nsfw-button" type="submit">{}</button></form>"#,
+        post.id,
+        html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_text(label),
     )
 }
 
@@ -1195,24 +1471,194 @@ fn icon_svg(icon: &str) -> &'static str {
         "repost" => {
             r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 7h9.2l-2-2L16 3l5.5 5.5L16 14l-1.8-2 2-2H8v3H5V9c0-1.1.9-2 2-2zm10 10H7.8l2 2L8 21l-5.5-5.5L8 10l1.8 2-2 2H16v-3h3v4c0 1.1-.9 2-2 2z"/></svg>"#
         }
+        "quote-post" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 4h10c1.1 0 2 .9 2 2v6.2l3 2.8-3 2.8V18c0 1.1-.9 2-2 2H5c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2zm1 3v10h8v-4.6l1.9 1.8.9-.9-2.8-2.7-2.8 2.7.9.9L14 12.4V7H6zm2 3.2c0-1.3.8-2.2 2.2-2.2v1.4c-.5 0-.8.2-.8.8h1.2V13H8v-2.8zm4 0c0-1.3.8-2.2 2.2-2.2v1.4c-.5 0-.8.2-.8.8h1.2V13H12v-2.8z"/></svg>"#
+        }
         "bookmark" => {
             r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 3h12c.6 0 1 .4 1 1v17l-7-4-7 4V4c0-.6.4-1 1-1z"/></svg>"#
         }
         "trash" => {
             r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v3H4V5h4l1-2zm-3 7h12l-1 11H7L6 10zm4 2v7h2v-7h-2zm4 0v7h2v-7h-2z"/></svg>"#
         }
+        "paperclip" => {
+            r#"<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M8.2 20.5a5.2 5.2 0 0 1-3.7-8.9l7.8-7.8a3.7 3.7 0 0 1 5.2 5.2l-7.8 7.8a2.2 2.2 0 0 1-3.1-3.1l7.3-7.3L16 8.5l-7.3 7.3.2.2 7.8-7.8a.7.7 0 0 0-1-1l-7.8 7.8a2.2 2.2 0 0 0 3.1 3.1l8.2-8.2 2.1 2.1-8.2 8.2a5.2 5.2 0 0 1-3.7 1.5c-.4 0-.8 0-1.2-.1z"/></svg>"#
+        }
         _ => r#"<svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg>"#,
     }
 }
 
-fn render_media(media: &MediaView) -> String {
+fn render_media(media: &MediaView, post_id: i64, index: usize, blur_nsfw_media: bool) -> String {
     let path = html_escape::encode_double_quoted_attribute(&media.public_path);
     let alt = html_escape::encode_double_quoted_attribute(&media.alt_text);
-    if media.media_kind == "video" {
+    let item = if media.media_kind == "video" {
         format!(r#"<video controls preload="metadata" src="{path}"></video>"#)
     } else {
         format!(r#"<img src="{path}" alt="{alt}" loading="lazy">"#)
+    };
+    if !media.is_nsfw || !blur_nsfw_media {
+        return item;
     }
+    let toggle_id = format!("nsfw-media-{post_id}-{index}");
+    format!(
+        r#"<div class="nsfw-media" data-testid="nsfw-media"><input class="nsfw-toggle sr-only" id="{toggle_id}" type="checkbox" aria-label="Show NSFW media"><div class="nsfw-media-frame">{item}<span class="nsfw-badge">NSFW</span></div><label class="nsfw-show" for="{toggle_id}">Show<span class="sr-only"> NSFW media</span></label><a class="nsfw-open" href="{path}">Open media</a></div>"#
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct YoutubePreview {
+    video_id: String,
+    href: String,
+    display_url: String,
+}
+
+fn render_youtube_previews(text: &str) -> String {
+    let previews = youtube_previews_for_text(text);
+    if previews.is_empty() {
+        return String::new();
+    }
+    let cards = previews
+        .iter()
+        .map(render_youtube_preview_card)
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<aside class="youtube-previews" aria-label="YouTube link previews">{cards}</aside>"#)
+}
+
+fn render_youtube_preview_card(preview: &YoutubePreview) -> String {
+    let href = html_escape::encode_double_quoted_attribute(&preview.href);
+    let display_url = html_escape::encode_text(&preview.display_url);
+    let thumbnail = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", preview.video_id);
+    format!(
+        r#"<a class="youtube-preview-card" data-testid="youtube-preview-card" href="{href}" rel="noopener noreferrer" referrerpolicy="no-referrer"><span class="youtube-thumbnail-frame"><img class="youtube-thumbnail" src="{}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="youtube-play" aria-hidden="true"></span></span><span class="youtube-preview-body"><span class="youtube-preview-source">YouTube</span><span class="youtube-preview-title">{}</span><span class="youtube-preview-url">{display_url}</span></span></a>"#,
+        html_escape::encode_double_quoted_attribute(&thumbnail),
+        html_escape::encode_text(YOUTUBE_PREVIEW_TITLE),
+    )
+}
+
+fn youtube_previews_for_text(text: &str) -> Vec<YoutubePreview> {
+    let mut previews = Vec::new();
+    for word in text.split_whitespace() {
+        if previews.len() >= MAX_YOUTUBE_PREVIEWS_PER_POST {
+            break;
+        }
+        if let Some(candidate) = youtube_candidate_from_word(word)
+            && let Some(preview) = youtube_preview_from_url(candidate)
+        {
+            previews.push(preview);
+        }
+    }
+    previews
+}
+
+fn youtube_candidate_from_word(word: &str) -> Option<&str> {
+    let candidate = word
+        .trim_start_matches(is_url_leading_trim_char)
+        .trim_end_matches(is_url_trailing_trim_char);
+    (!candidate.is_empty()).then_some(candidate)
+}
+
+fn is_url_leading_trim_char(ch: char) -> bool {
+    matches!(ch, '<' | '(' | '[' | '{' | '"' | '\'')
+}
+
+fn is_url_trailing_trim_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | '!' | '?' | ':' | ';' | ')' | ']' | '}' | '>' | '"' | '\''
+    )
+}
+
+fn youtube_preview_from_url(candidate: &str) -> Option<YoutubePreview> {
+    let href = youtube_absolute_http_url(candidate)?;
+    let uri = href.parse::<Uri>().ok()?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return None;
+    }
+    let host = uri.host()?.to_ascii_lowercase();
+    let video_id = youtube_video_id_from_parts(&host, uri.path(), uri.query())?;
+    Some(YoutubePreview {
+        video_id,
+        href,
+        display_url: candidate.to_owned(),
+    })
+}
+
+fn youtube_absolute_http_url(candidate: &str) -> Option<String> {
+    if has_http_scheme(candidate) {
+        return Some(candidate.to_owned());
+    }
+    let (host, _path) = candidate.split_once('/')?;
+    is_supported_youtube_host(host).then(|| format!("https://{candidate}"))
+}
+
+fn has_http_scheme(candidate: &str) -> bool {
+    candidate
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || candidate
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+fn youtube_video_id_from_parts(host: &str, path: &str, query: Option<&str>) -> Option<String> {
+    if is_youtu_be_host(host) {
+        return single_path_segment(path).and_then(valid_youtube_video_id);
+    }
+    if !is_youtube_host(host) {
+        return None;
+    }
+    if path == "/watch" {
+        return query.and_then(youtube_video_id_from_query);
+    }
+    path_segment_after_prefix(path, "/shorts/")
+        .or_else(|| path_segment_after_prefix(path, "/embed/"))
+        .and_then(valid_youtube_video_id)
+}
+
+fn youtube_video_id_from_query(query: &str) -> Option<String> {
+    let mut video_id = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "v" {
+            continue;
+        }
+        let valid = valid_youtube_video_id(value)?;
+        if video_id.replace(valid).is_some() {
+            return None;
+        }
+    }
+    video_id
+}
+
+fn single_path_segment(path: &str) -> Option<&str> {
+    let value = path.strip_prefix('/')?;
+    (!value.is_empty() && !value.contains('/')).then_some(value)
+}
+
+fn path_segment_after_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let value = path.strip_prefix(prefix)?;
+    (!value.is_empty() && !value.contains('/')).then_some(value)
+}
+
+fn valid_youtube_video_id(value: &str) -> Option<String> {
+    (value.len() == YOUTUBE_VIDEO_ID_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then(|| value.to_owned())
+}
+
+fn is_supported_youtube_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    is_youtube_host(&host) || is_youtu_be_host(&host)
+}
+
+fn is_youtube_host(host: &str) -> bool {
+    matches!(host, "youtube.com" | "www.youtube.com" | "m.youtube.com")
+}
+
+fn is_youtu_be_host(host: &str) -> bool {
+    host == "youtu.be"
 }
 
 pub fn linkify(text: &str) -> String {
@@ -1335,7 +1781,7 @@ fn notification_row(notification: &NotificationView) -> String {
     let target = notification_target(notification);
     let target_attrs = target.as_ref().map_or_else(String::new, |href| {
         format!(
-            r#" data-card-href="{}" tabindex="0""#,
+            r#" data-card-href="{}""#,
             html_escape::encode_double_quoted_attribute(href)
         )
     });
@@ -1519,34 +1965,35 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
 }
 
 const CSS: &str = r#"
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;line-height:1.5;--bg:#f5f6f1;--surface:#fff;--surface-subtle:#fbfcfa;--surface-muted:#f4f5f2;--header-bg:rgba(255,255,255,.96);--text:#202124;--text-strong:#172017;--muted:#667064;--muted-strong:#59625a;--border:#dfe4dc;--border-strong:#b9c2b8;--link:#1f5f8b;--link-strong:#24445f;--brand:#163b2f;--brand-hover:#235544;--brand-text:#fff;--hover:#eef3f0;--focus:#93c5fd;--shadow:rgba(20,35,30,.04);--reply-border:#c8d8d0;--avatar-bg:#eef3f0;--danger:#8a3d2d;--danger-strong:#6f2f22;--danger-bg:#fff8f5;--danger-border:#e6b8a8;--success-bg:#f4fbf5;--success-border:#add7b4;--media-bg:#f6f7f4}
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;line-height:1.5;--bg:#f5f6f1;--surface:#fff;--surface-subtle:#fbfcfa;--surface-muted:#f4f5f2;--header-bg:rgba(255,255,255,.96);--text:#202124;--text-strong:#172017;--muted:#667064;--muted-strong:#59625a;--border:#dfe4dc;--border-strong:#b9c2b8;--link:#1f5f8b;--link-strong:#24445f;--brand:#163b2f;--brand-hover:#235544;--brand-text:#fff;--hover:#eef3f0;--focus:#93c5fd;--shadow:rgba(20,35,30,.04);--reply-border:#c8d8d0;--avatar-bg:#eef3f0;--danger:#8a3d2d;--danger-strong:#6f2f22;--danger-bg:#fff8f5;--danger-border:#e6b8a8;--success-bg:#f4fbf5;--success-border:#add7b4;--media-bg:#f6f7f4;--shell-side:240px;--shell-primary:640px;--shell-gap:1.25rem;--shell-max:1160px;--header-padding-y:.8rem;--header-brand-size:2rem;--hairline:1px;--rail-sticky-top:calc(var(--header-brand-size) + var(--header-padding-y) + var(--header-padding-y) + var(--shell-gap) + var(--hairline))}
 :root[data-theme="dark"]{color-scheme:dark;--bg:#111827;--surface:#182231;--surface-subtle:#1d2939;--surface-muted:#233044;--header-bg:rgba(17,24,39,.96);--text:#eef4fb;--text-strong:#f8fafc;--muted:#c3cfdd;--muted-strong:#d4deea;--border:#344256;--border-strong:#596b83;--link:#8fc7ff;--link-strong:#badcff;--brand:#4f8fc7;--brand-hover:#6aa8df;--brand-text:#06111f;--hover:#243349;--focus:#fbbf24;--shadow:rgba(0,0,0,.26);--reply-border:#4f6680;--avatar-bg:#243349;--danger:#ffb4a2;--danger-strong:#ffd2c7;--danger-bg:#3a2020;--danger-border:#8f4d43;--success-bg:#163321;--success-border:#4c8a61;--media-bg:#0f172a}
 *{box-sizing:border-box}body{margin:0;min-width:320px;color:var(--text);background:var(--bg)}a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
 .site-header{position:sticky;top:0;z-index:10;background:var(--header-bg);border-bottom:1px solid var(--border);backdrop-filter:blur(8px)}
-.header-inner{max-width:1180px;margin:0 auto;padding:.8rem 1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
-.brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:var(--text-strong)}.brand-mark{display:inline-grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--brand);color:var(--brand-text)}
+.header-inner{max-width:var(--shell-max);margin:0 auto;padding:var(--header-padding-y) 1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.header-brand-row{display:flex;align-items:center;gap:.75rem;min-width:0;max-width:100%}.brand{display:flex;align-items:center;gap:.55rem;font-weight:800;color:var(--text-strong);min-width:0}.brand span:last-child{overflow-wrap:anywhere}.brand-mark{display:inline-grid;place-items:center;width:var(--header-brand-size);height:var(--header-brand-size);border-radius:7px;background:var(--brand);color:var(--brand-text);flex:0 0 auto}
+.tor-indicator{display:inline-flex;align-items:center;gap:.28rem;min-width:0;max-width:min(28rem,100%);flex:1 1 14rem;min-height:2rem;border-left:1px solid var(--border);padding:.05rem 0 .05rem .7rem;color:var(--muted-strong);font-size:.86rem;line-height:1;white-space:nowrap;overflow:hidden}.tor-label{flex:0 0 auto;color:var(--muted);font-weight:800}.tor-address-link{display:inline-flex;align-items:center;min-width:0;max-width:100%;flex:1 1 auto;min-height:1.9rem;padding:0 .1rem;color:var(--link-strong);font-weight:750}.tor-address-link:hover{color:var(--text-strong);text-decoration:underline}.tor-summary-text{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}.tor-copy-button{display:none;flex:0 0 auto;min-width:2.55rem;min-height:1.9rem;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--muted-strong);padding:.18rem .35rem;font-size:.82rem;font-weight:800;line-height:1;box-shadow:none}.js-enabled .tor-copy-button{display:inline-flex;align-items:center;justify-content:center}.tor-copy-button:hover{background:var(--hover);color:var(--link-strong)}
 nav{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}nav a,nav button,.button-link{display:inline-flex;align-items:center;gap:.35rem;min-height:2.15rem;border-radius:7px;padding:.42rem .65rem;color:var(--link-strong);border:1px solid transparent;background:transparent}
 nav a:hover,nav button:hover,.button-link:hover{background:var(--hover);text-decoration:none}nav form,.actions form{display:inline}
 nav svg{width:1.05rem;height:1.05rem;fill:currentColor;flex:0 0 auto}
 .nav-badge{display:inline-grid;place-items:center;min-width:1.25rem;height:1.25rem;border-radius:999px;padding:0 .35rem;background:var(--brand);color:var(--brand-text);font-size:.78rem;font-weight:800;line-height:1}
-main{padding:1.25rem}.app-shell{width:min(100%,1180px);margin:0 auto;display:grid;grid-template-columns:220px minmax(0,640px) 260px;gap:1.25rem;align-items:start;justify-content:center}.primary-column{min-width:0;width:100%}.left-rail,.right-rail{min-width:0;position:sticky;top:5rem;display:grid;gap:.75rem}.side-rail-card,.rail-nav{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem;color:var(--muted-strong);box-shadow:0 1px 2px var(--shadow)}.side-rail-card h2{margin:.1rem 0 .6rem;font-size:1rem;color:var(--text)}.rail-nav{display:grid;gap:.25rem}.rail-nav a,.rail-nav button{width:100%;justify-content:flex-start}.rail-nav form{display:block}.mobile-nav{display:none}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:var(--text)}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:var(--text)}.dashboard-account:hover{text-decoration:none}.dashboard-actions{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:1180px;margin:0 auto;padding:1rem;color:var(--muted);font-size:.9rem}.footer-onion{display:block;margin-top:.25rem;overflow-wrap:anywhere}
+main{padding:var(--shell-gap)}.app-shell{width:min(100%,var(--shell-max));margin:0 auto;display:grid;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary)) var(--shell-side);gap:var(--shell-gap);align-items:start;justify-content:center}.primary-column{min-width:0;width:100%}.left-rail,.right-rail{min-width:0;position:sticky;top:var(--rail-sticky-top);display:grid;gap:.75rem;align-items:start}.side-rail-card,.rail-nav{background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--muted-strong);box-shadow:0 1px 2px var(--shadow)}.side-rail-card{padding:.85rem}.side-rail-card h2{margin:.1rem 0 .6rem;font-size:1rem;color:var(--text)}.rail-nav{display:grid;grid-template-columns:minmax(0,1fr);gap:.2rem;width:100%;padding:.35rem;justify-content:stretch}.rail-nav a,.rail-nav button{width:100%;min-height:2.35rem;justify-content:flex-start;padding:.5rem .65rem}.rail-nav form{display:block}.mobile-nav{display:none}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:var(--text)}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:var(--text)}.dashboard-account:hover{text-decoration:none}.dashboard-actions{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:var(--shell-max);margin:0 auto;padding:1rem;color:var(--muted);font-size:.9rem}
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:.85rem;box-shadow:0 1px 2px var(--shadow)}
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.panel h1+table,.panel h1+form,.panel h1+p,.panel h1+dl{margin-top:.85rem}.page-header p,.muted,.empty-state p{color:var(--muted);margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
-.notifications-hero{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:1rem;box-shadow:0 1px 2px var(--shadow);display:flex;align-items:center;justify-content:space-between;gap:1rem}.notifications-hero h1{margin:0;font-size:1.55rem;line-height:1.15}.notifications-hero p:not(.eyebrow){margin:.35rem 0 0;color:var(--muted-strong)}.caught-up-pill{display:inline-flex;align-items:center;min-height:2rem;border:1px solid var(--success-border);border-radius:999px;background:var(--success-bg);color:var(--text-strong);padding:.32rem .75rem;font-weight:800}.caught-up{padding:.75rem .85rem}.caught-up p{margin:0}.notifications-list{display:grid;gap:.5rem}.notification-group{margin:.8rem .15rem .2rem;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.notification-row{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:start;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.8rem;box-shadow:0 1px 2px var(--shadow)}.notification-row.unread{border-color:var(--border-strong);background:var(--surface-subtle)}.notification-row[data-card-href]{cursor:pointer}.notification-row[data-card-href]:hover{border-color:var(--border-strong);background:var(--hover)}.notification-kind{display:grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--surface-muted);color:var(--link-strong);font-weight:900;font-size:.8rem}.notification-row.unread .notification-kind{background:var(--brand);color:var(--brand-text)}.notification-body{min-width:0}.notification-line{margin:0;overflow-wrap:anywhere}.notification-meta{margin:.35rem 0 0;color:var(--muted);font-size:.88rem}.notification-preview{display:block;margin:.5rem 0 0;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle);color:var(--muted-strong);overflow-wrap:anywhere}.notification-preview:hover{background:var(--surface);text-decoration:none}.notification-preview.unavailable{border-style:dashed}.unread-dot{width:.65rem;height:.65rem;border-radius:999px;background:var(--brand);margin-top:.7rem}
+.notifications-hero{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:1rem;box-shadow:0 1px 2px var(--shadow);display:flex;align-items:center;justify-content:space-between;gap:1rem}.notifications-hero h1{margin:0;font-size:1.55rem;line-height:1.15}.notifications-hero p:not(.eyebrow){margin:.35rem 0 0;color:var(--muted-strong)}.caught-up-pill{display:inline-flex;align-items:center;min-height:2rem;border:1px solid var(--success-border);border-radius:999px;background:var(--success-bg);color:var(--text-strong);padding:.32rem .75rem;font-weight:800}.caught-up{padding:.75rem .85rem}.caught-up p{margin:0}.notifications-list{display:grid;gap:.5rem}.notification-group{margin:.8rem .15rem .2rem;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.notification-row{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:start;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.8rem;box-shadow:0 1px 2px var(--shadow)}.notification-row.unread{border-color:var(--border-strong);background:var(--surface-subtle)}.js-enabled .notification-row[data-card-href]{cursor:pointer}.js-enabled .notification-row[data-card-href]:hover{border-color:var(--border-strong);background:var(--hover)}.notification-kind{display:grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--surface-muted);color:var(--link-strong);font-weight:900;font-size:.8rem}.notification-row.unread .notification-kind{background:var(--brand);color:var(--brand-text)}.notification-body{min-width:0}.notification-line{margin:0;overflow-wrap:anywhere}.notification-meta{margin:.35rem 0 0;color:var(--muted);font-size:.88rem}.notification-preview{display:block;margin:.5rem 0 0;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle);color:var(--muted-strong);overflow-wrap:anywhere}.notification-preview:hover{background:var(--surface);text-decoration:none}.notification-preview.unavailable{border-style:dashed}.unread-dot{width:.65rem;height:.65rem;border-radius:999px;background:var(--brand);margin-top:.7rem}
 label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button,select{font:inherit}input[type=text],input[type=search],input[type=password],input[type=url],input:not([type]),textarea,select{width:100%;padding:.72rem .8rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text)}textarea{resize:vertical;min-height:7rem}::placeholder{color:var(--muted)}
 input[type=checkbox]{accent-color:var(--brand)}.check-row,.theme-toggle{display:flex;align-items:center;gap:.55rem;font-weight:700;color:var(--text)}.theme-toggle{padding:.65rem .75rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle)}.theme-toggle input{width:auto}
-input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{background:var(--surface);color:var(--link-strong);border-color:var(--border);min-width:4.5rem}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}.auth-form .field-help{margin:.15rem 0 .4rem;color:var(--muted-strong)}
+input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{display:none;background:var(--surface);color:var(--link-strong);border-color:var(--border);min-width:4.5rem}.js-enabled .password-toggle{display:inline-block}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}.auth-form .field-help{margin:.15rem 0 .4rem;color:var(--muted-strong)}
 .search-panel h1{margin-bottom:.75rem}.search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center}.search-form input{min-width:0}.search-results{display:grid;gap:.65rem}.section-title{margin:.2rem 0 .65rem;font-size:1.05rem;color:var(--text)}.search-users{margin-bottom:0}.search-users .section-title{margin-top:0}.search-account{grid-template-columns:auto minmax(0,1fr)}
 input:focus,textarea:focus,select:focus,button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}button,.primary{border:1px solid var(--brand);background:var(--brand);color:var(--brand-text);border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:var(--brand-hover);text-decoration:none}
-nav button,.rail-nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.42rem .65rem}.rail-nav button:hover,.mobile-nav button:hover{background:var(--hover);color:var(--link-strong)}
-.composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}.file-control{display:inline-flex;align-items:center;gap:.6rem;margin:0;color:var(--link-strong);font-weight:700}.file-control input{max-width:15rem}
+nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.42rem .65rem}.rail-nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.5rem .65rem}.rail-nav button:hover,.mobile-nav button:hover{background:var(--hover);color:var(--link-strong)}
+.composer-surface{border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);overflow:hidden}.composer-surface textarea{border:0;border-radius:0;background:transparent;min-height:7rem;resize:vertical}.composer-surface textarea:focus{outline:0;box-shadow:inset 0 0 0 3px var(--focus)}.composer-footer{display:flex;align-items:center;justify-content:space-between;gap:.55rem;border-top:1px solid var(--border);padding:.42rem .5rem;background:var(--surface-subtle)}.composer-file-control{position:relative;display:inline-flex;align-items:center;gap:.45rem;max-width:100%;margin:0;color:var(--link-strong);font-weight:800}.composer-file-input{max-width:100%;color:var(--muted-strong)}.composer-file-input::file-selector-button{border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.34rem .58rem;font-weight:800;cursor:pointer}.composer-file-input::file-selector-button:hover{background:var(--hover);color:var(--text-strong)}.composer-file-button{display:none}.js-enabled .composer-file-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.js-enabled .composer-file-button{display:inline-flex;align-items:center;gap:.38rem;min-height:2rem;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.3rem .55rem;cursor:pointer}.composer-file-button svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.js-enabled .composer-file-control:hover .composer-file-button{background:var(--hover);color:var(--text-strong)}.js-enabled .composer-file-input:focus-visible+.composer-file-button{outline:3px solid var(--focus);outline-offset:2px}.composer-media-selection[hidden]{display:none}.composer-media-selection{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;border-top:1px solid var(--border);padding:.5rem;background:var(--surface)}.composer-media-summary{font-weight:800;color:var(--muted-strong);overflow-wrap:anywhere}.composer-nsfw{margin:0}.composer-clear-media{background:var(--surface);color:var(--link-strong);border-color:var(--border);padding:.32rem .55rem}.composer-clear-media:hover{background:var(--hover);color:var(--text-strong)}.composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}
 .thread-nav{display:flex;margin:0 0 .45rem .85rem}.thread-back{width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:var(--link-strong)}.thread-back svg{width:1.2rem;height:1.2rem;fill:currentColor}.thread-back:hover{background:var(--hover);text-decoration:none}
-.timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.post[data-card-href]{cursor:pointer}.post[data-card-href]:hover{border-color:var(--border-strong)}.post[data-card-href]:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.reply-post{margin-left:1.1rem;border-left:4px solid var(--reply-border);background:var(--surface-subtle)}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid var(--reply-border)}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid var(--border);background:var(--avatar-bg);flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:var(--muted-strong);font-weight:800}.author-name{font-weight:800;color:var(--text-strong)}.username,.post-time,.counts{color:var(--muted);font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-top:.5rem;background:var(--media-bg)}.post img.post-avatar{display:block;margin:0;border-radius:999px}
-.counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.actions{display:inline-flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem;max-width:100%}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.repost-control{position:relative;display:inline-flex;align-items:center;gap:.25rem}.repost-menu{position:absolute;z-index:8;left:0;top:calc(100% + .25rem);min-width:8.5rem;padding:.3rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 6px 18px var(--shadow)}.repost-menu a,.quote-fallback{display:inline-flex;align-items:center;min-height:2rem;border-radius:6px;padding:.32rem .55rem;color:var(--link-strong);font-weight:700}.repost-menu a{width:100%}.repost-menu a:hover,.quote-fallback:hover{background:var(--hover);text-decoration:none}.quote-fallback{font-size:.88rem}.quote-preview{display:block;margin:.6rem 0 .25rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);overflow:hidden}.quote-preview p{margin:.65rem;color:var(--muted-strong)}.quote-link{display:grid;gap:.2rem;padding:.6rem;color:var(--text)}.quote-link:hover{background:var(--hover);text-decoration:none}.quote-author{font-weight:800}.quote-text{white-space:pre-wrap;overflow-wrap:anywhere}.quote-time{color:var(--muted);font-size:.86rem}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}
-.profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid var(--border);background:var(--surface-muted)}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:999px;border:3px solid var(--surface);background:var(--avatar-bg);flex:0 0 auto}.profile-meta{color:var(--muted-strong);margin:.45rem 0 0}.settings-profile-editor{padding:0;overflow:hidden}.settings-editor-bar{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.85rem;border-bottom:1px solid var(--border)}.settings-editor-bar h1{margin:0}.settings-editor-bar .primary{flex:0 0 auto}.settings-profile-form{padding:0 .85rem .85rem}.settings-profile-media{margin:0 -.85rem .85rem}.settings-banner-wrap{background:var(--media-bg)}.settings-banner-preview{display:block;width:100%;height:220px;object-fit:cover;background:linear-gradient(135deg,var(--surface-muted),var(--hover));border:0;border-radius:0}.settings-banner-preview.placeholder::before{content:"";display:block;width:100%;height:100%}.settings-picture-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:1rem;align-items:end;padding:0 .85rem .85rem;margin-top:-48px}.settings-picture-preview{width:112px;height:112px;object-fit:cover;border-radius:999px;border:5px solid var(--surface);background:var(--avatar-bg);box-shadow:0 1px 4px var(--shadow)}.settings-picture-preview.placeholder{display:block}.settings-media-controls{display:grid;gap:.5rem;align-content:end;padding-top:3.25rem}.media-control-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}.settings-fields{display:grid;gap:.25rem}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-panel{padding:0;overflow:hidden}.deep-settings-form{padding:.85rem;display:grid;gap:.85rem}.deep-settings-group{border:1px solid var(--border);border-radius:8px;padding:.8rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-group legend{font-weight:800;padding:0 .35rem}.deep-settings-field{display:grid;gap:.25rem;align-content:start}.deep-settings-field label{font-weight:800}.deep-settings-field input,.deep-settings-field select{min-width:0}.field-help{font-size:.88rem}.deep-settings-confirm .settings-item-list li{display:block}.compact-panel h2,.danger-panel h2{margin:0 0 .65rem;font-size:1.1rem}.inline-settings-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center;margin:.2rem 0 .75rem}.inline-settings-form input{min-width:0}.settings-password-form button[type=submit]{margin-top:.9rem}.settings-item-list{list-style:none;margin:.25rem 0 0;padding:0;display:grid;gap:.45rem}.settings-item-list li{display:flex;justify-content:space-between;align-items:center;gap:.75rem;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle)}.settings-item-list form{flex:0 0 auto}.settings-item-list button{padding:.32rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border)}.compact-empty{border:1px dashed var(--border);border-radius:7px;padding:.75rem;background:var(--surface-subtle);color:var(--muted-strong)}.compact-empty p{margin:.25rem 0 0}.danger-panel{border-color:var(--danger-border);background:var(--danger-bg)}.danger,.danger-link{border-color:var(--danger-border);background:var(--danger);color:var(--brand-text)}.danger:hover,.danger-link:hover{background:var(--danger-strong);color:var(--brand-text);text-decoration:none}.delete-account-panel p{max-width:62ch}.favicon-preview{width:32px;height:32px;object-fit:contain;border:1px solid var(--border);border-radius:6px;background:var(--surface)}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--border);text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
-@media (max-width:1100px){.app-shell{grid-template-columns:200px minmax(0,640px)}.right-rail{display:none}}
+.timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.js-enabled .post[data-card-href]{cursor:pointer}.js-enabled .post[data-card-href]:hover{border-color:var(--border-strong)}.reply-post{margin-left:1.1rem;border-left:4px solid var(--reply-border);background:var(--surface-subtle)}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid var(--reply-border)}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid var(--border);background:var(--avatar-bg);flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:var(--muted-strong);font-weight:800}.author-name{font-weight:800;color:var(--text-strong)}.username,.post-time,.counts{color:var(--muted);font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-top:.5rem;background:var(--media-bg)}.post img.post-avatar{display:block;margin:0;border-radius:999px}.youtube-previews{display:grid;gap:.45rem;margin:.35rem 0 .55rem}.youtube-preview-card{display:grid;grid-template-columns:minmax(5.5rem,7.5rem) minmax(0,1fr);gap:.65rem;align-items:center;min-height:4.5rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);color:var(--text);overflow:hidden}.youtube-preview-card:hover{border-color:var(--border-strong);background:var(--hover);text-decoration:none}.youtube-thumbnail-frame{position:relative;display:block;width:100%;aspect-ratio:16/9;overflow:hidden;background:var(--media-bg)}.post img.youtube-thumbnail{width:100%;height:100%;object-fit:cover;margin:0;border:0;border-radius:0}.youtube-play{position:absolute;left:50%;top:50%;width:2rem;height:2rem;border-radius:999px;background:rgba(0,0,0,.68);transform:translate(-50%,-50%)}.youtube-play::before{content:"";position:absolute;left:.78rem;top:.55rem;border-top:.45rem solid transparent;border-bottom:.45rem solid transparent;border-left:.65rem solid #fff}.youtube-preview-body{display:grid;gap:.08rem;min-width:0;padding:.45rem .55rem .45rem 0}.youtube-preview-source{color:var(--muted);font-size:.78rem;font-weight:900;text-transform:uppercase}.youtube-preview-title{color:var(--text-strong);font-weight:850;overflow-wrap:anywhere}.youtube-preview-url{color:var(--muted-strong);font-size:.86rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nsfw-media{position:relative;margin-top:.5rem}.nsfw-media .post img,.nsfw-media .post video{margin-top:0}.nsfw-media-frame{position:relative;display:block;overflow:hidden;border-radius:8px}.nsfw-media-frame img,.nsfw-media-frame video{margin-top:0;filter:blur(24px);transform:scale(1.02)}.nsfw-toggle:checked+.nsfw-media-frame img,.nsfw-toggle:checked+.nsfw-media-frame video{filter:none;transform:none}.nsfw-badge{position:absolute;left:.55rem;bottom:.55rem;border-radius:999px;padding:.18rem .5rem;background:rgba(0,0,0,.72);color:#fff;font-size:.78rem;font-weight:900;letter-spacing:.03em}.nsfw-show{position:absolute;right:.55rem;bottom:.55rem;margin:0;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text-strong);padding:.32rem .65rem;font-weight:900;box-shadow:0 1px 2px var(--shadow);cursor:pointer}.nsfw-show:hover{background:var(--hover)}.nsfw-toggle:focus-visible~.nsfw-show{outline:3px solid var(--focus);outline-offset:2px}.nsfw-toggle:checked~.nsfw-show,.nsfw-toggle:checked+.nsfw-media-frame .nsfw-badge{display:none}.nsfw-open{display:block;margin:.35rem 0 0;font-size:.9rem;font-weight:700}
+.counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.post-permalink{font-weight:700;color:var(--link-strong)}.js-enabled .post-permalink{display:none}.actions{display:inline-flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem;max-width:100%}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.admin-nsfw-button{min-height:2.2rem;padding:.3rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border);font-size:.86rem}.admin-nsfw-button:hover{background:var(--hover);color:var(--text-strong)}.repost-control{position:relative;display:inline-flex;align-items:center;gap:.25rem}.repost-menu{position:absolute;z-index:8;left:0;top:calc(100% + .25rem);min-width:8.5rem;padding:.3rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 6px 18px var(--shadow)}.repost-menu a{display:inline-flex;align-items:center;gap:.35rem;width:100%;min-height:2rem;border-radius:6px;padding:.32rem .55rem;color:var(--link-strong);font-weight:700}.repost-menu a svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.repost-menu a:hover,.quote-fallback:hover{background:var(--hover);text-decoration:none}.quote-preview{display:block;margin:.6rem 0 .25rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);overflow:hidden}.quote-preview p{margin:.65rem;color:var(--muted-strong)}.quote-link{display:grid;gap:.2rem;padding:.6rem;color:var(--text)}.quote-link:hover{background:var(--hover);text-decoration:none}.quote-author{font-weight:800}.quote-text{white-space:pre-wrap;overflow-wrap:anywhere}.quote-time{color:var(--muted);font-size:.86rem}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}.noscript-banner{max-width:1100px;margin:.7rem auto 0;padding:.65rem .85rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle);color:var(--muted-strong)}.js-enabled .noscript-banner{display:none}
+.profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid var(--border);background:var(--surface-muted)}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:999px;border:3px solid var(--surface);background:var(--avatar-bg);flex:0 0 auto}.profile-meta{color:var(--muted-strong);margin:.45rem 0 0}.settings-profile-editor{padding:0;overflow:hidden}.settings-editor-bar{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.85rem;border-bottom:1px solid var(--border)}.settings-editor-bar h1{margin:0}.settings-editor-bar .primary{flex:0 0 auto}.settings-profile-form{padding:0 .85rem .85rem}.settings-profile-media{margin:0 -.85rem .85rem}.settings-banner-wrap{background:var(--media-bg)}.settings-banner-preview{display:block;width:100%;height:220px;object-fit:cover;background:linear-gradient(135deg,var(--surface-muted),var(--hover));border:0;border-radius:0}.settings-banner-preview.placeholder::before{content:"";display:block;width:100%;height:100%}.settings-picture-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:1rem;align-items:end;padding:0 .85rem .85rem;margin-top:-48px}.settings-picture-preview{width:112px;height:112px;object-fit:cover;border-radius:999px;border:5px solid var(--surface);background:var(--avatar-bg);box-shadow:0 1px 4px var(--shadow)}.settings-picture-preview.placeholder{display:block}.settings-media-controls{display:grid;gap:.5rem;align-content:end;padding-top:3.25rem}.media-control-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}.settings-fields{display:grid;gap:.25rem}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-panel{padding:0;overflow:hidden}.deep-settings-form{padding:.85rem;display:grid;gap:.85rem}.deep-settings-group{border:1px solid var(--border);border-radius:8px;padding:.8rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-group legend{font-weight:800;padding:0 .35rem}.deep-settings-field{display:grid;gap:.25rem;align-content:start}.deep-settings-field label{font-weight:800}.deep-settings-field input,.deep-settings-field select{min-width:0}.field-help{font-size:.88rem}.deep-settings-confirm .settings-item-list li{display:block}.compact-panel h2,.danger-panel h2{margin:0 0 .65rem;font-size:1.1rem}.inline-settings-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center;margin:.2rem 0 .75rem}.inline-settings-form input{min-width:0}.settings-password-form button[type=submit]{margin-top:.9rem}.settings-item-list{list-style:none;margin:.25rem 0 0;padding:0;display:grid;gap:.45rem}.settings-item-list li{display:flex;justify-content:space-between;align-items:center;gap:.75rem;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle)}.settings-item-list form{flex:0 0 auto}.settings-item-list button{padding:.32rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border)}.compact-empty{border:1px dashed var(--border);border-radius:7px;padding:.75rem;background:var(--surface-subtle);color:var(--muted-strong)}.compact-empty p{margin:.25rem 0 0}.danger-panel{border-color:var(--danger-border);background:var(--danger-bg)}.danger,.danger-link{border-color:var(--danger-border);background:var(--danger);color:var(--brand-text)}.danger:hover,.danger-link:hover{background:var(--danger-strong);color:var(--brand-text);text-decoration:none}.delete-account-panel p{max-width:62ch}.favicon-preview{width:32px;height:32px;object-fit:contain;border:1px solid var(--border);border-radius:6px;background:var(--surface)}.admin-user-search{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:.65rem;align-items:end;margin-top:.75rem}.admin-user-search label{margin-top:0}.admin-user-search-actions{display:flex;gap:.4rem;align-items:center;margin-bottom:.05rem}.admin-user-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.75rem;border:1px solid var(--border);border-radius:8px;padding:.75rem;margin-top:.65rem;background:var(--surface-subtle)}.admin-user-heading{overflow-wrap:anywhere}.admin-user-statuses,.admin-user-matches{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.45rem}.admin-user-pill,.admin-user-match{display:inline-flex;align-items:center;min-height:1.55rem;border:1px solid var(--border);border-radius:999px;padding:.15rem .5rem;background:var(--surface);font-size:.82rem;font-weight:800;color:var(--muted-strong)}.admin-user-match{border-color:var(--success-border);background:var(--success-bg);color:var(--text)}.admin-user-meta{margin:.6rem 0 0}.admin-post-preview{margin:.55rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.admin-user-actions{display:flex;align-items:flex-start}.admin-users-empty{margin-top:.75rem}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--border);text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
+@media (max-width:1100px){.app-shell{--shell-side:220px;--shell-max:880px;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary))}.right-rail{display:none}}
 @media (max-width:820px){.app-shell{grid-template-columns:minmax(0,680px)}.left-rail,.right-rail{display:none}.mobile-nav{display:flex}}
-@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.site-header{position:static}nav{justify-content:flex-start}.mobile-nav{width:100%}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar,.notifications-hero{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-item-list li{align-items:stretch;flex-direction:column}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.file-control{display:block}.file-control input{display:block;max-width:100%;margin-top:.35rem}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1,.notifications-hero h1{font-size:1.25rem}.notification-row{grid-template-columns:auto minmax(0,1fr);gap:.6rem}.unread-dot{position:absolute;right:.75rem;top:.75rem;margin:0}.notification-preview{padding:.5rem}}
+@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.header-brand-row{align-items:center;width:100%;gap:.55rem}.tor-indicator{max-width:calc(100% - 7rem);margin-left:auto}.tor-details{left:auto;right:0;max-width:calc(100vw - 1.5rem)}.site-header{position:static}nav{justify-content:flex-start}.mobile-nav{width:100%}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group,.admin-user-search,.admin-user-row{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar,.notifications-hero{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.composer-footer,.composer-media-selection{align-items:flex-start;flex-direction:column}.composer-file-input{max-width:100%}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-item-list li{align-items:stretch;flex-direction:column}.admin-user-search-actions,.admin-user-actions{align-items:stretch;flex-direction:column}.admin-user-search-actions button,.admin-user-search-actions .button-link,.admin-user-actions button{width:100%;justify-content:center}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1,.notifications-hero h1{font-size:1.25rem}.notification-row{grid-template-columns:auto minmax(0,1fr);gap:.6rem}.unread-dot{position:absolute;right:.75rem;top:.75rem;margin:0}.notification-preview{padding:.5rem}}
 "#;
 
 #[cfg(test)]
@@ -1580,6 +2027,7 @@ mod tests {
             is_admin: false,
             is_suspended: false,
             theme: Theme::Dark,
+            nsfw_blur_enabled: true,
         };
         let body = layout(Some(&user), "Home Feed", "<p>body</p>", "My Microblog");
 
@@ -1587,8 +2035,23 @@ mod tests {
     }
 
     #[test]
+    fn layout_includes_no_javascript_status_and_styles() {
+        let body = layout(None, "Home Feed", "<p>body</p>", "My Microblog");
+
+        assert!(body.contains(r#"class="noscript-banner" role="status""#));
+        assert!(body.contains(".js-enabled .noscript-banner"));
+        assert!(body.contains(".js-enabled .post-permalink"));
+        assert!(body.contains("display:none"));
+        assert!(
+            client_script().contains(r#"document.documentElement.classList.add("js-enabled")"#)
+        );
+        assert!(body.contains("JavaScript is disabled."));
+        assert!(body.contains("RustPost will use standard links and forms."));
+    }
+
+    #[test]
     fn register_form_uses_configured_password_length() {
-        let body = register_form(None, 5);
+        let body = register_form(None, 5, None);
 
         assert!(body.contains(r#"minlength="5" required"#));
         assert!(body.contains("Password must be at least 5 characters."));
@@ -1608,11 +2071,28 @@ mod tests {
 
     #[test]
     fn password_fields_allow_empty_when_minimum_is_zero() {
-        let body = register_form(None, 0);
+        let body = register_form(None, 0, None);
 
         assert!(!body.contains("minlength="));
         assert!(!body.contains(r#"autocomplete="new-password" required"#));
         assert!(body.contains("No minimum password length is currently required."));
+    }
+
+    #[test]
+    fn register_form_renders_optional_captcha_fields() {
+        let captcha = crate::registration_captcha::RegistrationCaptchaChallenge {
+            token: "token-1".to_owned(),
+            image_data_uri: "data:image/png;base64,abc".to_owned(),
+            expires_minutes: 10,
+            answer: "ABCDE".to_owned(),
+        };
+
+        let body = register_form(None, 10, Some(&captcha));
+
+        assert!(body.contains("<legend>Registration CAPTCHA</legend>"));
+        assert!(body.contains(r#"name="captcha_token" value="token-1""#));
+        assert!(body.contains(r#"id="captcha_answer" name="captcha_answer""#));
+        assert!(body.contains("The challenge expires in 10 minutes."));
     }
 
     #[test]
@@ -1624,6 +2104,7 @@ mod tests {
             is_admin: false,
             is_suspended: false,
             theme: Theme::Light,
+            nsfw_blur_enabled: true,
         };
         let body = layout_with_csrf(
             Some(&user),
@@ -1659,6 +2140,7 @@ mod tests {
             is_admin: false,
             is_suspended: false,
             theme: Theme::Light,
+            nsfw_blur_enabled: true,
         };
         let body = layout_with_context(
             Some(&user),
@@ -1706,6 +2188,7 @@ mod tests {
         );
         assert!(!without_tor.contains("examplehiddenservice.onion"));
         assert!(!without_tor.contains("Onion: <code>"));
+        assert!(!without_tor.contains("tor-header-indicator"));
 
         let with_tor = layout_with_context(
             None,
@@ -1719,17 +2202,79 @@ mod tests {
             },
         );
         assert!(with_tor.contains("examplehiddenservice.onion"));
-        assert!(with_tor.contains("footer-onion"));
+        assert!(with_tor.contains("tor-header-indicator"));
+        assert!(with_tor.contains("tor-summary-text"));
+        assert!(with_tor.contains(r#"<span class="tor-label">Tor:</span>"#));
+        assert!(with_tor.contains(r#"href="http://examplehiddenservice.onion""#));
+        assert!(with_tor.contains(r#"title="Open Tor mirror: examplehiddenservice.onion""#));
+        assert!(with_tor.contains(r#"aria-label="Open Tor mirror at examplehiddenservice.onion""#));
+        assert!(with_tor.contains("exampl...ice.onion"));
+        assert!(with_tor.contains(r#"data-copy-text="examplehiddenservice.onion""#));
+        assert!(with_tor.contains(r#"aria-label="Copy Tor onion address""#));
+        assert!(!with_tor.contains("footer-onion"));
+        assert!(!with_tor.contains("<details"));
+        assert!(!with_tor.contains("<summary"));
+        assert!(!with_tor.contains("Tor mirror: <code>"));
+        assert!(!with_tor.contains("Onion: <code>"));
     }
 
     #[test]
-    fn composer_has_live_remaining_counter_without_placeholder() {
-        let body = composer(Some("csrf"), Some(10), 512);
-        assert!(body.contains("512 remaining"));
+    fn short_onion_address_preserves_short_values() {
+        assert_eq!(
+            short_onion_address("abc.onion"),
+            "abc.onion",
+            "short or unusual values should remain readable"
+        );
+        assert_eq!(
+            short_onion_address("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion"),
+            "abcdef...vwx.onion"
+        );
+    }
+
+    #[test]
+    fn composer_has_live_remaining_counter_and_contextual_placeholder() {
+        let post = composer(Some("csrf"), None, 512);
+        assert!(post.contains("512 remaining"));
+        assert!(post.contains("data-character-limit=\"512\""));
+        assert!(post.contains("maxlength=\"512\""));
+        assert!(post.contains("What is happening?"));
+        assert!(post.contains(r#"placeholder="What's happening?""#));
+        assert!(post.contains(r#"<div class="composer-surface">"#));
+        assert!(post.contains(r#"id="post-media" name="media" type="file""#));
+        assert!(post.contains(r#"aria-label="Attach media" data-composer-media"#));
+        assert!(
+            post.contains(
+                r#"class="composer-media-selection" data-composer-media-selection hidden"#
+            )
+        );
+        assert!(post.contains(r#"id="post-nsfw" name="nsfw" type="checkbox""#));
+        assert!(post.contains(r#"data-composer-clear-media"#));
+        assert!(!post.contains(r#"class="file-control""#));
+
+        let reply = composer(Some("csrf"), Some(10), 512);
+        assert!(reply.contains(r#"id="reply-text-10""#));
+        assert!(reply.contains(r#"id="reply-media-10" name="media" type="file""#));
+        assert!(reply.contains(r#"id="reply-nsfw-10" name="nsfw" type="checkbox""#));
+        assert!(reply.contains(r#"placeholder="Write a reply...""#));
+    }
+
+    #[test]
+    fn quote_composer_has_contextual_placeholder() {
+        let quote = QuotePreview {
+            id: 42,
+            username: Some("ada".to_owned()),
+            display_name: Some("Ada".to_owned()),
+            anonymous_label: None,
+            text: "quoted post".to_owned(),
+            created_at: "2026-05-18 10:30".to_owned(),
+            unavailable: false,
+        };
+        let body = quote_composer("csrf", &quote, 512);
+
+        assert!(body.contains(r#"id="quote-text""#));
+        assert!(body.contains(r#"placeholder="Add your thoughts...""#));
         assert!(body.contains("data-character-limit=\"512\""));
         assert!(body.contains("maxlength=\"512\""));
-        assert!(body.contains("What is happening?"));
-        assert!(!body.contains("placeholder="));
     }
 
     #[test]
@@ -1738,8 +2283,8 @@ mod tests {
         let body = post_card(&post, None, None);
 
         assert!(body.contains(r#"data-card-href="/posts/42""#));
-        assert!(body.contains(r#"tabindex="0""#));
-        assert!(!body.contains(r#">Open post</a>"#));
+        assert!(!body.contains(r#"tabindex="0""#));
+        assert!(body.contains(r#"<a class="post-permalink" href="/posts/42">Open post</a>"#));
         assert!(!body.contains("Open thread"));
         assert!(!body.contains("2026-05-18 10:30"));
         assert!(!body.contains(r#"class="post-time""#));
@@ -1771,9 +2316,11 @@ mod tests {
             .expect("root card");
         assert!(!root_card.contains(r#"data-card-href="/posts/42""#));
         assert!(!root_card.contains(r#"tabindex="0""#));
+        assert!(!root_card.contains(r#"href="/posts/42">Open post</a>"#));
         assert!(root_card.contains(r#"<span class="post-time">2026-05-18 10:30</span>"#));
         assert!(!root_card.contains(r#"class="post-time" href="/posts/42""#));
         assert!(body.contains(r#"data-card-href="/posts/43""#));
+        assert!(body.contains(r#"href="/posts/43">Open post</a>"#));
     }
 
     #[test]
@@ -1810,7 +2357,7 @@ mod tests {
 
     #[test]
     fn search_page_preserves_and_escapes_query() {
-        let body = search_page("RustPost", r#"<rust> "query""#, &[], &[], None, None);
+        let body = search_page("RustPost", r#"<rust> "query""#, &[], &[], None, None, true);
 
         assert!(body.contains(r#"value="&lt;rust&gt; &quot;query&quot;""#));
         assert!(body.contains("No results found"));
@@ -1832,7 +2379,7 @@ mod tests {
             viewer_following: false,
         };
 
-        let body = search_page("RustPost", "ada", &[account], &[post], None, None);
+        let body = search_page("RustPost", "ada", &[account], &[post], None, None, true);
 
         assert!(body.contains(r#"2 results for "ada""#));
         assert!(body.contains(r#"id="search-users-title">People"#));
@@ -1849,6 +2396,7 @@ mod tests {
             is_admin: false,
             is_suspended: false,
             theme: Theme::Light,
+            nsfw_blur_enabled: true,
         };
         let mut post = test_post();
         post.user_id = Some(2);
@@ -1882,6 +2430,7 @@ mod tests {
             is_admin: false,
             is_suspended: false,
             theme: Theme::Light,
+            nsfw_blur_enabled: true,
         };
         let mut post = test_post();
         post.user_id = Some(2);
@@ -1892,8 +2441,13 @@ mod tests {
         assert!(body.contains("data-repost-menu-button"));
         assert!(body.contains(r#"aria-haspopup="menu""#));
         assert!(body.contains(r#"role="menu""#));
-        assert!(body.contains(r#"href="/posts/42/quote">Quote post</a>"#));
-        assert!(body.contains(r#"class="quote-fallback" href="/posts/42/quote">Quote</a>"#));
+        assert!(body.contains(r#"role="menuitem" href="/posts/42/quote">"#));
+        assert!(body.contains(r#"<span>Quote post</span></a>"#));
+        assert!(body.contains(
+            r#"class="icon-button quote-fallback" href="/posts/42/quote" aria-label="Quote post" title="Quote post""#
+        ));
+        assert!(body.contains(r#"<span class="sr-only">Quote post</span></a>"#));
+        assert!(!body.contains(r#">Quote</a>"#));
     }
 
     #[test]
@@ -1934,6 +2488,159 @@ mod tests {
         let body = post_card(&post, None, None);
 
         assert!(body.contains("Quoted post is no longer available."));
+    }
+
+    #[test]
+    fn nsfw_media_renders_blurred_with_accessible_reveal_control() {
+        let mut post = test_post();
+        post.media = vec![MediaView {
+            public_path: "/uploads/images/flagged.webp".to_owned(),
+            mime_type: "image/webp".to_owned(),
+            media_kind: "image".to_owned(),
+            alt_text: "Flagged image".to_owned(),
+            is_nsfw: true,
+        }];
+
+        let body = post_card(&post, None, None);
+
+        assert!(body.contains(r#"data-testid="nsfw-media""#));
+        assert!(body.contains(r#"aria-label="Show NSFW media""#));
+        assert!(body.contains(">Show<span"));
+        assert!(body.contains(r#"href="/uploads/images/flagged.webp">Open media</a>"#));
+    }
+
+    #[test]
+    fn nsfw_media_blur_can_be_disabled_for_rendering() {
+        let mut post = test_post();
+        post.media = vec![MediaView {
+            public_path: "/uploads/images/flagged.webp".to_owned(),
+            mime_type: "image/webp".to_owned(),
+            media_kind: "image".to_owned(),
+            alt_text: "Flagged image".to_owned(),
+            is_nsfw: true,
+        }];
+
+        let body = post_card_with_nsfw_blur(&post, None, None, false);
+
+        assert!(!body.contains(r#"data-testid="nsfw-media""#));
+        assert!(body.contains(r#"<img src="/uploads/images/flagged.webp""#));
+    }
+
+    #[test]
+    fn youtube_video_id_extraction_supports_common_url_shapes() {
+        let cases = [
+            ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            (
+                "https://youtube.com/watch?feature=share&v=dQw4w9WgXcQ",
+                "dQw4w9WgXcQ",
+            ),
+            ("https://youtu.be/dQw4w9WgXcQ?t=12", "dQw4w9WgXcQ"),
+            ("https://www.youtube.com/shorts/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            ("https://www.youtube.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            ("youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        ];
+
+        for (url, expected) in cases {
+            let preview = youtube_preview_from_url(url).expect("valid YouTube URL");
+
+            assert_eq!(preview.video_id, expected);
+        }
+    }
+
+    #[test]
+    fn youtube_video_id_extraction_rejects_invalid_and_spoofed_urls() {
+        let invalid = [
+            "https://youtube.com.evil/watch?v=dQw4w9WgXcQ",
+            "https://evil.example/youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtube.com@evil.example/watch?v=dQw4w9WgXcQ",
+            "javascript:https://youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXc",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ%2F",
+            "https://youtu.be/dQw4w9WgXcQ/extra",
+            "https://www.youtube.com/shorts/../dQw4w9WgXcQ",
+            "https://www.youtube.com/embed/dQw4w9WgXcQ/../x",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&v=aaaaaaaaaaa",
+        ];
+
+        for url in invalid {
+            assert!(
+                youtube_preview_from_url(url).is_none(),
+                "accepted invalid URL: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn youtube_preview_rendering_escapes_user_controlled_text_and_urls() {
+        let mut post = test_post();
+        post.text =
+            "unsafe <script>alert(1)</script> https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1"
+                .to_owned();
+
+        let body = post_card(&post, None, None);
+
+        assert!(body.contains("unsafe &lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!body.contains("<script>alert(1)</script>"));
+        assert!(body.contains(r#"href="https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;t=1""#));
+        assert!(body.contains(
+            r#"<span class="youtube-preview-url">https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;t=1</span>"#
+        ));
+    }
+
+    #[test]
+    fn posts_without_youtube_links_do_not_render_preview_cards() {
+        let mut post = test_post();
+        post.text = "hello https://example.com/watch?v=dQw4w9WgXcQ #rust".to_owned();
+
+        let body = post_card(&post, None, None);
+
+        assert!(!body.contains("youtube-preview-card"));
+        assert!(body.contains(
+            r#"<div class="text">hello https://example.com/watch?v=dQw4w9WgXcQ <a href="/tags/rust">#rust</a></div>"#
+        ));
+    }
+
+    #[test]
+    fn multiple_youtube_links_render_up_to_documented_cap() {
+        let mut post = test_post();
+        post.text = "https://youtu.be/dQw4w9WgXcQ https://youtube.com/shorts/aaaaaaaaaaa https://youtube.com/embed/bbbbbbbbbbb https://youtube.com/watch?v=ccccccccccc".to_owned();
+
+        let body = post_card(&post, None, None);
+
+        assert_eq!(
+            body.matches(r#"data-testid="youtube-preview-card""#)
+                .count(),
+            3
+        );
+        assert!(body.contains("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"));
+        assert!(body.contains("https://i.ytimg.com/vi/aaaaaaaaaaa/hqdefault.jpg"));
+        assert!(body.contains("https://i.ytimg.com/vi/bbbbbbbbbbb/hqdefault.jpg"));
+        assert!(!body.contains("https://i.ytimg.com/vi/ccccccccccc/hqdefault.jpg"));
+    }
+
+    #[test]
+    fn no_javascript_youtube_preview_shows_thumbnail_and_link_card() {
+        let mut post = test_post();
+        post.text = "watch https://youtu.be/dQw4w9WgXcQ".to_owned();
+
+        let body = post_card(&post, None, None);
+
+        assert!(body.contains(
+            r#"<a class="youtube-preview-card" data-testid="youtube-preview-card" href="https://youtu.be/dQw4w9WgXcQ""#
+        ));
+        assert!(body.contains(
+            r#"<img class="youtube-thumbnail" src="https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">"#
+        ));
+        assert!(body.contains(r#"<span class="youtube-preview-title">YouTube video</span>"#));
+        assert!(!body.contains("<iframe"));
+        assert!(!body.contains("<script"));
+    }
+
+    #[test]
+    fn layout_allows_only_static_youtube_thumbnail_origin() {
+        let body = layout(None, "Home Feed", "<p>body</p>", "RustPost");
+
+        assert!(body.contains("img-src 'self' data: https://i.ytimg.com"));
     }
 
     fn test_post() -> PostView {

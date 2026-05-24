@@ -7,6 +7,7 @@ use axum::Router;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{DefaultBodyLimit, Form, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::middleware;
 use axum::response::{Html, IntoResponse as _, Redirect, Response};
 use axum::routing::{get, post};
 use rusqlite::{OptionalExtension as _, params};
@@ -19,6 +20,7 @@ use crate::config::Settings;
 use crate::db::SqlitePool;
 use crate::errors::{AppError, AppResult};
 use crate::ffmpeg::FfmpegStatus;
+use crate::registration_captcha::RegistrationCaptchaStore;
 use crate::runtime::RuntimePaths;
 use crate::{account, admin, backup, csrf, favicon, media, rate_limit, render, social};
 
@@ -31,6 +33,7 @@ pub struct AppState {
     pub paths: RuntimePaths,
     pub ffmpeg: FfmpegStatus,
     pub tor: crate::tor::TorStatus,
+    pub registration_captcha: RegistrationCaptchaStore,
 }
 
 impl AppState {
@@ -48,6 +51,7 @@ impl AppState {
             paths,
             ffmpeg,
             tor,
+            registration_captcha: RegistrationCaptchaStore::default(),
         })
     }
 }
@@ -100,6 +104,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/users", get(admin_users))
         .route("/admin/users/{id}/suspend", post(admin_suspend))
         .route("/admin/posts/{id}/delete", post(admin_delete_post))
+        .route("/admin/posts/{id}/nsfw", post(admin_toggle_post_nsfw))
         .route("/admin/health", get(admin_health))
         .route("/admin/media", get(admin_media))
         .route(
@@ -129,6 +134,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             ServeDir::new(state.paths.uploads_thumbs.clone()),
         )
         .layer(DefaultBodyLimit::max(upload_body_limit))
+        .layer(middleware::from_fn(
+            crate::compression::response_compression,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -167,6 +175,8 @@ struct RegisterForm {
     username: String,
     password: String,
     confirm_password: Option<String>,
+    captcha_token: Option<String>,
+    captcha_answer: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -194,6 +204,12 @@ struct DeleteQuery {
 #[derive(Deserialize)]
 struct SearchQuery {
     q: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AdminUsersQuery {
+    user_q: Option<String>,
+    post_q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +253,7 @@ struct ParsedProfileUpdate {
     theme: Theme,
     delete_profile_picture: bool,
     delete_banner: bool,
+    nsfw_blur_enabled: bool,
     profile_picture_media_id: Option<i64>,
     banner_media_id: Option<i64>,
 }
@@ -250,6 +267,13 @@ struct ParsedPostCreate {
     text: String,
     parent_post_id: Option<i64>,
     media_ids: Vec<i64>,
+    is_nsfw: bool,
+}
+
+#[derive(Deserialize)]
+struct AdminNsfwForm {
+    csrf: String,
+    nsfw: String,
 }
 
 struct DeletePreview {
@@ -311,7 +335,12 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
         "{}{}{}",
         render::page_header("Home Feed", "All posts"),
         composer,
-        render::posts(&posts, user.as_ref(), csrf.as_deref())
+        render::posts_with_nsfw_blur(
+            &posts,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+        )
     );
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Home Feed", &body).await?,
@@ -332,7 +361,10 @@ async fn layout_context(
     };
     Ok(render::LayoutContext {
         anonymous_mode_enabled: state.settings.accounts.anonymous_mode_enabled,
-        tor_onion_address: state.tor.onion_address(),
+        tor_onion_address: state.tor.onion_address().or_else(|| {
+            (!state.settings.tor.display_onion_address.is_empty())
+                .then(|| state.settings.tor.display_onion_address.clone())
+        }),
         follower_count: counts.map(|(followers, _following)| followers),
         following_count: counts.map(|(_followers, following)| following),
         notification_unread_count,
@@ -356,6 +388,14 @@ async fn page_layout(
         &state.settings.site.name,
         &context,
     ))
+}
+
+fn blur_nsfw_media(state: &AppState, user: Option<&CurrentUser>) -> bool {
+    let global_blur = Settings::load(&state.paths.settings_path)
+        .map_or(state.settings.media.nsfw_blur_enabled, |settings| {
+            settings.media.nsfw_blur_enabled
+        });
+    global_blur && user.is_none_or(|user| user.nsfw_blur_enabled)
 }
 
 async fn login_form(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -418,7 +458,7 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
     if !state.settings.accounts.registration_enabled {
         return Err(AppError::Forbidden);
     }
-    let body = render::register_form(None, state.settings.accounts.min_password_length);
+    let body = register_form_body(&state, None).await?;
     Ok(Html(
         page_layout(&state, None, None, "Register", &body).await?,
     ))
@@ -451,6 +491,17 @@ async fn register(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
+    if state.settings.accounts.registration_captcha_enabled
+        && let Err(err) = state
+            .registration_captcha
+            .validate(
+                form.captcha_token.as_deref(),
+                form.captcha_answer.as_deref(),
+            )
+            .await
+    {
+        return register_form_response(&state, StatusCode::BAD_REQUEST, err.message()).await;
+    }
     let user_id = match auth::register_user(
         &state.pool,
         &state.settings,
@@ -510,12 +561,25 @@ async fn register_form_response(
     status: StatusCode,
     message: &str,
 ) -> AppResult<Response> {
-    let body = render::register_form(Some(message), state.settings.accounts.min_password_length);
+    let body = register_form_body(state, Some(message)).await?;
     Ok((
         status,
         Html(page_layout(state, None, None, "Register", &body).await?),
     )
         .into_response())
+}
+
+async fn register_form_body(state: &AppState, message: Option<&str>) -> AppResult<String> {
+    let captcha = if state.settings.accounts.registration_captcha_enabled {
+        Some(state.registration_captcha.create_challenge().await?)
+    } else {
+        None
+    };
+    Ok(render::register_form(
+        message,
+        state.settings.accounts.min_password_length,
+        captcha.as_ref(),
+    ))
 }
 
 async fn logout(
@@ -565,6 +629,9 @@ async fn create_post(
     }
     if user.is_some() {
         validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
+    }
+    if form.is_nsfw {
+        media::set_media_nsfw(&state.pool, &form.media_ids, true).await?;
     }
     let (scope, actor, max_events, window_secs) = if user.is_none() {
         (
@@ -617,16 +684,18 @@ async fn create_post(
             parent_post_id: form.parent_post_id,
             redirect,
             html: if form.parent_post_id.is_some() {
-                render::thread_post_card(
+                render::thread_post_card_with_nsfw_blur(
                     post,
                     user.as_ref(),
                     form_csrf(&state, &headers).await.as_deref(),
+                    blur_nsfw_media(&state, user.as_ref()),
                 )
             } else {
-                render::post_card(
+                render::post_card_with_nsfw_blur(
                     post,
                     user.as_ref(),
                     form_csrf(&state, &headers).await.as_deref(),
+                    blur_nsfw_media(&state, user.as_ref()),
                 )
             },
         })
@@ -645,6 +714,7 @@ async fn parse_post_create(
         text: String::new(),
         parent_post_id: None,
         media_ids: Vec::new(),
+        is_nsfw: false,
     };
     while let Some(field) = multipart
         .next_field()
@@ -683,6 +753,13 @@ async fn parse_post_create(
                         "reply target is invalid; open the post thread and try again".to_owned(),
                     )
                 })?);
+            }
+            "nsfw" => {
+                form.is_nsfw = true;
+                let _ignored = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
             }
             "media"
                 if field
@@ -747,7 +824,12 @@ async fn thread(
     let body = format!(
         "{}{}{}",
         render::thread_back_control(),
-        render::thread_posts(&posts, user.as_ref(), csrf.as_deref()),
+        render::thread_posts_with_nsfw_blur(
+            &posts,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+        ),
         composer
     );
     Ok(Html(
@@ -1052,7 +1134,12 @@ async fn profile(
         location_line,
         html_escape::encode_text(bio.as_str()),
         website_link,
-        render::posts(&posts, user.as_ref(), csrf.as_deref())
+        render::posts_with_nsfw_blur(
+            &posts,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+        )
     );
     Ok(Html(
         page_layout(
@@ -1269,6 +1356,49 @@ fn settings_query_notice(saved: Option<&str>) -> Option<(&'static str, &'static 
     }
 }
 
+struct SettingsProfile {
+    display_name: String,
+    bio: String,
+    location: String,
+    website: String,
+    theme: String,
+    nsfw_blur_enabled: bool,
+    picture_path: Option<String>,
+    banner_path: Option<String>,
+}
+
+async fn settings_profile(pool: &SqlitePool, user_id: i64) -> AppResult<SettingsProfile> {
+    pool.call(move |conn| {
+        conn.query_row(
+            r#"
+        SELECT u.display_name, u.bio, u.location, u.website, u.theme, u.nsfw_blur_enabled,
+          pic.public_path AS profile_picture_path,
+          banner.public_path AS banner_path
+        FROM users u
+        LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+        LEFT JOIN media banner ON banner.id = u.banner_media_id
+        WHERE u.id = ?
+        "#,
+            [user_id],
+            |row| {
+                Ok(SettingsProfile {
+                    display_name: row.get(0)?,
+                    bio: row.get(1)?,
+                    location: row.get(2)?,
+                    website: row.get(3)?,
+                    theme: row.get(4)?,
+                    nsfw_blur_enabled: row.get::<_, i64>(5)? != 0,
+                    picture_path: row.get(6)?,
+                    banner_path: row.get(7)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+    })
+    .await
+    .map_err(Into::into)
+}
+
 fn settings_profile_media(
     picture_path: Option<&str>,
     banner_path: Option<&str>,
@@ -1444,41 +1574,16 @@ async fn settings_page(
     csrf: &str,
     notice: Option<(&str, &str)>,
 ) -> AppResult<String> {
-    let user_id = user.id;
-    let profile = state
-        .pool
-        .call(move |conn| {
-            conn.query_row(
-                r#"
-        SELECT u.display_name, u.bio, u.location, u.website, u.theme,
-          pic.public_path AS profile_picture_path,
-          banner.public_path AS banner_path
-        FROM users u
-        LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
-        LEFT JOIN media banner ON banner.id = u.banner_media_id
-        WHERE u.id = ?
-        "#,
-                [user_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                    ))
-                },
-            )
-            .map_err(Into::into)
-        })
-        .await?;
-    let (display_name, bio, location, website, theme, picture_path, banner_path) = profile;
+    let profile = settings_profile(&state.pool, user.id).await?;
     let blocked = social::blocked_users(&state.pool, user.id).await?;
     let muted = social::muted_users(&state.pool, user.id).await?;
     let muted_words = social::muted_words(&state.pool, user.id).await?;
-    let dark_checked = if Theme::from(theme.as_str()) == Theme::Dark {
+    let dark_checked = if Theme::from(profile.theme.as_str()) == Theme::Dark {
+        " checked"
+    } else {
+        ""
+    };
+    let nsfw_checked = if profile.nsfw_blur_enabled {
         " checked"
     } else {
         ""
@@ -1502,20 +1607,21 @@ async fn settings_page(
         "confirm-new-password-requirement",
     );
     let profile_media = settings_profile_media(
-        picture_path.as_deref(),
-        banner_path.as_deref(),
+        profile.picture_path.as_deref(),
+        profile.banner_path.as_deref(),
         state.settings.accounts.allow_profile_pictures,
         state.settings.accounts.allow_profile_banners,
     );
     let body = format!(
-        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Blocked users</h2>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted users</h2>{}</section></div><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
+        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><label class="theme-toggle" for="nsfw_blur_enabled"><input id="nsfw_blur_enabled" name="nsfw_blur_enabled" type="checkbox" value="true"{}> Blur NSFW media</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Blocked users</h2>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted users</h2>{}</section></div><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         profile_media,
         dark_checked,
-        html_escape::encode_double_quoted_attribute(display_name.as_str()),
-        html_escape::encode_text(bio.as_str()),
-        html_escape::encode_double_quoted_attribute(location.as_str()),
-        html_escape::encode_double_quoted_attribute(website.as_str()),
+        nsfw_checked,
+        html_escape::encode_double_quoted_attribute(profile.display_name.as_str()),
+        html_escape::encode_text(profile.bio.as_str()),
+        html_escape::encode_double_quoted_attribute(profile.location.as_str()),
+        html_escape::encode_double_quoted_attribute(profile.website.as_str()),
         settings_user_list(
             &blocked,
             "/unblock",
@@ -1558,12 +1664,13 @@ async fn settings_update(
     let location = form.location.trim().to_owned();
     let website = form.website.trim().to_owned();
     let theme = form.theme.as_str().to_owned();
+    let nsfw_blur_enabled = i64::from(form.nsfw_blur_enabled);
     state
         .pool
         .call(move |conn| {
             conn.execute(
-                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                params![display_name, bio, location, website, theme, user.id],
+                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, nsfw_blur_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                params![display_name, bio, location, website, theme, nsfw_blur_enabled, user.id],
             )?;
             Ok(())
         })
@@ -1910,6 +2017,7 @@ async fn parse_profile_update(
         theme: Theme::Light,
         delete_profile_picture: false,
         delete_banner: false,
+        nsfw_blur_enabled: false,
         profile_picture_media_id: None,
         banner_media_id: None,
     };
@@ -1954,6 +2062,9 @@ async fn parse_profile_update(
             }
             "dark_mode" => {
                 form.theme = Theme::Dark;
+            }
+            "nsfw_blur_enabled" => {
+                form.nsfw_blur_enabled = true;
             }
             "delete_profile_picture" => {
                 form.delete_profile_picture = true;
@@ -2292,7 +2403,12 @@ async fn bookmarks(
     let body = format!(
         "{}{}",
         render::page_header("Bookmarks", "Posts you saved for later."),
-        render::posts(&posts, Some(&user), csrf.as_deref())
+        render::posts_with_nsfw_blur(
+            &posts,
+            Some(&user),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, Some(&user)),
+        )
     );
     Ok(Html(
         page_layout(&state, Some(&user), csrf.as_deref(), "Bookmarks", &body).await?,
@@ -2361,6 +2477,7 @@ async fn search(
         &posts,
         user.as_ref(),
         csrf.as_deref(),
+        blur_nsfw_media(&state, user.as_ref()),
     );
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Search", &body).await?,
@@ -2542,40 +2659,163 @@ async fn admin_health(
 async fn admin_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<AdminUsersQuery>,
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let rows = admin::users(&state.pool).await?;
-    let list = rows
-        .into_iter()
-        .map(|(id, username, is_admin, suspended)| {
-            format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
-                id,
-                html_escape::encode_text(&username),
-                is_admin,
-                suspended,
-                small_form(
-                    &format!("/admin/users/{id}/suspend"),
-                    &csrf,
-                    if suspended { "Unsuspend" } else { "Suspend" },
-                    if suspended {
-                        "Unsuspend this account"
-                    } else {
-                        "Suspend this account"
-                    },
-                )
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let user_query = query.user_q.unwrap_or_default();
+    let post_query = query.post_q.unwrap_or_default();
+    let search = admin::AdminUserSearch::new(&user_query, &post_query);
+    let malformed_quotes = search.post_search.malformed_quotes;
+    let has_filter = search.has_filter();
+    let rows = admin::users(&state.pool, search).await?;
+    let quote_notice = if malformed_quotes {
+        r#"<p class="notice error">Post search had unmatched quotes, so it was treated as plain keyword search.</p>"#
+    } else {
+        ""
+    };
+    let list = admin_user_rows(&rows, &csrf, has_filter);
     let body = format!(
-        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Users</h1><table><thead><tr><th>ID</th><th>Username</th><th>Admin</th><th>Suspended</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>"#,
+        r#"<section class="panel admin-card admin-users-panel" data-testid="admin-card"><h1>Users</h1><form method="get" action="/admin/users" class="admin-user-search"><div><label for="admin-user-q">Username, display name, or handle</label><input id="admin-user-q" name="user_q" type="search" value="{}" autocomplete="off" placeholder="alice or @alice"></div><div><label for="admin-post-q">Post keywords</label><input id="admin-post-q" name="post_q" type="search" value="{}" autocomplete="off" placeholder="keyword or &quot;exact phrase&quot;"></div><div class="admin-user-search-actions"><button type="submit">Search</button><a class="button-link" href="/admin/users">Reset</a></div></form>{}{}</section>"#,
+        html_escape::encode_double_quoted_attribute(&user_query),
+        html_escape::encode_double_quoted_attribute(&post_query),
+        quote_notice,
         list
     );
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Admin users", &body).await?,
     ))
+}
+
+fn admin_user_rows(rows: &[admin::AdminUserInvestigation], csrf: &str, searched: bool) -> String {
+    if rows.is_empty() {
+        let message = if searched {
+            "No users matched those filters."
+        } else {
+            "No users found."
+        };
+        return format!(
+            r#"<div class="compact-empty admin-users-empty"><strong>{}</strong><p>Try a different username, handle, display name, or post keyword.</p></div>"#,
+            html_escape::encode_text(message)
+        );
+    }
+
+    rows.iter()
+        .map(|row| admin_user_row(row, csrf, searched))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn admin_user_row(row: &admin::AdminUserInvestigation, csrf: &str, searched: bool) -> String {
+    let display_name = if row.display_name.trim().is_empty() {
+        row.username.as_str()
+    } else {
+        row.display_name.as_str()
+    };
+    let statuses = [
+        if row.is_admin { "Admin" } else { "Member" },
+        if row.is_suspended {
+            "Suspended"
+        } else {
+            "Active"
+        },
+        if row.is_deleted {
+            "Deleted"
+        } else {
+            "Not deleted"
+        },
+    ]
+    .iter()
+    .map(|status| {
+        format!(
+            r#"<span class="admin-user-pill">{}</span>"#,
+            html_escape::encode_text(status)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("");
+    let match_labels = admin_user_match_labels(row, searched);
+    let preview = row
+        .post_match_preview
+        .as_ref()
+        .map_or_else(String::new, |text| {
+            format!(
+                r#"<p class="admin-post-preview"><strong>Post match preview:</strong> {}</p>"#,
+                html_escape::encode_text(&short_preview(text))
+            )
+        });
+    let action = small_form(
+        &format!("/admin/users/{}/suspend", row.id),
+        csrf,
+        if row.is_suspended {
+            "Unsuspend"
+        } else {
+            "Suspend"
+        },
+        if row.is_suspended {
+            "Unsuspend this account"
+        } else {
+            "Suspend this account"
+        },
+    );
+    format!(
+        r#"<article class="admin-user-row"><div class="admin-user-main"><div class="admin-user-heading"><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span> <span class="muted">#{}</span></div><div class="admin-user-statuses">{}</div>{}<dl class="admin-user-meta"><dt>Created</dt><dd>{}</dd><dt>Updated</dt><dd>{}</dd><dt>Last session</dt><dd>{}</dd><dt>Last post</dt><dd>{}</dd><dt>Total posts</dt><dd>{}</dd><dt>Uploaded media</dt><dd>{}</dd><dt>Reports on posts</dt><dd>{}</dd><dt>Moderation actions</dt><dd>{}</dd><dt>Matching posts</dt><dd>{}</dd></dl>{}</div><div class="admin-user-actions">{}</div></article>"#,
+        html_escape::encode_double_quoted_attribute(&row.username),
+        html_escape::encode_text(display_name),
+        html_escape::encode_text(&row.username),
+        row.id,
+        statuses,
+        match_labels,
+        html_escape::encode_text(&row.created_at),
+        html_escape::encode_text(&row.updated_at),
+        html_escape::encode_text(row.last_session_at.as_deref().unwrap_or("No session")),
+        html_escape::encode_text(row.last_post_at.as_deref().unwrap_or("No posts")),
+        row.total_posts,
+        row.uploaded_media_count,
+        row.reports_on_posts_count,
+        row.moderation_action_count,
+        row.matching_post_count,
+        preview,
+        action
+    )
+}
+
+fn admin_user_match_labels(row: &admin::AdminUserInvestigation, searched: bool) -> String {
+    if !searched {
+        return String::new();
+    }
+
+    let mut labels = Vec::new();
+    if row.matched_name {
+        labels.push("Matched name".to_owned());
+    }
+    if row.matching_post_count > 0 {
+        labels.push(format!("Matched post content: {}", row.matching_post_count));
+    }
+    if labels.is_empty() {
+        return String::new();
+    }
+    let labels = labels
+        .iter()
+        .map(|label| {
+            format!(
+                r#"<span class="admin-user-match">{}</span>"#,
+                html_escape::encode_text(label)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<div class="admin-user-matches">{labels}</div>"#)
+}
+
+fn short_preview(text: &str) -> String {
+    const LIMIT: usize = 140;
+    let trimmed = text.trim();
+    let mut preview = trimmed.chars().take(LIMIT).collect::<String>();
+    if trimmed.chars().count() > LIMIT {
+        preview.push_str("...");
+    }
+    preview
 }
 
 async fn admin_suspend(
@@ -2611,6 +2851,39 @@ async fn admin_delete_post(
     social::delete_post(&state.pool, user.id, id, true).await?;
     admin::audit(&state.pool, user.id, "delete_post", &format!("post:{id}")).await?;
     Ok(Redirect::to("/admin").into_response())
+}
+
+async fn admin_toggle_post_nsfw(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<AdminNsfwForm>,
+) -> AppResult<Response> {
+    let user = require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let is_nsfw = match form.nsfw.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return Err(AppError::BadRequest("invalid NSFW setting".to_owned())),
+    };
+    let changed = social::set_post_media_nsfw(&state.pool, id, is_nsfw)
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    if changed == 0 {
+        return Err(AppError::BadRequest("post has no media".to_owned()));
+    }
+    admin::audit(
+        &state.pool,
+        user.id,
+        if is_nsfw {
+            "mark_post_nsfw"
+        } else {
+            "unmark_post_nsfw"
+        },
+        &format!("post:{id}"),
+    )
+    .await?;
+    Ok(redirect_to_post_anchor(&headers, id, false).into_response())
 }
 
 async fn admin_media(
@@ -3104,12 +3377,16 @@ fn user_actor(user_id: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::read::GzDecoder;
+    use std::io::Read as _;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     struct TestServer {
         base_url: String,
         data_dir: PathBuf,
+        pool: SqlitePool,
+        registration_captcha: RegistrationCaptchaStore,
         _task: tokio::task::JoinHandle<()>,
         _temp: tempfile::TempDir,
     }
@@ -3117,6 +3394,7 @@ mod tests {
     struct TestResponse {
         status: u16,
         headers: Vec<(String, String)>,
+        body_bytes: Vec<u8>,
         body: String,
     }
 
@@ -3211,6 +3489,244 @@ mod tests {
             safe_delete_return_target("/home#post-42", 42),
             Some("/home#post-42".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_access_admin_users() {
+        let server = spawn_test_server_with_admin().await;
+        let member_cookie = register_test_user(&server, "member").await;
+
+        let response = get_with_cookie(&server, "/admin/users", &member_cookie).await;
+
+        assert_eq!(response.status, 403);
+    }
+
+    #[tokio::test]
+    async fn admin_users_page_shows_expanded_user_details() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let settings = Settings::default();
+        let alice = auth::register_user(
+            &server.pool,
+            &settings,
+            "alice",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("alice");
+        let reporter = auth::register_user(
+            &server.pool,
+            &settings,
+            "reporter",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("reporter");
+        let post = social::create_post(
+            &server.pool,
+            &settings,
+            Some(alice),
+            "expanded admin detail post",
+            None,
+            &[],
+        )
+        .await
+        .expect("post");
+        server
+            .pool
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET display_name = 'Alice Admin' WHERE id = ?",
+                    [alice],
+                )?;
+                conn.execute(
+                    "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'alice.png', '/tmp/alice.png', '/uploads/images/alice.png', 'image/png', 'image', 12)",
+                    [alice],
+                )?;
+                conn.execute(
+                    "INSERT INTO reports (reporter_user_id, post_id, reason) VALUES (?, ?, 'spam')",
+                    params![reporter, post],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed details");
+
+        let response = get_with_cookie(&server, "/admin/users", &admin_cookie).await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("Alice Admin"));
+        assert!(response.body.contains("@alice"));
+        assert!(response.body.contains("Created"));
+        assert!(response.body.contains("Last post"));
+        assert!(response.body.contains("Total posts"));
+        assert!(response.body.contains("Uploaded media"));
+        assert!(response.body.contains("Reports on posts"));
+        assert!(response.body.contains("Moderation actions"));
+        assert!(response.body.contains(">1</dd>"));
+    }
+
+    #[tokio::test]
+    async fn admin_users_username_search_returns_expected_users() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let settings = Settings::default();
+        auth::register_user(
+            &server.pool,
+            &settings,
+            "alice",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("alice");
+        auth::register_user(
+            &server.pool,
+            &settings,
+            "bob",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("bob");
+
+        let response = get_with_cookie(&server, "/admin/users?user_q=ali", &admin_cookie).await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("@alice"));
+        assert!(!response.body.contains("@bob"));
+        assert!(response.body.contains("Matched name"));
+    }
+
+    #[tokio::test]
+    async fn admin_users_post_keyword_search_returns_matching_accounts() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let settings = Settings::default();
+        let alice = auth::register_user(
+            &server.pool,
+            &settings,
+            "alice",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("alice");
+        let bob = auth::register_user(
+            &server.pool,
+            &settings,
+            "bob",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("bob");
+        social::create_post(
+            &server.pool,
+            &settings,
+            Some(alice),
+            "admin keyword needle <script>",
+            None,
+            &[],
+        )
+        .await
+        .expect("alice post");
+        social::create_post(
+            &server.pool,
+            &settings,
+            Some(bob),
+            "ordinary post",
+            None,
+            &[],
+        )
+        .await
+        .expect("bob post");
+
+        let response = get_with_cookie(&server, "/admin/users?post_q=needle", &admin_cookie).await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("@alice"));
+        assert!(!response.body.contains("@bob"));
+        assert!(response.body.contains("Matched post content: 1"));
+        assert!(
+            response
+                .body
+                .contains("admin keyword needle &lt;script&gt;")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_users_quoted_phrase_search_requires_exact_post_substring() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let settings = Settings::default();
+        let alice = auth::register_user(
+            &server.pool,
+            &settings,
+            "alice",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("alice");
+        let bob = auth::register_user(
+            &server.pool,
+            &settings,
+            "bob",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("bob");
+        social::create_post(
+            &server.pool,
+            &settings,
+            Some(alice),
+            "hello world exact",
+            None,
+            &[],
+        )
+        .await
+        .expect("alice post");
+        social::create_post(
+            &server.pool,
+            &settings,
+            Some(bob),
+            "hello careful world",
+            None,
+            &[],
+        )
+        .await
+        .expect("bob post");
+
+        let response = get_with_cookie(
+            &server,
+            "/admin/users?post_q=%22hello%20world%22",
+            &admin_cookie,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("@alice"));
+        assert!(!response.body.contains("@bob"));
+    }
+
+    #[tokio::test]
+    async fn admin_users_search_has_empty_state_for_no_matches() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+
+        let response = get_with_cookie(
+            &server,
+            "/admin/users?user_q=missing&post_q=absent",
+            &admin_cookie,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("No users matched those filters."));
     }
 
     #[tokio::test]
@@ -3389,7 +3905,7 @@ mod tests {
         assert!(home.body.contains("hello from the browser-shaped form"));
         assert!(home.body.contains(r#"class="post""#));
         assert!(home.body.contains(r#"data-card-href="/posts/1""#));
-        assert!(!home.body.contains(r#">Open post</a>"#));
+        assert!(home.body.contains(r#"href="/posts/1">Open post</a>"#));
         assert!(!home.body.contains("Open thread"));
         assert!(!home.body.contains(r#"class="post-time""#));
 
@@ -3536,6 +4052,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registration_captcha_disabled_by_default_preserves_registration_flow() {
+        let server = spawn_test_server().await;
+
+        let page = request(&server.base_url, "GET", "/register", &[], Vec::new()).await;
+        assert_eq!(page.status, 200);
+        assert!(!page.body.contains("Registration CAPTCHA"));
+        assert!(!page.body.contains(r#"name="captcha_answer""#));
+
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=no-captcha&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+    }
+
+    #[tokio::test]
+    async fn registration_captcha_rejects_missing_wrong_expired_and_reused_answers() {
+        let mut settings = Settings::default();
+        settings.accounts.registration_captcha_enabled = true;
+        settings.moderation.account_creations_per_ip_per_day = 20;
+        let server = spawn_test_server_with_settings(settings).await;
+
+        let page = request(&server.base_url, "GET", "/register", &[], Vec::new()).await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("Registration CAPTCHA"));
+        assert!(page.body.contains(r#"name="captcha_token""#));
+        assert!(page.body.contains(r#"name="captcha_answer""#));
+        assert!(page.body.contains("data:image/png;base64,"));
+
+        let missing = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=missing-captcha&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(missing.status, 400);
+        assert!(missing.body.contains("CAPTCHA challenge is missing"));
+        assert!(missing.body.contains("Registration CAPTCHA"));
+
+        let wrong_challenge = server
+            .registration_captcha
+            .create_challenge()
+            .await
+            .expect("captcha");
+        let wrong = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            registration_body("wrong-captcha", Some(&wrong_challenge.token), Some("WRONG")),
+        )
+        .await;
+        assert_eq!(wrong.status, 400);
+        assert!(wrong.body.contains("CAPTCHA answer was incorrect"));
+        assert!(!wrong.body.contains(&wrong_challenge.answer));
+
+        let reused_after_wrong = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            registration_body(
+                "reused-after-wrong",
+                Some(&wrong_challenge.token),
+                Some(&wrong_challenge.answer),
+            ),
+        )
+        .await;
+        assert_eq!(reused_after_wrong.status, 400);
+        assert!(
+            reused_after_wrong
+                .body
+                .contains("expired or was already used")
+        );
+
+        let expired_challenge = server
+            .registration_captcha
+            .create_challenge()
+            .await
+            .expect("captcha");
+        server
+            .registration_captcha
+            .expire_for_test(&expired_challenge.token)
+            .await;
+        let expired = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            registration_body(
+                "expired-captcha",
+                Some(&expired_challenge.token),
+                Some(&expired_challenge.answer),
+            ),
+        )
+        .await;
+        assert_eq!(expired.status, 400);
+        assert!(expired.body.contains("expired or was already used"));
+    }
+
+    #[tokio::test]
+    async fn registration_captcha_accepts_correct_answer_once() {
+        let mut settings = Settings::default();
+        settings.accounts.registration_captcha_enabled = true;
+        settings.moderation.account_creations_per_ip_per_day = 20;
+        let server = spawn_test_server_with_settings(settings).await;
+        let challenge = server
+            .registration_captcha
+            .create_challenge()
+            .await
+            .expect("captcha");
+
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            registration_body(
+                "captcha-ok",
+                Some(&challenge.token),
+                Some(&challenge.answer.to_lowercase()),
+            ),
+        )
+        .await;
+        assert_eq!(registered.status, 303);
+
+        let reused = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            registration_body(
+                "captcha-reused",
+                Some(&challenge.token),
+                Some(&challenge.answer),
+            ),
+        )
+        .await;
+        assert_eq!(reused.status, 400);
+        assert!(reused.body.contains("expired or was already used"));
+    }
+
+    #[tokio::test]
     async fn post_actions_redirect_to_anchored_context_and_repost_errors_are_validation_failures() {
         let server = spawn_test_server().await;
         let registered = request(
@@ -3646,7 +4311,7 @@ mod tests {
         assert!(
             bob_home
                 .body
-                .contains(r#"class="quote-fallback" href="/posts/1/quote""#)
+                .contains(r#"class="icon-button quote-fallback" href="/posts/1/quote" aria-label="Quote post" title="Quote post""#)
         );
         assert!(bob_home.body.contains("data-repost-menu-button"));
 
@@ -4311,6 +4976,420 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn html_response_with_gzip_accept_encoding_is_compressed() {
+        let server = spawn_test_server().await;
+
+        let response = request(
+            &server.base_url,
+            "GET",
+            "/home",
+            &[("accept-encoding", "gzip")],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert_header(&response, "content-encoding", "gzip");
+        assert_vary_contains_accept_encoding(&response);
+        assert_eq!(
+            content_length(&response),
+            Some(response.body_bytes.len()),
+            "compressed content-length should match wire body length"
+        );
+        let body = gzip_decode(&response.body_bytes);
+        assert!(body.contains("<title>Home Feed - RustPost</title>"));
+    }
+
+    #[tokio::test]
+    async fn html_response_without_accept_encoding_is_not_compressed() {
+        let server = spawn_test_server().await;
+
+        let response = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+
+        assert_eq!(response.status, 200);
+        assert_no_header(&response, "content-encoding");
+        assert!(
+            response
+                .body
+                .contains("<title>Home Feed - RustPost</title>")
+        );
+    }
+
+    #[tokio::test]
+    async fn uploaded_media_response_is_not_compressed() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "image post")],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let conn = rusqlite::Connection::open(server.data_dir.join("db/rustpost.sqlite3"))
+            .expect("open database");
+        let public_path: String = conn
+            .query_row("SELECT public_path FROM media LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("media path");
+        drop(conn);
+
+        let media = request(
+            &server.base_url,
+            "GET",
+            &public_path,
+            &[("accept-encoding", "gzip")],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(media.status, 200);
+        assert_no_header(&media, "content-encoding");
+        assert!(media.body_bytes.starts_with(&tiny_png_bytes()[..8]));
+    }
+
+    #[tokio::test]
+    async fn user_can_flag_uploaded_media_as_nsfw_and_blur_is_safe_by_default() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains("Mark media as NSFW"));
+        let csrf = csrf_token(&home.body);
+
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("text", "flagged image post"),
+                    ("nsfw", "true"),
+                ],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let is_nsfw: i64 = server
+            .pool
+            .call(|conn| {
+                Ok(conn.query_row("SELECT is_nsfw FROM media LIMIT 1", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("nsfw flag");
+        assert_eq!(is_nsfw, 1);
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains(r#"data-testid="nsfw-media""#));
+        assert!(home.body.contains(r#"aria-label="Show NSFW media""#));
+        assert!(home.body.contains(">Show<span"));
+        assert!(home.body.contains("Open media"));
+    }
+
+    #[tokio::test]
+    async fn user_nsfw_blur_setting_persists_and_controls_rendering() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("text", "preference test image"),
+                    ("nsfw", "true"),
+                ],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let settings = get_with_cookie(&server, "/settings", &cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let disabled = request(
+            &server.base_url,
+            "POST",
+            "/settings",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=settings-boundary",
+                ),
+            ],
+            multipart_body(
+                "settings-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("display_name", "alice"),
+                    ("bio", ""),
+                    ("location", ""),
+                    ("website", ""),
+                ],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(disabled.status, 303);
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(!home.body.contains(r#"data-testid="nsfw-media""#));
+
+        let settings = get_with_cookie(&server, "/settings", &cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let enabled = request(
+            &server.base_url,
+            "POST",
+            "/settings",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=settings-boundary",
+                ),
+            ],
+            multipart_body(
+                "settings-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("display_name", "alice"),
+                    ("bio", ""),
+                    ("location", ""),
+                    ("website", ""),
+                    ("nsfw_blur_enabled", "true"),
+                ],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(enabled.status, 303);
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains(r#"data-testid="nsfw-media""#));
+    }
+
+    #[tokio::test]
+    async fn admin_can_mark_and_unmark_existing_media_post_as_nsfw_without_js() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[("csrf", csrf.as_str()), ("text", "admin toggle image")],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains("Mark NSFW"));
+        let csrf = csrf_token(&home.body);
+        let marked = post_form_with_cookie(
+            &server,
+            "/admin/posts/1/nsfw",
+            &cookie,
+            &format!("csrf={csrf}&nsfw=true"),
+        )
+        .await;
+        assert_eq!(marked.status, 303);
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains(r#"data-testid="nsfw-media""#));
+        assert!(home.body.contains("Unmark NSFW"));
+        let csrf = csrf_token(&home.body);
+        let unmarked = post_form_with_cookie(
+            &server,
+            "/admin/posts/1/nsfw",
+            &cookie,
+            &format!("csrf={csrf}&nsfw=false"),
+        )
+        .await;
+        assert_eq!(unmarked.status, 303);
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(!home.body.contains(r#"data-testid="nsfw-media""#));
+        assert!(home.body.contains("Mark NSFW"));
+    }
+
+    #[tokio::test]
+    async fn global_nsfw_blur_setting_controls_logged_out_safe_default() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("text", "logged out default image"),
+                    ("nsfw", "true"),
+                ],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let logged_out = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(logged_out.body.contains(r#"data-testid="nsfw-media""#));
+
+        let mut settings = Settings::load(&server.data_dir.join("settings.toml")).expect("load");
+        settings.media.nsfw_blur_enabled = false;
+        std::fs::write(
+            server.data_dir.join("settings.toml"),
+            toml::to_string(&settings).expect("settings toml"),
+        )
+        .expect("write settings");
+        let unblurred = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(!unblurred.body.contains(r#"data-testid="nsfw-media""#));
+
+        settings.media.nsfw_blur_enabled = true;
+        std::fs::write(
+            server.data_dir.join("settings.toml"),
+            toml::to_string(&settings).expect("settings toml"),
+        )
+        .expect("write settings");
+        let safe_again = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(safe_again.body.contains(r#"data-testid="nsfw-media""#));
+    }
+
+    #[tokio::test]
+    async fn head_response_uses_compression_headers_without_body() {
+        let server = spawn_test_server().await;
+
+        let response = request(
+            &server.base_url,
+            "HEAD",
+            "/home",
+            &[("accept-encoding", "gzip")],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert_header(&response, "content-encoding", "gzip");
+        assert_vary_contains_accept_encoding(&response);
+        assert_eq!(response.body_bytes.len(), 0);
+        assert!(
+            content_length(&response).is_some_and(|len| len > 0),
+            "compressed HEAD response should keep the GET content length"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_response_without_accept_encoding_keeps_get_length_without_body() {
+        let server = spawn_test_server().await;
+        let get = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        let head = request(&server.base_url, "HEAD", "/home", &[], Vec::new()).await;
+
+        assert_eq!(head.status, 200);
+        assert_no_header(&head, "content-encoding");
+        assert_eq!(head.body_bytes.len(), 0);
+        assert_eq!(content_length(&head), Some(get.body_bytes.len()));
+    }
+
+    #[tokio::test]
+    async fn head_response_for_skipped_favicon_keeps_length_without_compression() {
+        let server = spawn_test_server().await;
+        let get = request(
+            &server.base_url,
+            "GET",
+            "/favicon.ico",
+            &[("accept-encoding", "gzip")],
+            Vec::new(),
+        )
+        .await;
+        let head = request(
+            &server.base_url,
+            "HEAD",
+            "/favicon.ico",
+            &[("accept-encoding", "gzip")],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(head.status, 200);
+        assert_no_header(&head, "content-encoding");
+        assert_eq!(head.body_bytes.len(), 0);
+        assert_eq!(content_length(&head), Some(get.body_bytes.len()));
+    }
+
+    #[tokio::test]
     async fn admin_can_upload_replace_and_remove_png_favicon() {
         let server = spawn_test_server_with_admin().await;
         let cookie = admin_session_cookie(&server).await;
@@ -4461,8 +5540,13 @@ mod tests {
         assert!(response.body.contains("<legend>Site</legend>"));
         assert!(response.body.contains("<legend>Posts</legend>"));
         assert!(response.body.contains("<legend>Accounts</legend>"));
-        assert!(response.body.contains("<legend>Media limits</legend>"));
+        assert!(response.body.contains("<legend>Media</legend>"));
         assert!(response.body.contains(r#"name="allow_reposts""#));
+        assert!(
+            response
+                .body
+                .contains(r#"name="registration_captcha_enabled""#)
+        );
         assert!(response.body.contains("<select"));
         assert!(response.body.contains(r#"name="max_bio_len" type="text""#));
     }
@@ -4598,7 +5682,12 @@ mod tests {
             deep_settings_form_body(
                 &csrf,
                 "confirm",
-                &[("max_bio_len", "300"), ("allow_profile_pictures", "false")],
+                &[
+                    ("max_bio_len", "300"),
+                    ("allow_profile_pictures", "false"),
+                    ("nsfw_blur_enabled", "false"),
+                    ("registration_captcha_enabled", "true"),
+                ],
             ),
         )
         .await;
@@ -4608,6 +5697,8 @@ mod tests {
         assert!(response.body.contains("Settings saved successfully"));
         assert_eq!(saved.accounts.max_bio_len, 300);
         assert!(!saved.accounts.allow_profile_pictures);
+        assert!(!saved.media.nsfw_blur_enabled);
+        assert!(saved.accounts.registration_captcha_enabled);
 
         let fresh = request(
             &server.base_url,
@@ -5201,24 +6292,32 @@ mod tests {
     }
 
     async fn spawn_test_server() -> TestServer {
-        spawn_test_server_inner(false).await
+        spawn_test_server_inner(false, Settings::default()).await
     }
 
     async fn spawn_test_server_with_admin() -> TestServer {
-        spawn_test_server_inner(true).await
+        spawn_test_server_inner(true, Settings::default()).await
     }
 
-    async fn spawn_test_server_inner(create_admin: bool) -> TestServer {
+    async fn spawn_test_server_with_settings(settings: Settings) -> TestServer {
+        spawn_test_server_inner(false, settings).await
+    }
+
+    async fn spawn_test_server_inner(create_admin: bool, settings: Settings) -> TestServer {
         let temp = tempfile::tempdir().expect("temp dir");
         let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf());
         paths.ensure().expect("paths");
         crate::config::write_default_if_missing(&paths.settings_path).expect("settings");
+        std::fs::write(
+            &paths.settings_path,
+            toml::to_string(&settings).expect("serialize settings"),
+        )
+        .expect("write test settings");
         let data_dir = paths.data_dir.clone();
         let pool = crate::db::connect(&paths.database_path)
             .await
             .expect("connect");
         crate::db::migrate(&pool).await.expect("migrate");
-        let settings = Settings::default();
         if create_admin {
             crate::admin::create_admin(&pool, &settings, "siteowner", "very secure password")
                 .await
@@ -5232,7 +6331,9 @@ mod tests {
             error: Some("disabled in tests".to_owned()),
         };
         let tor = crate::tor::validate_startup(&settings.tor);
-        let app = router(AppState::new(pool, settings, paths, ffmpeg, tor));
+        let state = AppState::new(pool.clone(), settings, paths, ffmpeg, tor);
+        let registration_captcha = state.registration_captcha.clone();
+        let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -5248,6 +6349,8 @@ mod tests {
         TestServer {
             base_url: format!("127.0.0.1:{}", addr.port()),
             data_dir,
+            pool,
+            registration_captcha,
             _task: task,
             _temp: temp,
         }
@@ -5298,8 +6401,13 @@ mod tests {
     }
 
     fn parse_response(bytes: &[u8]) -> TestResponse {
-        let raw = String::from_utf8_lossy(bytes);
-        let (head, body) = raw.split_once("\r\n\r\n").expect("response split");
+        let split = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response split");
+        let head = String::from_utf8_lossy(&bytes[..split]);
+        let body_bytes = bytes[split + 4..].to_vec();
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
         let mut lines = head.lines();
         let status = lines
             .next()
@@ -5315,7 +6423,8 @@ mod tests {
         TestResponse {
             status,
             headers,
-            body: body.to_owned(),
+            body_bytes,
+            body,
         }
     }
 
@@ -5338,14 +6447,39 @@ mod tests {
     }
 
     fn assert_header(response: &TestResponse, name: &str, expected: &str) {
-        assert_eq!(
-            response
-                .headers
-                .iter()
-                .find(|(header_name, _)| header_name == name)
-                .map(|(_, value)| value.as_str()),
-            Some(expected)
+        assert_eq!(header_value(response, name), Some(expected));
+    }
+
+    fn assert_no_header(response: &TestResponse, name: &str) {
+        assert_eq!(header_value(response, name), None);
+    }
+
+    fn assert_vary_contains_accept_encoding(response: &TestResponse) {
+        let vary = header_value(response, "vary").expect("vary header");
+        assert!(
+            vary.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("accept-encoding")),
+            "Vary header should include Accept-Encoding: {vary}"
         );
+    }
+
+    fn header_value<'a>(response: &'a TestResponse, name: &str) -> Option<&'a str> {
+        response
+            .headers
+            .iter()
+            .find(|(header_name, _)| header_name == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn content_length(response: &TestResponse) -> Option<usize> {
+        header_value(response, "content-length")?.parse().ok()
+    }
+
+    fn gzip_decode(bytes: &[u8]) -> String {
+        let mut decoder = GzDecoder::new(bytes);
+        let mut output = String::new();
+        decoder.read_to_string(&mut output).expect("gzip body");
+        output
     }
 
     fn deep_settings_form_body(csrf: &str, intent: &str, overrides: &[(&str, &str)]) -> Vec<u8> {
@@ -5363,6 +6497,30 @@ mod tests {
                     |(_, value)| (*value).to_owned(),
                 );
             pairs.push((field.form_name().to_owned(), value));
+        }
+        pairs
+            .iter()
+            .map(|(name, value)| format!("{}={}", form_encode(name), form_encode(value)))
+            .collect::<Vec<_>>()
+            .join("&")
+            .into_bytes()
+    }
+
+    fn registration_body(
+        username: &str,
+        captcha_token: Option<&str>,
+        captcha_answer: Option<&str>,
+    ) -> Vec<u8> {
+        let mut pairs = vec![
+            ("username", username),
+            ("password", "very secure password"),
+            ("confirm_password", "very secure password"),
+        ];
+        if let Some(token) = captcha_token {
+            pairs.push(("captcha_token", token));
+        }
+        if let Some(answer) = captcha_answer {
+            pairs.push(("captcha_answer", answer));
         }
         pairs
             .iter()

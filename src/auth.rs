@@ -44,6 +44,7 @@ pub struct CurrentUser {
     pub is_admin: bool,
     pub is_suspended: bool,
     pub theme: Theme,
+    pub nsfw_blur_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -218,7 +219,7 @@ pub async fn current_user(
     pool.call(move |conn| {
         conn.query_row(
             r#"
-        SELECT u.id, u.username, u.display_name, u.is_admin, u.is_suspended, u.theme
+        SELECT u.id, u.username, u.display_name, u.is_admin, u.is_suspended, u.theme, u.nsfw_blur_enabled
         FROM sessions s
         JOIN users u ON u.id = s.user_id
         WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP AND u.is_deleted = 0
@@ -232,6 +233,7 @@ pub async fn current_user(
                     is_admin: row.get::<_, i64>(3)? != 0,
                     is_suspended: row.get::<_, i64>(4)? != 0,
                     theme: Theme::from(row.get::<_, String>(5)?.as_str()),
+                    nsfw_blur_enabled: row.get::<_, i64>(6)? != 0,
                 })
             },
         )
