@@ -238,7 +238,7 @@ async fn store_new_upload(
     let mut basename = stable_media_basename(&upload.original_filename, &upload.original_sha256);
     let original_path = unique_media_path(&context.paths.uploads_originals, &basename, ext);
     if let Some(stem) = original_path.file_stem().and_then(|stem| stem.to_str()) {
-        basename = stem.to_owned();
+        stem.clone_into(&mut basename);
     }
     let original_public_path = public_upload_path(context.paths, &original_path)?;
     tokio::fs::rename(&upload.staging, &original_path).await?;
