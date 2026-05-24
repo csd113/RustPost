@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension as _, params};
 
 use crate::auth;
 use crate::db::SqlitePool;
@@ -70,6 +70,7 @@ pub async fn delete_account(
 #[derive(Debug, Clone)]
 struct AccountMedia {
     id: i64,
+    original_path: Option<String>,
     stored_path: String,
     thumbnail_path: Option<String>,
 }
@@ -80,7 +81,7 @@ fn account_media_in_tx(
 ) -> anyhow::Result<Vec<AccountMedia>> {
     let mut stmt = tx.prepare(
         r#"
-            SELECT DISTINCT m.id, m.stored_path, m.thumbnail_path
+            SELECT DISTINCT m.id, m.original_path, m.stored_path, m.thumbnail_path
             FROM media m
             WHERE m.owner_user_id = ?
                OR m.id IN (
@@ -95,8 +96,9 @@ fn account_media_in_tx(
         .query_map(params![user_id, user_id], |row| {
             Ok(AccountMedia {
                 id: row.get(0)?,
-                stored_path: row.get(1)?,
-                thumbnail_path: row.get(2)?,
+                original_path: row.get(1)?,
+                stored_path: row.get(2)?,
+                thumbnail_path: row.get(3)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -117,11 +119,20 @@ async fn scrub_account_rows(
                 [user_id],
             )?;
             let media = account_media_in_tx(&tx, user_id)?;
-            let mut media_files = BTreeSet::new();
+            let mut media_paths = Vec::new();
             for item in &media {
-                media_files.extend(safe_media_path(&paths, &item.stored_path)?);
+                if let Some(original_path) = &item.original_path {
+                    media_paths.push(original_path.clone());
+                }
+                media_paths.push(item.stored_path.clone());
                 if let Some(thumbnail_path) = &item.thumbnail_path {
-                    media_files.extend(safe_media_path(&paths, thumbnail_path)?);
+                    media_paths.push(thumbnail_path.clone());
+                }
+            }
+            let mut safe_paths = Vec::new();
+            for path in &media_paths {
+                if let Some(safe_path) = safe_media_path(&paths, path)? {
+                    safe_paths.push((path.clone(), safe_path));
                 }
             }
             let media_ids = media.into_iter().map(|item| item.id).collect::<Vec<_>>();
@@ -165,8 +176,20 @@ async fn scrub_account_rows(
             )?;
             tx.execute("DELETE FROM posts WHERE user_id = ?", [user_id])?;
             for media_id in media_ids {
+                promote_canonical_references(&tx, media_id)?;
                 tx.execute("DELETE FROM media_jobs WHERE media_id = ?", [media_id])?;
                 tx.execute("DELETE FROM media WHERE id = ?", [media_id])?;
+            }
+            let mut media_files = BTreeSet::new();
+            for (raw_path, safe_path) in safe_paths {
+                let remaining: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM media WHERE original_path = ? OR stored_path = ? OR thumbnail_path = ?",
+                    params![raw_path, raw_path, raw_path],
+                    |row| row.get(0),
+                )?;
+                if remaining == 0 {
+                    media_files.insert(safe_path);
+                }
             }
             tx.execute("DELETE FROM users WHERE id = ?", [user_id])?;
             tx.commit()?;
@@ -229,6 +252,35 @@ fn has_parent_component(path: &Path) -> bool {
         .any(|component| matches!(component, Component::ParentDir))
 }
 
+fn promote_canonical_references(
+    tx: &rusqlite::Transaction<'_>,
+    media_id: i64,
+) -> anyhow::Result<()> {
+    let replacement: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM media WHERE canonical_media_id = ? ORDER BY id ASC LIMIT 1",
+            [media_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(replacement) = replacement else {
+        return Ok(());
+    };
+    tx.execute(
+        "UPDATE media SET original_sha256 = '', normalized_sha256 = NULL WHERE id = ?",
+        [media_id],
+    )?;
+    tx.execute(
+        "UPDATE media SET canonical_media_id = NULL WHERE id = ?",
+        [replacement],
+    )?;
+    tx.execute(
+        "UPDATE media SET canonical_media_id = ? WHERE canonical_media_id = ?",
+        params![replacement, media_id],
+    )?;
+    Ok(())
+}
+
 fn remove_media_files(paths: &BTreeSet<PathBuf>, user_id: i64) -> usize {
     let mut deleted = 0;
     for path in paths {
@@ -252,7 +304,6 @@ fn remove_media_files(paths: &BTreeSet<PathBuf>, user_id: i64) -> usize {
 mod tests {
     use super::*;
     use crate::{auth, config::Settings, db, social};
-    use rusqlite::OptionalExtension as _;
 
     async fn fixture() -> (
         tempfile::TempDir,
@@ -411,6 +462,86 @@ mod tests {
             .await
             .expect("media count");
         assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_account_keeps_shared_media_files_referenced_by_other_rows() {
+        let (_temp, paths, pool, _settings, alice, bob) = fixture().await;
+        let media_path = paths.uploads_images.join("shared.webp");
+        fs::write(&media_path, b"shared").expect("shared media file");
+        let media_path_string = media_path.to_string_lossy().to_string();
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'alice.webp', ?, '/uploads/images/shared.webp', 'image/webp', 'image', 6)",
+                params![alice, media_path_string],
+            )?;
+            let media_path_string = media_path_string.clone();
+            conn.execute(
+                "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'bob.webp', ?, '/uploads/images/shared.webp', 'image/webp', 'image', 6)",
+                params![bob, media_path_string],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("shared media rows");
+
+        let summary = delete_account(&pool, &paths, alice, "very secure password")
+            .await
+            .expect("delete account");
+
+        assert_eq!(summary.deleted_media_files, 0);
+        assert!(media_path.exists());
+        let bob_rows: i64 = pool
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM media WHERE owner_user_id = ?",
+                    [bob],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("bob media count");
+        assert_eq!(bob_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_account_promotes_shared_canonical_media_for_remaining_rows() {
+        let (_temp, paths, pool, _settings, alice, bob) = fixture().await;
+        let media_path = paths.uploads_images.join("promoted.webp");
+        fs::write(&media_path, b"shared").expect("shared media file");
+        let media_path_string = media_path.to_string_lossy().to_string();
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO media (id, owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, original_sha256, normalized_sha256) VALUES (100, ?, 'alice.webp', ?, '/uploads/images/promoted.webp', 'image/webp', 'image', 6, 'alice-raw', 'shared-normalized')",
+                params![alice, media_path_string],
+            )?;
+            let media_path_string = media_path_string.clone();
+            conn.execute(
+                "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, original_sha256, normalized_sha256, canonical_media_id) VALUES (?, 'bob.webp', ?, '/uploads/images/promoted.webp', 'image/webp', 'image', 6, 'bob-raw', 'shared-normalized', 100)",
+                params![bob, media_path_string],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("shared media rows");
+
+        let summary = delete_account(&pool, &paths, alice, "very secure password")
+            .await
+            .expect("delete account");
+
+        assert_eq!(summary.deleted_media_files, 0);
+        assert!(media_path.exists());
+        let bob_canonical: Option<i64> = pool
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT canonical_media_id FROM media WHERE owner_user_id = ?",
+                    [bob],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("bob canonical");
+        assert_eq!(bob_canonical, None);
     }
 
     #[tokio::test]
