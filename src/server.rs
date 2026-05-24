@@ -60,6 +60,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let upload_body_limit = upload_body_limit(&state.settings);
     Router::new()
         .route("/", get(home))
+        .route("/assets/rustpost-boot.js", get(client_boot_script))
         .route("/assets/rustpost.js", get(client_script))
         .route("/favicon.ico", get(site_favicon))
         .route("/local", get(local_redirect))
@@ -156,6 +157,17 @@ async fn client_script() -> Response {
             "application/javascript; charset=utf-8",
         )],
         render::client_script(),
+    )
+        .into_response()
+}
+
+async fn client_boot_script() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        render::client_boot_script(),
     )
         .into_response()
 }
