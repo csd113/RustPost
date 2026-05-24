@@ -1248,7 +1248,9 @@ pub async fn mention_suggestions(
     viewer_id: Option<i64>,
     query: &str,
 ) -> anyhow::Result<Vec<MentionSuggestion>> {
-    let fragment = mention_query_fragment(query);
+    let Some(fragment) = mention_query_fragment(query) else {
+        return Ok(Vec::new());
+    };
     let username_query = format!("{}%", escape_like_prefix(&fragment));
     let limit = i64::try_from(MENTION_SUGGESTION_LIMIT)?;
     pool.call(move |conn| {
@@ -1308,17 +1310,20 @@ pub async fn mention_suggestions(
     .await
 }
 
-fn mention_query_fragment(query: &str) -> String {
-    query
-        .trim()
-        .trim_start_matches('@')
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric() || *character == '_' || *character == '-'
-        })
-        .take(MENTION_QUERY_MAX_CHARS)
-        .collect::<String>()
-        .to_ascii_lowercase()
+fn mention_query_fragment(query: &str) -> Option<String> {
+    let fragment = query.trim().trim_start_matches('@');
+    if fragment.chars().any(|character| {
+        !(character.is_ascii_alphanumeric() || character == '_' || character == '-')
+    }) {
+        return None;
+    }
+    Some(
+        fragment
+            .chars()
+            .take(MENTION_QUERY_MAX_CHARS)
+            .collect::<String>()
+            .to_ascii_lowercase(),
+    )
 }
 
 fn escape_like_prefix(value: &str) -> String {
@@ -2903,8 +2908,31 @@ mod tests {
         let alx = auth::register_user(&pool, &settings, "alxex", "very secure password", false)
             .await
             .expect("alx");
+        let deleted = auth::register_user(
+            &pool,
+            &settings,
+            "al-deleted",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("deleted");
+        let muted =
+            auth::register_user(&pool, &settings, "al-muted", "very secure password", false)
+                .await
+                .expect("muted");
+        let blocker = auth::register_user(
+            &pool,
+            &settings,
+            "al-blocker",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("blocker");
         pool.call(move |conn| {
             conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [carol])?;
+            conn.execute("UPDATE users SET is_deleted = 1 WHERE id = ?", [deleted])?;
             conn.execute(
                 "UPDATE users SET display_name = '<b>Alice</b>' WHERE id = ?",
                 [alice],
@@ -2912,6 +2940,14 @@ mod tests {
             conn.execute(
                 "INSERT INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
                 params![bob, alx],
+            )?;
+            conn.execute(
+                "INSERT INTO mutes (muter_id, muted_id) VALUES (?, ?)",
+                params![bob, muted],
+            )?;
+            conn.execute(
+                "INSERT INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
+                params![blocker, bob],
             )?;
             Ok(())
         })
@@ -2950,6 +2986,16 @@ mod tests {
                 .iter()
                 .any(|suggestion| suggestion.username == "alxex")
         );
+
+        for wildcard_query in ["%", "_", "al%"] {
+            let wildcard = mention_suggestions(&pool, Some(bob), wildcard_query)
+                .await
+                .expect("wildcard query");
+            assert!(
+                wildcard.is_empty(),
+                "{wildcard_query:?} should not broaden mention suggestions"
+            );
+        }
     }
 
     #[tokio::test]
