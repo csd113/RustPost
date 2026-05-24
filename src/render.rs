@@ -2,8 +2,13 @@ use crate::auth::{CurrentUser, Theme};
 use crate::social::{
     AccountView, MediaView, NotificationView, PostView, QuotePreview, TimelineEventKind,
 };
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri};
 use chrono::{DateTime, NaiveDateTime, Utc};
+
+const YOUTUBE_VIDEO_ID_LEN: usize = 11;
+// Keep link-heavy posts compact in timelines while still showing useful context.
+const MAX_YOUTUBE_PREVIEWS_PER_POST: usize = 3;
+const YOUTUBE_PREVIEW_TITLE: &str = "YouTube video";
 
 #[derive(Debug, Clone)]
 pub struct LayoutContext {
@@ -125,7 +130,7 @@ pub fn layout_with_context(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https://i.ytimg.com; media-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta name="referrer" content="same-origin">
 <link rel="icon" href="/favicon.ico" type="{}">
@@ -1193,6 +1198,7 @@ fn post_card_with_options(
         },
     );
     let text = linkify(&post.text);
+    let youtube_previews = render_youtube_previews(&post.text);
     let media = post
         .media
         .iter()
@@ -1295,7 +1301,7 @@ fn post_card_with_options(
         .as_ref()
         .map_or_else(String::new, quote_preview_card);
     format!(
-        r#"<article class="{}" data-testid="post-card" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}{}<div class="counts"><span data-count="likes">{} likes</span><span data-count="reposts">{} reposts</span><span data-count="replies">{} replies</span>{}</div>{}</article>"#,
+        r#"<article class="{}" data-testid="post-card" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}{}{}<div class="counts"><span data-count="likes">{} likes</span><span data-count="reposts">{} reposts</span><span data-count="replies">{} replies</span>{}</div>{}</article>"#,
         post_class,
         post.id,
         post.id,
@@ -1307,6 +1313,7 @@ fn post_card_with_options(
         author,
         timestamp,
         text,
+        youtube_previews,
         media,
         quote,
         post.like_count,
@@ -1495,6 +1502,163 @@ fn render_media(media: &MediaView, post_id: i64, index: usize, blur_nsfw_media: 
     format!(
         r#"<div class="nsfw-media" data-testid="nsfw-media"><input class="nsfw-toggle sr-only" id="{toggle_id}" type="checkbox" aria-label="Show NSFW media"><div class="nsfw-media-frame">{item}<span class="nsfw-badge">NSFW</span></div><label class="nsfw-show" for="{toggle_id}">Show<span class="sr-only"> NSFW media</span></label><a class="nsfw-open" href="{path}">Open media</a></div>"#
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct YoutubePreview {
+    video_id: String,
+    href: String,
+    display_url: String,
+}
+
+fn render_youtube_previews(text: &str) -> String {
+    let previews = youtube_previews_for_text(text);
+    if previews.is_empty() {
+        return String::new();
+    }
+    let cards = previews
+        .iter()
+        .map(render_youtube_preview_card)
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<aside class="youtube-previews" aria-label="YouTube link previews">{cards}</aside>"#)
+}
+
+fn render_youtube_preview_card(preview: &YoutubePreview) -> String {
+    let href = html_escape::encode_double_quoted_attribute(&preview.href);
+    let display_url = html_escape::encode_text(&preview.display_url);
+    let thumbnail = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", preview.video_id);
+    format!(
+        r#"<a class="youtube-preview-card" data-testid="youtube-preview-card" href="{href}" rel="noopener noreferrer" referrerpolicy="no-referrer"><span class="youtube-thumbnail-frame"><img class="youtube-thumbnail" src="{}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="youtube-play" aria-hidden="true"></span></span><span class="youtube-preview-body"><span class="youtube-preview-source">YouTube</span><span class="youtube-preview-title">{}</span><span class="youtube-preview-url">{display_url}</span></span></a>"#,
+        html_escape::encode_double_quoted_attribute(&thumbnail),
+        html_escape::encode_text(YOUTUBE_PREVIEW_TITLE),
+    )
+}
+
+fn youtube_previews_for_text(text: &str) -> Vec<YoutubePreview> {
+    let mut previews = Vec::new();
+    for word in text.split_whitespace() {
+        if previews.len() >= MAX_YOUTUBE_PREVIEWS_PER_POST {
+            break;
+        }
+        if let Some(candidate) = youtube_candidate_from_word(word)
+            && let Some(preview) = youtube_preview_from_url(candidate)
+        {
+            previews.push(preview);
+        }
+    }
+    previews
+}
+
+fn youtube_candidate_from_word(word: &str) -> Option<&str> {
+    let candidate = word
+        .trim_start_matches(is_url_leading_trim_char)
+        .trim_end_matches(is_url_trailing_trim_char);
+    (!candidate.is_empty()).then_some(candidate)
+}
+
+fn is_url_leading_trim_char(ch: char) -> bool {
+    matches!(ch, '<' | '(' | '[' | '{' | '"' | '\'')
+}
+
+fn is_url_trailing_trim_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | '!' | '?' | ':' | ';' | ')' | ']' | '}' | '>' | '"' | '\''
+    )
+}
+
+fn youtube_preview_from_url(candidate: &str) -> Option<YoutubePreview> {
+    let href = youtube_absolute_http_url(candidate)?;
+    let uri = href.parse::<Uri>().ok()?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return None;
+    }
+    let host = uri.host()?.to_ascii_lowercase();
+    let video_id = youtube_video_id_from_parts(&host, uri.path(), uri.query())?;
+    Some(YoutubePreview {
+        video_id,
+        href,
+        display_url: candidate.to_owned(),
+    })
+}
+
+fn youtube_absolute_http_url(candidate: &str) -> Option<String> {
+    if has_http_scheme(candidate) {
+        return Some(candidate.to_owned());
+    }
+    let (host, _path) = candidate.split_once('/')?;
+    is_supported_youtube_host(host).then(|| format!("https://{candidate}"))
+}
+
+fn has_http_scheme(candidate: &str) -> bool {
+    candidate
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || candidate
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+fn youtube_video_id_from_parts(host: &str, path: &str, query: Option<&str>) -> Option<String> {
+    if is_youtu_be_host(host) {
+        return single_path_segment(path).and_then(valid_youtube_video_id);
+    }
+    if !is_youtube_host(host) {
+        return None;
+    }
+    if path == "/watch" {
+        return query.and_then(youtube_video_id_from_query);
+    }
+    path_segment_after_prefix(path, "/shorts/")
+        .or_else(|| path_segment_after_prefix(path, "/embed/"))
+        .and_then(valid_youtube_video_id)
+}
+
+fn youtube_video_id_from_query(query: &str) -> Option<String> {
+    let mut video_id = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "v" {
+            continue;
+        }
+        let valid = valid_youtube_video_id(value)?;
+        if video_id.replace(valid).is_some() {
+            return None;
+        }
+    }
+    video_id
+}
+
+fn single_path_segment(path: &str) -> Option<&str> {
+    let value = path.strip_prefix('/')?;
+    (!value.is_empty() && !value.contains('/')).then_some(value)
+}
+
+fn path_segment_after_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let value = path.strip_prefix(prefix)?;
+    (!value.is_empty() && !value.contains('/')).then_some(value)
+}
+
+fn valid_youtube_video_id(value: &str) -> Option<String> {
+    (value.len() == YOUTUBE_VIDEO_ID_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then(|| value.to_owned())
+}
+
+fn is_supported_youtube_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    is_youtube_host(&host) || is_youtu_be_host(&host)
+}
+
+fn is_youtube_host(host: &str) -> bool {
+    matches!(host, "youtube.com" | "www.youtube.com" | "m.youtube.com")
+}
+
+fn is_youtu_be_host(host: &str) -> bool {
+    host == "youtu.be"
 }
 
 pub fn linkify(text: &str) -> String {
@@ -1824,7 +1988,7 @@ input:focus,textarea:focus,select:focus,button:focus-visible,a:focus-visible{out
 nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.42rem .65rem}.rail-nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.5rem .65rem}.rail-nav button:hover,.mobile-nav button:hover{background:var(--hover);color:var(--link-strong)}
 .composer-surface{border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);overflow:hidden}.composer-surface textarea{border:0;border-radius:0;background:transparent;min-height:7rem;resize:vertical}.composer-surface textarea:focus{outline:0;box-shadow:inset 0 0 0 3px var(--focus)}.composer-footer{display:flex;align-items:center;justify-content:space-between;gap:.55rem;border-top:1px solid var(--border);padding:.42rem .5rem;background:var(--surface-subtle)}.composer-file-control{position:relative;display:inline-flex;align-items:center;gap:.45rem;max-width:100%;margin:0;color:var(--link-strong);font-weight:800}.composer-file-input{max-width:100%;color:var(--muted-strong)}.composer-file-input::file-selector-button{border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.34rem .58rem;font-weight:800;cursor:pointer}.composer-file-input::file-selector-button:hover{background:var(--hover);color:var(--text-strong)}.composer-file-button{display:none}.js-enabled .composer-file-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.js-enabled .composer-file-button{display:inline-flex;align-items:center;gap:.38rem;min-height:2rem;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.3rem .55rem;cursor:pointer}.composer-file-button svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.js-enabled .composer-file-control:hover .composer-file-button{background:var(--hover);color:var(--text-strong)}.js-enabled .composer-file-input:focus-visible+.composer-file-button{outline:3px solid var(--focus);outline-offset:2px}.composer-media-selection[hidden]{display:none}.composer-media-selection{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;border-top:1px solid var(--border);padding:.5rem;background:var(--surface)}.composer-media-summary{font-weight:800;color:var(--muted-strong);overflow-wrap:anywhere}.composer-nsfw{margin:0}.composer-clear-media{background:var(--surface);color:var(--link-strong);border-color:var(--border);padding:.32rem .55rem}.composer-clear-media:hover{background:var(--hover);color:var(--text-strong)}.composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}
 .thread-nav{display:flex;margin:0 0 .45rem .85rem}.thread-back{width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:var(--link-strong)}.thread-back svg{width:1.2rem;height:1.2rem;fill:currentColor}.thread-back:hover{background:var(--hover);text-decoration:none}
-.timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.js-enabled .post[data-card-href]{cursor:pointer}.js-enabled .post[data-card-href]:hover{border-color:var(--border-strong)}.reply-post{margin-left:1.1rem;border-left:4px solid var(--reply-border);background:var(--surface-subtle)}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid var(--reply-border)}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid var(--border);background:var(--avatar-bg);flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:var(--muted-strong);font-weight:800}.author-name{font-weight:800;color:var(--text-strong)}.username,.post-time,.counts{color:var(--muted);font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-top:.5rem;background:var(--media-bg)}.post img.post-avatar{display:block;margin:0;border-radius:999px}.nsfw-media{position:relative;margin-top:.5rem}.nsfw-media .post img,.nsfw-media .post video{margin-top:0}.nsfw-media-frame{position:relative;display:block;overflow:hidden;border-radius:8px}.nsfw-media-frame img,.nsfw-media-frame video{margin-top:0;filter:blur(24px);transform:scale(1.02)}.nsfw-toggle:checked+.nsfw-media-frame img,.nsfw-toggle:checked+.nsfw-media-frame video{filter:none;transform:none}.nsfw-badge{position:absolute;left:.55rem;bottom:.55rem;border-radius:999px;padding:.18rem .5rem;background:rgba(0,0,0,.72);color:#fff;font-size:.78rem;font-weight:900;letter-spacing:.03em}.nsfw-show{position:absolute;right:.55rem;bottom:.55rem;margin:0;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text-strong);padding:.32rem .65rem;font-weight:900;box-shadow:0 1px 2px var(--shadow);cursor:pointer}.nsfw-show:hover{background:var(--hover)}.nsfw-toggle:focus-visible~.nsfw-show{outline:3px solid var(--focus);outline-offset:2px}.nsfw-toggle:checked~.nsfw-show,.nsfw-toggle:checked+.nsfw-media-frame .nsfw-badge{display:none}.nsfw-open{display:block;margin:.35rem 0 0;font-size:.9rem;font-weight:700}
+.timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.js-enabled .post[data-card-href]{cursor:pointer}.js-enabled .post[data-card-href]:hover{border-color:var(--border-strong)}.reply-post{margin-left:1.1rem;border-left:4px solid var(--reply-border);background:var(--surface-subtle)}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid var(--reply-border)}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid var(--border);background:var(--avatar-bg);flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:var(--muted-strong);font-weight:800}.author-name{font-weight:800;color:var(--text-strong)}.username,.post-time,.counts{color:var(--muted);font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-top:.5rem;background:var(--media-bg)}.post img.post-avatar{display:block;margin:0;border-radius:999px}.youtube-previews{display:grid;gap:.45rem;margin:.35rem 0 .55rem}.youtube-preview-card{display:grid;grid-template-columns:minmax(5.5rem,7.5rem) minmax(0,1fr);gap:.65rem;align-items:center;min-height:4.5rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);color:var(--text);overflow:hidden}.youtube-preview-card:hover{border-color:var(--border-strong);background:var(--hover);text-decoration:none}.youtube-thumbnail-frame{position:relative;display:block;width:100%;aspect-ratio:16/9;overflow:hidden;background:var(--media-bg)}.post img.youtube-thumbnail{width:100%;height:100%;object-fit:cover;margin:0;border:0;border-radius:0}.youtube-play{position:absolute;left:50%;top:50%;width:2rem;height:2rem;border-radius:999px;background:rgba(0,0,0,.68);transform:translate(-50%,-50%)}.youtube-play::before{content:"";position:absolute;left:.78rem;top:.55rem;border-top:.45rem solid transparent;border-bottom:.45rem solid transparent;border-left:.65rem solid #fff}.youtube-preview-body{display:grid;gap:.08rem;min-width:0;padding:.45rem .55rem .45rem 0}.youtube-preview-source{color:var(--muted);font-size:.78rem;font-weight:900;text-transform:uppercase}.youtube-preview-title{color:var(--text-strong);font-weight:850;overflow-wrap:anywhere}.youtube-preview-url{color:var(--muted-strong);font-size:.86rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nsfw-media{position:relative;margin-top:.5rem}.nsfw-media .post img,.nsfw-media .post video{margin-top:0}.nsfw-media-frame{position:relative;display:block;overflow:hidden;border-radius:8px}.nsfw-media-frame img,.nsfw-media-frame video{margin-top:0;filter:blur(24px);transform:scale(1.02)}.nsfw-toggle:checked+.nsfw-media-frame img,.nsfw-toggle:checked+.nsfw-media-frame video{filter:none;transform:none}.nsfw-badge{position:absolute;left:.55rem;bottom:.55rem;border-radius:999px;padding:.18rem .5rem;background:rgba(0,0,0,.72);color:#fff;font-size:.78rem;font-weight:900;letter-spacing:.03em}.nsfw-show{position:absolute;right:.55rem;bottom:.55rem;margin:0;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text-strong);padding:.32rem .65rem;font-weight:900;box-shadow:0 1px 2px var(--shadow);cursor:pointer}.nsfw-show:hover{background:var(--hover)}.nsfw-toggle:focus-visible~.nsfw-show{outline:3px solid var(--focus);outline-offset:2px}.nsfw-toggle:checked~.nsfw-show,.nsfw-toggle:checked+.nsfw-media-frame .nsfw-badge{display:none}.nsfw-open{display:block;margin:.35rem 0 0;font-size:.9rem;font-weight:700}
 .counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.post-permalink{font-weight:700;color:var(--link-strong)}.js-enabled .post-permalink{display:none}.actions{display:inline-flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem;max-width:100%}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.admin-nsfw-button{min-height:2.2rem;padding:.3rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border);font-size:.86rem}.admin-nsfw-button:hover{background:var(--hover);color:var(--text-strong)}.repost-control{position:relative;display:inline-flex;align-items:center;gap:.25rem}.repost-menu{position:absolute;z-index:8;left:0;top:calc(100% + .25rem);min-width:8.5rem;padding:.3rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 6px 18px var(--shadow)}.repost-menu a{display:inline-flex;align-items:center;gap:.35rem;width:100%;min-height:2rem;border-radius:6px;padding:.32rem .55rem;color:var(--link-strong);font-weight:700}.repost-menu a svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.repost-menu a:hover,.quote-fallback:hover{background:var(--hover);text-decoration:none}.quote-preview{display:block;margin:.6rem 0 .25rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);overflow:hidden}.quote-preview p{margin:.65rem;color:var(--muted-strong)}.quote-link{display:grid;gap:.2rem;padding:.6rem;color:var(--text)}.quote-link:hover{background:var(--hover);text-decoration:none}.quote-author{font-weight:800}.quote-text{white-space:pre-wrap;overflow-wrap:anywhere}.quote-time{color:var(--muted);font-size:.86rem}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}.noscript-banner{max-width:1100px;margin:.7rem auto 0;padding:.65rem .85rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle);color:var(--muted-strong)}.js-enabled .noscript-banner{display:none}
 .profile-banner{width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid var(--border);background:var(--surface-muted)}.profile-heading{display:flex;gap:1rem;align-items:flex-start;margin-top:.85rem}.profile-main{min-width:0;flex:1}.profile-picture{width:88px;height:88px;object-fit:cover;border-radius:999px;border:3px solid var(--surface);background:var(--avatar-bg);flex:0 0 auto}.profile-meta{color:var(--muted-strong);margin:.45rem 0 0}.settings-profile-editor{padding:0;overflow:hidden}.settings-editor-bar{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.85rem;border-bottom:1px solid var(--border)}.settings-editor-bar h1{margin:0}.settings-editor-bar .primary{flex:0 0 auto}.settings-profile-form{padding:0 .85rem .85rem}.settings-profile-media{margin:0 -.85rem .85rem}.settings-banner-wrap{background:var(--media-bg)}.settings-banner-preview{display:block;width:100%;height:220px;object-fit:cover;background:linear-gradient(135deg,var(--surface-muted),var(--hover));border:0;border-radius:0}.settings-banner-preview.placeholder::before{content:"";display:block;width:100%;height:100%}.settings-picture-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:1rem;align-items:end;padding:0 .85rem .85rem;margin-top:-48px}.settings-picture-preview{width:112px;height:112px;object-fit:cover;border-radius:999px;border:5px solid var(--surface);background:var(--avatar-bg);box-shadow:0 1px 4px var(--shadow)}.settings-picture-preview.placeholder{display:block}.settings-media-controls{display:grid;gap:.5rem;align-content:end;padding-top:3.25rem}.media-control-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}.settings-fields{display:grid;gap:.25rem}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-panel{padding:0;overflow:hidden}.deep-settings-form{padding:.85rem;display:grid;gap:.85rem}.deep-settings-group{border:1px solid var(--border);border-radius:8px;padding:.8rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}.deep-settings-group legend{font-weight:800;padding:0 .35rem}.deep-settings-field{display:grid;gap:.25rem;align-content:start}.deep-settings-field label{font-weight:800}.deep-settings-field input,.deep-settings-field select{min-width:0}.field-help{font-size:.88rem}.deep-settings-confirm .settings-item-list li{display:block}.compact-panel h2,.danger-panel h2{margin:0 0 .65rem;font-size:1.1rem}.inline-settings-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center;margin:.2rem 0 .75rem}.inline-settings-form input{min-width:0}.settings-password-form button[type=submit]{margin-top:.9rem}.settings-item-list{list-style:none;margin:.25rem 0 0;padding:0;display:grid;gap:.45rem}.settings-item-list li{display:flex;justify-content:space-between;align-items:center;gap:.75rem;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle)}.settings-item-list form{flex:0 0 auto}.settings-item-list button{padding:.32rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border)}.compact-empty{border:1px dashed var(--border);border-radius:7px;padding:.75rem;background:var(--surface-subtle);color:var(--muted-strong)}.compact-empty p{margin:.25rem 0 0}.danger-panel{border-color:var(--danger-border);background:var(--danger-bg)}.danger,.danger-link{border-color:var(--danger-border);background:var(--danger);color:var(--brand-text)}.danger:hover,.danger-link:hover{background:var(--danger-strong);color:var(--brand-text);text-decoration:none}.delete-account-panel p{max-width:62ch}.favicon-preview{width:32px;height:32px;object-fit:contain;border:1px solid var(--border);border-radius:6px;background:var(--surface)}.admin-user-search{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:.65rem;align-items:end;margin-top:.75rem}.admin-user-search label{margin-top:0}.admin-user-search-actions{display:flex;gap:.4rem;align-items:center;margin-bottom:.05rem}.admin-user-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.75rem;border:1px solid var(--border);border-radius:8px;padding:.75rem;margin-top:.65rem;background:var(--surface-subtle)}.admin-user-heading{overflow-wrap:anywhere}.admin-user-statuses,.admin-user-matches{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.45rem}.admin-user-pill,.admin-user-match{display:inline-flex;align-items:center;min-height:1.55rem;border:1px solid var(--border);border-radius:999px;padding:.15rem .5rem;background:var(--surface);font-size:.82rem;font-weight:800;color:var(--muted-strong)}.admin-user-match{border-color:var(--success-border);background:var(--success-bg);color:var(--text)}.admin-user-meta{margin:.6rem 0 0}.admin-post-preview{margin:.55rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.admin-user-actions{display:flex;align-items:flex-start}.admin-users-empty{margin-top:.75rem}.account-list{display:grid;gap:.65rem}.account-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.85rem}.account-row p{margin:.3rem 0 0;color:var(--muted-strong);overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem}.item-list{margin:.75rem 0 0;padding-left:1.2rem}.item-list li{margin:.45rem 0}.panel dl:not(.dashboard-list){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .85rem}.panel dl:not(.dashboard-list) dt{font-weight:800}.panel dl:not(.dashboard-list) dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--border);text-align:left;padding:.55rem;vertical-align:top}pre{white-space:pre-wrap;overflow:auto;max-width:100%}
 @media (max-width:1100px){.app-shell{--shell-side:220px;--shell-max:880px;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary))}.right-rail{display:none}}
@@ -2360,6 +2524,123 @@ mod tests {
 
         assert!(!body.contains(r#"data-testid="nsfw-media""#));
         assert!(body.contains(r#"<img src="/uploads/images/flagged.webp""#));
+    }
+
+    #[test]
+    fn youtube_video_id_extraction_supports_common_url_shapes() {
+        let cases = [
+            ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            (
+                "https://youtube.com/watch?feature=share&v=dQw4w9WgXcQ",
+                "dQw4w9WgXcQ",
+            ),
+            ("https://youtu.be/dQw4w9WgXcQ?t=12", "dQw4w9WgXcQ"),
+            ("https://www.youtube.com/shorts/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            ("https://www.youtube.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            ("youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        ];
+
+        for (url, expected) in cases {
+            let preview = youtube_preview_from_url(url).expect("valid YouTube URL");
+
+            assert_eq!(preview.video_id, expected);
+        }
+    }
+
+    #[test]
+    fn youtube_video_id_extraction_rejects_invalid_and_spoofed_urls() {
+        let invalid = [
+            "https://youtube.com.evil/watch?v=dQw4w9WgXcQ",
+            "https://evil.example/youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtube.com@evil.example/watch?v=dQw4w9WgXcQ",
+            "javascript:https://youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXc",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ%2F",
+            "https://youtu.be/dQw4w9WgXcQ/extra",
+            "https://www.youtube.com/shorts/../dQw4w9WgXcQ",
+            "https://www.youtube.com/embed/dQw4w9WgXcQ/../x",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&v=aaaaaaaaaaa",
+        ];
+
+        for url in invalid {
+            assert!(
+                youtube_preview_from_url(url).is_none(),
+                "accepted invalid URL: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn youtube_preview_rendering_escapes_user_controlled_text_and_urls() {
+        let mut post = test_post();
+        post.text =
+            "unsafe <script>alert(1)</script> https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1"
+                .to_owned();
+
+        let body = post_card(&post, None, None);
+
+        assert!(body.contains("unsafe &lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!body.contains("<script>alert(1)</script>"));
+        assert!(body.contains(r#"href="https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;t=1""#));
+        assert!(body.contains(
+            r#"<span class="youtube-preview-url">https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;t=1</span>"#
+        ));
+    }
+
+    #[test]
+    fn posts_without_youtube_links_do_not_render_preview_cards() {
+        let mut post = test_post();
+        post.text = "hello https://example.com/watch?v=dQw4w9WgXcQ #rust".to_owned();
+
+        let body = post_card(&post, None, None);
+
+        assert!(!body.contains("youtube-preview-card"));
+        assert!(body.contains(
+            r#"<div class="text">hello https://example.com/watch?v=dQw4w9WgXcQ <a href="/tags/rust">#rust</a></div>"#
+        ));
+    }
+
+    #[test]
+    fn multiple_youtube_links_render_up_to_documented_cap() {
+        let mut post = test_post();
+        post.text = "https://youtu.be/dQw4w9WgXcQ https://youtube.com/shorts/aaaaaaaaaaa https://youtube.com/embed/bbbbbbbbbbb https://youtube.com/watch?v=ccccccccccc".to_owned();
+
+        let body = post_card(&post, None, None);
+
+        assert_eq!(
+            body.matches(r#"data-testid="youtube-preview-card""#)
+                .count(),
+            3
+        );
+        assert!(body.contains("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"));
+        assert!(body.contains("https://i.ytimg.com/vi/aaaaaaaaaaa/hqdefault.jpg"));
+        assert!(body.contains("https://i.ytimg.com/vi/bbbbbbbbbbb/hqdefault.jpg"));
+        assert!(!body.contains("https://i.ytimg.com/vi/ccccccccccc/hqdefault.jpg"));
+    }
+
+    #[test]
+    fn no_javascript_youtube_preview_shows_thumbnail_and_link_card() {
+        let mut post = test_post();
+        post.text = "watch https://youtu.be/dQw4w9WgXcQ".to_owned();
+
+        let body = post_card(&post, None, None);
+
+        assert!(body.contains(
+            r#"<a class="youtube-preview-card" data-testid="youtube-preview-card" href="https://youtu.be/dQw4w9WgXcQ""#
+        ));
+        assert!(body.contains(
+            r#"<img class="youtube-thumbnail" src="https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">"#
+        ));
+        assert!(body.contains(r#"<span class="youtube-preview-title">YouTube video</span>"#));
+        assert!(!body.contains("<iframe"));
+        assert!(!body.contains("<script"));
+    }
+
+    #[test]
+    fn layout_allows_only_static_youtube_thumbnail_origin() {
+        let body = layout(None, "Home Feed", "<p>body</p>", "RustPost");
+
+        assert!(body.contains("img-src 'self' data: https://i.ytimg.com"));
     }
 
     fn test_post() -> PostView {
