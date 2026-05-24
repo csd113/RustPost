@@ -455,20 +455,79 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
-function updateComposerCount(textarea) {
+const CHARACTER_COUNTER_CLASSES = [
+  "character-counter-normal",
+  "character-counter-warning",
+  "character-counter-danger"
+];
+
+function characterCounterFor(textarea) {
   const counter = document.querySelector(`[data-character-counter="${textarea.id}"]`);
+  return counter;
+}
+
+function characterCounterClass(remaining) {
+  if (remaining <= 10) {
+    return "character-counter-danger";
+  }
+  if (remaining <= 50) {
+    return "character-counter-warning";
+  }
+  return "character-counter-normal";
+}
+
+function updateComposerSubmit(textarea, remaining) {
+  const form = textarea.closest("form");
+  const submit = form ? form.querySelector('button[type="submit"]') : null;
+  if (!submit) {
+    return;
+  }
+  submit.disabled = remaining < 0 || form.dataset.submitting === "true";
+}
+
+function updateComposerCount(textarea) {
+  const counter = characterCounterFor(textarea);
   if (!counter) {
     return;
   }
   const max = Number.parseInt(textarea.getAttribute("data-character-limit") || "0", 10);
+  if (!Number.isFinite(max)) {
+    return;
+  }
   const length = Array.from(textarea.value).length;
-  counter.textContent = `${Math.max(0, max - length)} remaining`;
+  const remaining = max - length;
+  counter.textContent = `${remaining} remaining`;
+  counter.classList.remove(...CHARACTER_COUNTER_CLASSES);
+  counter.classList.add(characterCounterClass(remaining));
+  updateComposerSubmit(textarea, remaining);
 }
 
-document.querySelectorAll("textarea[data-character-limit]").forEach((textarea) => {
-  updateComposerCount(textarea);
-  textarea.addEventListener("input", () => updateComposerCount(textarea));
+function initializeComposerCounters(root) {
+  if (root.matches && root.matches("textarea[data-character-limit]")) {
+    updateComposerCount(root);
+  }
+  if (root.querySelectorAll) {
+    root.querySelectorAll("textarea[data-character-limit]").forEach(updateComposerCount);
+  }
+}
+
+document.addEventListener("input", (event) => {
+  const textarea = event.target.closest("textarea[data-character-limit]");
+  if (textarea) {
+    updateComposerCount(textarea);
+  }
 });
+
+initializeComposerCounters(document);
+window.addEventListener("pageshow", () => initializeComposerCounters(document));
+window.requestAnimationFrame(() => initializeComposerCounters(document));
+if (window.MutationObserver) {
+  new MutationObserver((mutations) => {
+    mutations.forEach((mutation) => {
+      mutation.addedNodes.forEach((node) => initializeComposerCounters(node));
+    });
+  }).observe(document.documentElement, { childList: true, subtree: true });
+}
 
 function mediaSummary(input) {
   if (!input.files || input.files.length === 0) {
@@ -760,11 +819,11 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
         "What's happening?"
     };
     format!(
-        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted" data-character-counter="{}">{} remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
+        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted character-counter character-counter-normal" data-character-counter="{}" aria-live="polite">{} remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
 <input type="hidden" name="csrf" value="{}">{}
 <label class="sr-only" for="{}">What is happening?</label>
 <div class="composer-surface">
-<textarea id="{}" name="text" maxlength="{}" rows="4" data-character-limit="{}" placeholder="{}"></textarea>
+<textarea id="{}" name="text" rows="4" data-character-limit="{}" placeholder="{}"></textarea>
 <div class="composer-footer"><label class="composer-file-control" for="{}"><input class="composer-file-input" id="{}" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime" aria-label="Attach media" data-composer-media><span class="composer-file-button" aria-hidden="true">{}<span>Attach media</span></span></label></div>
 <div class="composer-media-selection" data-composer-media-selection hidden><span class="composer-media-summary" data-composer-media-summary></span><label class="check-row composer-nsfw" for="{}"><input id="{}" name="nsfw" type="checkbox" value="true" data-composer-nsfw> Mark media as NSFW</label><button class="composer-clear-media" type="button" data-composer-clear-media>Clear</button></div>
 </div>
@@ -782,7 +841,6 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
         html_escape::encode_double_quoted_attribute(&input_id),
         html_escape::encode_double_quoted_attribute(&input_id),
         max_text_chars,
-        max_text_chars,
         html_escape::encode_double_quoted_attribute(placeholder),
         html_escape::encode_double_quoted_attribute(&media_id),
         html_escape::encode_double_quoted_attribute(&media_id),
@@ -795,15 +853,14 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
 pub fn quote_composer(csrf: &str, quote: &QuotePreview, max_text_chars: usize) -> String {
     let preview = quote_preview_card(quote);
     format!(
-        r#"<section class="composer quote-composer" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">Quote post</h1><span class="muted" data-character-counter="quote-text">{max_text_chars} remaining</span></div>{preview}<form method="post" action="/posts/{}/quote" class="quote-form">
+        r#"<section class="composer quote-composer" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">Quote post</h1><span class="muted character-counter character-counter-normal" data-character-counter="quote-text" aria-live="polite">{max_text_chars} remaining</span></div>{preview}<form method="post" action="/posts/{}/quote" class="quote-form">
 <input type="hidden" name="csrf" value="{}">
 <label class="sr-only" for="quote-text">Add your comment</label>
-<textarea id="quote-text" name="text" maxlength="{}" rows="4" data-character-limit="{}" placeholder="Add your thoughts..." required></textarea>
+<textarea id="quote-text" name="text" rows="4" data-character-limit="{}" placeholder="Add your thoughts..." required></textarea>
 <div class="composer-tools"><span></span><button class="primary" type="submit">Post quote</button></div>
 </form></section>"#,
         quote.id,
         html_escape::encode_double_quoted_attribute(csrf),
-        max_text_chars,
         max_text_chars
     )
 }
@@ -1998,8 +2055,8 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
 }
 
 const CSS: &str = r#"
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;line-height:1.5;--bg:#f5f6f1;--surface:#fff;--surface-subtle:#fbfcfa;--surface-muted:#f4f5f2;--header-bg:rgba(255,255,255,.96);--text:#202124;--text-strong:#172017;--muted:#667064;--muted-strong:#59625a;--border:#dfe4dc;--border-strong:#b9c2b8;--link:#1f5f8b;--link-strong:#24445f;--brand:#163b2f;--brand-hover:#235544;--brand-text:#fff;--hover:#eef3f0;--focus:#93c5fd;--shadow:rgba(20,35,30,.04);--reply-border:#c8d8d0;--avatar-bg:#eef3f0;--danger:#8a3d2d;--danger-strong:#6f2f22;--danger-bg:#fff8f5;--danger-border:#e6b8a8;--success-bg:#f4fbf5;--success-border:#add7b4;--media-bg:#f6f7f4;--shell-side:240px;--shell-primary:640px;--shell-gap:1.25rem;--shell-max:1160px;--header-padding-y:.8rem;--header-brand-size:2rem;--hairline:1px;--rail-sticky-top:calc(var(--header-brand-size) + var(--header-padding-y) + var(--header-padding-y) + var(--shell-gap) + var(--hairline))}
-:root[data-theme="dark"]{color-scheme:dark;--bg:#111827;--surface:#182231;--surface-subtle:#1d2939;--surface-muted:#233044;--header-bg:rgba(17,24,39,.96);--text:#eef4fb;--text-strong:#f8fafc;--muted:#c3cfdd;--muted-strong:#d4deea;--border:#344256;--border-strong:#596b83;--link:#8fc7ff;--link-strong:#badcff;--brand:#4f8fc7;--brand-hover:#6aa8df;--brand-text:#06111f;--hover:#243349;--focus:#fbbf24;--shadow:rgba(0,0,0,.26);--reply-border:#4f6680;--avatar-bg:#243349;--danger:#ffb4a2;--danger-strong:#ffd2c7;--danger-bg:#3a2020;--danger-border:#8f4d43;--success-bg:#163321;--success-border:#4c8a61;--media-bg:#0f172a}
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;line-height:1.5;--bg:#f5f6f1;--surface:#fff;--surface-subtle:#fbfcfa;--surface-muted:#f4f5f2;--header-bg:rgba(255,255,255,.96);--text:#202124;--text-strong:#172017;--muted:#667064;--muted-strong:#59625a;--border:#dfe4dc;--border-strong:#b9c2b8;--link:#1f5f8b;--link-strong:#24445f;--brand:#163b2f;--brand-hover:#235544;--brand-text:#fff;--hover:#eef3f0;--focus:#93c5fd;--shadow:rgba(20,35,30,.04);--reply-border:#c8d8d0;--avatar-bg:#eef3f0;--warning:#9a5a00;--danger:#8a3d2d;--danger-strong:#6f2f22;--danger-bg:#fff8f5;--danger-border:#e6b8a8;--success-bg:#f4fbf5;--success-border:#add7b4;--media-bg:#f6f7f4;--shell-side:240px;--shell-primary:640px;--shell-gap:1.25rem;--shell-max:1160px;--header-padding-y:.8rem;--header-brand-size:2rem;--hairline:1px;--rail-sticky-top:calc(var(--header-brand-size) + var(--header-padding-y) + var(--header-padding-y) + var(--shell-gap) + var(--hairline))}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#111827;--surface:#182231;--surface-subtle:#1d2939;--surface-muted:#233044;--header-bg:rgba(17,24,39,.96);--text:#eef4fb;--text-strong:#f8fafc;--muted:#c3cfdd;--muted-strong:#d4deea;--border:#344256;--border-strong:#596b83;--link:#8fc7ff;--link-strong:#badcff;--brand:#4f8fc7;--brand-hover:#6aa8df;--brand-text:#06111f;--hover:#243349;--focus:#fbbf24;--shadow:rgba(0,0,0,.26);--reply-border:#4f6680;--avatar-bg:#243349;--warning:#f6c36b;--danger:#ffb4a2;--danger-strong:#ffd2c7;--danger-bg:#3a2020;--danger-border:#8f4d43;--success-bg:#163321;--success-border:#4c8a61;--media-bg:#0f172a}
 *{box-sizing:border-box}body{margin:0;min-width:320px;color:var(--text);background:var(--bg)}a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
 .site-header{position:sticky;top:0;z-index:10;background:var(--header-bg);border-bottom:1px solid var(--border);backdrop-filter:blur(8px)}
 .header-inner{max-width:var(--shell-max);margin:0 auto;padding:var(--header-padding-y) 1rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
@@ -2012,12 +2069,13 @@ nav svg{width:1.05rem;height:1.05rem;fill:currentColor;flex:0 0 auto}
 main{padding:var(--shell-gap)}.app-shell{width:min(100%,var(--shell-max));margin:0 auto;display:grid;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary)) var(--shell-side);gap:var(--shell-gap);align-items:start;justify-content:center}.primary-column{min-width:0;width:100%}.left-rail,.right-rail{min-width:0;position:sticky;top:var(--rail-sticky-top);display:grid;gap:.75rem;align-items:start}.side-rail-card,.rail-nav{background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--muted-strong);box-shadow:0 1px 2px var(--shadow)}.side-rail-card{padding:.85rem}.side-rail-card h2{margin:.1rem 0 .6rem;font-size:1rem;color:var(--text)}.rail-nav{display:grid;grid-template-columns:minmax(0,1fr);gap:.2rem;width:100%;padding:.35rem;justify-content:stretch}.rail-nav a,.rail-nav button{width:100%;min-height:2.35rem;justify-content:flex-start;padding:.5rem .65rem}.rail-nav form{display:block}.mobile-nav{display:none}.dashboard-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .75rem;margin:.25rem 0 .85rem}.dashboard-list dt{font-weight:800;color:var(--text)}.dashboard-list dd{margin:0;overflow-wrap:anywhere}.dashboard-account{color:var(--text)}.dashboard-account:hover{text-decoration:none}.dashboard-actions{display:flex;flex-wrap:wrap;gap:.4rem}.site-footer{max-width:var(--shell-max);margin:0 auto;padding:1rem;color:var(--muted);font-size:.9rem}
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:.85rem;box-shadow:0 1px 2px var(--shadow)}
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.panel h1+table,.panel h1+form,.panel h1+p,.panel h1+dl{margin-top:.85rem}.page-header p,.muted,.empty-state p{color:var(--muted);margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
+.character-counter{display:inline-block;flex:0 0 auto;min-width:8.5rem;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.character-counter-normal{color:var(--muted)}.character-counter-warning{color:var(--warning)}.character-counter-danger{color:var(--danger)}
 .notifications-hero{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:1rem;box-shadow:0 1px 2px var(--shadow);display:flex;align-items:center;justify-content:space-between;gap:1rem}.notifications-hero h1{margin:0;font-size:1.55rem;line-height:1.15}.notifications-hero p:not(.eyebrow){margin:.35rem 0 0;color:var(--muted-strong)}.caught-up-pill{display:inline-flex;align-items:center;min-height:2rem;border:1px solid var(--success-border);border-radius:999px;background:var(--success-bg);color:var(--text-strong);padding:.32rem .75rem;font-weight:800}.caught-up{padding:.75rem .85rem}.caught-up p{margin:0}.notifications-list{display:grid;gap:.5rem}.notification-group{margin:.8rem .15rem .2rem;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.notification-row{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:start;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.8rem;box-shadow:0 1px 2px var(--shadow)}.notification-row.unread{border-color:var(--border-strong);background:var(--surface-subtle)}.js-enabled .notification-row[data-card-href]{cursor:pointer}.js-enabled .notification-row[data-card-href]:hover{border-color:var(--border-strong);background:var(--hover)}.notification-kind{display:grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--surface-muted);color:var(--link-strong);font-weight:900;font-size:.8rem}.notification-row.unread .notification-kind{background:var(--brand);color:var(--brand-text)}.notification-body{min-width:0}.notification-line{margin:0;overflow-wrap:anywhere}.notification-meta{margin:.35rem 0 0;color:var(--muted);font-size:.88rem}.notification-preview{display:block;margin:.5rem 0 0;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle);color:var(--muted-strong);overflow-wrap:anywhere}.notification-preview:hover{background:var(--surface);text-decoration:none}.notification-preview.unavailable{border-style:dashed}.unread-dot{width:.65rem;height:.65rem;border-radius:999px;background:var(--brand);margin-top:.7rem}
 label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button,select{font:inherit}input[type=text],input[type=search],input[type=password],input[type=url],input:not([type]),textarea,select{width:100%;padding:.72rem .8rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text)}textarea{resize:vertical;min-height:7rem}::placeholder{color:var(--muted)}
 input[type=checkbox]{accent-color:var(--brand)}.check-row,.theme-toggle{display:flex;align-items:center;gap:.55rem;font-weight:700;color:var(--text)}.theme-toggle{padding:.65rem .75rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle)}.theme-toggle input{width:auto}
 input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{display:none;background:var(--surface);color:var(--link-strong);border-color:var(--border);min-width:4.5rem}.js-enabled .password-toggle{display:inline-block}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}.auth-form .field-help{margin:.15rem 0 .4rem;color:var(--muted-strong)}
 .search-panel h1{margin-bottom:.75rem}.search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center}.search-form input{min-width:0}.search-results{display:grid;gap:.65rem}.section-title{margin:.2rem 0 .65rem;font-size:1.05rem;color:var(--text)}.search-users{margin-bottom:0}.search-users .section-title{margin-top:0}.search-account{grid-template-columns:auto minmax(0,1fr)}
-input:focus,textarea:focus,select:focus,button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}button,.primary{border:1px solid var(--brand);background:var(--brand);color:var(--brand-text);border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:var(--brand-hover);text-decoration:none}
+input:focus,textarea:focus,select:focus,button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}button,.primary{border:1px solid var(--brand);background:var(--brand);color:var(--brand-text);border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:var(--brand-hover);text-decoration:none}button:disabled,.primary:disabled,button:disabled:hover,.primary:disabled:hover{border-color:var(--border);background:var(--surface-muted);color:var(--muted);cursor:not-allowed;opacity:1}
 nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.42rem .65rem}.rail-nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.5rem .65rem}.rail-nav button:hover,.mobile-nav button:hover{background:var(--hover);color:var(--link-strong)}
 .composer-surface{border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);overflow:hidden}.composer-surface textarea{border:0;border-radius:0;background:transparent;min-height:7rem;resize:vertical}.composer-surface textarea:focus{outline:0;box-shadow:inset 0 0 0 3px var(--focus)}.composer-footer{display:flex;align-items:center;justify-content:space-between;gap:.55rem;border-top:1px solid var(--border);padding:.42rem .5rem;background:var(--surface-subtle)}.composer-file-control{position:relative;display:inline-flex;align-items:center;gap:.45rem;max-width:100%;margin:0;color:var(--link-strong);font-weight:800}.composer-file-input{max-width:100%;color:var(--muted-strong)}.composer-file-input::file-selector-button{border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.34rem .58rem;font-weight:800;cursor:pointer}.composer-file-input::file-selector-button:hover{background:var(--hover);color:var(--text-strong)}.composer-file-button{display:none}.js-enabled .composer-file-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.js-enabled .composer-file-button{display:inline-flex;align-items:center;gap:.38rem;min-height:2rem;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.3rem .55rem;cursor:pointer}.composer-file-button svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.js-enabled .composer-file-control:hover .composer-file-button{background:var(--hover);color:var(--text-strong)}.js-enabled .composer-file-input:focus-visible+.composer-file-button{outline:3px solid var(--focus);outline-offset:2px}.composer-media-selection[hidden]{display:none}.composer-media-selection{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;border-top:1px solid var(--border);padding:.5rem;background:var(--surface)}.composer-media-summary{font-weight:800;color:var(--muted-strong);overflow-wrap:anywhere}.composer-nsfw{margin:0}.composer-clear-media{background:var(--surface);color:var(--link-strong);border-color:var(--border);padding:.32rem .55rem}.composer-clear-media:hover{background:var(--hover);color:var(--text-strong)}.composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}
 .thread-nav{display:flex;margin:0 0 .45rem .85rem}.thread-back{width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:var(--link-strong)}.thread-back svg{width:1.2rem;height:1.2rem;fill:currentColor}.thread-back:hover{background:var(--hover);text-decoration:none}
@@ -2282,8 +2340,10 @@ mod tests {
     fn composer_has_live_remaining_counter_and_contextual_placeholder() {
         let post = composer(Some("csrf"), None, 512);
         assert!(post.contains("512 remaining"));
+        assert!(post.contains(r#"class="muted character-counter character-counter-normal""#));
+        assert!(post.contains(r#"aria-live="polite""#));
         assert!(post.contains("data-character-limit=\"512\""));
-        assert!(post.contains("maxlength=\"512\""));
+        assert!(!post.contains("maxlength="));
         assert!(post.contains("What is happening?"));
         assert!(post.contains(r#"placeholder="What's happening?""#));
         assert!(post.contains(r#"<div class="composer-surface">"#));
@@ -2300,6 +2360,7 @@ mod tests {
 
         let reply = composer(Some("csrf"), Some(10), 512);
         assert!(reply.contains(r#"id="reply-text-10""#));
+        assert!(reply.contains(r#"data-character-counter="reply-text-10""#));
         assert!(reply.contains(r#"id="reply-media-10" name="media" type="file""#));
         assert!(reply.contains(r#"id="reply-nsfw-10" name="nsfw" type="checkbox""#));
         assert!(reply.contains(r#"placeholder="Write a reply...""#));
@@ -2320,8 +2381,10 @@ mod tests {
 
         assert!(body.contains(r#"id="quote-text""#));
         assert!(body.contains(r#"placeholder="Add your thoughts...""#));
+        assert!(body.contains(r#"class="muted character-counter character-counter-normal""#));
+        assert!(body.contains(r#"aria-live="polite""#));
         assert!(body.contains("data-character-limit=\"512\""));
-        assert!(body.contains("maxlength=\"512\""));
+        assert!(!body.contains("maxlength="));
     }
 
     #[test]
