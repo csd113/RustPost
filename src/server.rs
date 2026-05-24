@@ -101,7 +101,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/following", get(following))
         .route("/bookmarks", get(bookmarks))
         .route("/notifications", get(notifications))
+        .route("/notifications/open", post(open_notification_group))
         .route("/notifications/read", post(mark_notifications_read))
+        .route("/mentions", get(mention_suggestions))
         .route("/search", get(search))
         .route("/tags/{tag}", get(tag))
         .route("/admin", get(admin_dashboard))
@@ -200,6 +202,15 @@ struct CsrfForm {
 }
 
 #[derive(Deserialize)]
+struct NotificationOpenForm {
+    csrf: String,
+    notification_ids: String,
+    group_kind: Option<String>,
+    group_target_post_id: Option<String>,
+    return_to: String,
+}
+
+#[derive(Deserialize)]
 struct QuoteForm {
     csrf: String,
     text: String,
@@ -224,6 +235,17 @@ struct ReturnQuery {
 #[derive(Deserialize)]
 struct SearchQuery {
     q: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MentionSuggestionsQuery {
+    q: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MentionSuggestionResponse {
+    username: String,
+    display_name: String,
 }
 
 #[derive(Deserialize)]
@@ -2848,6 +2870,62 @@ fn safe_delete_return_target(value: &str, post_id: i64) -> Option<String> {
     }
 }
 
+fn parse_notification_ids(value: &str) -> AppResult<Vec<i64>> {
+    if value.len() > 1024 {
+        return Err(AppError::BadRequest(
+            "notification group is too large".to_owned(),
+        ));
+    }
+    let mut ids = Vec::new();
+    for part in value.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id = trimmed
+            .parse::<i64>()
+            .map_err(|_err| AppError::BadRequest("notification group is invalid".to_owned()))?;
+        if id <= 0 {
+            return Err(AppError::BadRequest(
+                "notification group is invalid".to_owned(),
+            ));
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        if ids.len() > 80 {
+            return Err(AppError::BadRequest(
+                "notification group is too large".to_owned(),
+            ));
+        }
+    }
+    if ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "notification group is invalid".to_owned(),
+        ));
+    }
+    Ok(ids)
+}
+
+fn parse_notification_group_target(value: Option<&str>) -> AppResult<Option<i64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let target = trimmed
+        .parse::<i64>()
+        .map_err(|_err| AppError::BadRequest("notification group target is invalid".to_owned()))?;
+    if target <= 0 {
+        return Err(AppError::BadRequest(
+            "notification group target is invalid".to_owned(),
+        ));
+    }
+    Ok(Some(target))
+}
+
 fn path_without_query_or_fragment(target: &str) -> &str {
     target.split(['?', '#']).next().unwrap_or_default()
 }
@@ -2936,12 +3014,30 @@ async fn notifications(
 ) -> AppResult<Html<String>> {
     let user = require_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let items = social::notifications(&state.pool, user.id).await?;
+    let items = social::notification_groups(&state.pool, user.id).await?;
     let unread_count = social::unread_notification_count(&state.pool, user.id).await?;
     let body = render::notifications_page(&items, unread_count, &csrf);
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Notifications", &body).await?,
     ))
+}
+
+async fn open_notification_group(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<NotificationOpenForm>,
+) -> AppResult<Response> {
+    let user = require_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    if let Some(kind) = form.group_kind.as_deref() {
+        let target_post_id = parse_notification_group_target(form.group_target_post_id.as_deref())?;
+        social::mark_notification_group_read(&state.pool, user.id, kind, target_post_id).await?;
+    } else {
+        let notification_ids = parse_notification_ids(&form.notification_ids)?;
+        social::mark_notification_ids_read(&state.pool, user.id, &notification_ids).await?;
+    }
+    let target = safe_return_target(&form.return_to).unwrap_or_else(|| "/notifications".to_owned());
+    Ok(Redirect::to(&target).into_response())
 }
 
 async fn mark_notifications_read(
@@ -2953,6 +3049,29 @@ async fn mark_notifications_read(
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::mark_notifications_read(&state.pool, user.id).await?;
     Ok(Redirect::to("/notifications").into_response())
+}
+
+async fn mention_suggestions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<MentionSuggestionsQuery>,
+) -> AppResult<Json<Vec<MentionSuggestionResponse>>> {
+    let user = current(&state, &headers).await?;
+    let suggestions = social::mention_suggestions(
+        &state.pool,
+        user.as_ref().map(|user| user.id),
+        query.q.as_deref().unwrap_or_default(),
+    )
+    .await?;
+    Ok(Json(
+        suggestions
+            .into_iter()
+            .map(|suggestion| MentionSuggestionResponse {
+                username: suggestion.username,
+                display_name: suggestion.display_name,
+            })
+            .collect(),
+    ))
 }
 
 async fn search(
@@ -6143,6 +6262,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mention_suggestions_endpoint_returns_bounded_json_for_visible_users() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        crate::auth::register_user(
+            &server.pool,
+            &Settings::default(),
+            "bob",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("bob");
+        crate::auth::register_user(
+            &server.pool,
+            &Settings::default(),
+            "bobby",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("bobby");
+        let suspended = crate::auth::register_user(
+            &server.pool,
+            &Settings::default(),
+            "bot_suspended",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("suspended");
+        server
+            .pool
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET display_name = '<b>Bob</b>' WHERE normalized_username = 'bob'",
+                    [],
+                )?;
+                conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [suspended])?;
+                Ok(())
+            })
+            .await
+            .expect("update users");
+
+        let response = get_with_cookie(&server, "/mentions?q=BO", &alice_cookie).await;
+
+        assert_eq!(response.status, 200);
+        assert_header(&response, "content-type", "application/json");
+        assert!(response.body.starts_with('['));
+        assert!(response.body.contains(r#""username":"bob""#));
+        assert!(response.body.contains(r#""display_name":"<b>Bob</b>""#));
+        assert!(response.body.contains(r#""username":"bobby""#));
+        assert!(!response.body.contains("bot_suspended"));
+    }
+
+    #[tokio::test]
+    async fn grouped_notification_open_marks_group_read() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "grouped notification target").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+        let carol_cookie = register_test_user(&server, "carol").await;
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let bob_csrf = csrf_token(&bob_home.body);
+        let carol_home = get_with_cookie(&server, "/home", &carol_cookie).await;
+        let carol_csrf = csrf_token(&carol_home.body);
+
+        let bob_liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &bob_cookie,
+            &format!("csrf={}", form_encode(&bob_csrf)),
+        )
+        .await;
+        assert_eq!(bob_liked.status, 303);
+        let carol_liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &carol_cookie,
+            &format!("csrf={}", form_encode(&carol_csrf)),
+        )
+        .await;
+        assert_eq!(carol_liked.status, 303);
+
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert_eq!(notifications.status, 200);
+        assert!(notifications.body.contains("2 unread notifications"));
+        assert!(notifications.body.contains("2 people"));
+        assert!(notifications.body.contains("liked your post"));
+        assert!(notifications.body.contains("View people"));
+        assert_eq!(
+            notifications
+                .body
+                .matches(r#"class="notification-row unread""#)
+                .count(),
+            1
+        );
+        let csrf = csrf_token(&notifications.body);
+        let notification_ids = hidden_value(&notifications.body, "notification_ids");
+
+        let opened = post_form_with_cookie(
+            &server,
+            "/notifications/open",
+            &alice_cookie,
+            &format!(
+                "csrf={}&notification_ids={}&return_to={}",
+                form_encode(&csrf),
+                form_encode(&notification_ids),
+                form_encode("/posts/1")
+            ),
+        )
+        .await;
+
+        assert_eq!(opened.status, 303);
+        assert_eq!(location(&opened), "/posts/1");
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert!(notifications.body.contains("No unread notifications"));
+        assert!(
+            !notifications
+                .body
+                .contains(r#"class="notification-row unread""#)
+        );
+    }
+
+    #[tokio::test]
     async fn notifications_page_has_polished_empty_state() {
         let server = spawn_test_server().await;
         let cookie = register_test_user(&server, "alice").await;
@@ -7576,9 +7819,10 @@ mod tests {
         assert!(body.contains("reposted your post"));
         assert!(body.contains("followed you"));
         assert!(body.contains("alice original post"));
-        assert!(body.contains(r#"data-card-href="/posts/1""#));
-        assert!(body.contains(r#"data-card-href="/posts/2""#));
-        assert!(body.contains(r#"data-card-href="/users/bob""#));
+        assert!(body.contains(r#"data-card-form="notification-open-"#));
+        assert!(body.contains(r#"name="return_to" value="/posts/1""#));
+        assert!(body.contains(r#"name="return_to" value="/posts/2""#));
+        assert!(body.contains(r#"name="return_to" value="/users/bob""#));
     }
 
     fn quote_form_body(response: &TestResponse, text: &str) -> String {

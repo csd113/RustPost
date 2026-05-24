@@ -88,9 +88,38 @@ pub struct NotificationView {
     pub actor_username: Option<String>,
     pub actor_display_name: Option<String>,
     pub post_id: Option<i64>,
+    pub group_target_post_id: Option<i64>,
     pub post_text: Option<String>,
     pub post_available: bool,
     pub read_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionSuggestion {
+    pub username: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationActorView {
+    pub user_id: Option<i64>,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationGroupView {
+    pub id: i64,
+    pub kind: String,
+    pub group_target_post_id: Option<i64>,
+    pub post_id: Option<i64>,
+    pub post_text: Option<String>,
+    pub post_available: bool,
+    pub unread_count: i64,
+    pub total_count: usize,
+    pub notification_ids: Vec<i64>,
+    pub actors: Vec<NotificationActorView>,
     pub created_at: String,
 }
 
@@ -1211,6 +1240,98 @@ pub async fn search(
     Ok((users, rows_to_posts(pool, rows, viewer_id).await?))
 }
 
+const MENTION_SUGGESTION_LIMIT: usize = 8;
+const MENTION_QUERY_MAX_CHARS: usize = 32;
+
+pub async fn mention_suggestions(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    query: &str,
+) -> anyhow::Result<Vec<MentionSuggestion>> {
+    let fragment = mention_query_fragment(query);
+    let username_query = format!("{}%", escape_like_prefix(&fragment));
+    let limit = i64::try_from(MENTION_SUGGESTION_LIMIT)?;
+    pool.call(move |conn| {
+        if let Some(viewer_id) = viewer_id {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT username, display_name
+                FROM users u
+                WHERE u.is_deleted = 0
+                  AND u.is_suspended = 0
+                  AND u.normalized_username LIKE ? ESCAPE '\'
+                  AND u.id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+                  AND u.id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM blocks
+                    WHERE blocker_id = u.id AND blocked_id = ?
+                  )
+                ORDER BY u.normalized_username, u.id
+                LIMIT ?
+                "#,
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![username_query, viewer_id, viewer_id, viewer_id, limit],
+                    |row| {
+                        Ok(MentionSuggestion {
+                            username: row.get(0)?,
+                            display_name: row.get(1)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        } else {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT username, display_name
+                FROM users u
+                WHERE u.is_deleted = 0
+                  AND u.is_suspended = 0
+                  AND u.normalized_username LIKE ? ESCAPE '\'
+                ORDER BY u.normalized_username, u.id
+                LIMIT ?
+                "#,
+            )?;
+            let rows = stmt
+                .query_map(params![username_query, limit], |row| {
+                    Ok(MentionSuggestion {
+                        username: row.get(0)?,
+                        display_name: row.get(1)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    })
+    .await
+}
+
+fn mention_query_fragment(query: &str) -> String {
+    query
+        .trim()
+        .trim_start_matches('@')
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || *character == '_' || *character == '-'
+        })
+        .take(MENTION_QUERY_MAX_CHARS)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn escape_like_prefix(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 fn user_query_from_input(query: &str) -> Option<String> {
     let trimmed = query.trim().trim_start_matches('@').trim();
     let value = trimmed
@@ -1253,7 +1374,8 @@ pub async fn notifications(
         let mut stmt = conn.prepare(
             r#"
             SELECT n.id, n.kind, n.actor_user_id, u.username, u.display_name,
-              n.post_id, p.text, p.is_deleted, n.read_at, n.created_at
+              n.post_id, p.text, p.is_deleted, p.parent_post_id, p.quote_post_id,
+              n.read_at, n.created_at
             FROM notifications n
             LEFT JOIN users u ON u.id = n.actor_user_id AND u.is_deleted = 0
             LEFT JOIN posts p ON p.id = n.post_id
@@ -1264,28 +1386,128 @@ pub async fn notifications(
         )?;
         let rows = stmt
             .query_map([user_id], |row| {
+                let kind = row.get::<_, String>(1)?;
+                let post_id = row.get::<_, Option<i64>>(5)?;
                 let post_is_deleted = row
                     .get::<_, Option<i64>>(7)?
                     .is_some_and(|value| value != 0);
+                let parent_post_id = row.get::<_, Option<i64>>(8)?;
+                let quote_post_id = row.get::<_, Option<i64>>(9)?;
+                let group_target_post_id = match kind.as_str() {
+                    "reply" => parent_post_id.or(post_id),
+                    "quote" => quote_post_id.or(post_id),
+                    _ => post_id,
+                };
                 Ok(NotificationView {
                     id: row.get(0)?,
-                    kind: row.get(1)?,
+                    kind,
                     actor_user_id: row.get(2)?,
                     actor_username: row.get(3)?,
                     actor_display_name: row.get(4)?,
-                    post_id: row.get(5)?,
+                    post_id,
+                    group_target_post_id,
                     post_text: row.get(6)?,
                     post_available: row
                         .get::<_, Option<i64>>(7)?
                         .is_some_and(|_| !post_is_deleted),
-                    read_at: row.get(8)?,
-                    created_at: row.get(9)?,
+                    read_at: row.get(10)?,
+                    created_at: row.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })
     .await
+}
+
+pub async fn notification_groups(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> anyhow::Result<Vec<NotificationGroupView>> {
+    let notifications = notifications(pool, user_id).await?;
+    let mut groups = group_notifications(&notifications);
+    refresh_notification_group_counts(pool, user_id, &mut groups).await?;
+    Ok(groups)
+}
+
+fn group_notifications(notifications: &[NotificationView]) -> Vec<NotificationGroupView> {
+    let mut groups: Vec<(NotificationGroupKey, NotificationGroupView)> = Vec::new();
+    for notification in notifications {
+        let key = notification_group_key(notification);
+        if let Some((_key, group)) = groups
+            .iter_mut()
+            .find(|(existing_key, _group)| *existing_key == key)
+        {
+            push_notification_group_item(group, notification);
+        } else {
+            groups.push((key, notification_group_from_item(notification)));
+        }
+    }
+    groups.into_iter().map(|(_key, group)| group).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotificationGroupKey {
+    kind: String,
+    target: NotificationGroupTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotificationGroupTarget {
+    Follow,
+    Post(i64),
+    Notification(i64),
+}
+
+fn notification_group_key(notification: &NotificationView) -> NotificationGroupKey {
+    let target = match notification.kind.as_str() {
+        "follow" => NotificationGroupTarget::Follow,
+        "like" | "repost" | "reply" | "mention" | "quote" => {
+            notification.group_target_post_id.map_or(
+                NotificationGroupTarget::Notification(notification.id),
+                NotificationGroupTarget::Post,
+            )
+        }
+        _ => NotificationGroupTarget::Notification(notification.id),
+    };
+    NotificationGroupKey {
+        kind: notification.kind.clone(),
+        target,
+    }
+}
+
+fn notification_group_from_item(notification: &NotificationView) -> NotificationGroupView {
+    let mut group = NotificationGroupView {
+        id: notification.id,
+        kind: notification.kind.clone(),
+        group_target_post_id: notification.group_target_post_id,
+        post_id: notification.post_id,
+        post_text: notification.post_text.clone(),
+        post_available: notification.post_available,
+        unread_count: 0,
+        total_count: 0,
+        notification_ids: Vec::new(),
+        actors: Vec::new(),
+        created_at: notification.created_at.clone(),
+    };
+    push_notification_group_item(&mut group, notification);
+    group
+}
+
+fn push_notification_group_item(
+    group: &mut NotificationGroupView,
+    notification: &NotificationView,
+) {
+    group.total_count += 1;
+    group.notification_ids.push(notification.id);
+    if notification.read_at.is_none() {
+        group.unread_count += 1;
+    }
+    group.actors.push(NotificationActorView {
+        user_id: notification.actor_user_id,
+        username: notification.actor_username.clone(),
+        display_name: notification.actor_display_name.clone(),
+    });
 }
 
 pub async fn unread_notification_count(pool: &SqlitePool, user_id: i64) -> anyhow::Result<i64> {
@@ -1299,12 +1521,151 @@ pub async fn unread_notification_count(pool: &SqlitePool, user_id: i64) -> anyho
     .await
 }
 
+pub async fn mark_notification_ids_read(
+    pool: &SqlitePool,
+    user_id: i64,
+    notification_ids: &[i64],
+) -> anyhow::Result<()> {
+    let notification_ids = notification_ids.to_vec();
+    pool.call(move |conn| {
+        let tx = conn.transaction()?;
+        for notification_id in notification_ids {
+            tx.execute(
+                "UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = ? AND id = ? AND read_at IS NULL",
+                params![user_id, notification_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
+async fn refresh_notification_group_counts(
+    pool: &SqlitePool,
+    user_id: i64,
+    groups: &mut [NotificationGroupView],
+) -> anyhow::Result<()> {
+    let descriptors = groups
+        .iter()
+        .enumerate()
+        .filter(|(_index, group)| {
+            group.kind == "follow"
+                || (notification_group_target_expr(&group.kind).is_some()
+                    && group.group_target_post_id.is_some())
+        })
+        .map(|(index, group)| (index, group.kind.clone(), group.group_target_post_id))
+        .collect::<Vec<_>>();
+    let counts = pool
+        .call(move |conn| {
+            let mut counts = Vec::with_capacity(descriptors.len());
+            for (index, kind, target_post_id) in descriptors {
+                let (total_count, unread_count) =
+                    notification_group_counts_tx(conn, user_id, &kind, target_post_id)?;
+                counts.push((index, total_count, unread_count));
+            }
+            Ok(counts)
+        })
+        .await?;
+    for (index, total_count, unread_count) in counts {
+        groups[index].total_count = usize::try_from(total_count)?;
+        groups[index].unread_count = unread_count;
+    }
+    Ok(())
+}
+
+fn notification_group_counts_tx(
+    conn: &Connection,
+    user_id: i64,
+    kind: &str,
+    target_post_id: Option<i64>,
+) -> anyhow::Result<(i64, i64)> {
+    if kind == "follow" {
+        return Ok(conn.query_row(
+            r#"
+            SELECT COUNT(*), COALESCE(SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END), 0)
+            FROM notifications
+            WHERE user_id = ? AND kind = 'follow'
+            "#,
+            [user_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?);
+    }
+    let Some(target_expr) = notification_group_target_expr(kind) else {
+        return Ok((0, 0));
+    };
+    let Some(target_post_id) = target_post_id else {
+        return Ok((0, 0));
+    };
+    let sql = format!(
+        r#"
+        SELECT COUNT(*), COALESCE(SUM(CASE WHEN n.read_at IS NULL THEN 1 ELSE 0 END), 0)
+        FROM notifications n
+        LEFT JOIN posts p ON p.id = n.post_id
+        WHERE n.user_id = ? AND n.kind = ? AND {target_expr} = ?
+        "#
+    );
+    Ok(
+        conn.query_row(&sql, params![user_id, kind, target_post_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?,
+    )
+}
+
+fn notification_group_target_expr(kind: &str) -> Option<&'static str> {
+    match kind {
+        "like" | "repost" | "mention" => Some("n.post_id"),
+        "reply" => Some("COALESCE(p.parent_post_id, n.post_id)"),
+        "quote" => Some("COALESCE(p.quote_post_id, n.post_id)"),
+        _ => None,
+    }
+}
+
 pub async fn mark_notifications_read(pool: &SqlitePool, user_id: i64) -> anyhow::Result<()> {
     pool.call(move |conn| {
         conn.execute(
             "UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = ? AND read_at IS NULL",
             [user_id],
         )?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn mark_notification_group_read(
+    pool: &SqlitePool,
+    user_id: i64,
+    kind: &str,
+    target_post_id: Option<i64>,
+) -> anyhow::Result<()> {
+    let kind = kind.to_owned();
+    pool.call(move |conn| {
+        if kind == "follow" {
+            conn.execute(
+                "UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = ? AND kind = 'follow' AND read_at IS NULL",
+                [user_id],
+            )?;
+            return Ok(());
+        }
+        let Some(target_expr) = notification_group_target_expr(&kind) else {
+            anyhow::bail!("notification group kind is invalid");
+        };
+        let Some(target_post_id) = target_post_id else {
+            anyhow::bail!("notification group target is invalid");
+        };
+        let sql = format!(
+            r#"
+            UPDATE notifications
+            SET read_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND read_at IS NULL AND id IN (
+              SELECT n.id
+              FROM notifications n
+              LEFT JOIN posts p ON p.id = n.post_id
+              WHERE n.user_id = ? AND n.kind = ? AND {target_expr} = ?
+            )
+            "#
+        );
+        conn.execute(&sql, params![user_id, user_id, kind, target_post_id])?;
         Ok(())
     })
     .await
@@ -2528,6 +2889,273 @@ mod tests {
                 .expect("unread count"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn mention_suggestions_match_visible_usernames_safely() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        let _alex = auth::register_user(&pool, &settings, "al_ex", "very secure password", false)
+            .await
+            .expect("alex");
+        let alx = auth::register_user(&pool, &settings, "alxex", "very secure password", false)
+            .await
+            .expect("alx");
+        pool.call(move |conn| {
+            conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [carol])?;
+            conn.execute(
+                "UPDATE users SET display_name = '<b>Alice</b>' WHERE id = ?",
+                [alice],
+            )?;
+            conn.execute(
+                "INSERT INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
+                params![bob, alx],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("mark users");
+
+        let suggestions = mention_suggestions(&pool, Some(bob), "AL")
+            .await
+            .expect("suggestions");
+        assert_eq!(
+            suggestions,
+            vec![
+                MentionSuggestion {
+                    username: "al_ex".to_owned(),
+                    display_name: "al_ex".to_owned(),
+                },
+                MentionSuggestion {
+                    username: "alice".to_owned(),
+                    display_name: "<b>Alice</b>".to_owned(),
+                },
+            ]
+        );
+
+        let escaped = mention_suggestions(&pool, Some(bob), "al_")
+            .await
+            .expect("escaped suggestions");
+        assert_eq!(
+            escaped
+                .iter()
+                .map(|suggestion| suggestion.username.as_str())
+                .collect::<Vec<_>>(),
+            vec!["al_ex"]
+        );
+        assert!(
+            !escaped
+                .iter()
+                .any(|suggestion| suggestion.username == "alxex")
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_groups_count_unread_and_mark_group_read() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        let dave = auth::register_user(&pool, &settings, "dave", "very secure password", false)
+            .await
+            .expect("dave");
+        let first_post = create_post(&pool, &settings, Some(alice), "first post", None, &[])
+            .await
+            .expect("first post");
+        let second_post = create_post(&pool, &settings, Some(alice), "second post", None, &[])
+            .await
+            .expect("second post");
+
+        like(&pool, bob, first_post).await.expect("bob like");
+        like(&pool, carol, second_post).await.expect("carol like");
+        like(&pool, dave, first_post).await.expect("dave like");
+
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].kind, "like");
+        assert_eq!(groups[0].post_id, Some(first_post));
+        assert_eq!(groups[0].total_count, 2);
+        assert_eq!(groups[0].unread_count, 2);
+        assert_eq!(
+            groups[0]
+                .actors
+                .iter()
+                .filter_map(|actor| actor.username.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["dave", "bob"]
+        );
+        assert_eq!(groups[1].post_id, Some(second_post));
+        assert_eq!(groups[1].unread_count, 1);
+
+        mark_notification_ids_read(&pool, alice, &groups[0].notification_ids)
+            .await
+            .expect("mark group read");
+
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread count"),
+            1
+        );
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+        let first_group = groups
+            .iter()
+            .find(|group| group.post_id == Some(first_post))
+            .expect("first post group");
+        let second_group = groups
+            .iter()
+            .find(|group| group.post_id == Some(second_post))
+            .expect("second post group");
+        assert_eq!(first_group.unread_count, 0);
+        assert_eq!(second_group.unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn notification_group_counts_and_read_transition_include_older_rows() {
+        let (pool, settings, alice, _bob) = fixture().await;
+        let post = create_post(&pool, &settings, Some(alice), "busy post", None, &[])
+            .await
+            .expect("post");
+        pool.call(move |conn| {
+            let tx = conn.transaction()?;
+            for _ in 0..85 {
+                tx.execute(
+                    "INSERT INTO notifications (user_id, actor_user_id, post_id, kind, message) VALUES (?, NULL, ?, 'like', 'liked your post')",
+                    params![alice, post],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .expect("notifications");
+
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].total_count, 85);
+        assert_eq!(groups[0].unread_count, 85);
+        assert_eq!(groups[0].notification_ids.len(), 80);
+
+        mark_notification_group_read(&pool, alice, "like", Some(post))
+            .await
+            .expect("mark group read");
+
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread count"),
+            0
+        );
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+        assert_eq!(groups[0].total_count, 85);
+        assert_eq!(groups[0].unread_count, 0);
+    }
+
+    #[tokio::test]
+    async fn notification_groups_keep_types_and_targets_separate() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        let post = create_post(&pool, &settings, Some(alice), "group target", None, &[])
+            .await
+            .expect("post");
+
+        like(&pool, bob, post).await.expect("bob like");
+        like(&pool, carol, post).await.expect("carol like");
+        repost(&pool, bob, post).await.expect("bob repost");
+        repost(&pool, carol, post).await.expect("carol repost");
+        create_post(&pool, &settings, Some(bob), "reply one", Some(post), &[])
+            .await
+            .expect("reply one");
+        create_post(&pool, &settings, Some(carol), "reply two", Some(post), &[])
+            .await
+            .expect("reply two");
+        follow(&pool, bob, alice).await.expect("bob follow");
+        follow(&pool, carol, alice).await.expect("carol follow");
+
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+
+        let like_group = groups
+            .iter()
+            .find(|group| group.kind == "like")
+            .expect("like group");
+        let repost_group = groups
+            .iter()
+            .find(|group| group.kind == "repost")
+            .expect("repost group");
+        let reply_group = groups
+            .iter()
+            .find(|group| group.kind == "reply")
+            .expect("reply group");
+        let follow_group = groups
+            .iter()
+            .find(|group| group.kind == "follow")
+            .expect("follow group");
+
+        assert_eq!(like_group.total_count, 2);
+        assert_eq!(repost_group.total_count, 2);
+        assert_eq!(reply_group.total_count, 2);
+        assert_eq!(follow_group.total_count, 2);
+        assert_ne!(like_group.notification_ids, repost_group.notification_ids);
+        assert_ne!(like_group.notification_ids, reply_group.notification_ids);
+    }
+
+    #[test]
+    fn notification_grouping_keeps_mentions_on_distinct_targets() {
+        let rows = vec![
+            NotificationView {
+                id: 3,
+                kind: "mention".to_owned(),
+                actor_user_id: Some(3),
+                actor_username: Some("carol".to_owned()),
+                actor_display_name: Some("Carol".to_owned()),
+                post_id: Some(10),
+                group_target_post_id: Some(10),
+                post_text: Some("same target".to_owned()),
+                post_available: true,
+                read_at: None,
+                created_at: "2026-05-24 10:03:00".to_owned(),
+            },
+            NotificationView {
+                id: 2,
+                kind: "mention".to_owned(),
+                actor_user_id: Some(2),
+                actor_username: Some("bob".to_owned()),
+                actor_display_name: Some("Bob".to_owned()),
+                post_id: Some(10),
+                group_target_post_id: Some(10),
+                post_text: Some("same target".to_owned()),
+                post_available: true,
+                read_at: Some("2026-05-24 10:04:00".to_owned()),
+                created_at: "2026-05-24 10:02:00".to_owned(),
+            },
+            NotificationView {
+                id: 1,
+                kind: "mention".to_owned(),
+                actor_user_id: Some(4),
+                actor_username: Some("dave".to_owned()),
+                actor_display_name: Some("Dave".to_owned()),
+                post_id: Some(11),
+                group_target_post_id: Some(11),
+                post_text: Some("other target".to_owned()),
+                post_available: true,
+                read_at: None,
+                created_at: "2026-05-24 10:01:00".to_owned(),
+            },
+        ];
+
+        let groups = group_notifications(&rows);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].post_id, Some(10));
+        assert_eq!(groups[0].total_count, 2);
+        assert_eq!(groups[0].unread_count, 1);
+        assert_eq!(groups[1].post_id, Some(11));
+        assert_eq!(groups[1].total_count, 1);
     }
 
     #[tokio::test]

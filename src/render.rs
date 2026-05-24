@@ -1,6 +1,6 @@
 use crate::auth::{CurrentUser, Theme};
 use crate::social::{
-    AccountView, MediaView, NotificationView, PostView, QuotePreview, TimelineEventKind,
+    AccountView, MediaView, NotificationGroupView, PostView, QuotePreview, TimelineEventKind,
 };
 use axum::http::{StatusCode, Uri};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -373,6 +373,19 @@ document.addEventListener("click", (event) => {
   if (!(event.target instanceof Element)) {
     return;
   }
+  const formCard = event.target.closest("[data-card-form]");
+  if (formCard && !cardInteractiveTarget(event.target)) {
+    const form = document.getElementById(formCard.getAttribute("data-card-form"));
+    if (form instanceof HTMLFormElement) {
+      event.preventDefault();
+      if (form.requestSubmit) {
+        form.requestSubmit();
+      } else {
+        form.submit();
+      }
+      return;
+    }
+  }
   const card = event.target.closest("[data-card-href]");
   if (!card || cardInteractiveTarget(event.target)) {
     return;
@@ -383,6 +396,18 @@ document.addEventListener("click", (event) => {
 document.addEventListener("keydown", (event) => {
   if (!(event.target instanceof Element)) {
     return;
+  }
+  if (event.key === "Enter" && event.target === event.target.closest("[data-card-form]")) {
+    const form = document.getElementById(event.target.getAttribute("data-card-form"));
+    if (form instanceof HTMLFormElement) {
+      event.preventDefault();
+      if (form.requestSubmit) {
+        form.requestSubmit();
+      } else {
+        form.submit();
+      }
+      return;
+    }
   }
   if (event.key !== "Enter" || event.target !== event.target.closest("[data-card-href]")) {
     return;
@@ -546,20 +571,265 @@ function initializeComposerCounters(root) {
   }
 }
 
+const mentionStates = new WeakMap();
+const MENTION_DEBOUNCE_MS = 120;
+
+function mentionStateFor(textarea) {
+  let state = mentionStates.get(textarea);
+  if (state) {
+    return state;
+  }
+  const menu = document.getElementById(textarea.getAttribute("aria-controls"));
+  if (!menu) {
+    return null;
+  }
+  state = {
+    textarea,
+    menu,
+    items: [],
+    activeIndex: -1,
+    atIndex: -1,
+    fragment: "",
+    requestId: 0,
+    timer: 0,
+    controller: null
+  };
+  mentionStates.set(textarea, state);
+  return state;
+}
+
+function mentionContext(textarea) {
+  if (textarea.selectionStart !== textarea.selectionEnd) {
+    return null;
+  }
+  const cursor = textarea.selectionStart;
+  const before = textarea.value.slice(0, cursor);
+  const atIndex = before.lastIndexOf("@");
+  if (atIndex < 0) {
+    return null;
+  }
+  const preceding = atIndex > 0 ? before.charAt(atIndex - 1) : "";
+  if (preceding && /[A-Za-z0-9_@.-]/.test(preceding)) {
+    return null;
+  }
+  const fragment = before.slice(atIndex + 1);
+  if (!/^[A-Za-z0-9_-]*$/.test(fragment)) {
+    return null;
+  }
+  return { atIndex, fragment };
+}
+
+function closeMentionMenu(textarea) {
+  const state = mentionStateFor(textarea);
+  if (!state) {
+    return;
+  }
+  if (state.timer) {
+    window.clearTimeout(state.timer);
+    state.timer = 0;
+  }
+  if (state.controller) {
+    state.controller.abort();
+    state.controller = null;
+  }
+  state.items = [];
+  state.activeIndex = -1;
+  state.atIndex = -1;
+  state.fragment = "";
+  state.menu.hidden = true;
+  state.menu.textContent = "";
+  textarea.setAttribute("aria-expanded", "false");
+  textarea.removeAttribute("aria-activedescendant");
+}
+
+function setActiveMention(state, index) {
+  if (state.items.length === 0) {
+    state.activeIndex = -1;
+    state.textarea.removeAttribute("aria-activedescendant");
+    return;
+  }
+  state.activeIndex = (index + state.items.length) % state.items.length;
+  state.menu.querySelectorAll("[role='option']").forEach((option, optionIndex) => {
+    const selected = optionIndex === state.activeIndex;
+    option.setAttribute("aria-selected", selected ? "true" : "false");
+    if (selected) {
+      state.textarea.setAttribute("aria-activedescendant", option.id);
+      option.scrollIntoView({ block: "nearest" });
+    }
+  });
+}
+
+function selectMention(textarea, index) {
+  const state = mentionStateFor(textarea);
+  if (!state || index < 0 || index >= state.items.length) {
+    return;
+  }
+  const context = mentionContext(textarea);
+  if (!context || context.atIndex !== state.atIndex) {
+    closeMentionMenu(textarea);
+    return;
+  }
+  const username = state.items[index].username;
+  const start = state.atIndex;
+  const end = textarea.selectionStart;
+  const suffix = textarea.value.slice(end);
+  const needsSpace = suffix.length === 0 || /^[A-Za-z0-9_@#-]/.test(suffix);
+  const replacement = `@${username}${needsSpace ? " " : ""}`;
+  textarea.value = `${textarea.value.slice(0, start)}${replacement}${suffix}`;
+  const cursor = start + replacement.length;
+  textarea.setSelectionRange(cursor, cursor);
+  closeMentionMenu(textarea);
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  textarea.focus();
+}
+
+function renderMentionSuggestions(state, suggestions) {
+  state.items = suggestions;
+  state.menu.textContent = "";
+  if (suggestions.length === 0) {
+    closeMentionMenu(state.textarea);
+    return;
+  }
+  suggestions.forEach((suggestion, index) => {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = "mention-option";
+    option.id = `${state.menu.id}-option-${index}`;
+    option.setAttribute("role", "option");
+    option.setAttribute("aria-selected", "false");
+    option.dataset.username = suggestion.username;
+    const name = document.createElement("span");
+    name.className = "mention-name";
+    name.textContent = suggestion.display_name || suggestion.username;
+    const handle = document.createElement("span");
+    handle.className = "mention-handle";
+    handle.textContent = `@${suggestion.username}`;
+    option.append(name, handle);
+    option.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      selectMention(state.textarea, index);
+    });
+    option.addEventListener("mouseenter", () => setActiveMention(state, index));
+    state.menu.append(option);
+  });
+  state.menu.hidden = false;
+  state.textarea.setAttribute("aria-expanded", "true");
+  setActiveMention(state, 0);
+}
+
+function requestMentionSuggestions(textarea) {
+  const state = mentionStateFor(textarea);
+  const context = mentionContext(textarea);
+  if (!state || !context || !window.fetch) {
+    closeMentionMenu(textarea);
+    return;
+  }
+  state.atIndex = context.atIndex;
+  state.fragment = context.fragment;
+  if (state.timer) {
+    window.clearTimeout(state.timer);
+  }
+  state.timer = window.setTimeout(async () => {
+    state.timer = 0;
+    if (state.controller) {
+      state.controller.abort();
+    }
+    const requestId = state.requestId + 1;
+    state.requestId = requestId;
+    state.controller = window.AbortController ? new AbortController() : null;
+    try {
+      const response = await fetch(`/mentions?q=${encodeURIComponent(context.fragment)}`, {
+        headers: { "Accept": "application/json" },
+        credentials: "same-origin",
+        signal: state.controller ? state.controller.signal : undefined
+      });
+      if (!response.ok || requestId !== state.requestId) {
+        return;
+      }
+      const suggestions = await response.json();
+      const current = mentionContext(textarea);
+      if (!current || current.atIndex !== context.atIndex || current.fragment !== context.fragment) {
+        return;
+      }
+      renderMentionSuggestions(state, Array.isArray(suggestions) ? suggestions : []);
+    } catch (error) {
+      if (!state.controller || error.name !== "AbortError") {
+        closeMentionMenu(textarea);
+      }
+    }
+  }, MENTION_DEBOUNCE_MS);
+}
+
+function initializeMentionAutocomplete(root) {
+  if (root.matches && root.matches("textarea[data-mention-autocomplete]")) {
+    mentionStateFor(root);
+  }
+  if (root.querySelectorAll) {
+    root.querySelectorAll("textarea[data-mention-autocomplete]").forEach(mentionStateFor);
+  }
+}
+
 document.addEventListener("input", (event) => {
   const textarea = event.target.closest("textarea[data-character-limit]");
   if (textarea) {
     updateComposerCount(textarea);
   }
+  const mentionTextarea = event.target.closest("textarea[data-mention-autocomplete]");
+  if (mentionTextarea) {
+    requestMentionSuggestions(mentionTextarea);
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const textarea = event.target.closest("textarea[data-mention-autocomplete]");
+  if (!textarea) {
+    return;
+  }
+  const state = mentionStateFor(textarea);
+  if (!state || state.menu.hidden) {
+    return;
+  }
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    setActiveMention(state, state.activeIndex + 1);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    setActiveMention(state, state.activeIndex - 1);
+  } else if (event.key === "Enter" || event.key === "Tab") {
+    event.preventDefault();
+    selectMention(textarea, state.activeIndex);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    closeMentionMenu(textarea);
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  document.querySelectorAll("textarea[data-mention-autocomplete]").forEach((textarea) => {
+    const state = mentionStateFor(textarea);
+    if (state && event.target !== textarea && !state.menu.contains(event.target)) {
+      closeMentionMenu(textarea);
+    }
+  });
 });
 
 initializeComposerCounters(document);
+initializeMentionAutocomplete(document);
 window.addEventListener("pageshow", () => initializeComposerCounters(document));
 window.requestAnimationFrame(() => initializeComposerCounters(document));
 if (window.MutationObserver) {
   new MutationObserver((mutations) => {
     mutations.forEach((mutation) => {
-      mutation.addedNodes.forEach((node) => initializeComposerCounters(node));
+      mutation.addedNodes.forEach((node) => {
+        initializeComposerCounters(node);
+        initializeMentionAutocomplete(node);
+      });
     });
   }).observe(document.documentElement, { childList: true, subtree: true });
 }
@@ -846,6 +1116,7 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
     });
     let csrf = csrf.unwrap_or_default();
     let input_id = parent.map_or_else(|| "post-text".to_owned(), |id| format!("reply-text-{id}"));
+    let mention_menu_id = format!("{input_id}-mention-menu");
     let media_id = parent.map_or_else(|| "post-media".to_owned(), |id| format!("reply-media-{id}"));
     let nsfw_id = parent.map_or_else(|| "post-nsfw".to_owned(), |id| format!("reply-nsfw-{id}"));
     let placeholder = if parent.is_some() {
@@ -858,7 +1129,8 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
 <input type="hidden" name="csrf" value="{}">{}
 <label class="sr-only" for="{}">What is happening?</label>
 <div class="composer-surface">
-<textarea id="{}" name="text" rows="4" data-character-limit="{}" placeholder="{}"></textarea>
+<textarea id="{}" name="text" rows="4" data-character-limit="{}" data-mention-autocomplete aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-controls="{}" placeholder="{}"></textarea>
+<div id="{}" class="mention-menu" role="listbox" data-mention-menu hidden></div>
 <div class="composer-footer"><label class="composer-file-control" for="{}"><input class="composer-file-input" id="{}" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime" aria-label="Attach media" data-composer-media><span class="composer-file-button" aria-hidden="true">{}<span>Attach media</span></span></label></div>
 <div class="composer-media-selection" data-composer-media-selection hidden><span class="composer-media-summary" data-composer-media-summary></span><label class="check-row composer-nsfw" for="{}"><input id="{}" name="nsfw" type="checkbox" value="true" data-composer-nsfw> Mark media as NSFW</label><button class="composer-clear-media" type="button" data-composer-clear-media>Clear</button></div>
 </div>
@@ -876,7 +1148,9 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
         html_escape::encode_double_quoted_attribute(&input_id),
         html_escape::encode_double_quoted_attribute(&input_id),
         max_text_chars,
+        html_escape::encode_double_quoted_attribute(&mention_menu_id),
         html_escape::encode_double_quoted_attribute(placeholder),
+        html_escape::encode_double_quoted_attribute(&mention_menu_id),
         html_escape::encode_double_quoted_attribute(&media_id),
         html_escape::encode_double_quoted_attribute(&media_id),
         icon_svg("paperclip"),
@@ -2071,7 +2345,7 @@ pub fn page_header(title: &str, subtitle: &str) -> String {
 }
 
 pub fn notifications_page(
-    notifications: &[NotificationView],
+    notifications: &[NotificationGroupView],
     unread_count: i64,
     csrf: &str,
 ) -> String {
@@ -2114,11 +2388,11 @@ pub fn notifications_page(
         "{}{}<section class=\"notifications-list\" aria-label=\"Notifications\">{}</section>",
         header,
         caught_up,
-        grouped_notification_rows(notifications)
+        grouped_notification_rows(notifications, csrf)
     )
 }
 
-fn grouped_notification_rows(notifications: &[NotificationView]) -> String {
+fn grouped_notification_rows(notifications: &[NotificationGroupView], csrf: &str) -> String {
     let mut current_group = "";
     let mut html = String::new();
     for notification in notifications {
@@ -2130,13 +2404,13 @@ fn grouped_notification_rows(notifications: &[NotificationView]) -> String {
                 html_escape::encode_text(group)
             ));
         }
-        html.push_str(&notification_row(notification));
+        html.push_str(&notification_row(notification, csrf));
     }
     html
 }
 
-fn notification_group(notification: &NotificationView) -> &'static str {
-    if notification.read_at.is_none() {
+fn notification_group(notification: &NotificationGroupView) -> &'static str {
+    if notification.unread_count > 0 {
         "New"
     } else if is_today(&notification.created_at) {
         "Today"
@@ -2145,52 +2419,142 @@ fn notification_group(notification: &NotificationView) -> &'static str {
     }
 }
 
-fn notification_row(notification: &NotificationView) -> String {
-    let unread = notification.read_at.is_none();
+fn notification_row(notification: &NotificationGroupView, csrf: &str) -> String {
+    let unread = notification.unread_count > 0;
     let target = notification_target(notification);
-    let target_attrs = target.as_ref().map_or_else(String::new, |href| {
+    let form_id = format!("notification-open-{}", notification.id);
+    let target_attrs = target.as_ref().map_or_else(String::new, |_href| {
         format!(
-            r#" data-card-href="{}""#,
-            html_escape::encode_double_quoted_attribute(href)
+            r#" data-card-form="{}" tabindex="0""#,
+            html_escape::encode_double_quoted_attribute(&form_id)
         )
     });
     let preview = notification_preview(notification, target.as_deref());
     let unread_marker = if unread {
-        r#"<span class="unread-dot" aria-label="Unread"></span>"#
+        format!(
+            r#"<span class="unread-dot" aria-label="{}"></span>"#,
+            html_escape::encode_double_quoted_attribute(&notification_unread_label(
+                notification.unread_count
+            ))
+        )
     } else {
-        ""
+        String::new()
     };
+    let details = notification_actor_details(notification);
+    let open_control = notification_open_control(notification, target.as_deref(), &form_id, csrf);
     format!(
-        r#"<article class="notification-row{}"{}><div class="notification-kind" aria-hidden="true">{}</div><div class="notification-body"><p class="notification-line">{} <span>{}</span></p>{}<p class="notification-meta"><time datetime="{}">{}</time></p></div>{}</article>"#,
+        r#"<article class="notification-row{}"{}><div class="notification-kind" aria-hidden="true">{}</div><div class="notification-body"><p class="notification-line">{}</p>{}{}<p class="notification-meta"><time datetime="{}">{}</time>{}</p></div>{}{}</article>"#,
         if unread { " unread" } else { "" },
         target_attrs,
         html_escape::encode_text(notification_kind_label(&notification.kind)),
-        notification_actor(notification),
-        html_escape::encode_text(notification_action_text(&notification.kind)),
+        notification_line(notification),
         preview,
+        details,
         html_escape::encode_double_quoted_attribute(&notification.created_at),
         html_escape::encode_text(&relative_time(&notification.created_at)),
+        notification_count_meta(notification),
+        open_control,
         unread_marker
     )
 }
 
-fn notification_actor(notification: &NotificationView) -> String {
-    match (
-        notification.actor_username.as_deref(),
-        notification.actor_display_name.as_deref(),
-    ) {
+fn notification_line(notification: &NotificationGroupView) -> String {
+    if notification.total_count == 1 {
+        return format!(
+            "{} <span>{}</span>",
+            notification_actor(
+                notification
+                    .actors
+                    .first()
+                    .and_then(|actor| actor.username.as_deref()),
+                notification
+                    .actors
+                    .first()
+                    .and_then(|actor| actor.display_name.as_deref()),
+                notification.actors.first().and_then(|actor| actor.user_id)
+            ),
+            html_escape::encode_text(notification_action_text(&notification.kind))
+        );
+    }
+    format!(
+        r#"<strong>{}</strong> <span>{}</span>"#,
+        html_escape::encode_text(&notification_people_label(notification.total_count)),
+        html_escape::encode_text(notification_group_action_text(&notification.kind))
+    )
+}
+
+fn notification_actor(
+    username: Option<&str>,
+    display_name: Option<&str>,
+    user_id: Option<i64>,
+) -> String {
+    match (username, display_name) {
         (Some(username), display_name) => format!(
             r#"<a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span>"#,
             html_escape::encode_double_quoted_attribute(username),
             html_escape::encode_text(display_name.unwrap_or(username)),
             html_escape::encode_text(username)
         ),
-        (None, _) if notification.actor_user_id.is_some() => "Deleted account".to_owned(),
+        (None, _) if user_id.is_some() => "Deleted account".to_owned(),
         _ => "Someone".to_owned(),
     }
 }
 
-fn notification_preview(notification: &NotificationView, target: Option<&str>) -> String {
+fn notification_actor_details(notification: &NotificationGroupView) -> String {
+    if notification.total_count <= 1 {
+        return String::new();
+    }
+    let actors = notification
+        .actors
+        .iter()
+        .map(|actor| {
+            format!(
+                r#"<li>{}</li>"#,
+                notification_actor(
+                    actor.username.as_deref(),
+                    actor.display_name.as_deref(),
+                    actor.user_id
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<details class="notification-actors"><summary>View people</summary><ul>{actors}</ul></details>"#
+    )
+}
+
+fn notification_open_control(
+    notification: &NotificationGroupView,
+    target: Option<&str>,
+    form_id: &str,
+    csrf: &str,
+) -> String {
+    let Some(target) = target else {
+        return String::new();
+    };
+    let notification_ids = notification
+        .notification_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let group_target = notification
+        .group_target_post_id
+        .map_or_else(String::new, |id| {
+            format!(r#"<input type="hidden" name="group_target_post_id" value="{id}">"#)
+        });
+    format!(
+        r#"<form id="{}" class="notification-open-form" method="post" action="/notifications/open"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="notification_ids" value="{}"><input type="hidden" name="group_kind" value="{}">{group_target}<input type="hidden" name="return_to" value="{}"><button class="button-link notification-open" type="submit">Open</button></form>"#,
+        html_escape::encode_double_quoted_attribute(form_id),
+        html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_double_quoted_attribute(&notification_ids),
+        html_escape::encode_double_quoted_attribute(&notification.kind),
+        html_escape::encode_double_quoted_attribute(target)
+    )
+}
+
+fn notification_preview(notification: &NotificationGroupView, target: Option<&str>) -> String {
     if notification.kind == "follow" {
         return String::new();
     }
@@ -2218,10 +2582,12 @@ fn notification_preview(notification: &NotificationView, target: Option<&str>) -
     }
 }
 
-fn notification_target(notification: &NotificationView) -> Option<String> {
+fn notification_target(notification: &NotificationGroupView) -> Option<String> {
     if notification.kind == "follow" {
         return notification
-            .actor_username
+            .actors
+            .first()
+            .and_then(|actor| actor.username.as_ref())
             .as_ref()
             .map(|username| format!("/users/{username}"));
     }
@@ -2230,6 +2596,47 @@ fn notification_target(notification: &NotificationView) -> Option<String> {
         .then_some(notification.post_id)
         .flatten()
         .map(|post_id| format!("/posts/{post_id}"))
+}
+
+fn notification_count_meta(notification: &NotificationGroupView) -> String {
+    if notification.total_count <= 1 && notification.unread_count == 0 {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if notification.total_count > 1 {
+        parts.push(notification_items_label(notification.total_count));
+    }
+    if notification.unread_count > 0 {
+        parts.push(notification_unread_label(notification.unread_count));
+    }
+    format!(
+        r#" <span class="notification-counts">{}</span>"#,
+        html_escape::encode_text(&parts.join(" / "))
+    )
+}
+
+fn notification_people_label(count: usize) -> String {
+    if count == 1 {
+        "1 person".to_owned()
+    } else {
+        format!("{count} people")
+    }
+}
+
+fn notification_items_label(count: usize) -> String {
+    if count == 1 {
+        "1 notification".to_owned()
+    } else {
+        format!("{count} notifications")
+    }
+}
+
+fn notification_unread_label(count: i64) -> String {
+    if count == 1 {
+        "1 unread".to_owned()
+    } else {
+        format!("{count} unread")
+    }
 }
 
 fn notification_action_text(kind: &str) -> &'static str {
@@ -2241,6 +2648,18 @@ fn notification_action_text(kind: &str) -> &'static str {
         "follow" => "followed you",
         "mention" => "mentioned you in a post",
         _ => "sent you a notification",
+    }
+}
+
+fn notification_group_action_text(kind: &str) -> &'static str {
+    match kind {
+        "reply" => "replied to your post",
+        "like" => "liked your post",
+        "repost" => "reposted your post",
+        "quote" => "quoted your post",
+        "follow" => "followed you",
+        "mention" => "mentioned you in a post",
+        _ => "sent you notifications",
     }
 }
 
@@ -2349,14 +2768,14 @@ main{padding:var(--shell-gap)}.app-shell{width:min(100%,var(--shell-max));margin
 .page-header,.post,.composer,.panel,.empty-state,.notice{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:.85rem;box-shadow:0 1px 2px var(--shadow)}
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.panel h1+table,.panel h1+form,.panel h1+p,.panel h1+dl{margin-top:.85rem}.page-header p,.muted,.empty-state p{color:var(--muted);margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
 .character-counter{display:inline-block;flex:0 0 auto;min-width:8.5rem;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.character-counter-normal{color:var(--muted)}.character-counter-warning{color:var(--warning)}.character-counter-danger{color:var(--danger)}
-.notifications-hero{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:1rem;box-shadow:0 1px 2px var(--shadow);display:flex;align-items:center;justify-content:space-between;gap:1rem}.notifications-hero h1{margin:0;font-size:1.55rem;line-height:1.15}.notifications-hero p:not(.eyebrow){margin:.35rem 0 0;color:var(--muted-strong)}.caught-up-pill{display:inline-flex;align-items:center;min-height:2rem;border:1px solid var(--success-border);border-radius:999px;background:var(--success-bg);color:var(--text-strong);padding:.32rem .75rem;font-weight:800}.caught-up{padding:.75rem .85rem}.caught-up p{margin:0}.notifications-list{display:grid;gap:.5rem}.notification-group{margin:.8rem .15rem .2rem;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.notification-row{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:.75rem;align-items:start;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.8rem;box-shadow:0 1px 2px var(--shadow)}.notification-row.unread{border-color:var(--border-strong);background:var(--surface-subtle)}.js-enabled .notification-row[data-card-href]{cursor:pointer}.js-enabled .notification-row[data-card-href]:hover{border-color:var(--border-strong);background:var(--hover)}.notification-kind{display:grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--surface-muted);color:var(--link-strong);font-weight:900;font-size:.8rem}.notification-row.unread .notification-kind{background:var(--brand);color:var(--brand-text)}.notification-body{min-width:0}.notification-line{margin:0;overflow-wrap:anywhere}.notification-meta{margin:.35rem 0 0;color:var(--muted);font-size:.88rem}.notification-preview{display:block;margin:.5rem 0 0;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle);color:var(--muted-strong);overflow-wrap:anywhere}.notification-preview:hover{background:var(--surface);text-decoration:none}.notification-preview.unavailable{border-style:dashed}.unread-dot{width:.65rem;height:.65rem;border-radius:999px;background:var(--brand);margin-top:.7rem}
+.notifications-hero{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 .7rem;padding:1rem;box-shadow:0 1px 2px var(--shadow);display:flex;align-items:center;justify-content:space-between;gap:1rem}.notifications-hero h1{margin:0;font-size:1.55rem;line-height:1.15}.notifications-hero p:not(.eyebrow){margin:.35rem 0 0;color:var(--muted-strong)}.caught-up-pill{display:inline-flex;align-items:center;min-height:2rem;border:1px solid var(--success-border);border-radius:999px;background:var(--success-bg);color:var(--text-strong);padding:.32rem .75rem;font-weight:800}.caught-up{padding:.75rem .85rem}.caught-up p{margin:0}.notifications-list{display:grid;gap:.5rem}.notification-group{margin:.8rem .15rem .2rem;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.notification-row{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:.75rem;align-items:start;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.8rem;box-shadow:0 1px 2px var(--shadow)}.notification-row.unread{border-color:var(--border-strong);background:var(--surface-subtle)}.js-enabled .notification-row[data-card-href],.js-enabled .notification-row[data-card-form]{cursor:pointer}.js-enabled .notification-row[data-card-href]:hover,.js-enabled .notification-row[data-card-form]:hover{border-color:var(--border-strong);background:var(--hover)}.notification-kind{display:grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--surface-muted);color:var(--link-strong);font-weight:900;font-size:.8rem}.notification-row.unread .notification-kind{background:var(--brand);color:var(--brand-text)}.notification-body{min-width:0}.notification-line{margin:0;overflow-wrap:anywhere}.notification-meta{margin:.35rem 0 0;color:var(--muted);font-size:.88rem}.notification-counts{color:var(--muted-strong);font-weight:800}.notification-preview{display:block;margin:.5rem 0 0;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle);color:var(--muted-strong);overflow-wrap:anywhere}.notification-preview:hover{background:var(--surface);text-decoration:none}.notification-preview.unavailable{border-style:dashed}.notification-actors{margin:.45rem 0 0}.notification-actors summary{display:inline-flex;align-items:center;min-height:1.7rem;color:var(--link-strong);font-weight:800;cursor:pointer}.notification-actors ul{list-style:none;margin:.25rem 0 0;padding:0;display:flex;flex-wrap:wrap;gap:.35rem}.notification-actors li{border:1px solid var(--border);border-radius:999px;background:var(--surface-subtle);padding:.16rem .5rem;font-size:.88rem}.notification-open-form{display:flex;align-items:flex-start}.notification-open{min-height:2rem;padding:.3rem .55rem;background:var(--surface);border-color:var(--border)}.unread-dot{width:.65rem;height:.65rem;border-radius:999px;background:var(--brand);margin-top:.7rem}
 label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button,select{font:inherit}input[type=text],input[type=search],input[type=password],input[type=url],input:not([type]),textarea,select{width:100%;padding:.72rem .8rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text)}textarea{resize:vertical;min-height:7rem}::placeholder{color:var(--muted)}
 input[type=checkbox]{accent-color:var(--brand)}.check-row,.theme-toggle{display:flex;align-items:center;gap:.55rem;font-weight:700;color:var(--text)}.theme-toggle{padding:.65rem .75rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle)}.theme-toggle input{width:auto}
 input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{display:none;background:var(--surface);color:var(--link-strong);border-color:var(--border);min-width:4.5rem}.js-enabled .password-toggle{display:inline-block}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}.auth-form .field-help{margin:.15rem 0 .4rem;color:var(--muted-strong)}
 .search-panel h1{margin-bottom:.75rem}.search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center}.search-form input{min-width:0}.search-results{display:grid;gap:.65rem}.section-title{margin:.2rem 0 .65rem;font-size:1.05rem;color:var(--text)}.search-users{margin-bottom:0}.search-users .section-title{margin-top:0}.search-account{grid-template-columns:auto minmax(0,1fr)}
 input:focus,textarea:focus,select:focus,button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}button,.primary{border:1px solid var(--brand);background:var(--brand);color:var(--brand-text);border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:var(--brand-hover);text-decoration:none}button:disabled,.primary:disabled,button:disabled:hover,.primary:disabled:hover{border-color:var(--border);background:var(--surface-muted);color:var(--muted);cursor:not-allowed;opacity:1}
 nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.42rem .65rem}.rail-nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.5rem .65rem}.rail-nav button:hover,.mobile-nav button:hover{background:var(--hover);color:var(--link-strong)}
-.composer-surface{border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);overflow:hidden}.composer-surface textarea{border:0;border-radius:0;background:transparent;min-height:7rem;resize:vertical}.composer-surface textarea:focus{outline:0;box-shadow:inset 0 0 0 3px var(--focus)}.composer-footer{display:flex;align-items:center;justify-content:space-between;gap:.55rem;border-top:1px solid var(--border);padding:.42rem .5rem;background:var(--surface-subtle)}.composer-file-control{position:relative;display:inline-flex;align-items:center;gap:.45rem;max-width:100%;margin:0;color:var(--link-strong);font-weight:800}.composer-file-input{max-width:100%;color:var(--muted-strong)}.composer-file-input::file-selector-button{border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.34rem .58rem;font-weight:800;cursor:pointer}.composer-file-input::file-selector-button:hover{background:var(--hover);color:var(--text-strong)}.composer-file-button{display:none}.js-enabled .composer-file-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.js-enabled .composer-file-button{display:inline-flex;align-items:center;gap:.38rem;min-height:2rem;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.3rem .55rem;cursor:pointer}.composer-file-button svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.js-enabled .composer-file-control:hover .composer-file-button{background:var(--hover);color:var(--text-strong)}.js-enabled .composer-file-input:focus-visible+.composer-file-button{outline:3px solid var(--focus);outline-offset:2px}.composer-media-selection[hidden]{display:none}.composer-media-selection{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;border-top:1px solid var(--border);padding:.5rem;background:var(--surface)}.composer-media-summary{font-weight:800;color:var(--muted-strong);overflow-wrap:anywhere}.composer-nsfw{margin:0}.composer-clear-media{background:var(--surface);color:var(--link-strong);border-color:var(--border);padding:.32rem .55rem}.composer-clear-media:hover{background:var(--hover);color:var(--text-strong)}.composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}
+.composer-surface{position:relative;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);overflow:visible}.composer-surface textarea{border:0;border-radius:0;background:transparent;min-height:7rem;resize:vertical}.composer-surface textarea:focus{outline:0;box-shadow:inset 0 0 0 3px var(--focus)}.mention-menu[hidden]{display:none}.mention-menu{position:absolute;z-index:9;left:.55rem;right:.55rem;top:3.1rem;max-height:12rem;overflow:auto;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 8px 24px var(--shadow);padding:.25rem}.mention-option{display:grid;width:100%;grid-template-columns:minmax(0,1fr) auto;gap:.65rem;align-items:center;border:0;border-radius:6px;background:transparent;color:var(--text);padding:.42rem .5rem;text-align:left}.mention-option:hover,.mention-option[aria-selected="true"]{background:var(--hover);color:var(--text-strong)}.mention-name{font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mention-handle{color:var(--muted);font-size:.9rem}.composer-footer{display:flex;align-items:center;justify-content:space-between;gap:.55rem;border-top:1px solid var(--border);padding:.42rem .5rem;background:var(--surface-subtle)}.composer-file-control{position:relative;display:inline-flex;align-items:center;gap:.45rem;max-width:100%;margin:0;color:var(--link-strong);font-weight:800}.composer-file-input{max-width:100%;color:var(--muted-strong)}.composer-file-input::file-selector-button{border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.34rem .58rem;font-weight:800;cursor:pointer}.composer-file-input::file-selector-button:hover{background:var(--hover);color:var(--text-strong)}.composer-file-button{display:none}.js-enabled .composer-file-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.js-enabled .composer-file-button{display:inline-flex;align-items:center;gap:.38rem;min-height:2rem;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.3rem .55rem;cursor:pointer}.composer-file-button svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.js-enabled .composer-file-control:hover .composer-file-button{background:var(--hover);color:var(--text-strong)}.js-enabled .composer-file-input:focus-visible+.composer-file-button{outline:3px solid var(--focus);outline-offset:2px}.composer-media-selection[hidden]{display:none}.composer-media-selection{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;border-top:1px solid var(--border);padding:.5rem;background:var(--surface)}.composer-media-summary{font-weight:800;color:var(--muted-strong);overflow-wrap:anywhere}.composer-nsfw{margin:0}.composer-clear-media{background:var(--surface);color:var(--link-strong);border-color:var(--border);padding:.32rem .55rem}.composer-clear-media:hover{background:var(--hover);color:var(--text-strong)}.composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}
 .thread-nav{display:flex;margin:0 0 .45rem .85rem}.thread-back{width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:var(--link-strong)}.thread-back svg{width:1.2rem;height:1.2rem;fill:currentColor}.thread-back:hover{background:var(--hover);text-decoration:none}
 .timeline{display:grid;gap:.65rem}.post{overflow:hidden;position:relative}.js-enabled .post[data-card-href]{cursor:pointer}.js-enabled .post[data-card-href]:hover{border-color:var(--border-strong)}.reply-post{margin-left:1.1rem;border-left:4px solid var(--reply-border);background:var(--surface-subtle)}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid var(--reply-border)}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid var(--border);background:var(--avatar-bg);flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:var(--muted-strong);font-weight:800}.author-name{font-weight:800;color:var(--text-strong)}.username,.post-time,.counts{color:var(--muted);font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-top:.5rem;background:var(--media-bg)}.post img.post-avatar{display:block;margin:0;border-radius:999px}.youtube-previews{display:grid;gap:.45rem;margin:.35rem 0 .55rem}.youtube-preview-card{display:grid;grid-template-columns:minmax(5.5rem,7.5rem) minmax(0,1fr);gap:.65rem;align-items:center;min-height:4.5rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);color:var(--text);overflow:hidden}.youtube-preview-card:hover{border-color:var(--border-strong);background:var(--hover);text-decoration:none}.youtube-thumbnail-frame{position:relative;display:block;width:100%;aspect-ratio:16/9;overflow:hidden;background:var(--media-bg)}.post img.youtube-thumbnail{width:100%;height:100%;object-fit:cover;margin:0;border:0;border-radius:0}.youtube-play{position:absolute;left:50%;top:50%;width:2rem;height:2rem;border-radius:999px;background:rgba(0,0,0,.68);transform:translate(-50%,-50%)}.youtube-play::before{content:"";position:absolute;left:.78rem;top:.55rem;border-top:.45rem solid transparent;border-bottom:.45rem solid transparent;border-left:.65rem solid #fff}.youtube-preview-body{display:grid;gap:.08rem;min-width:0;padding:.45rem .55rem .45rem 0}.youtube-preview-source{color:var(--muted);font-size:.78rem;font-weight:900;text-transform:uppercase}.youtube-preview-title{color:var(--text-strong);font-weight:850;overflow-wrap:anywhere}.youtube-preview-url{color:var(--muted-strong);font-size:.86rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nsfw-media{position:relative;margin-top:.5rem}.nsfw-media .post img,.nsfw-media .post video{margin-top:0}.nsfw-media-frame{position:relative;display:block;overflow:hidden;border-radius:8px}.nsfw-media-frame img,.nsfw-media-frame video{margin-top:0;filter:blur(24px);transform:scale(1.02)}.nsfw-toggle:checked+.nsfw-media-frame img,.nsfw-toggle:checked+.nsfw-media-frame video{filter:none;transform:none}.nsfw-badge{position:absolute;left:.55rem;bottom:.55rem;border-radius:999px;padding:.18rem .5rem;background:rgba(0,0,0,.72);color:#fff;font-size:.78rem;font-weight:900;letter-spacing:.03em}.nsfw-show{position:absolute;right:.55rem;bottom:.55rem;margin:0;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text-strong);padding:.32rem .65rem;font-weight:900;box-shadow:0 1px 2px var(--shadow);cursor:pointer}.nsfw-show:hover{background:var(--hover)}.nsfw-toggle:focus-visible~.nsfw-show{outline:3px solid var(--focus);outline-offset:2px}.nsfw-toggle:checked~.nsfw-show,.nsfw-toggle:checked+.nsfw-media-frame .nsfw-badge{display:none}
 .counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.edited-marker{font-weight:800;color:var(--muted-strong)}.post-permalink{font-weight:700;color:var(--link-strong)}.js-enabled .post-permalink{display:none}.actions{display:inline-flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem;max-width:100%}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.admin-nsfw-button{min-height:2.2rem;padding:.3rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border);font-size:.86rem}.admin-nsfw-button:hover{background:var(--hover);color:var(--text-strong)}.repost-control{position:relative;display:inline-flex;align-items:center;gap:.25rem}.repost-menu{position:absolute;z-index:8;left:0;top:calc(100% + .25rem);min-width:8.5rem;padding:.3rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 6px 18px var(--shadow)}.repost-menu a{display:inline-flex;align-items:center;gap:.35rem;width:100%;min-height:2rem;border-radius:6px;padding:.32rem .55rem;color:var(--link-strong);font-weight:700}.repost-menu a svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.repost-menu a:hover,.quote-fallback:hover{background:var(--hover);text-decoration:none}.quote-preview{display:block;margin:.6rem 0 .25rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);overflow:hidden}.quote-preview p{margin:.65rem;color:var(--muted-strong)}.quote-link{display:grid;gap:.2rem;padding:.6rem;color:var(--text)}.quote-link:hover{background:var(--hover);text-decoration:none}.quote-author{font-weight:800}.quote-text{white-space:pre-wrap;overflow-wrap:anywhere}.quote-time{color:var(--muted);font-size:.86rem}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}.noscript-banner{max-width:1100px;margin:.7rem auto 0;padding:.65rem .85rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle);color:var(--muted-strong)}
@@ -2416,6 +2835,9 @@ mod tests {
         assert!(
             client_script().contains(r#"document.documentElement.classList.add("js-enabled")"#)
         );
+        assert!(client_script().contains("data-mention-autocomplete"));
+        assert!(client_script().contains("textContent = suggestion.display_name"));
+        assert!(!client_script().contains("innerHTML = suggestion"));
         assert!(
             client_boot_script()
                 .contains(r#"document.documentElement.classList.add("js-enabled")"#)
@@ -2622,6 +3044,10 @@ mod tests {
         assert!(post.contains(r#"class="muted character-counter character-counter-normal""#));
         assert!(post.contains(r#"aria-live="polite""#));
         assert!(post.contains("data-character-limit=\"512\""));
+        assert!(post.contains("data-mention-autocomplete"));
+        assert!(post.contains(r#"aria-autocomplete="list""#));
+        assert!(post.contains(r#"role="listbox" data-mention-menu hidden"#));
+        assert!(post.contains(r#"aria-controls="post-text-mention-menu""#));
         assert!(!post.contains("maxlength="));
         assert!(post.contains("What is happening?"));
         assert!(post.contains(r#"placeholder="What's happening?""#));
@@ -2640,6 +3066,7 @@ mod tests {
         let reply = composer(Some("csrf"), Some(10), 512);
         assert!(reply.contains(r#"id="reply-text-10""#));
         assert!(reply.contains(r#"data-character-counter="reply-text-10""#));
+        assert!(reply.contains(r#"aria-controls="reply-text-10-mention-menu""#));
         assert!(reply.contains(r#"id="reply-media-10" name="media" type="file""#));
         assert!(reply.contains(r#"id="reply-nsfw-10" name="nsfw" type="checkbox""#));
         assert!(reply.contains(r#"placeholder="Write a reply...""#));
