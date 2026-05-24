@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use rusqlite::{Connection, OptionalExtension as _, Row, params, params_from_iter};
 
 use crate::config::Settings;
@@ -27,6 +29,7 @@ pub struct PostView {
     pub text: String,
     pub parent_post_id: Option<i64>,
     pub created_at: String,
+    pub edited_at: Option<String>,
     pub event_created_at: String,
     pub like_count: i64,
     pub repost_count: i64,
@@ -35,6 +38,7 @@ pub struct PostView {
     pub viewer_bookmarked: bool,
     pub viewer_reposted: bool,
     pub viewer_can_repost: bool,
+    pub pinned_by_author: bool,
     pub original_unavailable: bool,
     pub reposted_by_user_id: Option<i64>,
     pub reposted_by_username: Option<String>,
@@ -109,16 +113,71 @@ struct PostRow {
     text: String,
     parent_post_id: Option<i64>,
     created_at: String,
+    edited_at: Option<String>,
     like_count: i64,
     repost_count: i64,
     reply_count: i64,
     quote_post_id: Option<i64>,
+    pinned_by_author: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuotePostOutcome {
     pub post_id: i64,
     pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditPostError {
+    NotFound,
+    Forbidden,
+    WindowExpired,
+    Validation(String),
+    Database(String),
+}
+
+impl std::fmt::Display for EditPostError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("post not found"),
+            Self::Forbidden => formatter.write_str("cannot edit this post"),
+            Self::WindowExpired => formatter.write_str("the edit window for this post has expired"),
+            Self::Validation(message) | Self::Database(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for EditPostError {}
+
+impl From<rusqlite::Error> for EditPostError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinPostError {
+    NotFound,
+    Forbidden,
+    Database(String),
+}
+
+impl std::fmt::Display for PinPostError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("post not found"),
+            Self::Forbidden => formatter.write_str("cannot pin this post"),
+            Self::Database(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PinPostError {}
+
+impl From<rusqlite::Error> for PinPostError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.to_string())
+    }
 }
 
 pub async fn create_post(
@@ -188,6 +247,84 @@ pub async fn create_post(
     .await
 }
 
+pub async fn edit_post(
+    pool: &SqlitePool,
+    settings: &Settings,
+    user_id: i64,
+    post_id: i64,
+    text: &str,
+) -> Result<bool, EditPostError> {
+    let max_text_chars = settings.posts.max_text_chars;
+    let edit_window_modifier = edit_window_modifier(settings.posts.post_edit_window_seconds);
+    let raw_text = text.to_owned();
+    pool.call(move |conn| {
+        let result: Result<bool, EditPostError> = (|| {
+            let tx = conn.transaction()?;
+            let row = tx
+                .query_row(
+                    r#"
+                    SELECT p.user_id, p.text,
+                      CASE
+                        WHEN ? IS NULL THEN 0
+                        ELSE p.created_at >= datetime('now', ?)
+                      END AS within_window,
+                      (SELECT COUNT(*) FROM post_media WHERE post_id = p.id) AS media_count
+                    FROM posts p
+                    WHERE p.id = ? AND p.is_deleted = 0
+                    "#,
+                    params![
+                        edit_window_modifier.clone(),
+                        edit_window_modifier,
+                        post_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)? != 0,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((owner, current_text, within_window, media_count)) = row else {
+                return Err(EditPostError::NotFound);
+            };
+            if owner != Some(user_id) {
+                return Err(EditPostError::Forbidden);
+            }
+            if !within_window {
+                return Err(EditPostError::WindowExpired);
+            }
+            let media_count = usize::try_from(media_count).unwrap_or(usize::MAX);
+            let text = clean_post_text(&raw_text, max_text_chars, media_count)
+                .map_err(|err| EditPostError::Validation(err.to_string()))?;
+            if text == current_text {
+                tx.commit()?;
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE posts SET text = ?, edited_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ? AND is_deleted = 0",
+                params![text, post_id, user_id],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })();
+        Ok(result)
+    })
+    .await
+    .map_err(|err| EditPostError::Database(err.to_string()))?
+}
+
+fn edit_window_modifier(seconds: u64) -> Option<String> {
+    if seconds == 0 {
+        return None;
+    }
+    i64::try_from(seconds)
+        .ok()
+        .map(|seconds| format!("-{seconds} seconds"))
+}
+
 pub async fn timeline(
     pool: &SqlitePool,
     viewer_id: Option<i64>,
@@ -223,6 +360,26 @@ pub async fn profile_timeline(
     });
     posts.truncate(40);
     Ok(posts)
+}
+
+pub async fn profile_pinned_post(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+) -> anyhow::Result<Option<PostView>> {
+    let mut sql = base_post_query();
+    sql.push_str(
+        " AND p.id = (SELECT pinned_post_id FROM users WHERE id = ? AND is_deleted = 0) AND p.user_id = ?",
+    );
+    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    sql.push_str(" LIMIT 1");
+    let mut bindings = vec![user_id, user_id];
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
+    let rows = pool
+        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
+        .await?;
+    let mut posts = rows_to_posts(pool, rows, viewer_id).await?;
+    Ok(posts.pop())
 }
 
 pub async fn post_thread(
@@ -370,6 +527,18 @@ pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> an
     }
     pool.call(move |conn| {
         let tx = conn.transaction()?;
+        let target_available = tx
+            .query_row(
+                "SELECT is_deleted = 0 AND is_suspended = 0 FROM users WHERE id = ?",
+                [followed_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            != 0;
+        if !target_available {
+            anyhow::bail!("account cannot be followed");
+        }
         let changed = tx.execute(
             "INSERT OR IGNORE INTO follows (follower_id, followed_id) VALUES (?, ?)",
             params![follower_id, followed_id],
@@ -388,6 +557,36 @@ pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> an
         Ok(changed > 0)
     })
     .await
+}
+
+pub async fn active_follow_targets(pool: &SqlitePool, ids: &[i64]) -> anyhow::Result<Vec<i64>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!(
+        "SELECT id FROM users WHERE id IN ({placeholders}) AND is_deleted = 0 AND is_suspended = 0"
+    );
+    let candidate_ids = ids.to_vec();
+    let query_ids = candidate_ids.clone();
+    let available = pool
+        .call(move |conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params_from_iter(query_ids.iter()), |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    Ok(candidate_ids
+        .iter()
+        .copied()
+        .filter(|id| available.contains(id))
+        .collect())
 }
 
 pub async fn unfollow(
@@ -480,6 +679,47 @@ pub async fn following_accounts(
                     bio: row.get(3)?,
                     profile_picture_path: row.get(4)?,
                     viewer_following: true,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+pub async fn onboarding_suggestions(
+    pool: &SqlitePool,
+    viewer_id: i64,
+    limit: usize,
+) -> anyhow::Result<Vec<AccountView>> {
+    let limit = i64::try_from(limit)?;
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name, u.bio,
+              COALESCE(pic.thumbnail_public_path, pic.public_path),
+              EXISTS(
+                SELECT 1 FROM follows vf
+                WHERE vf.follower_id = ? AND vf.followed_id = u.id
+              )
+            FROM users u
+            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+            WHERE u.id != ?
+              AND u.is_deleted = 0
+              AND u.is_suspended = 0
+            ORDER BY lower(u.username), u.id
+            LIMIT ?
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![viewer_id, viewer_id, limit], |row| {
+                Ok(AccountView {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    display_name: row.get(2)?,
+                    bio: row.get(3)?,
+                    profile_picture_path: row.get(4)?,
+                    viewer_following: row.get::<_, i64>(5)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -792,6 +1032,61 @@ pub async fn unbookmark(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow
     .await
 }
 
+pub async fn pinned_post_id(pool: &SqlitePool, user_id: i64) -> anyhow::Result<Option<i64>> {
+    pool.call(move |conn| {
+        conn.query_row(
+            "SELECT pinned_post_id FROM users WHERE id = ? AND is_deleted = 0",
+            [user_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(std::option::Option::flatten)
+        .map_err(Into::into)
+    })
+    .await
+}
+
+pub async fn pin_post(pool: &SqlitePool, user_id: i64, post_id: i64) -> Result<(), PinPostError> {
+    pool.call(move |conn| {
+        let result: Result<(), PinPostError> = (|| {
+            let tx = conn.transaction()?;
+            let owner = tx
+                .query_row(
+                    "SELECT user_id FROM posts WHERE id = ? AND is_deleted = 0",
+                    [post_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?;
+            let Some(owner) = owner else {
+                return Err(PinPostError::NotFound);
+            };
+            if owner != Some(user_id) {
+                return Err(PinPostError::Forbidden);
+            }
+            tx.execute(
+                "UPDATE users SET pinned_post_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
+                params![post_id, user_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        Ok(result)
+    })
+    .await
+    .map_err(|err| PinPostError::Database(err.to_string()))?
+}
+
+pub async fn unpin_post(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<bool> {
+    pool.call(move |conn| {
+        let changed = conn.execute(
+            "UPDATE users SET pinned_post_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND pinned_post_id = ?",
+            params![user_id, post_id],
+        )?;
+        Ok(changed > 0)
+    })
+    .await
+}
+
 pub async fn delete_post(
     pool: &SqlitePool,
     actor_id: i64,
@@ -815,6 +1110,10 @@ pub async fn delete_post(
     pool.call(move |conn| {
         conn.execute(
             "UPDATE posts SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [post_id],
+        )?;
+        conn.execute(
+            "UPDATE users SET pinned_post_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE pinned_post_id = ?",
             [post_id],
         )?;
         Ok(())
@@ -1019,11 +1318,13 @@ fn base_post_query() -> String {
       p.id, p.user_id, u.username, u.display_name,
       COALESCE(pic.thumbnail_public_path, pic.public_path) AS profile_picture_path,
       p.anonymous_label, p.text, p.parent_post_id, p.created_at,
+      p.edited_at,
       (SELECT COUNT(*) FROM likes WHERE post_id = p.id) AS like_count,
       ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
        (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0)) AS repost_count,
       (SELECT COUNT(*) FROM posts r WHERE r.parent_post_id = p.id AND r.is_deleted = 0) AS reply_count,
-      p.quote_post_id
+      p.quote_post_id,
+      COALESCE(u.pinned_post_id = p.id, 0) AS pinned_by_author
     FROM posts p
     LEFT JOIN users u ON u.id = p.user_id
     LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
@@ -1039,13 +1340,15 @@ fn base_repost_query() -> String {
       COALESCE(p.id, r.post_id) AS id, p.user_id, u.username, u.display_name,
       COALESCE(pic.thumbnail_public_path, pic.public_path) AS profile_picture_path, p.anonymous_label,
       COALESCE(p.text, '') AS text, p.parent_post_id, COALESCE(p.created_at, r.created_at) AS created_at,
+      p.edited_at,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM likes WHERE post_id = p.id) END AS like_count,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE
         ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
          (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0))
       END AS repost_count,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM posts replies WHERE replies.parent_post_id = p.id AND replies.is_deleted = 0) END AS reply_count,
-      p.quote_post_id
+      p.quote_post_id,
+      CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE COALESCE(u.pinned_post_id = p.id, 0) END AS pinned_by_author
     FROM reposts r
     JOIN users ru ON ru.id = r.user_id
     LEFT JOIN posts p ON p.id = r.post_id
@@ -1201,10 +1504,12 @@ fn map_post_row(row: &Row<'_>) -> rusqlite::Result<PostRow> {
         text: row.get(14)?,
         parent_post_id: row.get(15)?,
         created_at: row.get(16)?,
-        like_count: row.get(17)?,
-        repost_count: row.get(18)?,
-        reply_count: row.get(19)?,
-        quote_post_id: row.get(20)?,
+        edited_at: row.get(17)?,
+        like_count: row.get(18)?,
+        repost_count: row.get(19)?,
+        reply_count: row.get(20)?,
+        quote_post_id: row.get(21)?,
+        pinned_by_author: row.get::<_, i64>(22)? != 0,
     })
 }
 
@@ -1256,6 +1561,7 @@ async fn rows_to_posts(
             text: row.text,
             parent_post_id: row.parent_post_id,
             created_at: row.created_at,
+            edited_at: row.edited_at,
             event_created_at: row.event_created_at,
             like_count: row.like_count,
             repost_count: row.repost_count,
@@ -1264,6 +1570,7 @@ async fn rows_to_posts(
             viewer_bookmarked,
             viewer_reposted,
             viewer_can_repost,
+            pinned_by_author: row.pinned_by_author,
             original_unavailable,
             reposted_by_user_id: row.repost_user_id,
             reposted_by_username: row.repost_username,
@@ -2284,6 +2591,37 @@ mod tests {
         );
         assert!(
             !is_following(&pool, bob, alice)
+                .await
+                .expect("not following")
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_rejects_deleted_or_suspended_targets() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        pool.call(move |conn| {
+            conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [bob])?;
+            conn.execute("UPDATE users SET is_deleted = 1 WHERE id = ?", [carol])?;
+            Ok(())
+        })
+        .await
+        .expect("mark unavailable");
+
+        let suspended = follow(&pool, alice, bob).await.expect_err("suspended");
+        let deleted = follow(&pool, alice, carol).await.expect_err("deleted");
+
+        assert_eq!(suspended.to_string(), "account cannot be followed");
+        assert_eq!(deleted.to_string(), "account cannot be followed");
+        assert!(
+            !is_following(&pool, alice, bob)
+                .await
+                .expect("not following")
+        );
+        assert!(
+            !is_following(&pool, alice, carol)
                 .await
                 .expect("not following")
         );
