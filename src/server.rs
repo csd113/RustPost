@@ -238,6 +238,11 @@ struct SearchQuery {
 }
 
 #[derive(Deserialize)]
+struct ProfileQuery {
+    tab: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct MentionSuggestionsQuery {
     q: Option<String>,
 }
@@ -296,6 +301,7 @@ struct ParsedProfileUpdate {
     delete_profile_picture: bool,
     delete_banner: bool,
     nsfw_blur_enabled: bool,
+    liked_posts_public: bool,
     profile_picture_media_id: Option<i64>,
     banner_media_id: Option<i64>,
 }
@@ -1448,6 +1454,33 @@ async fn reply_redirect(Path(id): Path<i64>) -> Redirect {
     Redirect::to(&format!("/posts/{id}"))
 }
 
+fn profile_tab_from_query(tab: Option<&str>) -> social::ProfileTimelineTab {
+    match tab {
+        Some("replies") => social::ProfileTimelineTab::Replies,
+        Some("media") => social::ProfileTimelineTab::Media,
+        Some("likes") => social::ProfileTimelineTab::Likes,
+        _ => social::ProfileTimelineTab::Posts,
+    }
+}
+
+fn profile_tab_empty_state(tab: social::ProfileTimelineTab) -> render::EmptyState<'static> {
+    match tab {
+        social::ProfileTimelineTab::Posts => {
+            render::EmptyState::new("No posts yet.", "This profile has not posted yet.")
+        }
+        social::ProfileTimelineTab::Replies => {
+            render::EmptyState::new("No replies yet.", "This profile has not replied yet.")
+        }
+        social::ProfileTimelineTab::Media => render::EmptyState::new(
+            "No media posts yet.",
+            "Media posts and replies will appear here.",
+        ),
+        social::ProfileTimelineTab::Likes => {
+            render::EmptyState::new("No likes yet.", "Liked posts will appear here.")
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "profile rendering combines existing viewer controls and page assembly in one route handler"
@@ -1456,8 +1489,10 @@ async fn profile(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(username): Path<String>,
+    Query(query): Query<ProfileQuery>,
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
+    let active_tab = profile_tab_from_query(query.tab.as_deref());
     let profile = state
         .pool
         .call(move |conn| {
@@ -1465,7 +1500,8 @@ async fn profile(
                 r#"
         SELECT u.id, u.username, u.display_name, u.bio, u.location, u.website,
           pic.public_path AS profile_picture_path,
-          banner.public_path AS banner_path
+          banner.public_path AS banner_path,
+          u.liked_posts_public
         FROM users u
         LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
         LEFT JOIN media banner ON banner.id = u.banner_media_id
@@ -1482,6 +1518,7 @@ async fn profile(
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)? != 0,
                     ))
                 },
             )
@@ -1498,14 +1535,24 @@ async fn profile(
         website,
         picture_path,
         banner_path,
+        liked_posts_public,
     )) = profile
     else {
         return Err(AppError::NotFound);
     };
     let csrf = form_csrf(&state, &headers).await;
     let viewer_id = user.as_ref().map(|u| u.id);
-    let pinned_post = social::profile_pinned_post(&state.pool, viewer_id, profile_id).await?;
-    let mut posts = social::profile_timeline(&state.pool, viewer_id, profile_id).await?;
+    let likes_visible = liked_posts_public || viewer_id == Some(profile_id);
+    let pinned_post = if active_tab == social::ProfileTimelineTab::Posts {
+        social::profile_pinned_post(&state.pool, viewer_id, profile_id).await?
+    } else {
+        None
+    };
+    let mut posts = if active_tab == social::ProfileTimelineTab::Likes && !likes_visible {
+        Vec::new()
+    } else {
+        social::profile_tab_timeline(&state.pool, viewer_id, profile_id, active_tab).await?
+    };
     if let Some(pinned) = pinned_post.as_ref() {
         posts.retain(|post| {
             !(post.event_kind == social::TimelineEventKind::Post && post.id == pinned.id)
@@ -1557,8 +1604,21 @@ async fn profile(
             state.settings.posts.post_edit_window_seconds,
         )
     });
+    let tabs = render::profile_tabs(&profile_username, active_tab);
+    let timeline = if active_tab == social::ProfileTimelineTab::Likes && !likes_visible {
+        render::empty_state("This user’s likes are private", "")
+    } else {
+        render::posts_with_controls_empty_state(
+            &posts,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+            state.settings.posts.post_edit_window_seconds,
+            profile_tab_empty_state(active_tab),
+        )
+    };
     let body = format!(
-        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p>{}<p>{}</p>{}</div></div></section>{}{}"#,
+        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p>{}<p>{}</p>{}</div></div></section>{}{}{}"#,
         banner,
         picture,
         html_escape::encode_text(display_name.as_str()),
@@ -1572,14 +1632,8 @@ async fn profile(
         html_escape::encode_text(bio.as_str()),
         website_link,
         pinned,
-        render::posts_with_controls_empty_state(
-            &posts,
-            user.as_ref(),
-            csrf.as_deref(),
-            blur_nsfw_media(&state, user.as_ref()),
-            state.settings.posts.post_edit_window_seconds,
-            render::EmptyState::new("No posts yet.", "This profile has not posted yet."),
-        )
+        tabs,
+        timeline
     );
     Ok(Html(
         page_layout(
@@ -1812,6 +1866,7 @@ struct SettingsProfile {
     website: String,
     theme: String,
     nsfw_blur_enabled: bool,
+    liked_posts_public: bool,
     picture_path: Option<String>,
     banner_path: Option<String>,
 }
@@ -1821,6 +1876,7 @@ async fn settings_profile(pool: &SqlitePool, user_id: i64) -> AppResult<Settings
         conn.query_row(
             r#"
         SELECT u.display_name, u.bio, u.location, u.website, u.theme, u.nsfw_blur_enabled,
+          u.liked_posts_public,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path
         FROM users u
@@ -1837,8 +1893,9 @@ async fn settings_profile(pool: &SqlitePool, user_id: i64) -> AppResult<Settings
                     website: row.get(3)?,
                     theme: row.get(4)?,
                     nsfw_blur_enabled: row.get::<_, i64>(5)? != 0,
-                    picture_path: row.get(6)?,
-                    banner_path: row.get(7)?,
+                    liked_posts_public: row.get::<_, i64>(6)? != 0,
+                    picture_path: row.get(7)?,
+                    banner_path: row.get(8)?,
                 })
             },
         )
@@ -2029,6 +2086,11 @@ async fn settings_page(
     } else {
         ""
     };
+    let liked_posts_public_checked = if profile.liked_posts_public {
+        " checked"
+    } else {
+        ""
+    };
     let notice_html =
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
     let password_hint = if state.settings.accounts.min_password_length == 0 {
@@ -2054,11 +2116,12 @@ async fn settings_page(
         state.settings.accounts.allow_profile_banners,
     );
     let body = format!(
-        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><label class="theme-toggle" for="nsfw_blur_enabled"><input id="nsfw_blur_enabled" name="nsfw_blur_enabled" type="checkbox" value="true"{}> Blur NSFW media</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Blocked users</h2>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted users</h2>{}</section></div><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
+        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><label class="theme-toggle" for="nsfw_blur_enabled"><input id="nsfw_blur_enabled" name="nsfw_blur_enabled" type="checkbox" value="true"{}> Blur NSFW media</label><label class="theme-toggle" for="liked_posts_public"><input id="liked_posts_public" name="liked_posts_public" type="checkbox" value="true"{}> Make liked posts public</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Blocked users</h2>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted users</h2>{}</section></div><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         profile_media,
         dark_checked,
         nsfw_checked,
+        liked_posts_public_checked,
         html_escape::encode_double_quoted_attribute(profile.display_name.as_str()),
         html_escape::encode_text(profile.bio.as_str()),
         html_escape::encode_double_quoted_attribute(profile.location.as_str()),
@@ -2106,12 +2169,22 @@ async fn settings_update(
     let website = form.website.trim().to_owned();
     let theme = form.theme.as_str().to_owned();
     let nsfw_blur_enabled = i64::from(form.nsfw_blur_enabled);
+    let liked_posts_public = i64::from(form.liked_posts_public);
     state
         .pool
         .call(move |conn| {
             conn.execute(
-                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, nsfw_blur_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                params![display_name, bio, location, website, theme, nsfw_blur_enabled, user.id],
+                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, nsfw_blur_enabled = ?, liked_posts_public = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                params![
+                    display_name,
+                    bio,
+                    location,
+                    website,
+                    theme,
+                    nsfw_blur_enabled,
+                    liked_posts_public,
+                    user.id
+                ],
             )?;
             Ok(())
         })
@@ -2459,6 +2532,7 @@ async fn parse_profile_update(
         delete_profile_picture: false,
         delete_banner: false,
         nsfw_blur_enabled: false,
+        liked_posts_public: false,
         profile_picture_media_id: None,
         banner_media_id: None,
     };
@@ -2506,6 +2580,9 @@ async fn parse_profile_update(
             }
             "nsfw_blur_enabled" => {
                 form.nsfw_blur_enabled = true;
+            }
+            "liked_posts_public" => {
+                form.liked_posts_public = true;
             }
             "delete_profile_picture" => {
                 form.delete_profile_picture = true;
@@ -5989,6 +6066,122 @@ mod tests {
                 .contains(r#"data-profile-followers="1">1 followers"#)
         );
         assert!(!profile.body.contains(">Unfollow</button>"));
+    }
+
+    #[tokio::test]
+    async fn profile_tabs_render_labels_active_state_and_plain_links() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        assert_eq!(profile.status, 200);
+        assert!(profile.body.contains(r#"data-testid="profile-tabs""#));
+        assert!(
+            profile
+                .body
+                .contains(r#"<a href="/users/alice" class="active" aria-current="page">Posts</a>"#)
+        );
+        assert!(
+            profile
+                .body
+                .contains(r#"<a href="/users/alice?tab=replies">Replies</a>"#)
+        );
+        assert!(
+            profile
+                .body
+                .contains(r#"<a href="/users/alice?tab=media">Media</a>"#)
+        );
+        assert!(
+            profile
+                .body
+                .contains(r#"<a href="/users/alice?tab=likes">Likes</a>"#)
+        );
+        assert_eq!(profile.body.matches(r#"aria-current="page""#).count(), 1);
+
+        let replies = request(
+            &server.base_url,
+            "GET",
+            "/users/alice?tab=replies",
+            &[
+                ("cookie", &cookie),
+                ("user-agent", "Mozilla/5.0 Firefox/115.0"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(replies.status, 200);
+        assert!(replies.body.contains(
+            r#"<a href="/users/alice?tab=replies" class="active" aria-current="page">Replies</a>"#
+        ));
+        assert_eq!(replies.body.matches(r#"aria-current="page""#).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn profile_likes_tab_respects_public_and_private_visibility() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "privacy target post").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let csrf = csrf_token(&bob_home.body);
+        let liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(liked.status, 303);
+
+        let public_likes = get_with_cookie(&server, "/users/bob?tab=likes", &alice_cookie).await;
+        assert_eq!(public_likes.status, 200);
+        assert!(public_likes.body.contains("privacy target post"));
+        assert!(!public_likes.body.contains("This user’s likes are private"));
+
+        let settings = get_with_cookie(&server, "/settings", &bob_cookie).await;
+        assert_eq!(settings.status, 200);
+        assert!(settings.body.contains(
+            r#"id="liked_posts_public" name="liked_posts_public" type="checkbox" value="true" checked"#
+        ));
+        let csrf = csrf_token(&settings.body);
+        let saved = request(
+            &server.base_url,
+            "POST",
+            "/settings",
+            &[
+                ("cookie", &bob_cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=settings-boundary",
+                ),
+            ],
+            multipart_body(
+                "settings-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("display_name", "bob"),
+                    ("bio", ""),
+                    ("location", ""),
+                    ("website", ""),
+                ],
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(saved.status, 303);
+
+        let private_likes = get_with_cookie(&server, "/users/bob?tab=likes", &alice_cookie).await;
+        assert_eq!(private_likes.status, 200);
+        assert_empty_state(&private_likes.body, "This user’s likes are private", "");
+        assert!(!private_likes.body.contains("privacy target post"));
+        assert!(!private_likes.body.contains("liked by bob"));
+        assert!(!private_likes.body.contains("bob liked"));
+
+        let owner_likes = get_with_cookie(&server, "/users/bob?tab=likes", &bob_cookie).await;
+        assert_eq!(owner_likes.status, 200);
+        assert!(owner_likes.body.contains("privacy target post"));
+        assert!(!owner_likes.body.contains("This user’s likes are private"));
     }
 
     #[tokio::test]

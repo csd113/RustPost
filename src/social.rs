@@ -65,6 +65,23 @@ pub enum TimelineEventKind {
     Repost,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileTimelineTab {
+    Posts,
+    Replies,
+    Media,
+    Likes,
+}
+
+impl ProfileTimelineTab {
+    const fn repost_mode(self) -> &'static str {
+        match self {
+            Self::Media => "profile_media",
+            Self::Posts | Self::Replies | Self::Likes => "profile",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MediaView {
     pub public_path: String,
@@ -379,8 +396,24 @@ pub async fn profile_timeline(
     viewer_id: Option<i64>,
     user_id: i64,
 ) -> anyhow::Result<Vec<PostView>> {
-    let mut posts = post_events_for_user(pool, viewer_id, user_id).await?;
-    posts.extend(repost_events(pool, viewer_id, "profile", Some(user_id)).await?);
+    profile_tab_timeline(pool, viewer_id, user_id, ProfileTimelineTab::Posts).await
+}
+
+pub async fn profile_tab_timeline(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+    tab: ProfileTimelineTab,
+) -> anyhow::Result<Vec<PostView>> {
+    let mut posts = match tab {
+        ProfileTimelineTab::Posts => post_events_for_user(pool, viewer_id, user_id).await?,
+        ProfileTimelineTab::Replies => reply_events_for_user(pool, viewer_id, user_id).await?,
+        ProfileTimelineTab::Media => media_events_for_user(pool, viewer_id, user_id).await?,
+        ProfileTimelineTab::Likes => liked_events_for_user(pool, viewer_id, user_id).await?,
+    };
+    if matches!(tab, ProfileTimelineTab::Posts | ProfileTimelineTab::Media) {
+        posts.extend(repost_events(pool, viewer_id, tab.repost_mode(), Some(user_id)).await?);
+    }
     posts.sort_by(|left, right| {
         right
             .event_created_at
@@ -1779,6 +1812,61 @@ async fn post_events_for_user(
     rows_to_posts(pool, rows, viewer_id).await
 }
 
+async fn reply_events_for_user(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+) -> anyhow::Result<Vec<PostView>> {
+    let mut sql = base_post_query();
+    sql.push_str(" AND p.user_id = ? AND p.parent_post_id IS NOT NULL");
+    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    sql.push_str(" ORDER BY p.id DESC LIMIT 40");
+    let mut bindings = vec![user_id];
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
+    let rows = pool
+        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
+        .await?;
+    rows_to_posts(pool, rows, viewer_id).await
+}
+
+async fn media_events_for_user(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+) -> anyhow::Result<Vec<PostView>> {
+    let mut sql = base_post_query();
+    sql.push_str(" AND p.user_id = ? AND ");
+    sql.push_str(&media_surface_condition("p.id", "p.text"));
+    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    sql.push_str(" ORDER BY p.id DESC LIMIT 40");
+    let mut bindings = vec![user_id];
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
+    let rows = pool
+        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
+        .await?;
+    rows_to_posts(pool, rows, viewer_id).await
+}
+
+async fn liked_events_for_user(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+) -> anyhow::Result<Vec<PostView>> {
+    let mut sql = base_post_query();
+    sql.push_str(" AND p.id IN (SELECT post_id FROM likes WHERE user_id = ?)");
+    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    sql.push_str(
+        " ORDER BY (SELECT created_at FROM likes WHERE user_id = ? AND post_id = p.id) DESC, p.id DESC LIMIT 40",
+    );
+    let mut bindings = vec![user_id];
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
+    bindings.push(user_id);
+    let rows = pool
+        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
+        .await?;
+    rows_to_posts(pool, rows, viewer_id).await
+}
+
 async fn repost_events(
     pool: &SqlitePool,
     viewer_id: Option<i64>,
@@ -1791,6 +1879,10 @@ async fn repost_events(
             " AND (r.user_id = ? OR r.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?))",
         ),
         "profile" => sql.push_str(" AND r.user_id = ?"),
+        "profile_media" => {
+            sql.push_str(" AND r.user_id = ? AND ");
+            sql.push_str(&media_surface_condition("p.id", "COALESCE(p.text, '')"));
+        }
         _ => {}
     }
     if viewer_id.is_some() {
@@ -1816,6 +1908,12 @@ async fn repost_events(
         .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
         .await?;
     rows_to_posts(pool, rows, viewer_id).await
+}
+
+fn media_surface_condition(post_id_column: &str, text_column: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM post_media pm WHERE pm.post_id = {post_id_column}) OR instr(lower({text_column}), 'youtube.com/') > 0 OR instr(lower({text_column}), 'youtu.be/') > 0)"
+    )
 }
 
 fn append_viewer_filters(sql: &mut String, user_column: &str, viewer_id: Option<i64>) {
@@ -2728,6 +2826,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_posts_tab_includes_originals_and_reposts_but_excludes_plain_replies() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(&pool, &settings, Some(bob), "bob original", None, &[])
+            .await
+            .expect("original");
+        let parent = create_post(&pool, &settings, Some(alice), "alice parent", None, &[])
+            .await
+            .expect("parent");
+        let reply = create_post(&pool, &settings, Some(bob), "bob reply", Some(parent), &[])
+            .await
+            .expect("reply");
+        repost(&pool, bob, parent).await.expect("repost");
+
+        let posts = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Posts)
+            .await
+            .expect("posts tab");
+
+        assert!(posts.iter().any(|post| post.id == original));
+        assert!(
+            posts
+                .iter()
+                .any(|post| { post.id == parent && post.event_kind == TimelineEventKind::Repost })
+        );
+        assert!(!posts.iter().any(|post| post.id == reply));
+    }
+
+    #[tokio::test]
+    async fn profile_replies_tab_includes_plain_replies() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let parent = create_post(&pool, &settings, Some(alice), "alice parent", None, &[])
+            .await
+            .expect("parent");
+        let reply = create_post(&pool, &settings, Some(bob), "bob reply", Some(parent), &[])
+            .await
+            .expect("reply");
+
+        let replies = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Replies)
+            .await
+            .expect("replies tab");
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].id, reply);
+        assert_eq!(replies[0].parent_post_id, Some(parent));
+    }
+
+    #[tokio::test]
+    async fn profile_media_tab_includes_only_profile_user_media_posts_and_replies() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let plain = create_post(&pool, &settings, Some(bob), "plain", None, &[])
+            .await
+            .expect("plain");
+        let media_post = create_post(&pool, &settings, Some(bob), "with media", None, &[])
+            .await
+            .expect("media post");
+        attach_test_media(&pool, bob, media_post).await;
+        let embedded = create_post(
+            &pool,
+            &settings,
+            Some(bob),
+            "https://youtu.be/dQw4w9WgXcQ",
+            None,
+            &[],
+        )
+        .await
+        .expect("embedded");
+        let parent = create_post(&pool, &settings, Some(alice), "alice parent", None, &[])
+            .await
+            .expect("parent");
+        let media_reply = create_post(
+            &pool,
+            &settings,
+            Some(bob),
+            "reply media",
+            Some(parent),
+            &[],
+        )
+        .await
+        .expect("media reply");
+        attach_test_media(&pool, bob, media_reply).await;
+        let liked_media = create_post(&pool, &settings, Some(alice), "liked media", None, &[])
+            .await
+            .expect("liked media");
+        attach_test_media(&pool, alice, liked_media).await;
+        like(&pool, bob, liked_media).await.expect("like");
+
+        let media = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Media)
+            .await
+            .expect("media tab");
+
+        assert!(media.iter().any(|post| post.id == media_post));
+        assert!(media.iter().any(|post| post.id == embedded));
+        assert!(media.iter().any(|post| post.id == media_reply));
+        assert!(!media.iter().any(|post| post.id == plain));
+        assert!(!media.iter().any(|post| post.id == liked_media));
+    }
+
+    #[tokio::test]
+    async fn profile_likes_tab_shows_liked_posts_themselves() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let liked = create_post(&pool, &settings, Some(alice), "liked by bob", None, &[])
+            .await
+            .expect("liked");
+        let not_liked = create_post(&pool, &settings, Some(bob), "not liked by bob", None, &[])
+            .await
+            .expect("not liked");
+        like(&pool, bob, liked).await.expect("like");
+
+        let likes = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Likes)
+            .await
+            .expect("likes tab");
+
+        assert_eq!(likes.len(), 1);
+        assert_eq!(likes[0].id, liked);
+        assert_eq!(likes[0].user_id, Some(alice));
+        assert!(!likes.iter().any(|post| post.id == not_liked));
+    }
+
+    #[tokio::test]
     async fn deleted_original_repost_renders_as_unavailable_event() {
         let (pool, settings, alice, bob) = fixture().await;
         let post = create_post(&pool, &settings, Some(alice), "hello", None, &[])
@@ -2771,6 +2987,23 @@ mod tests {
         })
         .await
         .expect("profile picture");
+    }
+
+    async fn attach_test_media(pool: &SqlitePool, owner_user_id: i64, post_id: i64) {
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'media.webp', '/tmp/media.webp', '/uploads/images/media.webp', 'image/webp', 'image', 1)",
+                params![owner_user_id],
+            )?;
+            let media_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO post_media (post_id, media_id, position) VALUES (?, ?, 0)",
+                params![post_id, media_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("attach media");
     }
 
     async fn notification_count(

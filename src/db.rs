@@ -132,6 +132,10 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_12)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
         }
+        if applied.unwrap_or(0) < 13 {
+            tx.execute_batch(MIGRATION_13)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -441,6 +445,10 @@ SET onboarding_completed_at = CURRENT_TIMESTAMP
 WHERE onboarding_completed_at IS NULL AND is_deleted = 0;
 "#;
 
+const MIGRATION_13: &str = r#"
+ALTER TABLE users ADD COLUMN liked_posts_public INTEGER NOT NULL DEFAULT 1 CHECK (liked_posts_public IN (0, 1));
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,7 +490,7 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 12);
+        assert_eq!(versions, 13);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);
@@ -646,6 +654,32 @@ mod tests {
             .expect("onboarding state");
 
         assert!(completed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn liked_posts_are_public_by_default() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        let liked_posts_public: i64 = pool
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO users (username, normalized_username, password_hash, display_name) VALUES ('Alice', 'alice', 'hash', 'Alice')",
+                    [],
+                )?;
+                Ok(conn.query_row(
+                    "SELECT liked_posts_public FROM users WHERE normalized_username = 'alice'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("liked posts visibility");
+
+        assert_eq!(liked_posts_public, 1);
     }
 
     #[tokio::test]
