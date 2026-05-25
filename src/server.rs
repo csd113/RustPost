@@ -2094,21 +2094,6 @@ async fn settings_page(
     let blocked = social::blocked_users(&state.pool, user.id).await?;
     let muted = social::muted_users(&state.pool, user.id).await?;
     let muted_words = social::muted_words(&state.pool, user.id).await?;
-    let dark_checked = if Theme::from(profile.theme.as_str()) == Theme::Dark {
-        " checked"
-    } else {
-        ""
-    };
-    let nsfw_checked = if profile.nsfw_blur_enabled {
-        " checked"
-    } else {
-        ""
-    };
-    let liked_posts_public_checked = if profile.liked_posts_public {
-        " checked"
-    } else {
-        ""
-    };
     let notice_html =
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
     let password_hint = if state.settings.accounts.min_password_length == 0 {
@@ -2133,17 +2118,40 @@ async fn settings_page(
         state.settings.accounts.allow_profile_pictures,
         state.settings.accounts.allow_profile_banners,
     );
-    let body = format!(
-        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><label class="theme-toggle" for="nsfw_blur_enabled"><input id="nsfw_blur_enabled" name="nsfw_blur_enabled" type="checkbox" value="true"{}> Blur NSFW media</label><label class="theme-toggle" for="liked_posts_public"><input id="liked_posts_public" name="liked_posts_public" type="checkbox" value="true"{}> Make liked posts public</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Blocked users</h2>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted users</h2>{}</section></div><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
-        html_escape::encode_double_quoted_attribute(&csrf),
-        profile_media,
-        dark_checked,
-        nsfw_checked,
-        liked_posts_public_checked,
+    let profile_fields = format!(
+        r#"<div class="settings-fields settings-profile-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div>"#,
         html_escape::encode_double_quoted_attribute(profile.display_name.as_str()),
         html_escape::encode_text(profile.bio.as_str()),
         html_escape::encode_double_quoted_attribute(profile.location.as_str()),
         html_escape::encode_double_quoted_attribute(profile.website.as_str()),
+    );
+    let preference_switches = [
+        settings_switch(
+            "dark_mode",
+            Theme::from(profile.theme.as_str()) == Theme::Dark,
+            "Dark mode",
+            "Use the darker color theme for your signed-in session.",
+        ),
+        settings_switch(
+            "nsfw_blur_enabled",
+            profile.nsfw_blur_enabled,
+            "Blur NSFW media",
+            "Hide NSFW media previews behind a reveal control.",
+        ),
+        settings_switch(
+            "liked_posts_public",
+            profile.liked_posts_public,
+            "Make liked posts public",
+            "Allow other people to view your Likes tab on your profile.",
+        ),
+    ]
+    .join("");
+    let body = format!(
+        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, media, and account controls.</p></div></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}"><div class="settings-section settings-section-profile"><div class="settings-section-heading"><h2>Profile</h2><p class="settings-section-help">Your name, bio, location, and link as shown on your profile.</p></div>{}</div><div class="settings-section settings-section-media"><div class="settings-section-heading"><h2>Profile media</h2><p class="settings-section-help">Avatar and banner images for your profile header.</p></div>{}</div><div class="settings-section settings-section-preferences"><div class="settings-section-heading"><h2>Preferences and privacy</h2><p class="settings-section-help">Control your display theme, NSFW media blur, and profile activity visibility.</p></div><div class="settings-switch-list">{}</div></div><div class="settings-form-actions"><button class="primary" type="submit">Save profile settings</button></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Blocked users</h2><p class="settings-section-help">Blocked accounts cannot follow or interact with you.</p>{}</section><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted users</h2><p class="settings-section-help">Muted accounts stay hidden from your views.</p>{}</section></div><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted words</h2><p class="settings-section-help">Hide posts containing specific words or phrases.</p><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel settings-security-panel" data-testid="settings-card"><h2>Change password</h2><p class="settings-section-help">Update the password used to sign in to this account.</p><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p class="settings-danger-action"><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
+        html_escape::encode_double_quoted_attribute(&csrf),
+        profile_fields,
+        profile_media,
+        preference_switches,
         settings_user_list(
             &blocked,
             "/unblock",
@@ -2169,6 +2177,18 @@ async fn settings_page(
         confirm_new_password_attrs,
     );
     page_layout(state, Some(user), Some(csrf), "Settings", &body).await
+}
+
+fn settings_switch(id: &str, checked: bool, label: &str, help: &str) -> String {
+    let checked_attr = if checked { " checked" } else { "" };
+    let help_id = format!("{id}-help");
+    format!(
+        r#"<label class="settings-switch-row" for="{id}"><span class="settings-switch-copy"><span class="settings-switch-label">{label}</span><span class="settings-switch-help" id="{help_id}">{help}</span></span><span class="settings-switch-toggle"><input class="settings-switch-input" id="{id}" name="{id}" type="checkbox" role="switch" value="true"{checked_attr} aria-describedby="{help_id}"><span class="settings-switch-control" aria-hidden="true"></span></span></label>"#,
+        id = html_escape::encode_double_quoted_attribute(id),
+        help_id = html_escape::encode_double_quoted_attribute(&help_id),
+        label = html_escape::encode_text(label),
+        help = html_escape::encode_text(help),
+    )
 }
 
 async fn settings_update(
@@ -6151,7 +6171,7 @@ mod tests {
         let settings = get_with_cookie(&server, "/settings", &bob_cookie).await;
         assert_eq!(settings.status, 200);
         assert!(settings.body.contains(
-            r#"id="liked_posts_public" name="liked_posts_public" type="checkbox" value="true" checked"#
+            r#"id="liked_posts_public" name="liked_posts_public" type="checkbox" role="switch" value="true" checked aria-describedby="liked_posts_public-help""#
         ));
         let saved = save_profile_settings(
             &server,
@@ -6308,14 +6328,14 @@ mod tests {
         assert_eq!(settings.status, 200);
         assert!(
             settings.body.contains(
-                r#"id="dark_mode" name="dark_mode" type="checkbox" value="true" checked"#
+                r#"id="dark_mode" name="dark_mode" type="checkbox" role="switch" value="true" checked aria-describedby="dark_mode-help""#
             )
         );
         assert!(settings.body.contains(
-            r#"id="nsfw_blur_enabled" name="nsfw_blur_enabled" type="checkbox" value="true" checked"#
+            r#"id="nsfw_blur_enabled" name="nsfw_blur_enabled" type="checkbox" role="switch" value="true" checked aria-describedby="nsfw_blur_enabled-help""#
         ));
         assert!(!settings.body.contains(
-            r#"id="liked_posts_public" name="liked_posts_public" type="checkbox" value="true" checked"#
+            r#"id="liked_posts_public" name="liked_posts_public" type="checkbox" role="switch" value="true" checked"#
         ));
 
         let saved_public = save_profile_settings(

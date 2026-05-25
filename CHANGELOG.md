@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.1.6 - Pinned Profiles
+
+### Profiles and Timelines
+- Added profile timeline tabs for posts, replies, media, and liked posts.
+- Added pinned profile posts with owner-only pin/unpin controls and automatic cleanup when a pinned post is deleted.
+- Added a liked-posts visibility setting so users can make their likes private while still seeing their own likes.
+- Preserved relationship and moderation visibility rules across profile tabs, pinned posts, private likes, blocked users, muted users, suspended accounts, and anonymous viewers.
+
+### Posting and Composer
+- Added server-enforced post editing during a configurable short edit window, with no-JS edit forms and edited markers on changed posts.
+- Added live mention autocomplete to composer text areas backed by bounded `/mentions` suggestions.
+- Greyed out composer submit buttons when text exceeds the configured character limit.
+
+### Onboarding and Notifications
+- Added first-run account onboarding for new users with profile setup, optional avatar upload, and follow suggestions.
+- Grouped notifications by activity target, added grouped read/open handling, and improved empty-state rendering across feeds, lists, search, bookmarks, and notifications.
+
+### Admin, Settings, and Operations
+- Added `posts.post_edit_window_seconds` to settings and deep server settings, including validation from `0` to `300` seconds.
+- Added an admin backups page for creating backup archives from the web UI.
+- Refactored the backup restore workflow around staged extraction and clearer restore handling.
+
+### Privacy, Security, and UI Fixes
+- Hardened mention suggestions so wildcard characters cannot broaden searches and unavailable or hidden users stay excluded.
+- Hid private likes from profile likes tabs, notifications, and visible like counts except for the liker.
+- Rejected non-image onboarding/profile-picture uploads before creating profile avatar state.
+- Fixed the no-JS banner so it appears only when JavaScript is disabled.
+- Restored the compact Tor onion address pill with a disclosure and copy control.
+
+### Migrations and Compatibility
+- Added migrations for onboarding completion state and liked-post visibility.
+- Existing active users are marked as already onboarded, deleted users remain incomplete, and existing users keep public likes by default.
+- Bumped the crate version to `0.1.6` and refreshed `Cargo.lock`.
+
 ## v0.1.5 - Safety, Media, and Link Previews
 
 ### Posts and Composer
