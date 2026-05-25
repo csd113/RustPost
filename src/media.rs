@@ -123,7 +123,19 @@ pub async fn save_upload(
     paths: &RuntimePaths,
     ffmpeg: &FfmpegStatus,
     owner_user_id: Option<i64>,
+    field: Field<'_>,
+) -> anyhow::Result<i64> {
+    save_upload_inner(pool, settings, paths, ffmpeg, owner_user_id, field, None).await
+}
+
+async fn save_upload_inner(
+    pool: &SqlitePool,
+    settings: &Settings,
+    paths: &RuntimePaths,
+    ffmpeg: &FfmpegStatus,
+    owner_user_id: Option<i64>,
     mut field: Field<'_>,
+    required_image_label: Option<&'static str>,
 ) -> anyhow::Result<i64> {
     let original_filename = field.file_name().unwrap_or("upload").to_owned();
     reject_path_tricks(&original_filename)?;
@@ -144,6 +156,7 @@ pub async fn save_upload(
             staging,
             bytes,
         },
+        required_image_label,
     )
     .await
 }
@@ -151,8 +164,15 @@ pub async fn save_upload(
 async fn save_staged_upload(
     context: &UploadContext<'_>,
     upload: StagedUpload,
+    required_image_label: Option<&'static str>,
 ) -> anyhow::Result<i64> {
     let prepared = prepare_staged_upload(context.settings, upload).await?;
+    if let Some(label) = required_image_label
+        && prepared.media_kind != MediaKind::Image
+    {
+        remove_staged_upload(&prepared.staging).await;
+        anyhow::bail!("{label} must be an image");
+    }
     if let Some(media_id) = try_insert_duplicate(
         context,
         &prepared,
@@ -450,7 +470,16 @@ pub async fn save_profile_picture_upload(
     owner_user_id: i64,
     field: Field<'_>,
 ) -> anyhow::Result<i64> {
-    let media_id = save_upload(pool, settings, paths, ffmpeg, Some(owner_user_id), field).await?;
+    let media_id = save_upload_inner(
+        pool,
+        settings,
+        paths,
+        ffmpeg,
+        Some(owner_user_id),
+        field,
+        Some("profile picture"),
+    )
+    .await?;
     generate_profile_picture_thumbnail(pool, settings, paths, ffmpeg, media_id).await?;
     Ok(media_id)
 }
@@ -1777,6 +1806,7 @@ mod tests {
                 staging,
                 bytes: u64::try_from(bytes.len()).expect("byte len"),
             },
+            None,
         )
         .await
         .expect("save upload")

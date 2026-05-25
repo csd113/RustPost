@@ -1,8 +1,18 @@
 use crate::config::Settings;
 
 const RESERVED_USERNAMES: &[&str] = &[
-    "admin", "api", "assets", "auth", "login", "logout", "register", "search", "settings",
-    "static", "uploads",
+    "admin",
+    "api",
+    "assets",
+    "auth",
+    "login",
+    "logout",
+    "onboarding",
+    "register",
+    "search",
+    "settings",
+    "static",
+    "uploads",
 ];
 
 pub fn normalize_username(username: &str, max_len: usize) -> anyhow::Result<String> {

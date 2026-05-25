@@ -3,6 +3,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_POST_EDIT_WINDOW_SECONDS: u64 = 15;
+pub const MAX_POST_EDIT_WINDOW_SECONDS: u64 = 300;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
@@ -56,6 +59,8 @@ pub struct AccountSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostSettings {
     pub max_text_chars: usize,
+    #[serde(default = "default_post_edit_window_seconds")]
+    pub post_edit_window_seconds: u64,
     pub max_images_per_post: usize,
     pub max_videos_per_post: usize,
     pub max_media_per_post: usize,
@@ -143,6 +148,7 @@ impl Default for Settings {
             },
             posts: PostSettings {
                 max_text_chars: 280,
+                post_edit_window_seconds: DEFAULT_POST_EDIT_WINDOW_SECONDS,
                 max_images_per_post: 4,
                 max_videos_per_post: 1,
                 max_media_per_post: 4,
@@ -227,8 +233,22 @@ impl Settings {
         }
         validate_onion_service_name(&self.tor.onion_service_name)?;
         validate_display_onion_address(&self.tor.display_onion_address)?;
+        validate_post_edit_window(self.posts.post_edit_window_seconds)?;
         Ok(())
     }
+}
+
+const fn default_post_edit_window_seconds() -> u64 {
+    DEFAULT_POST_EDIT_WINDOW_SECONDS
+}
+
+fn validate_post_edit_window(seconds: u64) -> anyhow::Result<()> {
+    if seconds > MAX_POST_EDIT_WINDOW_SECONDS {
+        anyhow::bail!(
+            "posts.post_edit_window_seconds must be {MAX_POST_EDIT_WINDOW_SECONDS} seconds or less"
+        );
+    }
+    Ok(())
 }
 
 pub fn write_default_if_missing(path: &Path) -> anyhow::Result<()> {
@@ -319,6 +339,9 @@ allow_profile_pictures = {allow_profile_pictures}
 [posts]
 # Maximum post text length in characters.
 max_text_chars = {max_text_chars}
+
+# Seconds after creation that a user may edit their own post. Set to 0 to disable editing.
+post_edit_window_seconds = {post_edit_window_seconds}
 
 # Maximum image attachments allowed on one post.
 max_images_per_post = {max_images_per_post}
@@ -478,6 +501,7 @@ backup_dir = {backup_dir}
         allow_profile_banners = settings.accounts.allow_profile_banners,
         allow_profile_pictures = settings.accounts.allow_profile_pictures,
         max_text_chars = settings.posts.max_text_chars,
+        post_edit_window_seconds = settings.posts.post_edit_window_seconds,
         max_images_per_post = settings.posts.max_images_per_post,
         max_videos_per_post = settings.posts.max_videos_per_post,
         max_media_per_post = settings.posts.max_media_per_post,
@@ -641,6 +665,39 @@ mod tests {
         let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
 
         assert!(parsed.tor.display_onion_address.is_empty());
+    }
+
+    #[test]
+    fn missing_post_edit_window_defaults_to_fifteen_seconds() {
+        let raw = toml::to_string(&Settings::default())
+            .expect("settings toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("post_edit_window_seconds"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
+
+        assert_eq!(
+            parsed.posts.post_edit_window_seconds,
+            DEFAULT_POST_EDIT_WINDOW_SECONDS
+        );
+        parsed.validate().expect("defaulted setting validates");
+    }
+
+    #[test]
+    fn accepts_zero_post_edit_window_as_disabled() {
+        let mut settings = Settings::default();
+        settings.posts.post_edit_window_seconds = 0;
+
+        settings.validate().expect("zero disables post editing");
+    }
+
+    #[test]
+    fn rejects_unsafe_post_edit_windows() {
+        let mut settings = Settings::default();
+
+        settings.posts.post_edit_window_seconds = MAX_POST_EDIT_WINDOW_SECONDS + 1;
+        assert!(settings.validate().is_err());
     }
 
     #[test]

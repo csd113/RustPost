@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use rusqlite::{Connection, OptionalExtension as _, Row, params, params_from_iter};
 
 use crate::config::Settings;
@@ -27,6 +29,7 @@ pub struct PostView {
     pub text: String,
     pub parent_post_id: Option<i64>,
     pub created_at: String,
+    pub edited_at: Option<String>,
     pub event_created_at: String,
     pub like_count: i64,
     pub repost_count: i64,
@@ -35,6 +38,7 @@ pub struct PostView {
     pub viewer_bookmarked: bool,
     pub viewer_reposted: bool,
     pub viewer_can_repost: bool,
+    pub pinned_by_author: bool,
     pub original_unavailable: bool,
     pub reposted_by_user_id: Option<i64>,
     pub reposted_by_username: Option<String>,
@@ -61,6 +65,23 @@ pub enum TimelineEventKind {
     Repost,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileTimelineTab {
+    Posts,
+    Replies,
+    Media,
+    Likes,
+}
+
+impl ProfileTimelineTab {
+    const fn repost_mode(self) -> &'static str {
+        match self {
+            Self::Media => "profile_media",
+            Self::Posts | Self::Replies | Self::Likes => "profile",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MediaView {
     pub public_path: String,
@@ -84,9 +105,38 @@ pub struct NotificationView {
     pub actor_username: Option<String>,
     pub actor_display_name: Option<String>,
     pub post_id: Option<i64>,
+    pub group_target_post_id: Option<i64>,
     pub post_text: Option<String>,
     pub post_available: bool,
     pub read_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionSuggestion {
+    pub username: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationActorView {
+    pub user_id: Option<i64>,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationGroupView {
+    pub id: i64,
+    pub kind: String,
+    pub group_target_post_id: Option<i64>,
+    pub post_id: Option<i64>,
+    pub post_text: Option<String>,
+    pub post_available: bool,
+    pub unread_count: i64,
+    pub total_count: usize,
+    pub notification_ids: Vec<i64>,
+    pub actors: Vec<NotificationActorView>,
     pub created_at: String,
 }
 
@@ -109,16 +159,70 @@ struct PostRow {
     text: String,
     parent_post_id: Option<i64>,
     created_at: String,
-    like_count: i64,
+    edited_at: Option<String>,
     repost_count: i64,
     reply_count: i64,
     quote_post_id: Option<i64>,
+    pinned_by_author: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuotePostOutcome {
     pub post_id: i64,
     pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditPostError {
+    NotFound,
+    Forbidden,
+    WindowExpired,
+    Validation(String),
+    Database(String),
+}
+
+impl std::fmt::Display for EditPostError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("post not found"),
+            Self::Forbidden => formatter.write_str("cannot edit this post"),
+            Self::WindowExpired => formatter.write_str("the edit window for this post has expired"),
+            Self::Validation(message) | Self::Database(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for EditPostError {}
+
+impl From<rusqlite::Error> for EditPostError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinPostError {
+    NotFound,
+    Forbidden,
+    Database(String),
+}
+
+impl std::fmt::Display for PinPostError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("post not found"),
+            Self::Forbidden => formatter.write_str("cannot pin this post"),
+            Self::Database(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PinPostError {}
+
+impl From<rusqlite::Error> for PinPostError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.to_string())
+    }
 }
 
 pub async fn create_post(
@@ -188,6 +292,84 @@ pub async fn create_post(
     .await
 }
 
+pub async fn edit_post(
+    pool: &SqlitePool,
+    settings: &Settings,
+    user_id: i64,
+    post_id: i64,
+    text: &str,
+) -> Result<bool, EditPostError> {
+    let max_text_chars = settings.posts.max_text_chars;
+    let edit_window_modifier = edit_window_modifier(settings.posts.post_edit_window_seconds);
+    let raw_text = text.to_owned();
+    pool.call(move |conn| {
+        let result: Result<bool, EditPostError> = (|| {
+            let tx = conn.transaction()?;
+            let row = tx
+                .query_row(
+                    r#"
+                    SELECT p.user_id, p.text,
+                      CASE
+                        WHEN ? IS NULL THEN 0
+                        ELSE p.created_at >= datetime('now', ?)
+                      END AS within_window,
+                      (SELECT COUNT(*) FROM post_media WHERE post_id = p.id) AS media_count
+                    FROM posts p
+                    WHERE p.id = ? AND p.is_deleted = 0
+                    "#,
+                    params![
+                        edit_window_modifier.clone(),
+                        edit_window_modifier,
+                        post_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)? != 0,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((owner, current_text, within_window, media_count)) = row else {
+                return Err(EditPostError::NotFound);
+            };
+            if owner != Some(user_id) {
+                return Err(EditPostError::Forbidden);
+            }
+            if !within_window {
+                return Err(EditPostError::WindowExpired);
+            }
+            let media_count = usize::try_from(media_count).unwrap_or(usize::MAX);
+            let text = clean_post_text(&raw_text, max_text_chars, media_count)
+                .map_err(|err| EditPostError::Validation(err.to_string()))?;
+            if text == current_text {
+                tx.commit()?;
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE posts SET text = ?, edited_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ? AND is_deleted = 0",
+                params![text, post_id, user_id],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })();
+        Ok(result)
+    })
+    .await
+    .map_err(|err| EditPostError::Database(err.to_string()))?
+}
+
+fn edit_window_modifier(seconds: u64) -> Option<String> {
+    if seconds == 0 {
+        return None;
+    }
+    i64::try_from(seconds)
+        .ok()
+        .map(|seconds| format!("-{seconds} seconds"))
+}
+
 pub async fn timeline(
     pool: &SqlitePool,
     viewer_id: Option<i64>,
@@ -213,8 +395,27 @@ pub async fn profile_timeline(
     viewer_id: Option<i64>,
     user_id: i64,
 ) -> anyhow::Result<Vec<PostView>> {
-    let mut posts = post_events_for_user(pool, viewer_id, user_id).await?;
-    posts.extend(repost_events(pool, viewer_id, "profile", Some(user_id)).await?);
+    profile_tab_timeline(pool, viewer_id, user_id, ProfileTimelineTab::Posts).await
+}
+
+pub async fn profile_tab_timeline(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+    tab: ProfileTimelineTab,
+) -> anyhow::Result<Vec<PostView>> {
+    if !profile_activity_visible(pool, viewer_id, user_id).await? {
+        return Ok(Vec::new());
+    }
+    let mut posts = match tab {
+        ProfileTimelineTab::Posts => post_events_for_user(pool, viewer_id, user_id).await?,
+        ProfileTimelineTab::Replies => reply_events_for_user(pool, viewer_id, user_id).await?,
+        ProfileTimelineTab::Media => media_events_for_user(pool, viewer_id, user_id).await?,
+        ProfileTimelineTab::Likes => liked_events_for_user(pool, viewer_id, user_id).await?,
+    };
+    if matches!(tab, ProfileTimelineTab::Posts | ProfileTimelineTab::Media) {
+        posts.extend(repost_events(pool, viewer_id, tab.repost_mode(), Some(user_id)).await?);
+    }
     posts.sort_by(|left, right| {
         right
             .event_created_at
@@ -223,6 +424,53 @@ pub async fn profile_timeline(
     });
     posts.truncate(40);
     Ok(posts)
+}
+
+pub async fn profile_activity_visible(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+) -> anyhow::Result<bool> {
+    let Some(viewer_id) = viewer_id else {
+        return Ok(true);
+    };
+    if viewer_id == user_id {
+        return Ok(true);
+    }
+    pool.call(move |conn| {
+        let hidden: i64 = conn.query_row(
+            r#"
+            SELECT
+              EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?)
+              OR EXISTS(SELECT 1 FROM mutes WHERE muter_id = ? AND muted_id = ?)
+              OR EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?)
+            "#,
+            params![viewer_id, user_id, viewer_id, user_id, user_id, viewer_id],
+            |row| row.get(0),
+        )?;
+        Ok(hidden == 0)
+    })
+    .await
+}
+
+pub async fn profile_pinned_post(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+) -> anyhow::Result<Option<PostView>> {
+    let mut sql = base_post_query();
+    sql.push_str(
+        " AND p.id = (SELECT pinned_post_id FROM users WHERE id = ? AND is_deleted = 0) AND p.user_id = ?",
+    );
+    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    sql.push_str(" LIMIT 1");
+    let mut bindings = vec![user_id, user_id];
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
+    let rows = pool
+        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
+        .await?;
+    let mut posts = rows_to_posts(pool, rows, viewer_id).await?;
+    Ok(posts.pop())
 }
 
 pub async fn post_thread(
@@ -370,6 +618,18 @@ pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> an
     }
     pool.call(move |conn| {
         let tx = conn.transaction()?;
+        let target_available = tx
+            .query_row(
+                "SELECT is_deleted = 0 AND is_suspended = 0 FROM users WHERE id = ?",
+                [followed_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            != 0;
+        if !target_available {
+            anyhow::bail!("account cannot be followed");
+        }
         let changed = tx.execute(
             "INSERT OR IGNORE INTO follows (follower_id, followed_id) VALUES (?, ?)",
             params![follower_id, followed_id],
@@ -388,6 +648,36 @@ pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> an
         Ok(changed > 0)
     })
     .await
+}
+
+pub async fn active_follow_targets(pool: &SqlitePool, ids: &[i64]) -> anyhow::Result<Vec<i64>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!(
+        "SELECT id FROM users WHERE id IN ({placeholders}) AND is_deleted = 0 AND is_suspended = 0"
+    );
+    let candidate_ids = ids.to_vec();
+    let query_ids = candidate_ids.clone();
+    let available = pool
+        .call(move |conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params_from_iter(query_ids.iter()), |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    Ok(candidate_ids
+        .iter()
+        .copied()
+        .filter(|id| available.contains(id))
+        .collect())
 }
 
 pub async fn unfollow(
@@ -480,6 +770,47 @@ pub async fn following_accounts(
                     bio: row.get(3)?,
                     profile_picture_path: row.get(4)?,
                     viewer_following: true,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+pub async fn onboarding_suggestions(
+    pool: &SqlitePool,
+    viewer_id: i64,
+    limit: usize,
+) -> anyhow::Result<Vec<AccountView>> {
+    let limit = i64::try_from(limit)?;
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name, u.bio,
+              COALESCE(pic.thumbnail_public_path, pic.public_path),
+              EXISTS(
+                SELECT 1 FROM follows vf
+                WHERE vf.follower_id = ? AND vf.followed_id = u.id
+              )
+            FROM users u
+            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+            WHERE u.id != ?
+              AND u.is_deleted = 0
+              AND u.is_suspended = 0
+            ORDER BY lower(u.username), u.id
+            LIMIT ?
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![viewer_id, viewer_id, limit], |row| {
+                Ok(AccountView {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    display_name: row.get(2)?,
+                    bio: row.get(3)?,
+                    profile_picture_path: row.get(4)?,
+                    viewer_following: row.get::<_, i64>(5)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -792,6 +1123,61 @@ pub async fn unbookmark(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow
     .await
 }
 
+pub async fn pinned_post_id(pool: &SqlitePool, user_id: i64) -> anyhow::Result<Option<i64>> {
+    pool.call(move |conn| {
+        conn.query_row(
+            "SELECT pinned_post_id FROM users WHERE id = ? AND is_deleted = 0",
+            [user_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(std::option::Option::flatten)
+        .map_err(Into::into)
+    })
+    .await
+}
+
+pub async fn pin_post(pool: &SqlitePool, user_id: i64, post_id: i64) -> Result<(), PinPostError> {
+    pool.call(move |conn| {
+        let result: Result<(), PinPostError> = (|| {
+            let tx = conn.transaction()?;
+            let owner = tx
+                .query_row(
+                    "SELECT user_id FROM posts WHERE id = ? AND is_deleted = 0",
+                    [post_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?;
+            let Some(owner) = owner else {
+                return Err(PinPostError::NotFound);
+            };
+            if owner != Some(user_id) {
+                return Err(PinPostError::Forbidden);
+            }
+            tx.execute(
+                "UPDATE users SET pinned_post_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
+                params![post_id, user_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        Ok(result)
+    })
+    .await
+    .map_err(|err| PinPostError::Database(err.to_string()))?
+}
+
+pub async fn unpin_post(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<bool> {
+    pool.call(move |conn| {
+        let changed = conn.execute(
+            "UPDATE users SET pinned_post_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND pinned_post_id = ?",
+            params![user_id, post_id],
+        )?;
+        Ok(changed > 0)
+    })
+    .await
+}
+
 pub async fn delete_post(
     pool: &SqlitePool,
     actor_id: i64,
@@ -815,6 +1201,10 @@ pub async fn delete_post(
     pool.call(move |conn| {
         conn.execute(
             "UPDATE posts SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [post_id],
+        )?;
+        conn.execute(
+            "UPDATE users SET pinned_post_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE pinned_post_id = ?",
             [post_id],
         )?;
         Ok(())
@@ -912,6 +1302,103 @@ pub async fn search(
     Ok((users, rows_to_posts(pool, rows, viewer_id).await?))
 }
 
+const MENTION_SUGGESTION_LIMIT: usize = 8;
+const MENTION_QUERY_MAX_CHARS: usize = 32;
+
+pub async fn mention_suggestions(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    query: &str,
+) -> anyhow::Result<Vec<MentionSuggestion>> {
+    let Some(fragment) = mention_query_fragment(query) else {
+        return Ok(Vec::new());
+    };
+    let username_query = format!("{}%", escape_like_prefix(&fragment));
+    let limit = i64::try_from(MENTION_SUGGESTION_LIMIT)?;
+    pool.call(move |conn| {
+        if let Some(viewer_id) = viewer_id {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT username, display_name
+                FROM users u
+                WHERE u.is_deleted = 0
+                  AND u.is_suspended = 0
+                  AND u.normalized_username LIKE ? ESCAPE '\'
+                  AND u.id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+                  AND u.id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM blocks
+                    WHERE blocker_id = u.id AND blocked_id = ?
+                  )
+                ORDER BY u.normalized_username, u.id
+                LIMIT ?
+                "#,
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![username_query, viewer_id, viewer_id, viewer_id, limit],
+                    |row| {
+                        Ok(MentionSuggestion {
+                            username: row.get(0)?,
+                            display_name: row.get(1)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        } else {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT username, display_name
+                FROM users u
+                WHERE u.is_deleted = 0
+                  AND u.is_suspended = 0
+                  AND u.normalized_username LIKE ? ESCAPE '\'
+                ORDER BY u.normalized_username, u.id
+                LIMIT ?
+                "#,
+            )?;
+            let rows = stmt
+                .query_map(params![username_query, limit], |row| {
+                    Ok(MentionSuggestion {
+                        username: row.get(0)?,
+                        display_name: row.get(1)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    })
+    .await
+}
+
+fn mention_query_fragment(query: &str) -> Option<String> {
+    let fragment = query.trim().trim_start_matches('@');
+    if fragment.chars().any(|character| {
+        !(character.is_ascii_alphanumeric() || character == '_' || character == '-')
+    }) {
+        return None;
+    }
+    Some(
+        fragment
+            .chars()
+            .take(MENTION_QUERY_MAX_CHARS)
+            .collect::<String>()
+            .to_ascii_lowercase(),
+    )
+}
+
+fn escape_like_prefix(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 fn user_query_from_input(query: &str) -> Option<String> {
     let trimmed = query.trim().trim_start_matches('@').trim();
     let value = trimmed
@@ -954,33 +1441,49 @@ pub async fn notifications(
         let mut stmt = conn.prepare(
             r#"
             SELECT n.id, n.kind, n.actor_user_id, u.username, u.display_name,
-              n.post_id, p.text, p.is_deleted, n.read_at, n.created_at
+              n.post_id, p.text, p.is_deleted, p.parent_post_id, p.quote_post_id,
+              n.read_at, n.created_at
             FROM notifications n
             LEFT JOIN users u ON u.id = n.actor_user_id AND u.is_deleted = 0
             LEFT JOIN posts p ON p.id = n.post_id
             WHERE n.user_id = ?
+              AND (
+                n.kind != 'like'
+                OR n.actor_user_id IS NULL
+                OR COALESCE(u.liked_posts_public, 0) != 0
+              )
             ORDER BY n.id DESC
             LIMIT 80
             "#,
         )?;
         let rows = stmt
             .query_map([user_id], |row| {
+                let kind = row.get::<_, String>(1)?;
+                let post_id = row.get::<_, Option<i64>>(5)?;
                 let post_is_deleted = row
                     .get::<_, Option<i64>>(7)?
                     .is_some_and(|value| value != 0);
+                let parent_post_id = row.get::<_, Option<i64>>(8)?;
+                let quote_post_id = row.get::<_, Option<i64>>(9)?;
+                let group_target_post_id = match kind.as_str() {
+                    "reply" => parent_post_id.or(post_id),
+                    "quote" => quote_post_id.or(post_id),
+                    _ => post_id,
+                };
                 Ok(NotificationView {
                     id: row.get(0)?,
-                    kind: row.get(1)?,
+                    kind,
                     actor_user_id: row.get(2)?,
                     actor_username: row.get(3)?,
                     actor_display_name: row.get(4)?,
-                    post_id: row.get(5)?,
+                    post_id,
+                    group_target_post_id,
                     post_text: row.get(6)?,
                     post_available: row
                         .get::<_, Option<i64>>(7)?
                         .is_some_and(|_| !post_is_deleted),
-                    read_at: row.get(8)?,
-                    created_at: row.get(9)?,
+                    read_at: row.get(10)?,
+                    created_at: row.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -989,15 +1492,221 @@ pub async fn notifications(
     .await
 }
 
+pub async fn notification_groups(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> anyhow::Result<Vec<NotificationGroupView>> {
+    let notifications = notifications(pool, user_id).await?;
+    let mut groups = group_notifications(&notifications);
+    refresh_notification_group_counts(pool, user_id, &mut groups).await?;
+    Ok(groups)
+}
+
+fn group_notifications(notifications: &[NotificationView]) -> Vec<NotificationGroupView> {
+    let mut groups: Vec<(NotificationGroupKey, NotificationGroupView)> = Vec::new();
+    for notification in notifications {
+        let key = notification_group_key(notification);
+        if let Some((_key, group)) = groups
+            .iter_mut()
+            .find(|(existing_key, _group)| *existing_key == key)
+        {
+            push_notification_group_item(group, notification);
+        } else {
+            groups.push((key, notification_group_from_item(notification)));
+        }
+    }
+    groups.into_iter().map(|(_key, group)| group).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotificationGroupKey {
+    kind: String,
+    target: NotificationGroupTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotificationGroupTarget {
+    Follow,
+    Post(i64),
+    Notification(i64),
+}
+
+fn notification_group_key(notification: &NotificationView) -> NotificationGroupKey {
+    let target = match notification.kind.as_str() {
+        "follow" => NotificationGroupTarget::Follow,
+        "like" | "repost" | "reply" | "mention" | "quote" => {
+            notification.group_target_post_id.map_or(
+                NotificationGroupTarget::Notification(notification.id),
+                NotificationGroupTarget::Post,
+            )
+        }
+        _ => NotificationGroupTarget::Notification(notification.id),
+    };
+    NotificationGroupKey {
+        kind: notification.kind.clone(),
+        target,
+    }
+}
+
+fn notification_group_from_item(notification: &NotificationView) -> NotificationGroupView {
+    let mut group = NotificationGroupView {
+        id: notification.id,
+        kind: notification.kind.clone(),
+        group_target_post_id: notification.group_target_post_id,
+        post_id: notification.post_id,
+        post_text: notification.post_text.clone(),
+        post_available: notification.post_available,
+        unread_count: 0,
+        total_count: 0,
+        notification_ids: Vec::new(),
+        actors: Vec::new(),
+        created_at: notification.created_at.clone(),
+    };
+    push_notification_group_item(&mut group, notification);
+    group
+}
+
+fn push_notification_group_item(
+    group: &mut NotificationGroupView,
+    notification: &NotificationView,
+) {
+    group.total_count += 1;
+    group.notification_ids.push(notification.id);
+    if notification.read_at.is_none() {
+        group.unread_count += 1;
+    }
+    group.actors.push(NotificationActorView {
+        user_id: notification.actor_user_id,
+        username: notification.actor_username.clone(),
+        display_name: notification.actor_display_name.clone(),
+    });
+}
+
 pub async fn unread_notification_count(pool: &SqlitePool, user_id: i64) -> anyhow::Result<i64> {
     pool.call(move |conn| {
         Ok(conn.query_row(
-            "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL",
+            r#"
+            SELECT COUNT(*)
+            FROM notifications n
+            LEFT JOIN users u ON u.id = n.actor_user_id AND u.is_deleted = 0
+            WHERE n.user_id = ? AND n.read_at IS NULL
+              AND (
+                n.kind != 'like'
+                OR n.actor_user_id IS NULL
+                OR COALESCE(u.liked_posts_public, 0) != 0
+              )
+            "#,
             [user_id],
             |row| row.get(0),
         )?)
     })
     .await
+}
+
+pub async fn mark_notification_ids_read(
+    pool: &SqlitePool,
+    user_id: i64,
+    notification_ids: &[i64],
+) -> anyhow::Result<()> {
+    let notification_ids = notification_ids.to_vec();
+    pool.call(move |conn| {
+        let tx = conn.transaction()?;
+        for notification_id in notification_ids {
+            tx.execute(
+                "UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = ? AND id = ? AND read_at IS NULL",
+                params![user_id, notification_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
+async fn refresh_notification_group_counts(
+    pool: &SqlitePool,
+    user_id: i64,
+    groups: &mut [NotificationGroupView],
+) -> anyhow::Result<()> {
+    let descriptors = groups
+        .iter()
+        .enumerate()
+        .filter(|(_index, group)| {
+            group.kind == "follow"
+                || (notification_group_target_expr(&group.kind).is_some()
+                    && group.group_target_post_id.is_some())
+        })
+        .map(|(index, group)| (index, group.kind.clone(), group.group_target_post_id))
+        .collect::<Vec<_>>();
+    let counts = pool
+        .call(move |conn| {
+            let mut counts = Vec::with_capacity(descriptors.len());
+            for (index, kind, target_post_id) in descriptors {
+                let (total_count, unread_count) =
+                    notification_group_counts_tx(conn, user_id, &kind, target_post_id)?;
+                counts.push((index, total_count, unread_count));
+            }
+            Ok(counts)
+        })
+        .await?;
+    for (index, total_count, unread_count) in counts {
+        groups[index].total_count = usize::try_from(total_count)?;
+        groups[index].unread_count = unread_count;
+    }
+    Ok(())
+}
+
+fn notification_group_counts_tx(
+    conn: &Connection,
+    user_id: i64,
+    kind: &str,
+    target_post_id: Option<i64>,
+) -> anyhow::Result<(i64, i64)> {
+    if kind == "follow" {
+        return Ok(conn.query_row(
+            r#"
+            SELECT COUNT(*), COALESCE(SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END), 0)
+            FROM notifications
+            WHERE user_id = ? AND kind = 'follow'
+            "#,
+            [user_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?);
+    }
+    let Some(target_expr) = notification_group_target_expr(kind) else {
+        return Ok((0, 0));
+    };
+    let Some(target_post_id) = target_post_id else {
+        return Ok((0, 0));
+    };
+    let sql = format!(
+        r#"
+        SELECT COUNT(*), COALESCE(SUM(CASE WHEN n.read_at IS NULL THEN 1 ELSE 0 END), 0)
+        FROM notifications n
+        LEFT JOIN users actor ON actor.id = n.actor_user_id AND actor.is_deleted = 0
+        LEFT JOIN posts p ON p.id = n.post_id
+        WHERE n.user_id = ? AND n.kind = ? AND {target_expr} = ?
+          AND (
+            n.kind != 'like'
+            OR n.actor_user_id IS NULL
+            OR COALESCE(actor.liked_posts_public, 0) != 0
+          )
+        "#
+    );
+    Ok(
+        conn.query_row(&sql, params![user_id, kind, target_post_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?,
+    )
+}
+
+fn notification_group_target_expr(kind: &str) -> Option<&'static str> {
+    match kind {
+        "like" | "repost" | "mention" => Some("n.post_id"),
+        "reply" => Some("COALESCE(p.parent_post_id, n.post_id)"),
+        "quote" => Some("COALESCE(p.quote_post_id, n.post_id)"),
+        _ => None,
+    }
 }
 
 pub async fn mark_notifications_read(pool: &SqlitePool, user_id: i64) -> anyhow::Result<()> {
@@ -1011,6 +1720,45 @@ pub async fn mark_notifications_read(pool: &SqlitePool, user_id: i64) -> anyhow:
     .await
 }
 
+pub async fn mark_notification_group_read(
+    pool: &SqlitePool,
+    user_id: i64,
+    kind: &str,
+    target_post_id: Option<i64>,
+) -> anyhow::Result<()> {
+    let kind = kind.to_owned();
+    pool.call(move |conn| {
+        if kind == "follow" {
+            conn.execute(
+                "UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = ? AND kind = 'follow' AND read_at IS NULL",
+                [user_id],
+            )?;
+            return Ok(());
+        }
+        let Some(target_expr) = notification_group_target_expr(&kind) else {
+            anyhow::bail!("notification group kind is invalid");
+        };
+        let Some(target_post_id) = target_post_id else {
+            anyhow::bail!("notification group target is invalid");
+        };
+        let sql = format!(
+            r#"
+            UPDATE notifications
+            SET read_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND read_at IS NULL AND id IN (
+              SELECT n.id
+              FROM notifications n
+              LEFT JOIN posts p ON p.id = n.post_id
+              WHERE n.user_id = ? AND n.kind = ? AND {target_expr} = ?
+            )
+            "#
+        );
+        conn.execute(&sql, params![user_id, user_id, kind, target_post_id])?;
+        Ok(())
+    })
+    .await
+}
+
 fn base_post_query() -> String {
     r#"
     SELECT 'post' AS event_kind, 'p:' || p.id AS event_id, p.created_at AS event_created_at,
@@ -1019,11 +1767,12 @@ fn base_post_query() -> String {
       p.id, p.user_id, u.username, u.display_name,
       COALESCE(pic.thumbnail_public_path, pic.public_path) AS profile_picture_path,
       p.anonymous_label, p.text, p.parent_post_id, p.created_at,
-      (SELECT COUNT(*) FROM likes WHERE post_id = p.id) AS like_count,
+      p.edited_at,
       ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
        (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0)) AS repost_count,
       (SELECT COUNT(*) FROM posts r WHERE r.parent_post_id = p.id AND r.is_deleted = 0) AS reply_count,
-      p.quote_post_id
+      p.quote_post_id,
+      COALESCE(u.pinned_post_id = p.id, 0) AS pinned_by_author
     FROM posts p
     LEFT JOIN users u ON u.id = p.user_id
     LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
@@ -1039,13 +1788,14 @@ fn base_repost_query() -> String {
       COALESCE(p.id, r.post_id) AS id, p.user_id, u.username, u.display_name,
       COALESCE(pic.thumbnail_public_path, pic.public_path) AS profile_picture_path, p.anonymous_label,
       COALESCE(p.text, '') AS text, p.parent_post_id, COALESCE(p.created_at, r.created_at) AS created_at,
-      CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM likes WHERE post_id = p.id) END AS like_count,
+      p.edited_at,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE
         ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
          (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0))
       END AS repost_count,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM posts replies WHERE replies.parent_post_id = p.id AND replies.is_deleted = 0) END AS reply_count,
-      p.quote_post_id
+      p.quote_post_id,
+      CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE COALESCE(u.pinned_post_id = p.id, 0) END AS pinned_by_author
     FROM reposts r
     JOIN users ru ON ru.id = r.user_id
     LEFT JOIN posts p ON p.id = r.post_id
@@ -1110,6 +1860,61 @@ async fn post_events_for_user(
     rows_to_posts(pool, rows, viewer_id).await
 }
 
+async fn reply_events_for_user(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+) -> anyhow::Result<Vec<PostView>> {
+    let mut sql = base_post_query();
+    sql.push_str(" AND p.user_id = ? AND p.parent_post_id IS NOT NULL");
+    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    sql.push_str(" ORDER BY p.id DESC LIMIT 40");
+    let mut bindings = vec![user_id];
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
+    let rows = pool
+        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
+        .await?;
+    rows_to_posts(pool, rows, viewer_id).await
+}
+
+async fn media_events_for_user(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+) -> anyhow::Result<Vec<PostView>> {
+    let mut sql = base_post_query();
+    sql.push_str(" AND p.user_id = ? AND ");
+    sql.push_str(&media_surface_condition("p.id", "p.text"));
+    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    sql.push_str(" ORDER BY p.id DESC LIMIT 40");
+    let mut bindings = vec![user_id];
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
+    let rows = pool
+        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
+        .await?;
+    rows_to_posts(pool, rows, viewer_id).await
+}
+
+async fn liked_events_for_user(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+) -> anyhow::Result<Vec<PostView>> {
+    let mut sql = base_post_query();
+    sql.push_str(" AND p.id IN (SELECT post_id FROM likes WHERE user_id = ?)");
+    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    sql.push_str(
+        " ORDER BY (SELECT created_at FROM likes WHERE user_id = ? AND post_id = p.id) DESC, p.id DESC LIMIT 40",
+    );
+    let mut bindings = vec![user_id];
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
+    bindings.push(user_id);
+    let rows = pool
+        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
+        .await?;
+    rows_to_posts(pool, rows, viewer_id).await
+}
+
 async fn repost_events(
     pool: &SqlitePool,
     viewer_id: Option<i64>,
@@ -1122,6 +1927,10 @@ async fn repost_events(
             " AND (r.user_id = ? OR r.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?))",
         ),
         "profile" => sql.push_str(" AND r.user_id = ?"),
+        "profile_media" => {
+            sql.push_str(" AND r.user_id = ? AND ");
+            sql.push_str(&media_surface_condition("p.id", "COALESCE(p.text, '')"));
+        }
         _ => {}
     }
     if viewer_id.is_some() {
@@ -1147,6 +1956,12 @@ async fn repost_events(
         .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
         .await?;
     rows_to_posts(pool, rows, viewer_id).await
+}
+
+fn media_surface_condition(post_id_column: &str, text_column: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM post_media pm WHERE pm.post_id = {post_id_column}) OR instr(lower({text_column}), 'youtube.com/') > 0 OR instr(lower({text_column}), 'youtu.be/') > 0)"
+    )
 }
 
 fn append_viewer_filters(sql: &mut String, user_column: &str, viewer_id: Option<i64>) {
@@ -1201,10 +2016,11 @@ fn map_post_row(row: &Row<'_>) -> rusqlite::Result<PostRow> {
         text: row.get(14)?,
         parent_post_id: row.get(15)?,
         created_at: row.get(16)?,
-        like_count: row.get(17)?,
+        edited_at: row.get(17)?,
         repost_count: row.get(18)?,
         reply_count: row.get(19)?,
         quote_post_id: row.get(20)?,
+        pinned_by_author: row.get::<_, i64>(21)? != 0,
     })
 }
 
@@ -1237,6 +2053,11 @@ async fn rows_to_posts(
         } else {
             false
         };
+        let like_count = if original_unavailable {
+            0
+        } else {
+            visible_like_count(pool, viewer_id, id).await?
+        };
         let viewer_can_repost =
             viewer_id.is_some_and(|user_id| !original_unavailable && row.user_id != Some(user_id));
         let quote = quote_preview_for_post(pool, row.quote_post_id, viewer_id).await?;
@@ -1256,14 +2077,16 @@ async fn rows_to_posts(
             text: row.text,
             parent_post_id: row.parent_post_id,
             created_at: row.created_at,
+            edited_at: row.edited_at,
             event_created_at: row.event_created_at,
-            like_count: row.like_count,
+            like_count,
             repost_count: row.repost_count,
             reply_count: row.reply_count,
             viewer_liked,
             viewer_bookmarked,
             viewer_reposted,
             viewer_can_repost,
+            pinned_by_author: row.pinned_by_author,
             original_unavailable,
             reposted_by_user_id: row.repost_user_id,
             reposted_by_username: row.repost_username,
@@ -1274,6 +2097,27 @@ async fn rows_to_posts(
         });
     }
     Ok(posts)
+}
+
+async fn visible_like_count(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    post_id: i64,
+) -> anyhow::Result<i64> {
+    let viewer_id = viewer_id.unwrap_or(-1);
+    pool.call(move |conn| {
+        Ok(conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM likes l
+            JOIN users u ON u.id = l.user_id AND u.is_deleted = 0
+            WHERE l.post_id = ? AND (u.liked_posts_public != 0 OR l.user_id = ?)
+            "#,
+            params![post_id, viewer_id],
+            |row| row.get(0),
+        )?)
+    })
+    .await
 }
 
 async fn quote_preview_for_post(
@@ -1446,10 +2290,22 @@ fn notify_post_owner_tx(
     if let Some(owner) = owner
         && owner != actor_id
         && !is_blocked_tx(tx, owner, actor_id)?
+        && (kind != "like" || likes_public_tx(tx, actor_id)?)
     {
         create_notification_tx(tx, owner, Some(actor_id), Some(link_post_id), kind, message)?;
     }
     Ok(owner)
+}
+
+fn likes_public_tx(tx: &rusqlite::Transaction<'_>, user_id: i64) -> anyhow::Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT liked_posts_public FROM users WHERE id = ? AND is_deleted = 0",
+            [user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some_and(|value| value != 0))
 }
 
 fn notify_mentioned_users_tx(
@@ -2055,6 +2911,215 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_posts_tab_includes_originals_and_reposts_but_excludes_plain_replies() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(&pool, &settings, Some(bob), "bob original", None, &[])
+            .await
+            .expect("original");
+        let parent = create_post(&pool, &settings, Some(alice), "alice parent", None, &[])
+            .await
+            .expect("parent");
+        let reply = create_post(&pool, &settings, Some(bob), "bob reply", Some(parent), &[])
+            .await
+            .expect("reply");
+        repost(&pool, bob, parent).await.expect("repost");
+
+        let posts = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Posts)
+            .await
+            .expect("posts tab");
+
+        assert!(posts.iter().any(|post| post.id == original));
+        assert!(
+            posts
+                .iter()
+                .any(|post| { post.id == parent && post.event_kind == TimelineEventKind::Repost })
+        );
+        assert!(!posts.iter().any(|post| post.id == reply));
+    }
+
+    #[tokio::test]
+    async fn profile_replies_tab_includes_plain_replies() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let top_level = create_post(&pool, &settings, Some(bob), "bob original", None, &[])
+            .await
+            .expect("top-level");
+        let parent = create_post(&pool, &settings, Some(alice), "alice parent", None, &[])
+            .await
+            .expect("parent");
+        let reply = create_post(&pool, &settings, Some(bob), "bob reply", Some(parent), &[])
+            .await
+            .expect("reply");
+
+        let replies = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Replies)
+            .await
+            .expect("replies tab");
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].id, reply);
+        assert_eq!(replies[0].parent_post_id, Some(parent));
+        assert!(!replies.iter().any(|post| post.id == top_level));
+    }
+
+    #[tokio::test]
+    async fn profile_media_tab_includes_only_profile_user_media_posts_and_replies() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let plain = create_post(&pool, &settings, Some(bob), "plain", None, &[])
+            .await
+            .expect("plain");
+        let media_post = create_post(&pool, &settings, Some(bob), "with media", None, &[])
+            .await
+            .expect("media post");
+        attach_test_media(&pool, bob, media_post).await;
+        let embedded = create_post(
+            &pool,
+            &settings,
+            Some(bob),
+            "https://youtu.be/dQw4w9WgXcQ",
+            None,
+            &[],
+        )
+        .await
+        .expect("embedded");
+        let parent = create_post(&pool, &settings, Some(alice), "alice parent", None, &[])
+            .await
+            .expect("parent");
+        let media_reply = create_post(
+            &pool,
+            &settings,
+            Some(bob),
+            "reply media",
+            Some(parent),
+            &[],
+        )
+        .await
+        .expect("media reply");
+        attach_test_media(&pool, bob, media_reply).await;
+        let liked_media = create_post(&pool, &settings, Some(alice), "liked media", None, &[])
+            .await
+            .expect("liked media");
+        attach_test_media(&pool, alice, liked_media).await;
+        like(&pool, bob, liked_media).await.expect("like");
+        let reposted_media =
+            create_post(&pool, &settings, Some(alice), "reposted media", None, &[])
+                .await
+                .expect("reposted media");
+        attach_test_media(&pool, alice, reposted_media).await;
+        repost(&pool, bob, reposted_media)
+            .await
+            .expect("repost media");
+
+        let media = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Media)
+            .await
+            .expect("media tab");
+
+        assert!(media.iter().any(|post| post.id == media_post));
+        assert!(media.iter().any(|post| post.id == embedded));
+        assert!(media.iter().any(|post| post.id == media_reply));
+        assert!(!media.iter().any(|post| post.id == plain));
+        assert!(!media.iter().any(|post| post.id == liked_media));
+        assert!(media.iter().any(|post| {
+            post.id == reposted_media && post.event_kind == TimelineEventKind::Repost
+        }));
+    }
+
+    #[tokio::test]
+    async fn profile_likes_tab_shows_liked_posts_themselves() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let liked = create_post(&pool, &settings, Some(alice), "liked by bob", None, &[])
+            .await
+            .expect("liked");
+        let not_liked = create_post(&pool, &settings, Some(bob), "not liked by bob", None, &[])
+            .await
+            .expect("not liked");
+        like(&pool, bob, liked).await.expect("like");
+
+        let likes = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Likes)
+            .await
+            .expect("likes tab");
+
+        assert_eq!(likes.len(), 1);
+        assert_eq!(likes[0].id, liked);
+        assert_eq!(likes[0].user_id, Some(alice));
+        assert!(!likes.iter().any(|post| post.id == not_liked));
+    }
+
+    #[tokio::test]
+    async fn profile_tabs_hide_activity_when_profile_user_blocks_viewer() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(&pool, &settings, Some(bob), "blocked original", None, &[])
+            .await
+            .expect("original");
+        let reply_target = create_post(&pool, &settings, Some(alice), "reply target", None, &[])
+            .await
+            .expect("reply target");
+        create_post(
+            &pool,
+            &settings,
+            Some(bob),
+            "blocked reply",
+            Some(reply_target),
+            &[],
+        )
+        .await
+        .expect("reply");
+        let liked = create_post(&pool, &settings, Some(alice), "blocked like", None, &[])
+            .await
+            .expect("liked");
+        like(&pool, bob, liked).await.expect("like");
+        let media_post = create_post(&pool, &settings, Some(bob), "blocked media", None, &[])
+            .await
+            .expect("media");
+        attach_test_media(&pool, bob, media_post).await;
+
+        let visible = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Posts)
+            .await
+            .expect("visible posts");
+        assert!(visible.iter().any(|post| post.id == original));
+
+        block(&pool, bob, alice).await.expect("block viewer");
+
+        for tab in [
+            ProfileTimelineTab::Posts,
+            ProfileTimelineTab::Replies,
+            ProfileTimelineTab::Media,
+            ProfileTimelineTab::Likes,
+        ] {
+            let posts = profile_tab_timeline(&pool, Some(alice), bob, tab)
+                .await
+                .expect("blocked profile tab");
+            assert!(posts.is_empty(), "{tab:?} should be hidden");
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_likes_tab_hides_activity_when_viewer_mutes_profile_user() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let liked = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "muted profile like",
+            None,
+            &[],
+        )
+        .await
+        .expect("liked");
+        like(&pool, bob, liked).await.expect("like");
+
+        let visible = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Likes)
+            .await
+            .expect("visible likes");
+        assert_eq!(visible.len(), 1);
+
+        mute(&pool, alice, bob).await.expect("mute profile");
+
+        let hidden = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Likes)
+            .await
+            .expect("muted likes");
+        assert!(hidden.is_empty());
+    }
+
+    #[tokio::test]
     async fn deleted_original_repost_renders_as_unavailable_event() {
         let (pool, settings, alice, bob) = fixture().await;
         let post = create_post(&pool, &settings, Some(alice), "hello", None, &[])
@@ -2098,6 +3163,23 @@ mod tests {
         })
         .await
         .expect("profile picture");
+    }
+
+    async fn attach_test_media(pool: &SqlitePool, owner_user_id: i64, post_id: i64) {
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'media.webp', '/tmp/media.webp', '/uploads/images/media.webp', 'image/webp', 'image', 1)",
+                params![owner_user_id],
+            )?;
+            let media_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO post_media (post_id, media_id, position) VALUES (?, ?, 0)",
+                params![post_id, media_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("attach media");
     }
 
     async fn notification_count(
@@ -2178,6 +3260,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_likes_do_not_create_or_render_like_notifications() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let first_post = create_post(&pool, &settings, Some(alice), "first", None, &[])
+            .await
+            .expect("first post");
+        let second_post = create_post(&pool, &settings, Some(alice), "second", None, &[])
+            .await
+            .expect("second post");
+
+        like(&pool, bob, first_post).await.expect("public like");
+        let public_groups = notification_groups(&pool, alice)
+            .await
+            .expect("public notifications");
+        assert_eq!(public_groups.len(), 1);
+        assert_eq!(public_groups[0].kind, "like");
+        assert_eq!(public_groups[0].total_count, 1);
+
+        pool.call(move |conn| {
+            conn.execute(
+                "UPDATE users SET liked_posts_public = 0 WHERE id = ?",
+                [bob],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("make likes private");
+
+        let hidden_groups = notification_groups(&pool, alice)
+            .await
+            .expect("private notifications");
+        assert!(hidden_groups.is_empty());
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread count"),
+            0
+        );
+
+        like(&pool, bob, second_post).await.expect("private like");
+        let raw_like_notifications = notification_count(&pool, alice, "like")
+            .await
+            .expect("raw notification count");
+        assert_eq!(raw_like_notifications, 1);
+        let hidden_groups = notification_groups(&pool, alice)
+            .await
+            .expect("private notifications after private like");
+        assert!(hidden_groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn private_like_counts_are_visible_only_to_liker() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let post = create_post(&pool, &settings, Some(alice), "private count", None, &[])
+            .await
+            .expect("post");
+        pool.call(move |conn| {
+            conn.execute(
+                "UPDATE users SET liked_posts_public = 0 WHERE id = ?",
+                [bob],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("make likes private");
+        like(&pool, bob, post).await.expect("private like");
+
+        let alice_timeline = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("alice timeline");
+        let alice_post = alice_timeline
+            .iter()
+            .find(|item| item.id == post)
+            .expect("alice post");
+        assert_eq!(alice_post.like_count, 0);
+
+        let anonymous_timeline = timeline(&pool, None, "local", None)
+            .await
+            .expect("anonymous timeline");
+        let anonymous_post = anonymous_timeline
+            .iter()
+            .find(|item| item.id == post)
+            .expect("anonymous post");
+        assert_eq!(anonymous_post.like_count, 0);
+
+        let bob_timeline = timeline(&pool, Some(bob), "local", None)
+            .await
+            .expect("bob timeline");
+        let bob_post = bob_timeline
+            .iter()
+            .find(|item| item.id == post)
+            .expect("bob post");
+        assert_eq!(bob_post.like_count, 1);
+        assert!(bob_post.viewer_liked);
+    }
+
+    #[tokio::test]
     async fn own_actions_do_not_create_notifications() {
         let (pool, settings, alice, _) = fixture().await;
         let post = create_post(&pool, &settings, Some(alice), "hello @alice", None, &[])
@@ -2221,6 +3399,314 @@ mod tests {
                 .expect("unread count"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn mention_suggestions_match_visible_usernames_safely() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        let _alex = auth::register_user(&pool, &settings, "al_ex", "very secure password", false)
+            .await
+            .expect("alex");
+        let alx = auth::register_user(&pool, &settings, "alxex", "very secure password", false)
+            .await
+            .expect("alx");
+        let deleted = auth::register_user(
+            &pool,
+            &settings,
+            "al-deleted",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("deleted");
+        let muted =
+            auth::register_user(&pool, &settings, "al-muted", "very secure password", false)
+                .await
+                .expect("muted");
+        let blocker = auth::register_user(
+            &pool,
+            &settings,
+            "al-blocker",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("blocker");
+        pool.call(move |conn| {
+            conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [carol])?;
+            conn.execute("UPDATE users SET is_deleted = 1 WHERE id = ?", [deleted])?;
+            conn.execute(
+                "UPDATE users SET display_name = '<b>Alice</b>' WHERE id = ?",
+                [alice],
+            )?;
+            conn.execute(
+                "INSERT INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
+                params![bob, alx],
+            )?;
+            conn.execute(
+                "INSERT INTO mutes (muter_id, muted_id) VALUES (?, ?)",
+                params![bob, muted],
+            )?;
+            conn.execute(
+                "INSERT INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
+                params![blocker, bob],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("mark users");
+
+        let suggestions = mention_suggestions(&pool, Some(bob), "AL")
+            .await
+            .expect("suggestions");
+        assert_eq!(
+            suggestions,
+            vec![
+                MentionSuggestion {
+                    username: "al_ex".to_owned(),
+                    display_name: "al_ex".to_owned(),
+                },
+                MentionSuggestion {
+                    username: "alice".to_owned(),
+                    display_name: "<b>Alice</b>".to_owned(),
+                },
+            ]
+        );
+
+        let escaped = mention_suggestions(&pool, Some(bob), "al_")
+            .await
+            .expect("escaped suggestions");
+        assert_eq!(
+            escaped
+                .iter()
+                .map(|suggestion| suggestion.username.as_str())
+                .collect::<Vec<_>>(),
+            vec!["al_ex"]
+        );
+        assert!(
+            !escaped
+                .iter()
+                .any(|suggestion| suggestion.username == "alxex")
+        );
+
+        for wildcard_query in ["%", "_", "al%"] {
+            let wildcard = mention_suggestions(&pool, Some(bob), wildcard_query)
+                .await
+                .expect("wildcard query");
+            assert!(
+                wildcard.is_empty(),
+                "{wildcard_query:?} should not broaden mention suggestions"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_groups_count_unread_and_mark_group_read() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        let dave = auth::register_user(&pool, &settings, "dave", "very secure password", false)
+            .await
+            .expect("dave");
+        let first_post = create_post(&pool, &settings, Some(alice), "first post", None, &[])
+            .await
+            .expect("first post");
+        let second_post = create_post(&pool, &settings, Some(alice), "second post", None, &[])
+            .await
+            .expect("second post");
+
+        like(&pool, bob, first_post).await.expect("bob like");
+        like(&pool, carol, second_post).await.expect("carol like");
+        like(&pool, dave, first_post).await.expect("dave like");
+
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].kind, "like");
+        assert_eq!(groups[0].post_id, Some(first_post));
+        assert_eq!(groups[0].total_count, 2);
+        assert_eq!(groups[0].unread_count, 2);
+        assert_eq!(
+            groups[0]
+                .actors
+                .iter()
+                .filter_map(|actor| actor.username.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["dave", "bob"]
+        );
+        assert_eq!(groups[1].post_id, Some(second_post));
+        assert_eq!(groups[1].unread_count, 1);
+
+        mark_notification_ids_read(&pool, alice, &groups[0].notification_ids)
+            .await
+            .expect("mark group read");
+
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread count"),
+            1
+        );
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+        let first_group = groups
+            .iter()
+            .find(|group| group.post_id == Some(first_post))
+            .expect("first post group");
+        let second_group = groups
+            .iter()
+            .find(|group| group.post_id == Some(second_post))
+            .expect("second post group");
+        assert_eq!(first_group.unread_count, 0);
+        assert_eq!(second_group.unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn notification_group_counts_and_read_transition_include_older_rows() {
+        let (pool, settings, alice, _bob) = fixture().await;
+        let post = create_post(&pool, &settings, Some(alice), "busy post", None, &[])
+            .await
+            .expect("post");
+        pool.call(move |conn| {
+            let tx = conn.transaction()?;
+            for _ in 0..85 {
+                tx.execute(
+                    "INSERT INTO notifications (user_id, actor_user_id, post_id, kind, message) VALUES (?, NULL, ?, 'like', 'liked your post')",
+                    params![alice, post],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .expect("notifications");
+
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].total_count, 85);
+        assert_eq!(groups[0].unread_count, 85);
+        assert_eq!(groups[0].notification_ids.len(), 80);
+
+        mark_notification_group_read(&pool, alice, "like", Some(post))
+            .await
+            .expect("mark group read");
+
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread count"),
+            0
+        );
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+        assert_eq!(groups[0].total_count, 85);
+        assert_eq!(groups[0].unread_count, 0);
+    }
+
+    #[tokio::test]
+    async fn notification_groups_keep_types_and_targets_separate() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        let post = create_post(&pool, &settings, Some(alice), "group target", None, &[])
+            .await
+            .expect("post");
+
+        like(&pool, bob, post).await.expect("bob like");
+        like(&pool, carol, post).await.expect("carol like");
+        repost(&pool, bob, post).await.expect("bob repost");
+        repost(&pool, carol, post).await.expect("carol repost");
+        create_post(&pool, &settings, Some(bob), "reply one", Some(post), &[])
+            .await
+            .expect("reply one");
+        create_post(&pool, &settings, Some(carol), "reply two", Some(post), &[])
+            .await
+            .expect("reply two");
+        follow(&pool, bob, alice).await.expect("bob follow");
+        follow(&pool, carol, alice).await.expect("carol follow");
+
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+
+        let like_group = groups
+            .iter()
+            .find(|group| group.kind == "like")
+            .expect("like group");
+        let repost_group = groups
+            .iter()
+            .find(|group| group.kind == "repost")
+            .expect("repost group");
+        let reply_group = groups
+            .iter()
+            .find(|group| group.kind == "reply")
+            .expect("reply group");
+        let follow_group = groups
+            .iter()
+            .find(|group| group.kind == "follow")
+            .expect("follow group");
+
+        assert_eq!(like_group.total_count, 2);
+        assert_eq!(repost_group.total_count, 2);
+        assert_eq!(reply_group.total_count, 2);
+        assert_eq!(follow_group.total_count, 2);
+        assert_ne!(like_group.notification_ids, repost_group.notification_ids);
+        assert_ne!(like_group.notification_ids, reply_group.notification_ids);
+    }
+
+    #[test]
+    fn notification_grouping_keeps_mentions_on_distinct_targets() {
+        let rows = vec![
+            NotificationView {
+                id: 3,
+                kind: "mention".to_owned(),
+                actor_user_id: Some(3),
+                actor_username: Some("carol".to_owned()),
+                actor_display_name: Some("Carol".to_owned()),
+                post_id: Some(10),
+                group_target_post_id: Some(10),
+                post_text: Some("same target".to_owned()),
+                post_available: true,
+                read_at: None,
+                created_at: "2026-05-24 10:03:00".to_owned(),
+            },
+            NotificationView {
+                id: 2,
+                kind: "mention".to_owned(),
+                actor_user_id: Some(2),
+                actor_username: Some("bob".to_owned()),
+                actor_display_name: Some("Bob".to_owned()),
+                post_id: Some(10),
+                group_target_post_id: Some(10),
+                post_text: Some("same target".to_owned()),
+                post_available: true,
+                read_at: Some("2026-05-24 10:04:00".to_owned()),
+                created_at: "2026-05-24 10:02:00".to_owned(),
+            },
+            NotificationView {
+                id: 1,
+                kind: "mention".to_owned(),
+                actor_user_id: Some(4),
+                actor_username: Some("dave".to_owned()),
+                actor_display_name: Some("Dave".to_owned()),
+                post_id: Some(11),
+                group_target_post_id: Some(11),
+                post_text: Some("other target".to_owned()),
+                post_available: true,
+                read_at: None,
+                created_at: "2026-05-24 10:01:00".to_owned(),
+            },
+        ];
+
+        let groups = group_notifications(&rows);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].post_id, Some(10));
+        assert_eq!(groups[0].total_count, 2);
+        assert_eq!(groups[0].unread_count, 1);
+        assert_eq!(groups[1].post_id, Some(11));
+        assert_eq!(groups[1].total_count, 1);
     }
 
     #[tokio::test]
@@ -2284,6 +3770,37 @@ mod tests {
         );
         assert!(
             !is_following(&pool, bob, alice)
+                .await
+                .expect("not following")
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_rejects_deleted_or_suspended_targets() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        pool.call(move |conn| {
+            conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [bob])?;
+            conn.execute("UPDATE users SET is_deleted = 1 WHERE id = ?", [carol])?;
+            Ok(())
+        })
+        .await
+        .expect("mark unavailable");
+
+        let suspended = follow(&pool, alice, bob).await.expect_err("suspended");
+        let deleted = follow(&pool, alice, carol).await.expect_err("deleted");
+
+        assert_eq!(suspended.to_string(), "account cannot be followed");
+        assert_eq!(deleted.to_string(), "account cannot be followed");
+        assert!(
+            !is_following(&pool, alice, bob)
+                .await
+                .expect("not following")
+        );
+        assert!(
+            !is_following(&pool, alice, carol)
                 .await
                 .expect("not following")
         );

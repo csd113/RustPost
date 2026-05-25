@@ -128,6 +128,14 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_11)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (11)", [])?;
         }
+        if applied.unwrap_or(0) < 12 {
+            tx.execute_batch(MIGRATION_12)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
+        }
+        if applied.unwrap_or(0) < 13 {
+            tx.execute_batch(MIGRATION_13)?;
+            tx.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -430,6 +438,17 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_12: &str = r#"
+ALTER TABLE users ADD COLUMN onboarding_completed_at TEXT;
+UPDATE users
+SET onboarding_completed_at = CURRENT_TIMESTAMP
+WHERE onboarding_completed_at IS NULL AND is_deleted = 0;
+"#;
+
+const MIGRATION_13: &str = r#"
+ALTER TABLE users ADD COLUMN liked_posts_public INTEGER NOT NULL DEFAULT 1 CHECK (liked_posts_public IN (0, 1));
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,7 +490,7 @@ mod tests {
             .await
             .expect("settings");
 
-        assert_eq!(versions, 11);
+        assert_eq!(versions, 13);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);
@@ -609,6 +628,176 @@ mod tests {
 
         assert_eq!(blur_enabled, 1);
         assert_eq!(is_nsfw, 0);
+    }
+
+    #[tokio::test]
+    async fn onboarding_completion_defaults_to_incomplete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        let completed_at: Option<String> = pool
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO users (username, normalized_username, password_hash, display_name) VALUES ('Alice', 'alice', 'hash', 'Alice')",
+                    [],
+                )?;
+                Ok(conn.query_row(
+                    "SELECT onboarding_completed_at FROM users WHERE normalized_username = 'alice'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("onboarding state");
+
+        assert!(completed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn liked_posts_are_public_by_default() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        migrate(&pool).await.expect("migrate");
+
+        let liked_posts_public: i64 = pool
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO users (username, normalized_username, password_hash, display_name) VALUES ('Alice', 'alice', 'hash', 'Alice')",
+                    [],
+                )?;
+                Ok(conn.query_row(
+                    "SELECT liked_posts_public FROM users WHERE normalized_username = 'alice'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("liked posts visibility");
+
+        assert_eq!(liked_posts_public, 1);
+    }
+
+    #[tokio::test]
+    async fn liked_posts_public_migration_defaults_existing_users_public() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        pool.call(|conn| {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (12);
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    normalized_username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    is_deleted INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO users (username, normalized_username, password_hash, display_name)
+                    VALUES ('Alice', 'alice', 'hash', 'Alice');
+                INSERT INTO users (username, normalized_username, password_hash, display_name, is_deleted)
+                    VALUES ('Deleted', 'deleted', 'hash', 'Deleted', 1);
+                "#,
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("legacy schema");
+
+        migrate(&pool).await.expect("migrate to liked_posts_public");
+        migrate(&pool).await.expect("second migrate");
+
+        let (alice_public, deleted_public, column_count, version): (i64, i64, i64, i64) = pool
+            .call(|conn| {
+                let alice = conn.query_row(
+                    "SELECT liked_posts_public FROM users WHERE normalized_username = 'alice'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let deleted = conn.query_row(
+                    "SELECT liked_posts_public FROM users WHERE normalized_username = 'deleted'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let column_count = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'liked_posts_public'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let version =
+                    conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                        row.get(0)
+                    })?;
+                Ok((alice, deleted, column_count, version))
+            })
+            .await
+            .expect("liked posts migration state");
+
+        assert_eq!(alice_public, 1);
+        assert_eq!(deleted_public, 1);
+        assert_eq!(column_count, 1);
+        assert_eq!(version, 13);
+    }
+
+    #[tokio::test]
+    async fn onboarding_migration_marks_existing_active_users_complete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        pool.call(|conn| {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (11);
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    normalized_username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    is_deleted INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO users (username, normalized_username, password_hash, display_name)
+                    VALUES ('Alice', 'alice', 'hash', 'Alice');
+                INSERT INTO users (username, normalized_username, password_hash, display_name, is_deleted)
+                    VALUES ('Deleted', 'deleted', 'hash', 'Deleted', 1);
+                "#,
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("legacy schema");
+
+        migrate(&pool).await.expect("migrate");
+
+        let (active_completed_at, deleted_completed_at): (Option<String>, Option<String>) = pool
+            .call(|conn| {
+                let active = conn.query_row(
+                    "SELECT onboarding_completed_at FROM users WHERE normalized_username = 'alice'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let deleted = conn.query_row(
+                    "SELECT onboarding_completed_at FROM users WHERE normalized_username = 'deleted'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((active, deleted))
+            })
+            .await
+            .expect("onboarding state");
+
+        assert!(active_completed_at.is_some());
+        assert!(deleted_completed_at.is_none());
     }
 
     #[tokio::test]

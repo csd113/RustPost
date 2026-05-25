@@ -60,18 +60,22 @@ pub fn router(state: Arc<AppState>) -> Router {
     let upload_body_limit = upload_body_limit(&state.settings);
     Router::new()
         .route("/", get(home))
+        .route("/assets/rustpost-boot.js", get(client_boot_script))
         .route("/assets/rustpost.js", get(client_script))
         .route("/favicon.ico", get(site_favicon))
         .route("/local", get(local_redirect))
         .route("/home", get(home))
         .route("/login", get(login_form).post(login))
         .route("/register", get(register_form).post(register))
+        .route("/onboarding", get(onboarding).post(onboarding_update))
         .route("/logout", post(logout))
         .route("/posts", post(create_post))
         .route("/posts/{id}", get(thread))
+        .route("/posts/{id}/edit", get(edit_post_form).post(edit_post))
         .route("/posts/{id}/delete", get(delete_confirm).post(delete_post))
         .route("/posts/{id}/like", post(toggle_like))
         .route("/posts/{id}/bookmark", post(toggle_bookmark))
+        .route("/posts/{id}/pin", post(toggle_pin_post))
         .route("/posts/{id}/repost", post(repost))
         .route("/posts/{id}/quote", get(quote_form).post(quote_post))
         .route("/posts/{id}/reply", post(reply_redirect))
@@ -97,7 +101,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/following", get(following))
         .route("/bookmarks", get(bookmarks))
         .route("/notifications", get(notifications))
+        .route("/notifications/open", post(open_notification_group))
         .route("/notifications/read", post(mark_notifications_read))
+        .route("/mentions", get(mention_suggestions))
         .route("/search", get(search))
         .route("/tags/{tag}", get(tag))
         .route("/admin", get(admin_dashboard))
@@ -160,6 +166,17 @@ async fn client_script() -> Response {
         .into_response()
 }
 
+async fn client_boot_script() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        render::client_boot_script(),
+    )
+        .into_response()
+}
+
 async fn site_favicon(State(state): State<Arc<AppState>>) -> Response {
     favicon::response(&state.paths).await
 }
@@ -185,6 +202,15 @@ struct CsrfForm {
 }
 
 #[derive(Deserialize)]
+struct NotificationOpenForm {
+    csrf: String,
+    notification_ids: String,
+    group_kind: Option<String>,
+    group_target_post_id: Option<String>,
+    return_to: String,
+}
+
+#[derive(Deserialize)]
 struct QuoteForm {
     csrf: String,
     text: String,
@@ -202,8 +228,29 @@ struct DeleteQuery {
 }
 
 #[derive(Deserialize)]
+struct ReturnQuery {
+    return_to: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SearchQuery {
     q: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProfileQuery {
+    tab: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MentionSuggestionsQuery {
+    q: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MentionSuggestionResponse {
+    username: String,
+    display_name: String,
 }
 
 #[derive(Deserialize)]
@@ -254,6 +301,7 @@ struct ParsedProfileUpdate {
     delete_profile_picture: bool,
     delete_banner: bool,
     nsfw_blur_enabled: bool,
+    liked_posts_public: bool,
     profile_picture_media_id: Option<i64>,
     banner_media_id: Option<i64>,
 }
@@ -270,16 +318,37 @@ struct ParsedPostCreate {
     is_nsfw: bool,
 }
 
+struct ParsedOnboardingUpdate {
+    csrf_token: String,
+    intent: String,
+    display_name: String,
+    bio: String,
+    profile_picture_media_id: Option<i64>,
+    follow_user_ids: Vec<i64>,
+}
+
 #[derive(Deserialize)]
 struct AdminNsfwForm {
     csrf: String,
     nsfw: String,
 }
 
+#[derive(Deserialize)]
+struct EditPostForm {
+    csrf: String,
+    text: String,
+    return_to: Option<String>,
+}
+
 struct DeletePreview {
     text: String,
     username: Option<String>,
     display_name: Option<String>,
+    parent_post_id: Option<i64>,
+}
+
+struct EditPreview {
+    text: String,
     parent_post_id: Option<i64>,
 }
 
@@ -335,11 +404,12 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
         "{}{}{}",
         render::page_header("Home Feed", "All posts"),
         composer,
-        render::posts_with_nsfw_blur(
+        render::posts_with_controls(
             &posts,
             user.as_ref(),
             csrf.as_deref(),
             blur_nsfw_media(&state, user.as_ref()),
+            state.settings.posts.post_edit_window_seconds,
         )
     );
     Ok(Html(
@@ -531,7 +601,7 @@ async fn register(
         }
     };
     let session = auth::create_session(&state.pool, user_id).await?;
-    let mut response = Redirect::to("/home").into_response();
+    let mut response = Redirect::to("/onboarding").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&auth::set_session_cookie(
@@ -580,6 +650,271 @@ async fn register_form_body(state: &AppState, message: Option<&str>) -> AppResul
         state.settings.accounts.min_password_length,
         captcha.as_ref(),
     ))
+}
+
+async fn onboarding(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResult<Response> {
+    let user = require_user(&state, &headers).await?;
+    if onboarding_completed(&state.pool, user.id).await? {
+        return Ok(Redirect::to("/home").into_response());
+    }
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    Ok(Html(onboarding_page(&state, &user, &csrf).await?).into_response())
+}
+
+async fn onboarding_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> AppResult<Response> {
+    let user = require_user(&state, &headers).await?;
+    let form = parse_onboarding_update(&state, user.id, multipart).await?;
+    if let Err(err) = validate_csrf(&state.pool, &headers, &form.csrf_token).await {
+        cleanup_onboarding_uploads(&state, &form).await;
+        return Err(err);
+    }
+    if form.intent == "skip" {
+        cleanup_onboarding_uploads(&state, &form).await;
+        mark_onboarding_complete(&state.pool, user.id).await?;
+        return Ok(Redirect::to("/home").into_response());
+    }
+    if form.intent != "save" {
+        cleanup_onboarding_uploads(&state, &form).await;
+        return onboarding_response(
+            &state,
+            &user,
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "Unknown onboarding action.",
+        )
+        .await;
+    }
+    if let Err(err) =
+        crate::validation::validate_profile_text(&form.display_name, &form.bio, &state.settings)
+    {
+        cleanup_onboarding_uploads(&state, &form).await;
+        return onboarding_response(
+            &state,
+            &user,
+            &headers,
+            StatusCode::BAD_REQUEST,
+            &err.to_string(),
+        )
+        .await;
+    }
+    update_onboarding_profile(&state.pool, user.id, &form.display_name, &form.bio).await?;
+    if let Some(media_id) = form.profile_picture_media_id {
+        media::set_profile_media(
+            &state.pool,
+            user.id,
+            media::ProfileMediaSlot::Picture,
+            media_id,
+        )
+        .await?;
+    }
+    let follow_user_ids = dedup_user_ids(form.follow_user_ids, user.id);
+    let follow_user_ids = social::active_follow_targets(&state.pool, &follow_user_ids).await?;
+    for followed_id in follow_user_ids {
+        social::follow(&state.pool, user.id, followed_id)
+            .await
+            .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    }
+    mark_onboarding_complete(&state.pool, user.id).await?;
+    Ok(Redirect::to("/home").into_response())
+}
+
+async fn cleanup_onboarding_uploads(state: &AppState, form: &ParsedOnboardingUpdate) {
+    if let Some(media_id) = form.profile_picture_media_id
+        && let Err(error) = media::delete_media(&state.pool, media_id).await
+    {
+        tracing::warn!(
+            media_id,
+            error = %error,
+            "failed to clean up rejected onboarding profile picture"
+        );
+    }
+}
+
+async fn onboarding_response(
+    state: &AppState,
+    user: &CurrentUser,
+    headers: &HeaderMap,
+    status: StatusCode,
+    message: &str,
+) -> AppResult<Response> {
+    let csrf = form_csrf(state, headers).await.unwrap_or_default();
+    let body = format!(
+        "{}{}",
+        render::notice("error", message),
+        onboarding_page_body(state, user, &csrf).await?
+    );
+    Ok((
+        status,
+        Html(page_layout(state, Some(user), Some(&csrf), "Onboarding", &body).await?),
+    )
+        .into_response())
+}
+
+async fn onboarding_page(state: &AppState, user: &CurrentUser, csrf: &str) -> AppResult<String> {
+    let body = onboarding_page_body(state, user, csrf).await?;
+    page_layout(state, Some(user), Some(csrf), "Onboarding", &body).await
+}
+
+async fn onboarding_page_body(
+    state: &AppState,
+    user: &CurrentUser,
+    csrf: &str,
+) -> AppResult<String> {
+    let profile = settings_profile(&state.pool, user.id).await?;
+    let suggestions = social::onboarding_suggestions(&state.pool, user.id, 6).await?;
+    Ok(render::onboarding_page(render::OnboardingPage {
+        csrf,
+        display_name: &profile.display_name,
+        bio: &profile.bio,
+        picture_path: profile.picture_path.as_deref(),
+        suggestions: &suggestions,
+        allow_profile_pictures: state.settings.accounts.allow_profile_pictures,
+        max_display_name_len: state.settings.accounts.max_display_name_len,
+        max_bio_len: state.settings.accounts.max_bio_len,
+    }))
+}
+
+async fn parse_onboarding_update(
+    state: &AppState,
+    user_id: i64,
+    mut multipart: Multipart,
+) -> AppResult<ParsedOnboardingUpdate> {
+    let mut form = ParsedOnboardingUpdate {
+        csrf_token: String::new(),
+        intent: "save".to_owned(),
+        display_name: String::new(),
+        bio: String::new(),
+        profile_picture_media_id: None,
+        follow_user_ids: Vec::new(),
+    };
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?
+    {
+        let Some(name) = field.name().map(ToOwned::to_owned) else {
+            continue;
+        };
+        match name.as_str() {
+            "csrf" => {
+                form.csrf_token = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
+            "intent" => {
+                form.intent = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
+            "display_name" => {
+                form.display_name = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
+            "bio" => {
+                form.bio = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
+            "follow_user_id" => {
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+                form.follow_user_ids
+                    .push(value.trim().parse::<i64>().map_err(|_parse_err| {
+                        AppError::BadRequest("follow suggestion is invalid".to_owned())
+                    })?);
+            }
+            "profile_picture" if field.file_name().is_some() => {
+                if !state.settings.accounts.allow_profile_pictures {
+                    return Err(AppError::Forbidden);
+                }
+                if field.file_name().is_none_or(|name| name.trim().is_empty()) {
+                    continue;
+                }
+                form.profile_picture_media_id = Some(
+                    media::save_profile_picture_upload(
+                        &state.pool,
+                        &state.settings,
+                        &state.paths,
+                        &state.ffmpeg,
+                        user_id,
+                        field,
+                    )
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(form)
+}
+
+async fn update_onboarding_profile(
+    pool: &SqlitePool,
+    user_id: i64,
+    display_name: &str,
+    bio: &str,
+) -> AppResult<()> {
+    let display_name = display_name.trim().to_owned();
+    let bio = bio.trim().to_owned();
+    pool.call(move |conn| {
+        conn.execute(
+            "UPDATE users SET display_name = ?, bio = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
+            params![display_name, bio, user_id],
+        )?;
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
+async fn mark_onboarding_complete(pool: &SqlitePool, user_id: i64) -> AppResult<()> {
+    pool.call(move |conn| {
+        conn.execute(
+            "UPDATE users SET onboarding_completed_at = COALESCE(onboarding_completed_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
+            [user_id],
+        )?;
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
+async fn onboarding_completed(pool: &SqlitePool, user_id: i64) -> AppResult<bool> {
+    Ok(pool
+        .call(move |conn| {
+            conn.query_row(
+                "SELECT onboarding_completed_at IS NOT NULL FROM users WHERE id = ? AND is_deleted = 0",
+                [user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(0) != 0)
+            .map_err(Into::into)
+        })
+        .await?)
+}
+
+fn dedup_user_ids(ids: Vec<i64>, current_user_id: i64) -> Vec<i64> {
+    let mut deduped = Vec::new();
+    for id in ids {
+        if id == current_user_id || deduped.contains(&id) {
+            continue;
+        }
+        deduped.push(id);
+    }
+    deduped
 }
 
 async fn logout(
@@ -684,18 +1019,20 @@ async fn create_post(
             parent_post_id: form.parent_post_id,
             redirect,
             html: if form.parent_post_id.is_some() {
-                render::thread_post_card_with_nsfw_blur(
+                render::thread_post_card_with_controls(
                     post,
                     user.as_ref(),
                     form_csrf(&state, &headers).await.as_deref(),
                     blur_nsfw_media(&state, user.as_ref()),
+                    state.settings.posts.post_edit_window_seconds,
                 )
             } else {
-                render::post_card_with_nsfw_blur(
+                render::post_card_with_controls(
                     post,
                     user.as_ref(),
                     form_csrf(&state, &headers).await.as_deref(),
                     blur_nsfw_media(&state, user.as_ref()),
+                    state.settings.posts.post_edit_window_seconds,
                 )
             },
         })
@@ -824,17 +1161,83 @@ async fn thread(
     let body = format!(
         "{}{}{}",
         render::thread_back_control(),
-        render::thread_posts_with_nsfw_blur(
+        render::thread_posts_with_controls(
             &posts,
             user.as_ref(),
             csrf.as_deref(),
             blur_nsfw_media(&state, user.as_ref()),
+            state.settings.posts.post_edit_window_seconds,
         ),
         composer
     );
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Thread", &body).await?,
     ))
+}
+
+async fn edit_post_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(query): Query<ReturnQuery>,
+) -> AppResult<Html<String>> {
+    let user = require_active_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let preview = edit_preview(
+        &state.pool,
+        user.id,
+        id,
+        state.settings.posts.post_edit_window_seconds,
+    )
+    .await?;
+    let fallback = edit_return_fallback(&headers, id, preview.parent_post_id);
+    let return_to = query
+        .return_to
+        .as_deref()
+        .and_then(|target| safe_edit_return_target(target, id))
+        .unwrap_or(fallback);
+    let body = format!(
+        "{}{}",
+        render::thread_back_control(),
+        render::edit_post_form(
+            &csrf,
+            id,
+            &preview.text,
+            state.settings.posts.max_text_chars,
+            &return_to,
+        )
+    );
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Edit post", &body).await?,
+    ))
+}
+
+async fn edit_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<EditPostForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    match social::edit_post(&state.pool, &state.settings, user.id, id, &form.text).await {
+        Ok(_changed) => {
+            let target = form
+                .return_to
+                .as_deref()
+                .and_then(|target| safe_edit_return_target(target, id))
+                .unwrap_or_else(|| format!("/posts/{id}"));
+            Ok(Redirect::to(&target).into_response())
+        }
+        Err(social::EditPostError::NotFound) => Err(AppError::NotFound),
+        Err(social::EditPostError::Forbidden) => Err(AppError::Forbidden),
+        Err(
+            err @ (social::EditPostError::WindowExpired | social::EditPostError::Validation(_)),
+        ) => bad_request_page(&state, Some(&user), &err.to_string()).await,
+        Err(social::EditPostError::Database(message)) => {
+            Err(AppError::Anyhow(anyhow::anyhow!(message)))
+        }
+    }
 }
 
 async fn delete_confirm(
@@ -937,6 +1340,31 @@ async fn toggle_bookmark(
     Ok(redirect_to_post_anchor(&headers, id, is_reply).into_response())
 }
 
+async fn toggle_pin_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let is_reply = post_is_reply(&state.pool, id).await?;
+    if social::pinned_post_id(&state.pool, user.id).await? == Some(id) {
+        social::unpin_post(&state.pool, user.id, id).await?;
+    } else {
+        social::pin_post(&state.pool, user.id, id)
+            .await
+            .map_err(|err| match err {
+                social::PinPostError::NotFound => AppError::NotFound,
+                social::PinPostError::Forbidden => AppError::Forbidden,
+                social::PinPostError::Database(message) => {
+                    AppError::Anyhow(anyhow::anyhow!(message))
+                }
+            })?;
+    }
+    Ok(redirect_to_post_anchor(&headers, id, is_reply).into_response())
+}
+
 async fn repost(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1026,6 +1454,33 @@ async fn reply_redirect(Path(id): Path<i64>) -> Redirect {
     Redirect::to(&format!("/posts/{id}"))
 }
 
+fn profile_tab_from_query(tab: Option<&str>) -> social::ProfileTimelineTab {
+    match tab {
+        Some("replies") => social::ProfileTimelineTab::Replies,
+        Some("media") => social::ProfileTimelineTab::Media,
+        Some("likes") => social::ProfileTimelineTab::Likes,
+        _ => social::ProfileTimelineTab::Posts,
+    }
+}
+
+fn profile_tab_empty_state(tab: social::ProfileTimelineTab) -> render::EmptyState<'static> {
+    match tab {
+        social::ProfileTimelineTab::Posts => {
+            render::EmptyState::new("No posts yet.", "This profile has not posted yet.")
+        }
+        social::ProfileTimelineTab::Replies => {
+            render::EmptyState::new("No replies yet.", "This profile has not replied yet.")
+        }
+        social::ProfileTimelineTab::Media => render::EmptyState::new(
+            "No media posts yet.",
+            "Media posts and replies will appear here.",
+        ),
+        social::ProfileTimelineTab::Likes => {
+            render::EmptyState::new("No likes yet.", "Liked posts will appear here.")
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "profile rendering combines existing viewer controls and page assembly in one route handler"
@@ -1034,8 +1489,10 @@ async fn profile(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(username): Path<String>,
+    Query(query): Query<ProfileQuery>,
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
+    let active_tab = profile_tab_from_query(query.tab.as_deref());
     let profile = state
         .pool
         .call(move |conn| {
@@ -1043,7 +1500,9 @@ async fn profile(
                 r#"
         SELECT u.id, u.username, u.display_name, u.bio, u.location, u.website,
           pic.public_path AS profile_picture_path,
-          banner.public_path AS banner_path
+          banner.public_path AS banner_path,
+          u.liked_posts_public,
+          u.is_suspended
         FROM users u
         LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
         LEFT JOIN media banner ON banner.id = u.banner_media_id
@@ -1060,6 +1519,8 @@ async fn profile(
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)? != 0,
+                        row.get::<_, i64>(9)? != 0,
                     ))
                 },
             )
@@ -1076,13 +1537,36 @@ async fn profile(
         website,
         picture_path,
         banner_path,
+        liked_posts_public,
+        is_suspended,
     )) = profile
     else {
         return Err(AppError::NotFound);
     };
     let csrf = form_csrf(&state, &headers).await;
-    let posts =
-        social::profile_timeline(&state.pool, user.as_ref().map(|u| u.id), profile_id).await?;
+    let viewer_id = user.as_ref().map(|u| u.id);
+    let owner_or_admin =
+        viewer_id == Some(profile_id) || user.as_ref().is_some_and(|viewer| viewer.is_admin);
+    let activity_visible = (!is_suspended || owner_or_admin)
+        && social::profile_activity_visible(&state.pool, viewer_id, profile_id).await?;
+    let likes_visible = activity_visible && (liked_posts_public || viewer_id == Some(profile_id));
+    let pinned_post = if active_tab == social::ProfileTimelineTab::Posts && activity_visible {
+        social::profile_pinned_post(&state.pool, viewer_id, profile_id).await?
+    } else {
+        None
+    };
+    let mut posts = if !activity_visible
+        || (active_tab == social::ProfileTimelineTab::Likes && !likes_visible)
+    {
+        Vec::new()
+    } else {
+        social::profile_tab_timeline(&state.pool, viewer_id, profile_id, active_tab).await?
+    };
+    if let Some(pinned) = pinned_post.as_ref() {
+        posts.retain(|post| {
+            !(post.event_kind == social::TimelineEventKind::Post && post.id == pinned.id)
+        });
+    }
     let (followers, following) = social::follow_counts(&state.pool, profile_id).await?;
     let controls = profile_controls(&state, user.as_ref(), csrf.as_deref(), profile_id).await?;
     let picture = picture_path.map_or_else(
@@ -1120,8 +1604,39 @@ async fn profile(
             html_escape::encode_text(location.as_str())
         )
     };
+    let pinned = pinned_post.as_ref().map_or_else(String::new, |post| {
+        render::pinned_post_with_controls(
+            post,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+            state.settings.posts.post_edit_window_seconds,
+        )
+    });
+    let tabs = render::profile_tabs(&profile_username, active_tab);
+    let timeline = if !activity_visible {
+        render::posts_with_controls_empty_state(
+            &posts,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+            state.settings.posts.post_edit_window_seconds,
+            profile_tab_empty_state(active_tab),
+        )
+    } else if active_tab == social::ProfileTimelineTab::Likes && !likes_visible {
+        render::empty_state("This user’s likes are private", "")
+    } else {
+        render::posts_with_controls_empty_state(
+            &posts,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+            state.settings.posts.post_edit_window_seconds,
+            profile_tab_empty_state(active_tab),
+        )
+    };
     let body = format!(
-        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p>{}<p>{}</p>{}</div></div></section>{}"#,
+        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p>{}<p>{}</p>{}</div></div></section>{}{}{}"#,
         banner,
         picture,
         html_escape::encode_text(display_name.as_str()),
@@ -1134,12 +1649,9 @@ async fn profile(
         location_line,
         html_escape::encode_text(bio.as_str()),
         website_link,
-        render::posts_with_nsfw_blur(
-            &posts,
-            user.as_ref(),
-            csrf.as_deref(),
-            blur_nsfw_media(&state, user.as_ref()),
-        )
+        pinned,
+        tabs,
+        timeline
     );
     Ok(Html(
         page_layout(
@@ -1195,7 +1707,10 @@ async fn profile_followers(
             &format!("{display_name} followers"),
             &format!("Users who follow @{profile_username}.")
         ),
-        render::account_links(&accounts, "No followers yet.")
+        render::account_links_with_empty_state(
+            &accounts,
+            render::EmptyState::new("No followers yet.", "Followers will appear here.",),
+        )
     );
     Ok(Html(
         page_layout(
@@ -1233,7 +1748,13 @@ async fn profile_following(
             &format!("{display_name} following"),
             &format!("Users @{profile_username} follows.")
         ),
-        render::account_links(&accounts, "Not following anyone yet.")
+        render::account_links_with_empty_state(
+            &accounts,
+            render::EmptyState::new(
+                "Not following anyone yet.",
+                "Followed accounts will appear here.",
+            ),
+        )
     );
     Ok(Html(
         page_layout(
@@ -1363,6 +1884,7 @@ struct SettingsProfile {
     website: String,
     theme: String,
     nsfw_blur_enabled: bool,
+    liked_posts_public: bool,
     picture_path: Option<String>,
     banner_path: Option<String>,
 }
@@ -1372,6 +1894,7 @@ async fn settings_profile(pool: &SqlitePool, user_id: i64) -> AppResult<Settings
         conn.query_row(
             r#"
         SELECT u.display_name, u.bio, u.location, u.website, u.theme, u.nsfw_blur_enabled,
+          u.liked_posts_public,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path
         FROM users u
@@ -1388,8 +1911,9 @@ async fn settings_profile(pool: &SqlitePool, user_id: i64) -> AppResult<Settings
                     website: row.get(3)?,
                     theme: row.get(4)?,
                     nsfw_blur_enabled: row.get::<_, i64>(5)? != 0,
-                    picture_path: row.get(6)?,
-                    banner_path: row.get(7)?,
+                    liked_posts_public: row.get::<_, i64>(6)? != 0,
+                    picture_path: row.get(7)?,
+                    banner_path: row.get(8)?,
                 })
             },
         )
@@ -1429,30 +1953,83 @@ fn settings_profile_media(
             )
         },
     );
-    let banner_control = if allow_profile_banners {
-        let delete = banner_path.map_or_else(String::new, |_| {
-            r#"<label class="check-row"><input type="checkbox" name="delete_banner" value="true"> Remove banner</label>"#
-                .to_owned()
-        });
-        format!(
-            r#"<div class="media-control-row"><label class="file-control" for="banner">Change banner<input id="banner" name="banner" type="file" accept="image/*"></label>{delete}</div>"#
+    let banner_controls = if allow_profile_banners {
+        settings_media_actions(
+            "settings-banner-actions",
+            "banner",
+            "banner",
+            "Change banner",
+            banner_path.map(|_| ("delete_banner", "delete_banner", "Remove banner")),
         )
     } else {
-        r#"<p class="muted">Profile banners are disabled.</p>"#.to_owned()
+        settings_media_disabled("Profile banners are disabled.")
     };
-    let picture_control = if allow_profile_pictures {
-        let delete = picture_path.map_or_else(String::new, |_| {
-            r#"<label class="check-row"><input type="checkbox" name="delete_profile_picture" value="true"> Remove profile picture</label>"#
-                .to_owned()
-        });
-        format!(
-            r#"<div class="media-control-row"><label class="file-control" for="profile_picture">Change profile picture<input id="profile_picture" name="profile_picture" type="file" accept="image/*"></label>{delete}</div>"#
+    let picture_controls = if allow_profile_pictures {
+        settings_media_actions(
+            "settings-picture-actions",
+            "profile_picture",
+            "profile_picture",
+            "Change profile picture",
+            picture_path.map(|_| {
+                (
+                    "delete_profile_picture",
+                    "delete_profile_picture",
+                    "Remove profile picture",
+                )
+            }),
         )
     } else {
-        r#"<p class="muted">Profile pictures are disabled.</p>"#.to_owned()
+        settings_media_disabled("Profile pictures are disabled.")
     };
     format!(
-        r#"<div class="settings-profile-media"><div class="settings-banner-wrap">{banner}</div><div class="settings-picture-row">{picture}<div class="settings-media-controls">{banner_control}{picture_control}</div></div></div>"#
+        r#"<div class="settings-profile-media"><div class="settings-banner-wrap settings-media-frame" data-profile-media-frame>{banner}{banner_controls}</div><div class="settings-picture-row"><div class="settings-picture-wrap settings-media-frame" data-profile-media-frame>{picture}{picture_controls}</div></div></div>"#
+    )
+}
+
+fn settings_media_actions(
+    action_class: &str,
+    file_id: &str,
+    file_name: &str,
+    change_label: &str,
+    delete: Option<(&str, &str, &str)>,
+) -> String {
+    let delete_control =
+        delete.map_or_else(String::new, |(delete_id, delete_name, delete_label)| {
+            settings_media_delete_control(delete_id, delete_name, delete_label)
+        });
+    format!(
+        r#"<div class="settings-media-actions {action_class}">{}{delete_control}</div><span class="sr-only" aria-live="polite" data-profile-media-status></span>"#,
+        settings_media_file_control(file_id, file_name, change_label),
+        action_class = html_escape::encode_double_quoted_attribute(action_class),
+    )
+}
+
+fn settings_media_file_control(input_id: &str, name: &str, label: &str) -> String {
+    let input_id = html_escape::encode_double_quoted_attribute(input_id);
+    let name = html_escape::encode_double_quoted_attribute(name);
+    let label_attr = html_escape::encode_double_quoted_attribute(label);
+    let label_text = html_escape::encode_text(label);
+    format!(
+        r#"<span class="settings-media-control"><input class="settings-media-input" id="{input_id}" name="{name}" type="file" accept="image/*" aria-label="{label_attr}" data-profile-media-file><label class="settings-media-icon-button settings-media-change" for="{input_id}" title="{label_attr}">{}<span class="sr-only">{label_text}</span></label></span>"#,
+        render::icon_svg("edit"),
+    )
+}
+
+fn settings_media_delete_control(input_id: &str, name: &str, label: &str) -> String {
+    let input_id = html_escape::encode_double_quoted_attribute(input_id);
+    let name = html_escape::encode_double_quoted_attribute(name);
+    let label_attr = html_escape::encode_double_quoted_attribute(label);
+    let label_text = html_escape::encode_text(label);
+    format!(
+        r#"<span class="settings-media-control"><input class="settings-media-delete-input" id="{input_id}" name="{name}" type="checkbox" value="true" aria-label="{label_attr}" data-profile-media-delete><label class="settings-media-icon-button settings-media-remove" for="{input_id}" title="{label_attr}">{}<span class="sr-only">{label_text}</span></label></span>"#,
+        render::icon_svg("trash"),
+    )
+}
+
+fn settings_media_disabled(message: &str) -> String {
+    format!(
+        r#"<p class="settings-media-disabled">{}</p>"#,
+        html_escape::encode_text(message),
     )
 }
 
@@ -1465,7 +2042,7 @@ fn settings_user_list(
     empty_message: &str,
 ) -> String {
     if users.is_empty() {
-        return compact_empty_state(empty_title, empty_message);
+        return render::compact_empty_state(empty_title, empty_message);
     }
     let rows = users
         .iter()
@@ -1484,7 +2061,7 @@ fn settings_user_list(
 
 fn settings_muted_word_list(words: &[social::MutedWord], csrf: &str) -> String {
     if words.is_empty() {
-        return compact_empty_state(
+        return render::compact_empty_state(
             "No muted words",
             "Posts containing muted words will be hidden.",
         );
@@ -1506,14 +2083,6 @@ fn settings_muted_word_list(words: &[social::MutedWord], csrf: &str) -> String {
         .collect::<Vec<_>>()
         .join("");
     format!(r#"<ul class="settings-item-list">{rows}</ul>"#)
-}
-
-fn compact_empty_state(title: &str, message: &str) -> String {
-    format!(
-        r#"<div class="compact-empty"><strong>{}</strong><p>{}</p></div>"#,
-        html_escape::encode_text(title),
-        html_escape::encode_text(message)
-    )
 }
 
 fn validate_profile_location(location: &str) -> AppResult<()> {
@@ -1578,16 +2147,6 @@ async fn settings_page(
     let blocked = social::blocked_users(&state.pool, user.id).await?;
     let muted = social::muted_users(&state.pool, user.id).await?;
     let muted_words = social::muted_words(&state.pool, user.id).await?;
-    let dark_checked = if Theme::from(profile.theme.as_str()) == Theme::Dark {
-        " checked"
-    } else {
-        ""
-    };
-    let nsfw_checked = if profile.nsfw_blur_enabled {
-        " checked"
-    } else {
-        ""
-    };
     let notice_html =
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
     let password_hint = if state.settings.accounts.min_password_length == 0 {
@@ -1612,16 +2171,40 @@ async fn settings_page(
         state.settings.accounts.allow_profile_pictures,
         state.settings.accounts.allow_profile_banners,
     );
-    let body = format!(
-        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, and account controls.</p></div><button class="primary" type="submit" form="profile-settings-form">Save settings</button></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}">{}<label class="theme-toggle" for="dark_mode"><input id="dark_mode" name="dark_mode" type="checkbox" value="true"{}> Dark mode</label><label class="theme-toggle" for="nsfw_blur_enabled"><input id="nsfw_blur_enabled" name="nsfw_blur_enabled" type="checkbox" value="true"{}> Blur NSFW media</label><div class="settings-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Blocked users</h2>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted users</h2>{}</section></div><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Muted words</h2><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel" data-testid="settings-card"><h2>Change password</h2><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><button type="submit">Change password</button></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
-        html_escape::encode_double_quoted_attribute(&csrf),
-        profile_media,
-        dark_checked,
-        nsfw_checked,
+    let profile_fields = format!(
+        r#"<div class="settings-fields settings-profile-fields"><label for="display_name">Display name</label><input id="display_name" name="display_name" value="{}"><label for="bio">Bio</label><textarea id="bio" name="bio">{}</textarea><label for="location">Location</label><input id="location" name="location" value="{}"><label for="website">Website</label><input id="website" type="url" name="website" value="{}"></div>"#,
         html_escape::encode_double_quoted_attribute(profile.display_name.as_str()),
         html_escape::encode_text(profile.bio.as_str()),
         html_escape::encode_double_quoted_attribute(profile.location.as_str()),
         html_escape::encode_double_quoted_attribute(profile.website.as_str()),
+    );
+    let preference_switches = [
+        settings_switch(
+            "dark_mode",
+            Theme::from(profile.theme.as_str()) == Theme::Dark,
+            "Dark mode",
+            "Use the darker color theme for your signed-in session.",
+        ),
+        settings_switch(
+            "nsfw_blur_enabled",
+            profile.nsfw_blur_enabled,
+            "Blur NSFW media",
+            "Hide NSFW media previews behind a reveal control.",
+        ),
+        settings_switch(
+            "liked_posts_public",
+            profile.liked_posts_public,
+            "Make liked posts public",
+            "Allow other people to view your Likes tab on your profile.",
+        ),
+    ]
+    .join("");
+    let body = format!(
+        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, media, and account controls.</p></div></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}"><div class="settings-section settings-section-media"><div class="settings-section-heading"><h2>Profile media</h2><p class="settings-section-help">Avatar and banner images for your profile header.</p></div>{}</div><div class="settings-section settings-section-profile"><div class="settings-section-heading"><h2>Profile</h2><p class="settings-section-help">Your name, bio, location, and link as shown on your profile.</p></div>{}</div><div class="settings-section settings-section-preferences"><div class="settings-section-heading"><h2>Preferences and privacy</h2><p class="settings-section-help">Control your display theme, NSFW media blur, and profile activity visibility.</p></div><div class="settings-switch-list">{}</div></div><div class="settings-form-actions"><button class="primary" type="submit">Save profile settings</button></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Blocked users</h2><p class="settings-section-help">Blocked accounts cannot follow or interact with you.</p>{}</section><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted users</h2><p class="settings-section-help">Muted accounts stay hidden from your views.</p>{}</section></div><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted words</h2><p class="settings-section-help">Hide posts containing specific words or phrases.</p><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel settings-security-panel" data-testid="settings-card"><h2>Change password</h2><p class="settings-section-help">Update the password used to sign in to this account.</p><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p class="settings-danger-action"><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
+        html_escape::encode_double_quoted_attribute(&csrf),
+        profile_media,
+        profile_fields,
+        preference_switches,
         settings_user_list(
             &blocked,
             "/unblock",
@@ -1649,6 +2232,18 @@ async fn settings_page(
     page_layout(state, Some(user), Some(csrf), "Settings", &body).await
 }
 
+fn settings_switch(id: &str, checked: bool, label: &str, help: &str) -> String {
+    let checked_attr = if checked { " checked" } else { "" };
+    let help_id = format!("{id}-help");
+    format!(
+        r#"<label class="settings-switch-row" for="{id}"><span class="settings-switch-copy"><span class="settings-switch-label">{label}</span><span class="settings-switch-help" id="{help_id}">{help}</span></span><span class="settings-switch-toggle"><input class="settings-switch-input" id="{id}" name="{id}" type="checkbox" role="switch" value="true"{checked_attr} aria-describedby="{help_id}"><span class="settings-switch-control" aria-hidden="true"></span></span></label>"#,
+        id = html_escape::encode_double_quoted_attribute(id),
+        help_id = html_escape::encode_double_quoted_attribute(&help_id),
+        label = html_escape::encode_text(label),
+        help = html_escape::encode_text(help),
+    )
+}
+
 async fn settings_update(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1665,12 +2260,22 @@ async fn settings_update(
     let website = form.website.trim().to_owned();
     let theme = form.theme.as_str().to_owned();
     let nsfw_blur_enabled = i64::from(form.nsfw_blur_enabled);
+    let liked_posts_public = i64::from(form.liked_posts_public);
     state
         .pool
         .call(move |conn| {
             conn.execute(
-                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, nsfw_blur_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                params![display_name, bio, location, website, theme, nsfw_blur_enabled, user.id],
+                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, nsfw_blur_enabled = ?, liked_posts_public = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                params![
+                    display_name,
+                    bio,
+                    location,
+                    website,
+                    theme,
+                    nsfw_blur_enabled,
+                    liked_posts_public,
+                    user.id
+                ],
             )?;
             Ok(())
         })
@@ -2018,6 +2623,7 @@ async fn parse_profile_update(
         delete_profile_picture: false,
         delete_banner: false,
         nsfw_blur_enabled: false,
+        liked_posts_public: false,
         profile_picture_media_id: None,
         banner_media_id: None,
     };
@@ -2065,6 +2671,9 @@ async fn parse_profile_update(
             }
             "nsfw_blur_enabled" => {
                 form.nsfw_blur_enabled = true;
+            }
+            "liked_posts_public" => {
+                form.liked_posts_public = true;
             }
             "delete_profile_picture" => {
                 form.delete_profile_picture = true;
@@ -2190,6 +2799,65 @@ async fn delete_preview(
     })
 }
 
+async fn edit_preview(
+    pool: &SqlitePool,
+    actor_id: i64,
+    post_id: i64,
+    edit_window_seconds: u64,
+) -> AppResult<EditPreview> {
+    let edit_window_modifier = edit_window_modifier(edit_window_seconds);
+    let preview = pool
+        .call(move |conn| {
+            conn.query_row(
+                r#"
+                SELECT p.user_id, p.text, p.parent_post_id,
+                  CASE
+                    WHEN ? IS NULL THEN 0
+                    ELSE p.created_at >= datetime('now', ?)
+                  END AS within_window
+                FROM posts p
+                WHERE p.id = ? AND p.is_deleted = 0
+                "#,
+                params![edit_window_modifier.clone(), edit_window_modifier, post_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?;
+    let Some((owner, text, parent_post_id, within_window)) = preview else {
+        return Err(AppError::NotFound);
+    };
+    if owner != Some(actor_id) {
+        return Err(AppError::Forbidden);
+    }
+    if !within_window {
+        return Err(AppError::BadRequest(
+            "the edit window for this post has expired".to_owned(),
+        ));
+    }
+    Ok(EditPreview {
+        text,
+        parent_post_id,
+    })
+}
+
+fn edit_window_modifier(seconds: u64) -> Option<String> {
+    if seconds == 0 {
+        return None;
+    }
+    i64::try_from(seconds)
+        .ok()
+        .map(|seconds| format!("-{seconds} seconds"))
+}
+
 async fn post_is_reply(pool: &SqlitePool, post_id: i64) -> AppResult<bool> {
     Ok(pool
         .call(move |conn| {
@@ -2248,7 +2916,12 @@ async fn post_action_response(
             conn.query_row(
                 r#"
                 SELECT
-                  (SELECT COUNT(*) FROM likes WHERE post_id = p.id),
+                  (
+                    SELECT COUNT(*)
+                    FROM likes l
+                    JOIN users u ON u.id = l.user_id AND u.is_deleted = 0
+                    WHERE l.post_id = p.id AND (u.liked_posts_public != 0 OR l.user_id = ?)
+                  ),
                   ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
                    (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0)),
                   (SELECT COUNT(*) FROM posts replies WHERE replies.parent_post_id = p.id AND replies.is_deleted = 0),
@@ -2258,7 +2931,7 @@ async fn post_action_response(
                 FROM posts p
                 WHERE p.id = ? AND p.is_deleted = 0
                 "#,
-                params![viewer_id, viewer_id, viewer_id, post_id],
+                params![viewer_id, viewer_id, viewer_id, viewer_id, post_id],
                 |row| {
                     Ok(PostActionResponse {
                         kind: "post-action",
@@ -2339,6 +3012,27 @@ fn delete_return_fallback(
     )
 }
 
+fn edit_return_fallback(headers: &HeaderMap, post_id: i64, parent_post_id: Option<i64>) -> String {
+    let fallback = anchored_return(headers, post_id, parent_post_id.is_some(), "/home");
+    if safe_edit_return_target(&fallback, post_id).is_some() {
+        return fallback;
+    }
+    parent_post_id.map_or_else(
+        || format!("/posts/{post_id}"),
+        |parent_id| format!("/posts/{parent_id}#reply-{post_id}"),
+    )
+}
+
+fn safe_edit_return_target(value: &str, post_id: i64) -> Option<String> {
+    let target = safe_return_target(value)?;
+    let self_path = format!("/posts/{post_id}/edit");
+    if path_without_query_or_fragment(&target) == self_path {
+        None
+    } else {
+        Some(target)
+    }
+}
+
 fn safe_delete_return_target(value: &str, post_id: i64) -> Option<String> {
     let target = safe_return_target(value)?;
     let self_path = format!("/posts/{post_id}/delete");
@@ -2349,6 +3043,62 @@ fn safe_delete_return_target(value: &str, post_id: i64) -> Option<String> {
     } else {
         Some(target)
     }
+}
+
+fn parse_notification_ids(value: &str) -> AppResult<Vec<i64>> {
+    if value.len() > 1024 {
+        return Err(AppError::BadRequest(
+            "notification group is too large".to_owned(),
+        ));
+    }
+    let mut ids = Vec::new();
+    for part in value.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id = trimmed
+            .parse::<i64>()
+            .map_err(|_err| AppError::BadRequest("notification group is invalid".to_owned()))?;
+        if id <= 0 {
+            return Err(AppError::BadRequest(
+                "notification group is invalid".to_owned(),
+            ));
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        if ids.len() > 80 {
+            return Err(AppError::BadRequest(
+                "notification group is too large".to_owned(),
+            ));
+        }
+    }
+    if ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "notification group is invalid".to_owned(),
+        ));
+    }
+    Ok(ids)
+}
+
+fn parse_notification_group_target(value: Option<&str>) -> AppResult<Option<i64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let target = trimmed
+        .parse::<i64>()
+        .map_err(|_err| AppError::BadRequest("notification group target is invalid".to_owned()))?;
+    if target <= 0 {
+        return Err(AppError::BadRequest(
+            "notification group target is invalid".to_owned(),
+        ));
+    }
+    Ok(Some(target))
 }
 
 fn path_without_query_or_fragment(target: &str) -> &str {
@@ -2403,11 +3153,13 @@ async fn bookmarks(
     let body = format!(
         "{}{}",
         render::page_header("Bookmarks", "Posts you saved for later."),
-        render::posts_with_nsfw_blur(
+        render::posts_with_controls_empty_state(
             &posts,
             Some(&user),
             csrf.as_deref(),
             blur_nsfw_media(&state, Some(&user)),
+            state.settings.posts.post_edit_window_seconds,
+            render::EmptyState::new("No bookmarks yet.", "Saved posts will appear here."),
         )
     );
     Ok(Html(
@@ -2438,12 +3190,30 @@ async fn notifications(
 ) -> AppResult<Html<String>> {
     let user = require_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let items = social::notifications(&state.pool, user.id).await?;
+    let items = social::notification_groups(&state.pool, user.id).await?;
     let unread_count = social::unread_notification_count(&state.pool, user.id).await?;
     let body = render::notifications_page(&items, unread_count, &csrf);
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Notifications", &body).await?,
     ))
+}
+
+async fn open_notification_group(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<NotificationOpenForm>,
+) -> AppResult<Response> {
+    let user = require_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    if let Some(kind) = form.group_kind.as_deref() {
+        let target_post_id = parse_notification_group_target(form.group_target_post_id.as_deref())?;
+        social::mark_notification_group_read(&state.pool, user.id, kind, target_post_id).await?;
+    } else {
+        let notification_ids = parse_notification_ids(&form.notification_ids)?;
+        social::mark_notification_ids_read(&state.pool, user.id, &notification_ids).await?;
+    }
+    let target = safe_return_target(&form.return_to).unwrap_or_else(|| "/notifications".to_owned());
+    Ok(Redirect::to(&target).into_response())
 }
 
 async fn mark_notifications_read(
@@ -2455,6 +3225,29 @@ async fn mark_notifications_read(
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::mark_notifications_read(&state.pool, user.id).await?;
     Ok(Redirect::to("/notifications").into_response())
+}
+
+async fn mention_suggestions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<MentionSuggestionsQuery>,
+) -> AppResult<Json<Vec<MentionSuggestionResponse>>> {
+    let user = current(&state, &headers).await?;
+    let suggestions = social::mention_suggestions(
+        &state.pool,
+        user.as_ref().map(|user| user.id),
+        query.q.as_deref().unwrap_or_default(),
+    )
+    .await?;
+    Ok(Json(
+        suggestions
+            .into_iter()
+            .map(|suggestion| MentionSuggestionResponse {
+                username: suggestion.username,
+                display_name: suggestion.display_name,
+            })
+            .collect(),
+    ))
 }
 
 async fn search(
@@ -2477,7 +3270,10 @@ async fn search(
         &posts,
         user.as_ref(),
         csrf.as_deref(),
-        blur_nsfw_media(&state, user.as_ref()),
+        render::SearchRenderOptions {
+            blur_nsfw_media: blur_nsfw_media(&state, user.as_ref()),
+            post_edit_window_seconds: state.settings.posts.post_edit_window_seconds,
+        },
     );
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Search", &body).await?,
@@ -2694,9 +3490,10 @@ fn admin_user_rows(rows: &[admin::AdminUserInvestigation], csrf: &str, searched:
         } else {
             "No users found."
         };
-        return format!(
-            r#"<div class="compact-empty admin-users-empty"><strong>{}</strong><p>Try a different username, handle, display name, or post keyword.</p></div>"#,
-            html_escape::encode_text(message)
+        return render::compact_empty_state_with_class(
+            "admin-users-empty",
+            message,
+            "Try a different username, handle, display name, or post keyword.",
         );
     }
 
@@ -3842,6 +4639,343 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registration_redirects_to_onboarding_with_session() {
+        let server = spawn_test_server().await;
+
+        let registered = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=alice&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+
+        assert_eq!(registered.status, 303);
+        assert_eq!(location(&registered), "/onboarding");
+        let cookie = session_cookie(&registered);
+        let onboarding = get_with_cookie(&server, "/onboarding", &cookie).await;
+        assert_eq!(onboarding.status, 200);
+        assert!(onboarding.body.contains("<h1>Set up your account</h1>"));
+    }
+
+    #[tokio::test]
+    async fn onboarding_saves_profile_avatar_follows_and_marks_complete() {
+        let server = spawn_test_server().await;
+        let _bob_cookie = register_test_user(&server, "bob").await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        let onboarding = get_with_cookie(&server, "/onboarding", &alice_cookie).await;
+        assert_eq!(onboarding.status, 200);
+        assert!(onboarding.body.contains("@bob"));
+        let csrf = csrf_token(&onboarding.body);
+
+        let body = multipart_body_with_file(
+            "onboarding-boundary",
+            &[
+                ("csrf", csrf.as_str()),
+                ("intent", "save"),
+                ("display_name", "Alice Display"),
+                ("bio", "building a local RustPost"),
+                ("follow_user_id", "1"),
+            ],
+            "profile_picture",
+            "avatar.png",
+            "image/png",
+            &tiny_png_bytes(),
+        );
+        let saved = request(
+            &server.base_url,
+            "POST",
+            "/onboarding",
+            &[
+                ("cookie", &alice_cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=onboarding-boundary",
+                ),
+            ],
+            body,
+        )
+        .await;
+
+        assert_eq!(saved.status, 303);
+        assert_eq!(location(&saved), "/home");
+        let (display_name, bio, completed, has_avatar, follows_bob): (
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+        ) = server
+            .pool
+            .call(|conn| {
+                let profile = conn.query_row(
+                    r#"
+                    SELECT display_name, bio, onboarding_completed_at IS NOT NULL,
+                      profile_picture_media_id IS NOT NULL
+                    FROM users WHERE normalized_username = 'alice'
+                    "#,
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )?;
+                let follows_bob = conn.query_row(
+                    "SELECT COUNT(*) FROM follows WHERE follower_id = 2 AND followed_id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok((profile.0, profile.1, profile.2, profile.3, follows_bob))
+            })
+            .await
+            .expect("profile state");
+        assert_eq!(display_name, "Alice Display");
+        assert_eq!(bio, "building a local RustPost");
+        assert_eq!(completed, 1);
+        assert_eq!(has_avatar, 1);
+        assert_eq!(follows_bob, 1);
+    }
+
+    #[tokio::test]
+    async fn onboarding_can_skip_optional_steps() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "charlie").await;
+        let onboarding = get_with_cookie(&server, "/onboarding", &cookie).await;
+        let csrf = csrf_token(&onboarding.body);
+
+        let skipped = request(
+            &server.base_url,
+            "POST",
+            "/onboarding",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=onboarding-boundary",
+                ),
+            ],
+            multipart_body(
+                "onboarding-boundary",
+                &[("csrf", csrf.as_str()), ("intent", "skip")],
+                false,
+            ),
+        )
+        .await;
+
+        assert_eq!(skipped.status, 303);
+        assert_eq!(location(&skipped), "/home");
+        let (display_name, completed): (String, i64) = server
+            .pool
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT display_name, onboarding_completed_at IS NOT NULL FROM users WHERE normalized_username = 'charlie'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .expect("onboarding completion");
+        assert_eq!(display_name, "charlie");
+        assert_eq!(completed, 1);
+
+        let onboarding = get_with_cookie(&server, "/onboarding", &cookie).await;
+        assert_eq!(onboarding.status, 303);
+        assert_eq!(location(&onboarding), "/home");
+    }
+
+    #[tokio::test]
+    async fn onboarding_suggestions_exclude_current_user() {
+        let server = spawn_test_server().await;
+        let _bob_cookie = register_test_user(&server, "bob").await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+
+        let onboarding = get_with_cookie(&server, "/onboarding", &alice_cookie).await;
+
+        assert_eq!(onboarding.status, 200);
+        assert!(onboarding.body.contains("@bob"));
+        let suggestions = onboarding
+            .body
+            .split_once(r#"<fieldset class="onboarding-suggestions">"#)
+            .and_then(|(_, rest)| rest.split_once("</fieldset>"))
+            .map(|(section, _)| section)
+            .expect("suggestions section");
+        assert!(!suggestions.contains(r#"value="2""#));
+        assert!(!suggestions.contains("@alice"));
+    }
+
+    #[tokio::test]
+    async fn onboarding_ignores_unavailable_suggested_follow_ids() {
+        let server = spawn_test_server().await;
+        let _bob_cookie = register_test_user(&server, "bob").await;
+        let _carol_cookie = register_test_user(&server, "carol").await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        let (bob_id, carol_id, alice_id): (i64, i64, i64) = server
+            .pool
+            .call(|conn| {
+                conn.execute(
+                    "UPDATE users SET is_suspended = 1 WHERE normalized_username = 'bob'",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE users SET is_deleted = 1 WHERE normalized_username = 'carol'",
+                    [],
+                )?;
+                let bob_id = conn.query_row(
+                    "SELECT id FROM users WHERE normalized_username = 'bob'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let carol_id = conn.query_row(
+                    "SELECT id FROM users WHERE normalized_username = 'carol'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let alice_id = conn.query_row(
+                    "SELECT id FROM users WHERE normalized_username = 'alice'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((bob_id, carol_id, alice_id))
+            })
+            .await
+            .expect("users");
+
+        let onboarding = get_with_cookie(&server, "/onboarding", &alice_cookie).await;
+
+        assert_eq!(onboarding.status, 200);
+        assert!(!onboarding.body.contains("@bob"));
+        assert!(!onboarding.body.contains("@carol"));
+        assert!(
+            onboarding
+                .body
+                .contains("No local accounts to suggest yet.")
+        );
+        let csrf = csrf_token(&onboarding.body);
+        let bob_id = bob_id.to_string();
+        let carol_id = carol_id.to_string();
+        let saved = request(
+            &server.base_url,
+            "POST",
+            "/onboarding",
+            &[
+                ("cookie", &alice_cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=onboarding-boundary",
+                ),
+            ],
+            multipart_body(
+                "onboarding-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("intent", "save"),
+                    ("display_name", "Alice"),
+                    ("bio", ""),
+                    ("follow_user_id", bob_id.as_str()),
+                    ("follow_user_id", carol_id.as_str()),
+                ],
+                false,
+            ),
+        )
+        .await;
+
+        assert_eq!(saved.status, 303);
+        let follows: i64 = server
+            .pool
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM follows WHERE follower_id = ?",
+                    [alice_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("follow count");
+        assert_eq!(follows, 0);
+    }
+
+    #[tokio::test]
+    async fn onboarding_rejects_non_image_avatar_without_media_row() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let onboarding = get_with_cookie(&server, "/onboarding", &cookie).await;
+        let csrf = csrf_token(&onboarding.body);
+        let body = multipart_body_with_file(
+            "onboarding-boundary",
+            &[
+                ("csrf", csrf.as_str()),
+                ("intent", "save"),
+                ("display_name", "Alice"),
+                ("bio", ""),
+            ],
+            "profile_picture",
+            "avatar.mp4",
+            "video/mp4",
+            &tiny_mp4_bytes(),
+        );
+
+        let saved = request(
+            &server.base_url,
+            "POST",
+            "/onboarding",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=onboarding-boundary",
+                ),
+            ],
+            body,
+        )
+        .await;
+
+        assert_eq!(saved.status, 400);
+        assert_eq!(media_row_count(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn onboarding_cleans_uploaded_avatar_when_csrf_fails() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let body = multipart_body_with_file(
+            "onboarding-boundary",
+            &[
+                ("csrf", "invalid"),
+                ("intent", "save"),
+                ("display_name", "Alice"),
+                ("bio", ""),
+            ],
+            "profile_picture",
+            "avatar.png",
+            "image/png",
+            &tiny_png_bytes(),
+        );
+
+        let saved = request(
+            &server.base_url,
+            "POST",
+            "/onboarding",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=onboarding-boundary",
+                ),
+            ],
+            body,
+        )
+        .await;
+
+        assert_eq!(saved.status, 403);
+        assert_eq!(media_row_count(&server).await, 0);
+    }
+
+    #[tokio::test]
     async fn logged_in_ui_post_succeeds_with_empty_media_part_and_appears_on_home_feed() {
         let server = spawn_test_server().await;
         let registered = request(
@@ -3930,6 +5064,239 @@ mod tests {
         assert!(!thread.body.contains(r#"class="post-time" href="/posts/1""#));
         assert!(!thread.body.contains(r#"data-card-href="/posts/1""#));
         assert!(!thread.body.contains(r#"href="/posts/1">Open post</a>"#));
+    }
+
+    #[tokio::test]
+    async fn post_edit_succeeds_within_default_window_and_marks_edited() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &cookie, "original text").await;
+        set_post_created_seconds_ago(&server, 1, 0).await;
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains(r#"href="/posts/1/edit""#));
+        let edit = get_with_cookie(&server, "/posts/1/edit", &cookie).await;
+        assert_eq!(edit.status, 200);
+        assert!(
+            edit.body
+                .contains("<h1 id=\"edit-post-title\">Edit post</h1>")
+        );
+        assert!(edit.body.contains("original text"));
+        let csrf = csrf_token(&edit.body);
+        let edited = post_form_with_cookie(
+            &server,
+            "/posts/1/edit",
+            &cookie,
+            &format!(
+                "csrf={}&text={}&return_to={}",
+                form_encode(&csrf),
+                form_encode("edited text"),
+                form_encode("/home#post-1")
+            ),
+        )
+        .await;
+
+        assert_eq!(edited.status, 303);
+        assert_eq!(location(&edited), "/home#post-1");
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains("edited text"));
+        assert!(!home.body.contains("original text"));
+        assert!(home.body.contains(r#"<span class="edited-marker""#));
+        let edited_at: Option<String> = server
+            .pool
+            .call(|conn| {
+                conn.query_row("SELECT edited_at FROM posts WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .map_err(Into::into)
+            })
+            .await
+            .expect("edited_at");
+        assert!(edited_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn post_edit_is_rejected_after_default_window_expires() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &cookie, "too old").await;
+        set_post_created_seconds_ago(&server, 1, 20).await;
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(!home.body.contains(r#"href="/posts/1/edit""#));
+        let edit = get_with_cookie(&server, "/posts/1/edit", &cookie).await;
+        assert_eq!(edit.status, 400);
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let edited = post_form_with_cookie(
+            &server,
+            "/posts/1/edit",
+            &cookie,
+            &format!("csrf={}&text=late", form_encode(&csrf)),
+        )
+        .await;
+        assert_eq!(edited.status, 400);
+        assert!(edited.body.contains("edit window"));
+        let text: String = server
+            .pool
+            .call(|conn| {
+                conn.query_row("SELECT text FROM posts WHERE id = 1", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .await
+            .expect("post text");
+        assert_eq!(text, "too old");
+    }
+
+    #[tokio::test]
+    async fn edit_controls_do_not_appear_for_other_users() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "alice post").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+
+        assert_eq!(bob_home.status, 200);
+        assert!(bob_home.body.contains("alice post"));
+        assert!(!bob_home.body.contains(r#"href="/posts/1/edit""#));
+        let edit = get_with_cookie(&server, "/posts/1/edit", &bob_cookie).await;
+        assert_eq!(edit.status, 403);
+    }
+
+    #[tokio::test]
+    async fn no_js_edit_form_is_still_server_window_enforced() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &cookie, "fallback edit").await;
+        let edit = get_with_cookie(&server, "/posts/1/edit", &cookie).await;
+        assert_eq!(edit.status, 200);
+        assert!(
+            edit.body
+                .contains(r#"method="post" action="/posts/1/edit""#)
+        );
+        assert!(!edit.body.contains(r#"data-enhance"#));
+        let csrf = csrf_token(&edit.body);
+        set_post_created_seconds_ago(&server, 1, 20).await;
+
+        let expired = post_form_with_cookie(
+            &server,
+            "/posts/1/edit",
+            &cookie,
+            &format!(
+                "csrf={}&text={}",
+                form_encode(&csrf),
+                form_encode("late fallback")
+            ),
+        )
+        .await;
+
+        assert_eq!(expired.status, 400);
+        assert!(expired.body.contains("edit window"));
+        let thread = get_with_cookie(&server, "/posts/1", &cookie).await;
+        assert!(thread.body.contains("fallback edit"));
+        assert!(!thread.body.contains("late fallback"));
+    }
+
+    #[tokio::test]
+    async fn configured_post_edit_window_is_respected() {
+        let mut settings = Settings::default();
+        settings.posts.post_edit_window_seconds = 30;
+        let server = spawn_test_server_with_settings(settings).await;
+        let cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &cookie, "still editable").await;
+        set_post_created_seconds_ago(&server, 1, 20).await;
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(home.body.contains(r#"href="/posts/1/edit""#));
+        let csrf = csrf_token(&home.body);
+        let edited = post_form_with_cookie(
+            &server,
+            "/posts/1/edit",
+            &cookie,
+            &format!(
+                "csrf={}&text={}",
+                form_encode(&csrf),
+                form_encode("edited in 30")
+            ),
+        )
+        .await;
+
+        assert_eq!(edited.status, 303);
+        let thread = get_with_cookie(&server, "/posts/1", &cookie).await;
+        assert!(thread.body.contains("edited in 30"));
+    }
+
+    #[tokio::test]
+    async fn zero_post_edit_window_disables_get_post_and_controls() {
+        let mut settings = Settings::default();
+        settings.posts.post_edit_window_seconds = 0;
+        let server = spawn_test_server_with_settings(settings).await;
+        let cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &cookie, "not editable").await;
+        set_post_created_seconds_ago(&server, 1, 0).await;
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(!home.body.contains(r#"href="/posts/1/edit""#));
+        let edit = get_with_cookie(&server, "/posts/1/edit", &cookie).await;
+        assert_eq!(edit.status, 400);
+        let csrf = csrf_token(&home.body);
+        let edited = post_form_with_cookie(
+            &server,
+            "/posts/1/edit",
+            &cookie,
+            &format!("csrf={}&text=changed", form_encode(&csrf)),
+        )
+        .await;
+
+        assert_eq!(edited.status, 400);
+        let text: String = server
+            .pool
+            .call(|conn| {
+                conn.query_row("SELECT text FROM posts WHERE id = 1", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .await
+            .expect("post text");
+        assert_eq!(text, "not editable");
+    }
+
+    #[tokio::test]
+    async fn editing_to_same_clean_text_does_not_mark_post_edited() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &cookie, "same text").await;
+        set_post_created_seconds_ago(&server, 1, 0).await;
+        let edit = get_with_cookie(&server, "/posts/1/edit", &cookie).await;
+        let csrf = csrf_token(&edit.body);
+
+        let edited = post_form_with_cookie(
+            &server,
+            "/posts/1/edit",
+            &cookie,
+            &format!(
+                "csrf={}&text={}",
+                form_encode(&csrf),
+                form_encode("same text")
+            ),
+        )
+        .await;
+
+        assert_eq!(edited.status, 303);
+        let edited_at: Option<String> = server
+            .pool
+            .call(|conn| {
+                conn.query_row("SELECT edited_at FROM posts WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .map_err(Into::into)
+            })
+            .await
+            .expect("edited_at");
+        assert!(edited_at.is_none());
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert!(!home.body.contains(r#"<span class="edited-marker""#));
     }
 
     #[tokio::test]
@@ -4798,6 +6165,651 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_tabs_render_labels_active_state_and_plain_links() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        assert_eq!(profile.status, 200);
+        assert!(profile.body.contains(r#"data-testid="profile-tabs""#));
+        assert!(
+            profile
+                .body
+                .contains(r#"<a href="/users/alice" class="active" aria-current="page">Posts</a>"#)
+        );
+        assert!(
+            profile
+                .body
+                .contains(r#"<a href="/users/alice?tab=replies">Replies</a>"#)
+        );
+        assert!(
+            profile
+                .body
+                .contains(r#"<a href="/users/alice?tab=media">Media</a>"#)
+        );
+        assert!(
+            profile
+                .body
+                .contains(r#"<a href="/users/alice?tab=likes">Likes</a>"#)
+        );
+        assert_eq!(profile.body.matches(r#"aria-current="page""#).count(), 1);
+
+        let replies = request(
+            &server.base_url,
+            "GET",
+            "/users/alice?tab=replies",
+            &[
+                ("cookie", &cookie),
+                ("user-agent", "Mozilla/5.0 Firefox/115.0"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(replies.status, 200);
+        assert!(replies.body.contains(
+            r#"<a href="/users/alice?tab=replies" class="active" aria-current="page">Replies</a>"#
+        ));
+        assert_eq!(replies.body.matches(r#"aria-current="page""#).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn profile_likes_tab_respects_public_and_private_visibility() {
+        let (server, alice_cookie, bob_cookie) = liked_profile_fixture().await;
+
+        let public_likes = get_with_cookie(&server, "/users/bob?tab=likes", &alice_cookie).await;
+        assert_eq!(public_likes.status, 200);
+        assert!(public_likes.body.contains("privacy target post"));
+        assert!(!public_likes.body.contains("This user’s likes are private"));
+
+        let settings = get_with_cookie(&server, "/settings", &bob_cookie).await;
+        assert_eq!(settings.status, 200);
+        assert!(settings.body.contains(
+            r#"id="liked_posts_public" name="liked_posts_public" type="checkbox" role="switch" value="true" checked aria-describedby="liked_posts_public-help""#
+        ));
+        let saved = save_profile_settings(
+            &server,
+            &bob_cookie,
+            &[
+                ("display_name", "bob"),
+                ("bio", ""),
+                ("location", ""),
+                ("website", ""),
+            ],
+        )
+        .await;
+        assert_eq!(saved.status, 303);
+
+        let private_likes = get_with_cookie(&server, "/users/bob?tab=likes", &alice_cookie).await;
+        assert_eq!(private_likes.status, 200);
+        assert_empty_state(&private_likes.body, "This user’s likes are private", "");
+        assert!(!private_likes.body.contains("privacy target post"));
+        assert!(!private_likes.body.contains("liked by bob"));
+        assert!(!private_likes.body.contains("bob liked"));
+
+        let owner_likes = get_with_cookie(&server, "/users/bob?tab=likes", &bob_cookie).await;
+        assert_eq!(owner_likes.status, 200);
+        assert!(owner_likes.body.contains("privacy target post"));
+        assert!(!owner_likes.body.contains("This user’s likes are private"));
+
+        let anonymous_likes = request(
+            &server.base_url,
+            "GET",
+            "/users/bob?tab=likes&offset=999",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(anonymous_likes.status, 200);
+        assert_empty_state(&anonymous_likes.body, "This user’s likes are private", "");
+        assert!(!anonymous_likes.body.contains("privacy target post"));
+    }
+
+    #[test]
+    fn settings_profile_media_mounts_controls_on_preview_frames() {
+        let body = settings_profile_media(
+            Some("/uploads/profile.webp"),
+            Some("/uploads/banner.webp"),
+            true,
+            true,
+        );
+
+        assert!(body.contains(
+            r#"class="settings-banner-wrap settings-media-frame" data-profile-media-frame"#
+        ));
+        assert!(body.contains(r#"class="settings-picture-wrap settings-media-frame""#));
+        assert!(
+            body.contains(r#"class="settings-media-input" id="banner" name="banner" type="file""#)
+        );
+        assert!(body.contains(
+            r#"class="settings-media-delete-input" id="delete_banner" name="delete_banner" type="checkbox" value="true""#
+        ));
+        assert!(body.contains(
+            r#"class="settings-media-input" id="profile_picture" name="profile_picture" type="file""#
+        ));
+        assert!(body.contains(
+            r#"class="settings-media-delete-input" id="delete_profile_picture" name="delete_profile_picture" type="checkbox" value="true""#
+        ));
+        assert!(body.contains(r#"for="banner" title="Change banner""#));
+        assert!(body.contains(r#"for="delete_banner" title="Remove banner""#));
+        assert!(body.contains(r#"for="profile_picture" title="Change profile picture""#));
+        assert!(body.contains(r#"for="delete_profile_picture" title="Remove profile picture""#));
+        assert!(!body.contains("media-control-row"));
+        assert!(!body.contains("file-control"));
+        assert!(!body.contains("check-row"));
+    }
+
+    #[tokio::test]
+    async fn settings_page_places_profile_media_before_profile_fields() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+
+        let settings = get_with_cookie(&server, "/settings", &cookie).await;
+        assert_eq!(settings.status, 200);
+        let media = settings
+            .body
+            .find("settings-section settings-section-media")
+            .expect("profile media section");
+        let profile = settings
+            .body
+            .find("settings-section settings-section-profile")
+            .expect("profile fields section");
+        let form_start = settings
+            .body
+            .find(r#"<form id="profile-settings-form""#)
+            .expect("settings form");
+        let form_end = settings.body[form_start..]
+            .find("</form>")
+            .expect("settings form end");
+        let settings_form = &settings.body[form_start..form_start + form_end];
+
+        assert!(media < profile);
+        assert!(
+            settings
+                .body
+                .contains(r#"class="settings-media-input" id="banner" name="banner" type="file""#)
+        );
+        assert!(settings.body.contains(
+            r#"class="settings-media-input" id="profile_picture" name="profile_picture" type="file""#
+        ));
+        assert!(!settings_form.contains("media-control-row"));
+        assert!(!settings_form.contains("check-row"));
+    }
+
+    #[tokio::test]
+    async fn private_likes_reject_bypass_notifications_and_json_count_leaks() {
+        let (server, alice_cookie, bob_cookie) = liked_profile_fixture().await;
+        let saved = save_profile_settings(
+            &server,
+            &bob_cookie,
+            &[
+                ("display_name", "bob"),
+                ("bio", ""),
+                ("location", ""),
+                ("website", ""),
+            ],
+        )
+        .await;
+        assert_eq!(saved.status, 303);
+
+        for path in [
+            "/users/bob?tab=likes&page=2",
+            "/users/bob?tab=likes&cursor=1",
+        ] {
+            let bypass = get_with_cookie(&server, path, &alice_cookie).await;
+            assert_eq!(bypass.status, 200);
+            assert_empty_state(&bypass.body, "This user’s likes are private", "");
+            assert!(!bypass.body.contains("privacy target post"));
+        }
+
+        let invalid_tab = get_with_cookie(&server, "/users/bob?tab=LIKES", &alice_cookie).await;
+        assert_eq!(invalid_tab.status, 200);
+        assert!(invalid_tab.body.contains("bob fallback post"));
+        assert!(!invalid_tab.body.contains("privacy target post"));
+        assert!(
+            invalid_tab
+                .body
+                .contains(r#"<a href="/users/bob" class="active" aria-current="page">Posts</a>"#)
+        );
+
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert_eq!(notifications.status, 200);
+        assert!(!notifications.body.contains("bob"));
+        assert!(!notifications.body.contains("liked your post"));
+        assert!(!notifications.body.contains("privacy target post"));
+
+        let alice_home = get_with_cookie(&server, "/home", &alice_cookie).await;
+        let csrf = csrf_token(&alice_home.body);
+        let alice_json = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/bookmark",
+            &[
+                ("cookie", &alice_cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("accept", "application/json"),
+                ("x-rustpost-enhance", "1"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(alice_json.status, 200);
+        assert!(alice_json.body.contains(r#""likes":0"#));
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let csrf = csrf_token(&bob_home.body);
+        let bob_json = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/bookmark",
+            &[
+                ("cookie", &bob_cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("accept", "application/json"),
+                ("x-rustpost-enhance", "1"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(bob_json.status, 200);
+        assert!(bob_json.body.contains(r#""likes":1"#));
+    }
+
+    #[tokio::test]
+    async fn liked_posts_public_setting_persists_without_changing_other_preferences() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+
+        let saved_private = save_profile_settings(
+            &server,
+            &cookie,
+            &[
+                ("dark_mode", "true"),
+                ("nsfw_blur_enabled", "true"),
+                ("display_name", "Alice"),
+                ("bio", "same bio"),
+                ("location", "same place"),
+                ("website", "https://example.test"),
+            ],
+        )
+        .await;
+        assert_eq!(saved_private.status, 303);
+
+        let private_state = user_settings_state(&server, "alice").await;
+        assert_eq!(
+            private_state,
+            (
+                "dark".to_owned(),
+                1,
+                0,
+                "Alice".to_owned(),
+                "same bio".to_owned(),
+                "same place".to_owned(),
+                "https://example.test".to_owned(),
+            )
+        );
+
+        let settings = get_with_cookie(&server, "/settings", &cookie).await;
+        assert_eq!(settings.status, 200);
+        assert!(
+            settings.body.contains(
+                r#"id="dark_mode" name="dark_mode" type="checkbox" role="switch" value="true" checked aria-describedby="dark_mode-help""#
+            )
+        );
+        assert!(settings.body.contains(
+            r#"id="nsfw_blur_enabled" name="nsfw_blur_enabled" type="checkbox" role="switch" value="true" checked aria-describedby="nsfw_blur_enabled-help""#
+        ));
+        assert!(!settings.body.contains(
+            r#"id="liked_posts_public" name="liked_posts_public" type="checkbox" role="switch" value="true" checked"#
+        ));
+
+        let saved_public = save_profile_settings(
+            &server,
+            &cookie,
+            &[
+                ("dark_mode", "true"),
+                ("nsfw_blur_enabled", "true"),
+                ("liked_posts_public", "true"),
+                ("display_name", "Alice"),
+                ("bio", "same bio"),
+                ("location", "same place"),
+                ("website", "https://example.test"),
+            ],
+        )
+        .await;
+        assert_eq!(saved_public.status, 303);
+
+        let (theme, nsfw_blur_enabled, liked_posts_public, ..) =
+            user_settings_state(&server, "alice").await;
+        assert_eq!(
+            (theme, nsfw_blur_enabled, liked_posts_public),
+            ("dark".to_owned(), 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_tabs_apply_relationship_and_suspended_visibility() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "relationship liked target").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+        create_text_post(&server, &bob_cookie, "relationship bob post").await;
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let csrf = csrf_token(&bob_home.body);
+        let liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(liked.status, 303);
+
+        let visible_likes = get_with_cookie(&server, "/users/bob?tab=likes", &alice_cookie).await;
+        assert_eq!(visible_likes.status, 200);
+        assert!(visible_likes.body.contains("relationship liked target"));
+
+        let bob_id = server
+            .pool
+            .call(|conn| {
+                conn.query_row(
+                    "SELECT id FROM users WHERE normalized_username = 'bob'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("bob id");
+        let alice_id = server
+            .pool
+            .call(|conn| {
+                conn.query_row(
+                    "SELECT id FROM users WHERE normalized_username = 'alice'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("alice id");
+        social::block(&server.pool, bob_id, alice_id)
+            .await
+            .expect("bob blocks alice");
+
+        let blocked_likes = get_with_cookie(&server, "/users/bob?tab=likes", &alice_cookie).await;
+        assert_eq!(blocked_likes.status, 200);
+        assert!(!blocked_likes.body.contains("relationship liked target"));
+        assert!(!blocked_likes.body.contains("This user’s likes are private"));
+        let blocked_posts = get_with_cookie(&server, "/users/bob", &alice_cookie).await;
+        assert_eq!(blocked_posts.status, 200);
+        assert!(!blocked_posts.body.contains("relationship bob post"));
+
+        server
+            .pool
+            .call(move |conn| {
+                conn.execute(
+                    "DELETE FROM blocks WHERE blocker_id = ? AND blocked_id = ?",
+                    params![bob_id, alice_id],
+                )?;
+                conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [bob_id])?;
+                Ok(())
+            })
+            .await
+            .expect("suspend bob");
+
+        let suspended_likes = request(
+            &server.base_url,
+            "GET",
+            "/users/bob?tab=likes",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(suspended_likes.status, 200);
+        assert!(!suspended_likes.body.contains("relationship liked target"));
+        assert!(
+            !suspended_likes
+                .body
+                .contains("This user’s likes are private")
+        );
+        let suspended_posts = request(&server.base_url, "GET", "/users/bob", &[], Vec::new()).await;
+        assert_eq!(suspended_posts.status, 200);
+        assert!(!suspended_posts.body.contains("relationship bob post"));
+    }
+
+    #[tokio::test]
+    async fn profile_owner_can_pin_and_replace_one_profile_post() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &cookie, "first profile post").await;
+        create_text_post(&server, &cookie, "second profile post").await;
+
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        assert_eq!(profile.status, 200);
+        assert!(profile.body.contains(r#"action="/posts/1/pin""#));
+        assert!(profile.body.contains(r#"aria-label="Pin to profile""#));
+        let csrf = csrf_token(&profile.body);
+        let pinned = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/pin",
+            &[
+                ("cookie", &cookie),
+                ("referer", "/users/alice"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={}", form_encode(&csrf)).into_bytes(),
+        )
+        .await;
+
+        assert_eq!(pinned.status, 303);
+        assert_eq!(location(&pinned), "/users/alice#post-1");
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        assert!(profile.body.contains(r#"aria-label="Pinned post""#));
+        assert!(
+            profile
+                .body
+                .contains(r#"<h2 class="section-title">Pinned post</h2>"#)
+        );
+        assert!(profile.body.contains(r#"aria-label="Unpin from profile""#));
+        assert_eq!(profile.body.matches(r#"id="post-1""#).count(), 1);
+        let first_index = profile.body.find("first profile post").expect("first post");
+        let second_index = profile
+            .body
+            .find("second profile post")
+            .expect("second post");
+        assert!(first_index < second_index);
+
+        let csrf = csrf_token(&profile.body);
+        let replaced = request(
+            &server.base_url,
+            "POST",
+            "/posts/2/pin",
+            &[
+                ("cookie", &cookie),
+                ("referer", "/users/alice"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={}", form_encode(&csrf)).into_bytes(),
+        )
+        .await;
+
+        assert_eq!(replaced.status, 303);
+        assert_eq!(location(&replaced), "/users/alice#post-2");
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        assert_eq!(profile.body.matches(r#"id="post-2""#).count(), 1);
+        let first_index = profile.body.find("first profile post").expect("first post");
+        let second_index = profile
+            .body
+            .find("second profile post")
+            .expect("second post");
+        assert!(second_index < first_index);
+        assert_eq!(pinned_post_id_for_user(&server, "alice").await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn users_cannot_pin_someone_elses_post() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "alice post").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let csrf = csrf_token(&bob_home.body);
+
+        let pinned = post_form_with_cookie(
+            &server,
+            "/posts/1/pin",
+            &bob_cookie,
+            &format!("csrf={}", form_encode(&csrf)),
+        )
+        .await;
+
+        assert_eq!(pinned.status, 403);
+        assert_eq!(pinned_post_id_for_user(&server, "alice").await, None);
+        assert_eq!(pinned_post_id_for_user(&server, "bob").await, None);
+    }
+
+    #[tokio::test]
+    async fn deleting_pinned_post_clears_profile_pin() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &cookie, "temporary pinned post").await;
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        let csrf = csrf_token(&profile.body);
+        let pinned = post_form_with_cookie(
+            &server,
+            "/posts/1/pin",
+            &cookie,
+            &format!("csrf={}", form_encode(&csrf)),
+        )
+        .await;
+        assert_eq!(pinned.status, 303);
+        assert_eq!(pinned_post_id_for_user(&server, "alice").await, Some(1));
+
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        let csrf = csrf_token(&profile.body);
+        let deleted = post_form_with_cookie(
+            &server,
+            "/posts/1/delete",
+            &cookie,
+            &format!(
+                "csrf={}&return_to={}",
+                form_encode(&csrf),
+                form_encode("/users/alice")
+            ),
+        )
+        .await;
+
+        assert_eq!(deleted.status, 303);
+        assert_eq!(location(&deleted), "/users/alice");
+        assert_eq!(pinned_post_id_for_user(&server, "alice").await, None);
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        assert!(!profile.body.contains(r#"aria-label="Pinned post""#));
+        assert!(!profile.body.contains("temporary pinned post"));
+    }
+
+    #[tokio::test]
+    async fn empty_states_render_for_empty_feeds_lists_and_search() {
+        let server = spawn_test_server().await;
+
+        let public_home = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert_eq!(public_home.status, 200);
+        assert_empty_state(
+            &public_home.body,
+            "No posts yet.",
+            "The timeline will fill in once people start posting.",
+        );
+
+        let alice_cookie = register_test_user(&server, "alice").await;
+
+        let home = get_with_cookie(&server, "/home", &alice_cookie).await;
+        assert_eq!(home.status, 200);
+        assert_empty_state(
+            &home.body,
+            "No posts yet.",
+            "The timeline will fill in once people start posting.",
+        );
+
+        let profile = get_with_cookie(&server, "/users/alice", &alice_cookie).await;
+        assert_eq!(profile.status, 200);
+        assert_empty_state(
+            &profile.body,
+            "No posts yet.",
+            "This profile has not posted yet.",
+        );
+
+        let following = get_with_cookie(&server, "/following", &alice_cookie).await;
+        assert_eq!(following.status, 200);
+        assert_empty_state(
+            &following.body,
+            "Follow people to build your feed.",
+            "Accounts you follow will appear here.",
+        );
+
+        let followers = request(
+            &server.base_url,
+            "GET",
+            "/users/alice/followers",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(followers.status, 200);
+        assert_empty_state(
+            &followers.body,
+            "No followers yet.",
+            "Followers will appear here.",
+        );
+
+        let profile_following = request(
+            &server.base_url,
+            "GET",
+            "/users/alice/following",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(profile_following.status, 200);
+        assert_empty_state(
+            &profile_following.body,
+            "Not following anyone yet.",
+            "Followed accounts will appear here.",
+        );
+
+        let bookmarks = get_with_cookie(&server, "/bookmarks", &alice_cookie).await;
+        assert_eq!(bookmarks.status, 200);
+        assert_empty_state(
+            &bookmarks.body,
+            "No bookmarks yet.",
+            "Saved posts will appear here.",
+        );
+
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert_eq!(notifications.status, 200);
+        assert_empty_state(
+            &notifications.body,
+            "No notifications.",
+            "New activity will appear here.",
+        );
+
+        let search = request(
+            &server.base_url,
+            "GET",
+            "/search?q=missing",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(search.status, 200);
+        assert_empty_state(
+            &search.body,
+            "No matching posts or users found.",
+            "Try another search.",
+        );
+    }
+
+    #[tokio::test]
     async fn enhanced_follow_returns_button_and_count_state() {
         let server = spawn_test_server().await;
         let bob = request(
@@ -4941,6 +6953,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mention_suggestions_endpoint_returns_bounded_json_for_visible_users() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        crate::auth::register_user(
+            &server.pool,
+            &Settings::default(),
+            "bob",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("bob");
+        crate::auth::register_user(
+            &server.pool,
+            &Settings::default(),
+            "bobby",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("bobby");
+        let suspended = crate::auth::register_user(
+            &server.pool,
+            &Settings::default(),
+            "bot_suspended",
+            "very secure password",
+            false,
+        )
+        .await
+        .expect("suspended");
+        server
+            .pool
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET display_name = '<b>Bob</b>' WHERE normalized_username = 'bob'",
+                    [],
+                )?;
+                conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [suspended])?;
+                Ok(())
+            })
+            .await
+            .expect("update users");
+
+        let response = get_with_cookie(&server, "/mentions?q=BO", &alice_cookie).await;
+
+        assert_eq!(response.status, 200);
+        assert_header(&response, "content-type", "application/json");
+        assert!(response.body.starts_with('['));
+        assert!(response.body.contains(r#""username":"bob""#));
+        assert!(response.body.contains(r#""display_name":"<b>Bob</b>""#));
+        assert!(response.body.contains(r#""username":"bobby""#));
+        assert!(!response.body.contains("bot_suspended"));
+    }
+
+    #[tokio::test]
+    async fn grouped_notification_open_marks_group_read() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "grouped notification target").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+        let carol_cookie = register_test_user(&server, "carol").await;
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let bob_csrf = csrf_token(&bob_home.body);
+        let carol_home = get_with_cookie(&server, "/home", &carol_cookie).await;
+        let carol_csrf = csrf_token(&carol_home.body);
+
+        let bob_liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &bob_cookie,
+            &format!("csrf={}", form_encode(&bob_csrf)),
+        )
+        .await;
+        assert_eq!(bob_liked.status, 303);
+        let carol_liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &carol_cookie,
+            &format!("csrf={}", form_encode(&carol_csrf)),
+        )
+        .await;
+        assert_eq!(carol_liked.status, 303);
+
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert_eq!(notifications.status, 200);
+        assert!(notifications.body.contains("2 unread notifications"));
+        assert!(notifications.body.contains("2 people"));
+        assert!(notifications.body.contains("liked your post"));
+        assert!(notifications.body.contains("View people"));
+        assert_eq!(
+            notifications
+                .body
+                .matches(r#"class="notification-row unread""#)
+                .count(),
+            1
+        );
+        let csrf = csrf_token(&notifications.body);
+        let notification_ids = hidden_value(&notifications.body, "notification_ids");
+
+        let opened = post_form_with_cookie(
+            &server,
+            "/notifications/open",
+            &alice_cookie,
+            &format!(
+                "csrf={}&notification_ids={}&return_to={}",
+                form_encode(&csrf),
+                form_encode(&notification_ids),
+                form_encode("/posts/1")
+            ),
+        )
+        .await;
+
+        assert_eq!(opened.status, 303);
+        assert_eq!(location(&opened), "/posts/1");
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert!(notifications.body.contains("No unread notifications"));
+        assert!(
+            !notifications
+                .body
+                .contains(r#"class="notification-row unread""#)
+        );
+    }
+
+    #[tokio::test]
     async fn notifications_page_has_polished_empty_state() {
         let server = spawn_test_server().await;
         let cookie = register_test_user(&server, "alice").await;
@@ -4950,11 +7086,11 @@ mod tests {
         assert_eq!(notifications.status, 200);
         assert!(notifications.body.contains(r#"class="notifications-hero""#));
         assert!(notifications.body.contains("No unread notifications"));
-        assert!(notifications.body.contains("No notifications yet"));
+        assert!(notifications.body.contains("No notifications."));
         assert!(
             notifications
                 .body
-                .contains("Replies, likes, reposts, follows, and mentions will appear here.")
+                .contains("New activity will appear here.")
         );
     }
 
@@ -5115,7 +7251,7 @@ mod tests {
         assert!(home.body.contains(r#"data-testid="nsfw-media""#));
         assert!(home.body.contains(r#"aria-label="Show NSFW media""#));
         assert!(home.body.contains(">Show<span"));
-        assert!(home.body.contains("Open media"));
+        assert!(!home.body.contains(r#"class="nsfw-open""#));
     }
 
     #[tokio::test]
@@ -5542,6 +7678,7 @@ mod tests {
         assert!(response.body.contains("<legend>Accounts</legend>"));
         assert!(response.body.contains("<legend>Media</legend>"));
         assert!(response.body.contains(r#"name="allow_reposts""#));
+        assert!(response.body.contains(r#"name="post_edit_window_seconds""#));
         assert!(
             response
                 .body
@@ -5684,6 +7821,7 @@ mod tests {
                 "confirm",
                 &[
                     ("max_bio_len", "300"),
+                    ("post_edit_window_seconds", "20"),
                     ("allow_profile_pictures", "false"),
                     ("nsfw_blur_enabled", "false"),
                     ("registration_captcha_enabled", "true"),
@@ -5696,6 +7834,7 @@ mod tests {
         assert_eq!(response.status, 200);
         assert!(response.body.contains("Settings saved successfully"));
         assert_eq!(saved.accounts.max_bio_len, 300);
+        assert_eq!(saved.posts.post_edit_window_seconds, 20);
         assert!(!saved.accounts.allow_profile_pictures);
         assert!(!saved.media.nsfw_blur_enabled);
         assert!(saved.accounts.registration_captcha_enabled);
@@ -5710,6 +7849,9 @@ mod tests {
         .await;
         assert!(fresh.body.contains(
             r#"name="max_bio_len" type="text" inputmode="numeric" pattern="[0-9]+" value="300""#
+        ));
+        assert!(fresh.body.contains(
+            r#"name="post_edit_window_seconds" type="text" inputmode="numeric" pattern="[0-9]+" value="20""#
         ));
         assert!(
             fresh
@@ -5754,6 +7896,45 @@ mod tests {
             response
                 .body
                 .contains("Minimum password length must not be negative")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_post_edit_window_deep_setting_is_rejected_without_writing() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = request(
+            &server.base_url,
+            "GET",
+            "/admin/deep-settings",
+            &[("cookie", &cookie)],
+            Vec::new(),
+        )
+        .await;
+        let csrf = csrf_token(&page.body);
+        let before =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(&csrf, "preview", &[("post_edit_window_seconds", "999")]),
+        )
+        .await;
+        let after =
+            std::fs::read_to_string(server.data_dir.join("settings.toml")).expect("settings");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(before, after);
+        assert!(
+            response
+                .body
+                .contains("Post edit window must be 300 seconds or less")
         );
     }
 
@@ -6192,6 +8373,39 @@ mod tests {
         ]
     }
 
+    fn tiny_mp4_bytes() -> Vec<u8> {
+        let mut bytes = vec![
+            0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0x00, 0x00,
+            0x00, 0x00, b'i', b's', b'o', b'm', b'm', b'p', b'4', b'2',
+        ];
+        bytes.extend_from_slice(b"rustpost-test-video");
+        bytes
+    }
+
+    async fn media_row_count(server: &TestServer) -> i64 {
+        server
+            .pool
+            .call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?))
+            .await
+            .expect("media count")
+    }
+
+    async fn pinned_post_id_for_user(server: &TestServer, username: &str) -> Option<i64> {
+        let username = username.to_owned();
+        server
+            .pool
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT pinned_post_id FROM users WHERE normalized_username = ?",
+                    [username],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("pinned post")
+    }
+
     async fn register_test_user(server: &TestServer, username: &str) -> String {
         let body = format!(
             "username={}&password=very%20secure%20password&confirm_password=very%20secure%20password",
@@ -6220,6 +8434,25 @@ mod tests {
         .await
     }
 
+    async fn liked_profile_fixture() -> (TestServer, String, String) {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "privacy target post").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+        create_text_post(&server, &bob_cookie, "bob fallback post").await;
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let csrf = csrf_token(&bob_home.body);
+        let liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(liked.status, 303);
+        (server, alice_cookie, bob_cookie)
+    }
+
     async fn post_form_with_cookie(
         server: &TestServer,
         path: &str,
@@ -6237,6 +8470,64 @@ mod tests {
             body.as_bytes().to_vec(),
         )
         .await
+    }
+
+    async fn save_profile_settings(
+        server: &TestServer,
+        cookie: &str,
+        fields: &[(&str, &str)],
+    ) -> TestResponse {
+        let settings = get_with_cookie(server, "/settings", cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let mut all_fields = Vec::with_capacity(fields.len() + 1);
+        all_fields.push(("csrf", csrf.as_str()));
+        all_fields.extend_from_slice(fields);
+        request(
+            &server.base_url,
+            "POST",
+            "/settings",
+            &[
+                ("cookie", cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=settings-boundary",
+                ),
+            ],
+            multipart_body("settings-boundary", &all_fields, false),
+        )
+        .await
+    }
+
+    async fn user_settings_state(
+        server: &TestServer,
+        username: &str,
+    ) -> (String, i64, i64, String, String, String, String) {
+        let username = username.to_owned();
+        server
+            .pool
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    r#"
+                    SELECT theme, nsfw_blur_enabled, liked_posts_public,
+                      display_name, bio, location, website
+                    FROM users WHERE normalized_username = ?
+                    "#,
+                    [username],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )?)
+            })
+            .await
+            .expect("user settings state")
     }
 
     async fn create_text_post(server: &TestServer, cookie: &str, text: &str) {
@@ -6263,6 +8554,21 @@ mod tests {
         assert_eq!(posted.status, 303);
     }
 
+    async fn set_post_created_seconds_ago(server: &TestServer, post_id: i64, seconds: i64) {
+        let modifier = format!("-{seconds} seconds");
+        server
+            .pool
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE posts SET created_at = datetime('now', ?), edited_at = NULL WHERE id = ?",
+                    params![modifier, post_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("set post age");
+    }
+
     fn assert_populated_notifications_page(body: &str) {
         assert!(body.contains("4 unread notifications"));
         assert!(
@@ -6281,9 +8587,20 @@ mod tests {
         assert!(body.contains("reposted your post"));
         assert!(body.contains("followed you"));
         assert!(body.contains("alice original post"));
-        assert!(body.contains(r#"data-card-href="/posts/1""#));
-        assert!(body.contains(r#"data-card-href="/posts/2""#));
-        assert!(body.contains(r#"data-card-href="/users/bob""#));
+        assert!(body.contains(r#"data-card-form="notification-open-"#));
+        assert!(body.contains(r#"name="return_to" value="/posts/1""#));
+        assert!(body.contains(r#"name="return_to" value="/posts/2""#));
+        assert!(body.contains(r#"name="return_to" value="/users/bob""#));
+    }
+
+    fn assert_empty_state(body: &str, title: &str, message: &str) {
+        assert!(body.contains(r#"class="empty-state" data-testid="empty-state""#));
+        assert!(body.contains(&format!("<h2>{title}</h2>")));
+        if message.is_empty() {
+            assert!(!body.contains(r#"<section class="empty-state" data-testid="empty-state"><h2></h2><p></p></section>"#));
+        } else {
+            assert!(body.contains(&format!("<p>{message}</p>")));
+        }
     }
 
     fn quote_form_body(response: &TestResponse, text: &str) -> String {

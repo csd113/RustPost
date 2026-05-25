@@ -7,7 +7,7 @@ use rusqlite::{Row, params, params_from_iter};
 use serde::Deserialize;
 
 use crate::auth;
-use crate::config::Settings;
+use crate::config::{MAX_POST_EDIT_WINDOW_SECONDS, Settings};
 use crate::db::SqlitePool;
 
 const MIB: u64 = 1024 * 1024;
@@ -18,6 +18,7 @@ pub struct DeepSettingsForm {
     pub intent: Option<String>,
     pub site_name: String,
     pub max_text_chars: String,
+    pub post_edit_window_seconds: String,
     pub max_images_per_post: String,
     pub max_videos_per_post: String,
     pub max_media_per_post: String,
@@ -45,6 +46,7 @@ pub struct DeepSettingsForm {
 pub enum DeepSettingsField {
     SiteName,
     MaxTextChars,
+    PostEditWindowSeconds,
     MaxImagesPerPost,
     MaxVideosPerPost,
     MaxMediaPerPost,
@@ -79,6 +81,7 @@ pub enum DeepSettingsInputKind {
 pub struct DeepSettingsValues {
     pub site_name: String,
     pub max_text_chars: usize,
+    pub post_edit_window_seconds: u64,
     pub max_images_per_post: usize,
     pub max_videos_per_post: usize,
     pub max_media_per_post: usize,
@@ -110,9 +113,10 @@ pub struct DeepSettingsChange {
 }
 
 impl DeepSettingsField {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::SiteName,
         Self::MaxTextChars,
+        Self::PostEditWindowSeconds,
         Self::MaxImagesPerPost,
         Self::MaxVideosPerPost,
         Self::MaxMediaPerPost,
@@ -141,6 +145,7 @@ impl DeepSettingsField {
         match self {
             Self::SiteName => "Site",
             Self::MaxTextChars
+            | Self::PostEditWindowSeconds
             | Self::MaxImagesPerPost
             | Self::MaxVideosPerPost
             | Self::MaxMediaPerPost
@@ -168,6 +173,7 @@ impl DeepSettingsField {
         match self {
             Self::SiteName => "site",
             Self::MaxTextChars
+            | Self::PostEditWindowSeconds
             | Self::MaxImagesPerPost
             | Self::MaxVideosPerPost
             | Self::MaxMediaPerPost
@@ -195,6 +201,7 @@ impl DeepSettingsField {
         match self {
             Self::SiteName => "name",
             Self::MaxTextChars => "max_text_chars",
+            Self::PostEditWindowSeconds => "post_edit_window_seconds",
             Self::MaxImagesPerPost => "max_images_per_post",
             Self::MaxVideosPerPost => "max_videos_per_post",
             Self::MaxMediaPerPost => "max_media_per_post",
@@ -224,6 +231,7 @@ impl DeepSettingsField {
         match self {
             Self::SiteName => "site_name",
             Self::MaxTextChars => "max_text_chars",
+            Self::PostEditWindowSeconds => "post_edit_window_seconds",
             Self::MaxImagesPerPost => "max_images_per_post",
             Self::MaxVideosPerPost => "max_videos_per_post",
             Self::MaxMediaPerPost => "max_media_per_post",
@@ -253,6 +261,7 @@ impl DeepSettingsField {
         match self {
             Self::SiteName => "Site name",
             Self::MaxTextChars => "Maximum post text length",
+            Self::PostEditWindowSeconds => "Post edit window",
             Self::MaxImagesPerPost => "Maximum images per post",
             Self::MaxVideosPerPost => "Maximum videos per post",
             Self::MaxMediaPerPost => "Maximum total media per post",
@@ -285,6 +294,9 @@ impl DeepSettingsField {
             | Self::MaxUsernameLen
             | Self::MaxDisplayNameLen
             | Self::MaxBioLen => Some("Characters."),
+            Self::PostEditWindowSeconds => {
+                Some("Seconds. Default is 15; valid range is 0 to 300. Set 0 to disable.")
+            }
             Self::MaxImagesPerPost | Self::MaxVideosPerPost | Self::MaxMediaPerPost => {
                 Some("Attachments per post.")
             }
@@ -325,6 +337,7 @@ impl DeepSettingsValues {
         Self {
             site_name: settings.site.name.clone(),
             max_text_chars: settings.posts.max_text_chars,
+            post_edit_window_seconds: settings.posts.post_edit_window_seconds,
             max_images_per_post: settings.posts.max_images_per_post,
             max_videos_per_post: settings.posts.max_videos_per_post,
             max_media_per_post: settings.posts.max_media_per_post,
@@ -354,6 +367,7 @@ impl DeepSettingsValues {
         match field {
             DeepSettingsField::SiteName => self.site_name.clone(),
             DeepSettingsField::MaxTextChars => self.max_text_chars.to_string(),
+            DeepSettingsField::PostEditWindowSeconds => self.post_edit_window_seconds.to_string(),
             DeepSettingsField::MaxImagesPerPost => self.max_images_per_post.to_string(),
             DeepSettingsField::MaxVideosPerPost => self.max_videos_per_post.to_string(),
             DeepSettingsField::MaxMediaPerPost => self.max_media_per_post.to_string(),
@@ -389,6 +403,7 @@ impl DeepSettingsValues {
             | DeepSettingsField::MaxUsernameLen
             | DeepSettingsField::MaxDisplayNameLen
             | DeepSettingsField::MaxBioLen => format!("{value} characters"),
+            DeepSettingsField::PostEditWindowSeconds => format!("{value} seconds"),
             DeepSettingsField::MaxImageSizeMb | DeepSettingsField::MaxVideoSizeMb => {
                 format!("{value} MB")
             }
@@ -401,6 +416,7 @@ impl DeepSettingsValues {
         let mut updated = current.clone();
         updated.site.name.clone_from(&self.site_name);
         updated.posts.max_text_chars = self.max_text_chars;
+        updated.posts.post_edit_window_seconds = self.post_edit_window_seconds;
         updated.posts.max_images_per_post = self.max_images_per_post;
         updated.posts.max_videos_per_post = self.max_videos_per_post;
         updated.posts.max_media_per_post = self.max_media_per_post;
@@ -433,6 +449,7 @@ pub fn parse_deep_settings_form(
     let values = DeepSettingsValues {
         site_name: form.site_name.clone(),
         max_text_chars: parse_usize(&form.max_text_chars, DeepSettingsField::MaxTextChars)?,
+        post_edit_window_seconds: parse_post_edit_window_seconds(&form.post_edit_window_seconds)?,
         max_images_per_post: parse_usize(
             &form.max_images_per_post,
             DeepSettingsField::MaxImagesPerPost,
@@ -537,6 +554,23 @@ fn parse_usize(value: &str, field: DeepSettingsField) -> anyhow::Result<usize> {
     trimmed
         .parse::<usize>()
         .with_context(|| format!("{} must be a whole number", field.label()))
+}
+
+fn parse_post_edit_window_seconds(value: &str) -> anyhow::Result<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Post edit window is required");
+    }
+    if trimmed.starts_with('-') {
+        anyhow::bail!("Post edit window must not be negative");
+    }
+    let seconds = trimmed
+        .parse::<u64>()
+        .with_context(|| "Post edit window must be a whole number of seconds")?;
+    if seconds > MAX_POST_EDIT_WINDOW_SECONDS {
+        anyhow::bail!("Post edit window must be {MAX_POST_EDIT_WINDOW_SECONDS} seconds or less");
+    }
+    Ok(seconds)
 }
 
 fn parse_mb(value: &str, field: DeepSettingsField) -> anyhow::Result<u64> {
@@ -667,6 +701,9 @@ fn toml_value(field: DeepSettingsField, settings: &Settings) -> String {
     match field {
         DeepSettingsField::SiteName => toml::Value::String(settings.site.name.clone()).to_string(),
         DeepSettingsField::MaxTextChars => settings.posts.max_text_chars.to_string(),
+        DeepSettingsField::PostEditWindowSeconds => {
+            settings.posts.post_edit_window_seconds.to_string()
+        }
         DeepSettingsField::MaxImagesPerPost => settings.posts.max_images_per_post.to_string(),
         DeepSettingsField::MaxVideosPerPost => settings.posts.max_videos_per_post.to_string(),
         DeepSettingsField::MaxMediaPerPost => settings.posts.max_media_per_post.to_string(),
@@ -1301,6 +1338,7 @@ mod tests {
             intent: Some("preview".to_owned()),
             site_name: values.site_name,
             max_text_chars: values.max_text_chars.to_string(),
+            post_edit_window_seconds: values.post_edit_window_seconds.to_string(),
             max_images_per_post: values.max_images_per_post.to_string(),
             max_videos_per_post: values.max_videos_per_post.to_string(),
             max_media_per_post: values.max_media_per_post.to_string(),
@@ -1545,6 +1583,18 @@ mod tests {
         let updated = parsed.apply_to(&settings);
 
         assert_eq!(updated.accounts.min_password_length, 5);
+    }
+
+    #[test]
+    fn deep_settings_accepts_zero_post_edit_window_as_disabled() {
+        let settings = Settings::default();
+        let mut form = form_from_settings(&settings);
+        form.post_edit_window_seconds = "0".to_owned();
+
+        let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
+        let updated = parsed.apply_to(&settings);
+
+        assert_eq!(updated.posts.post_edit_window_seconds, 0);
     }
 
     #[test]

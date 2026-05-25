@@ -229,6 +229,15 @@ registration_captcha_enabled = false
 
 `registration_captcha_enabled` adds a single-use CAPTCHA challenge to registration only. Login is unchanged.
 
+### Post editing
+
+```toml
+[posts]
+post_edit_window_seconds = 15
+```
+
+Users can edit their own post text only during this short server-enforced window. The default is 15 seconds; set it to `0` to disable post editing.
+
 ### Clearnet only (default)
 
 ```toml
