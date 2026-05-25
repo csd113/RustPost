@@ -1953,30 +1953,83 @@ fn settings_profile_media(
             )
         },
     );
-    let banner_control = if allow_profile_banners {
-        let delete = banner_path.map_or_else(String::new, |_| {
-            r#"<label class="check-row"><input type="checkbox" name="delete_banner" value="true"> Remove banner</label>"#
-                .to_owned()
-        });
-        format!(
-            r#"<div class="media-control-row"><label class="file-control" for="banner">Change banner<input id="banner" name="banner" type="file" accept="image/*"></label>{delete}</div>"#
+    let banner_controls = if allow_profile_banners {
+        settings_media_actions(
+            "settings-banner-actions",
+            "banner",
+            "banner",
+            "Change banner",
+            banner_path.map(|_| ("delete_banner", "delete_banner", "Remove banner")),
         )
     } else {
-        r#"<p class="muted">Profile banners are disabled.</p>"#.to_owned()
+        settings_media_disabled("Profile banners are disabled.")
     };
-    let picture_control = if allow_profile_pictures {
-        let delete = picture_path.map_or_else(String::new, |_| {
-            r#"<label class="check-row"><input type="checkbox" name="delete_profile_picture" value="true"> Remove profile picture</label>"#
-                .to_owned()
-        });
-        format!(
-            r#"<div class="media-control-row"><label class="file-control" for="profile_picture">Change profile picture<input id="profile_picture" name="profile_picture" type="file" accept="image/*"></label>{delete}</div>"#
+    let picture_controls = if allow_profile_pictures {
+        settings_media_actions(
+            "settings-picture-actions",
+            "profile_picture",
+            "profile_picture",
+            "Change profile picture",
+            picture_path.map(|_| {
+                (
+                    "delete_profile_picture",
+                    "delete_profile_picture",
+                    "Remove profile picture",
+                )
+            }),
         )
     } else {
-        r#"<p class="muted">Profile pictures are disabled.</p>"#.to_owned()
+        settings_media_disabled("Profile pictures are disabled.")
     };
     format!(
-        r#"<div class="settings-profile-media"><div class="settings-banner-wrap">{banner}</div><div class="settings-picture-row">{picture}<div class="settings-media-controls">{banner_control}{picture_control}</div></div></div>"#
+        r#"<div class="settings-profile-media"><div class="settings-banner-wrap settings-media-frame" data-profile-media-frame>{banner}{banner_controls}</div><div class="settings-picture-row"><div class="settings-picture-wrap settings-media-frame" data-profile-media-frame>{picture}{picture_controls}</div></div></div>"#
+    )
+}
+
+fn settings_media_actions(
+    action_class: &str,
+    file_id: &str,
+    file_name: &str,
+    change_label: &str,
+    delete: Option<(&str, &str, &str)>,
+) -> String {
+    let delete_control =
+        delete.map_or_else(String::new, |(delete_id, delete_name, delete_label)| {
+            settings_media_delete_control(delete_id, delete_name, delete_label)
+        });
+    format!(
+        r#"<div class="settings-media-actions {action_class}">{}{delete_control}</div><span class="sr-only" aria-live="polite" data-profile-media-status></span>"#,
+        settings_media_file_control(file_id, file_name, change_label),
+        action_class = html_escape::encode_double_quoted_attribute(action_class),
+    )
+}
+
+fn settings_media_file_control(input_id: &str, name: &str, label: &str) -> String {
+    let input_id = html_escape::encode_double_quoted_attribute(input_id);
+    let name = html_escape::encode_double_quoted_attribute(name);
+    let label_attr = html_escape::encode_double_quoted_attribute(label);
+    let label_text = html_escape::encode_text(label);
+    format!(
+        r#"<span class="settings-media-control"><input class="settings-media-input" id="{input_id}" name="{name}" type="file" accept="image/*" aria-label="{label_attr}" data-profile-media-file><label class="settings-media-icon-button settings-media-change" for="{input_id}" title="{label_attr}">{}<span class="sr-only">{label_text}</span></label></span>"#,
+        render::icon_svg("edit"),
+    )
+}
+
+fn settings_media_delete_control(input_id: &str, name: &str, label: &str) -> String {
+    let input_id = html_escape::encode_double_quoted_attribute(input_id);
+    let name = html_escape::encode_double_quoted_attribute(name);
+    let label_attr = html_escape::encode_double_quoted_attribute(label);
+    let label_text = html_escape::encode_text(label);
+    format!(
+        r#"<span class="settings-media-control"><input class="settings-media-delete-input" id="{input_id}" name="{name}" type="checkbox" value="true" aria-label="{label_attr}" data-profile-media-delete><label class="settings-media-icon-button settings-media-remove" for="{input_id}" title="{label_attr}">{}<span class="sr-only">{label_text}</span></label></span>"#,
+        render::icon_svg("trash"),
+    )
+}
+
+fn settings_media_disabled(message: &str) -> String {
+    format!(
+        r#"<p class="settings-media-disabled">{}</p>"#,
+        html_escape::encode_text(message),
     )
 }
 
@@ -2147,10 +2200,10 @@ async fn settings_page(
     ]
     .join("");
     let body = format!(
-        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, media, and account controls.</p></div></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}"><div class="settings-section settings-section-profile"><div class="settings-section-heading"><h2>Profile</h2><p class="settings-section-help">Your name, bio, location, and link as shown on your profile.</p></div>{}</div><div class="settings-section settings-section-media"><div class="settings-section-heading"><h2>Profile media</h2><p class="settings-section-help">Avatar and banner images for your profile header.</p></div>{}</div><div class="settings-section settings-section-preferences"><div class="settings-section-heading"><h2>Preferences and privacy</h2><p class="settings-section-help">Control your display theme, NSFW media blur, and profile activity visibility.</p></div><div class="settings-switch-list">{}</div></div><div class="settings-form-actions"><button class="primary" type="submit">Save profile settings</button></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Blocked users</h2><p class="settings-section-help">Blocked accounts cannot follow or interact with you.</p>{}</section><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted users</h2><p class="settings-section-help">Muted accounts stay hidden from your views.</p>{}</section></div><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted words</h2><p class="settings-section-help">Hide posts containing specific words or phrases.</p><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel settings-security-panel" data-testid="settings-card"><h2>Change password</h2><p class="settings-section-help">Update the password used to sign in to this account.</p><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p class="settings-danger-action"><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
+        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, media, and account controls.</p></div></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}"><div class="settings-section settings-section-media"><div class="settings-section-heading"><h2>Profile media</h2><p class="settings-section-help">Avatar and banner images for your profile header.</p></div>{}</div><div class="settings-section settings-section-profile"><div class="settings-section-heading"><h2>Profile</h2><p class="settings-section-help">Your name, bio, location, and link as shown on your profile.</p></div>{}</div><div class="settings-section settings-section-preferences"><div class="settings-section-heading"><h2>Preferences and privacy</h2><p class="settings-section-help">Control your display theme, NSFW media blur, and profile activity visibility.</p></div><div class="settings-switch-list">{}</div></div><div class="settings-form-actions"><button class="primary" type="submit">Save profile settings</button></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Blocked users</h2><p class="settings-section-help">Blocked accounts cannot follow or interact with you.</p>{}</section><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted users</h2><p class="settings-section-help">Muted accounts stay hidden from your views.</p>{}</section></div><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted words</h2><p class="settings-section-help">Hide posts containing specific words or phrases.</p><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel settings-security-panel" data-testid="settings-card"><h2>Change password</h2><p class="settings-section-help">Update the password used to sign in to this account.</p><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p class="settings-danger-action"><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
         html_escape::encode_double_quoted_attribute(&csrf),
-        profile_fields,
         profile_media,
+        profile_fields,
         preference_switches,
         settings_user_list(
             &blocked,
@@ -6209,6 +6262,77 @@ mod tests {
         assert_eq!(anonymous_likes.status, 200);
         assert_empty_state(&anonymous_likes.body, "This user’s likes are private", "");
         assert!(!anonymous_likes.body.contains("privacy target post"));
+    }
+
+    #[test]
+    fn settings_profile_media_mounts_controls_on_preview_frames() {
+        let body = settings_profile_media(
+            Some("/uploads/profile.webp"),
+            Some("/uploads/banner.webp"),
+            true,
+            true,
+        );
+
+        assert!(body.contains(
+            r#"class="settings-banner-wrap settings-media-frame" data-profile-media-frame"#
+        ));
+        assert!(body.contains(r#"class="settings-picture-wrap settings-media-frame""#));
+        assert!(
+            body.contains(r#"class="settings-media-input" id="banner" name="banner" type="file""#)
+        );
+        assert!(body.contains(
+            r#"class="settings-media-delete-input" id="delete_banner" name="delete_banner" type="checkbox" value="true""#
+        ));
+        assert!(body.contains(
+            r#"class="settings-media-input" id="profile_picture" name="profile_picture" type="file""#
+        ));
+        assert!(body.contains(
+            r#"class="settings-media-delete-input" id="delete_profile_picture" name="delete_profile_picture" type="checkbox" value="true""#
+        ));
+        assert!(body.contains(r#"for="banner" title="Change banner""#));
+        assert!(body.contains(r#"for="delete_banner" title="Remove banner""#));
+        assert!(body.contains(r#"for="profile_picture" title="Change profile picture""#));
+        assert!(body.contains(r#"for="delete_profile_picture" title="Remove profile picture""#));
+        assert!(!body.contains("media-control-row"));
+        assert!(!body.contains("file-control"));
+        assert!(!body.contains("check-row"));
+    }
+
+    #[tokio::test]
+    async fn settings_page_places_profile_media_before_profile_fields() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+
+        let settings = get_with_cookie(&server, "/settings", &cookie).await;
+        assert_eq!(settings.status, 200);
+        let media = settings
+            .body
+            .find("settings-section settings-section-media")
+            .expect("profile media section");
+        let profile = settings
+            .body
+            .find("settings-section settings-section-profile")
+            .expect("profile fields section");
+        let form_start = settings
+            .body
+            .find(r#"<form id="profile-settings-form""#)
+            .expect("settings form");
+        let form_end = settings.body[form_start..]
+            .find("</form>")
+            .expect("settings form end");
+        let settings_form = &settings.body[form_start..form_start + form_end];
+
+        assert!(media < profile);
+        assert!(
+            settings
+                .body
+                .contains(r#"class="settings-media-input" id="banner" name="banner" type="file""#)
+        );
+        assert!(settings.body.contains(
+            r#"class="settings-media-input" id="profile_picture" name="profile_picture" type="file""#
+        ));
+        assert!(!settings_form.contains("media-control-row"));
+        assert!(!settings_form.contains("check-row"));
     }
 
     #[tokio::test]
