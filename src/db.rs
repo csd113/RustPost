@@ -683,6 +683,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn liked_posts_public_migration_defaults_existing_users_public() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        pool.call(|conn| {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (12);
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    normalized_username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    is_deleted INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO users (username, normalized_username, password_hash, display_name)
+                    VALUES ('Alice', 'alice', 'hash', 'Alice');
+                INSERT INTO users (username, normalized_username, password_hash, display_name, is_deleted)
+                    VALUES ('Deleted', 'deleted', 'hash', 'Deleted', 1);
+                "#,
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("legacy schema");
+
+        migrate(&pool).await.expect("migrate to liked_posts_public");
+        migrate(&pool).await.expect("second migrate");
+
+        let (alice_public, deleted_public, column_count, version): (i64, i64, i64, i64) = pool
+            .call(|conn| {
+                let alice = conn.query_row(
+                    "SELECT liked_posts_public FROM users WHERE normalized_username = 'alice'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let deleted = conn.query_row(
+                    "SELECT liked_posts_public FROM users WHERE normalized_username = 'deleted'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let column_count = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'liked_posts_public'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let version =
+                    conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                        row.get(0)
+                    })?;
+                Ok((alice, deleted, column_count, version))
+            })
+            .await
+            .expect("liked posts migration state");
+
+        assert_eq!(alice_public, 1);
+        assert_eq!(deleted_public, 1);
+        assert_eq!(column_count, 1);
+        assert_eq!(version, 13);
+    }
+
+    #[tokio::test]
     async fn onboarding_migration_marks_existing_active_users_complete() {
         let temp = tempfile::tempdir().expect("temp dir");
         let pool = connect(&temp.path().join("test.sqlite3"))

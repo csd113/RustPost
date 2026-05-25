@@ -160,7 +160,6 @@ struct PostRow {
     parent_post_id: Option<i64>,
     created_at: String,
     edited_at: Option<String>,
-    like_count: i64,
     repost_count: i64,
     reply_count: i64,
     quote_post_id: Option<i64>,
@@ -405,6 +404,9 @@ pub async fn profile_tab_timeline(
     user_id: i64,
     tab: ProfileTimelineTab,
 ) -> anyhow::Result<Vec<PostView>> {
+    if !profile_activity_visible(pool, viewer_id, user_id).await? {
+        return Ok(Vec::new());
+    }
     let mut posts = match tab {
         ProfileTimelineTab::Posts => post_events_for_user(pool, viewer_id, user_id).await?,
         ProfileTimelineTab::Replies => reply_events_for_user(pool, viewer_id, user_id).await?,
@@ -422,6 +424,33 @@ pub async fn profile_tab_timeline(
     });
     posts.truncate(40);
     Ok(posts)
+}
+
+pub async fn profile_activity_visible(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    user_id: i64,
+) -> anyhow::Result<bool> {
+    let Some(viewer_id) = viewer_id else {
+        return Ok(true);
+    };
+    if viewer_id == user_id {
+        return Ok(true);
+    }
+    pool.call(move |conn| {
+        let hidden: i64 = conn.query_row(
+            r#"
+            SELECT
+              EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?)
+              OR EXISTS(SELECT 1 FROM mutes WHERE muter_id = ? AND muted_id = ?)
+              OR EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?)
+            "#,
+            params![viewer_id, user_id, viewer_id, user_id, user_id, viewer_id],
+            |row| row.get(0),
+        )?;
+        Ok(hidden == 0)
+    })
+    .await
 }
 
 pub async fn profile_pinned_post(
@@ -1418,6 +1447,11 @@ pub async fn notifications(
             LEFT JOIN users u ON u.id = n.actor_user_id AND u.is_deleted = 0
             LEFT JOIN posts p ON p.id = n.post_id
             WHERE n.user_id = ?
+              AND (
+                n.kind != 'like'
+                OR n.actor_user_id IS NULL
+                OR COALESCE(u.liked_posts_public, 0) != 0
+              )
             ORDER BY n.id DESC
             LIMIT 80
             "#,
@@ -1551,7 +1585,17 @@ fn push_notification_group_item(
 pub async fn unread_notification_count(pool: &SqlitePool, user_id: i64) -> anyhow::Result<i64> {
     pool.call(move |conn| {
         Ok(conn.query_row(
-            "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL",
+            r#"
+            SELECT COUNT(*)
+            FROM notifications n
+            LEFT JOIN users u ON u.id = n.actor_user_id AND u.is_deleted = 0
+            WHERE n.user_id = ? AND n.read_at IS NULL
+              AND (
+                n.kind != 'like'
+                OR n.actor_user_id IS NULL
+                OR COALESCE(u.liked_posts_public, 0) != 0
+              )
+            "#,
             [user_id],
             |row| row.get(0),
         )?)
@@ -1639,8 +1683,14 @@ fn notification_group_counts_tx(
         r#"
         SELECT COUNT(*), COALESCE(SUM(CASE WHEN n.read_at IS NULL THEN 1 ELSE 0 END), 0)
         FROM notifications n
+        LEFT JOIN users actor ON actor.id = n.actor_user_id AND actor.is_deleted = 0
         LEFT JOIN posts p ON p.id = n.post_id
         WHERE n.user_id = ? AND n.kind = ? AND {target_expr} = ?
+          AND (
+            n.kind != 'like'
+            OR n.actor_user_id IS NULL
+            OR COALESCE(actor.liked_posts_public, 0) != 0
+          )
         "#
     );
     Ok(
@@ -1718,7 +1768,6 @@ fn base_post_query() -> String {
       COALESCE(pic.thumbnail_public_path, pic.public_path) AS profile_picture_path,
       p.anonymous_label, p.text, p.parent_post_id, p.created_at,
       p.edited_at,
-      (SELECT COUNT(*) FROM likes WHERE post_id = p.id) AS like_count,
       ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
        (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0)) AS repost_count,
       (SELECT COUNT(*) FROM posts r WHERE r.parent_post_id = p.id AND r.is_deleted = 0) AS reply_count,
@@ -1740,7 +1789,6 @@ fn base_repost_query() -> String {
       COALESCE(pic.thumbnail_public_path, pic.public_path) AS profile_picture_path, p.anonymous_label,
       COALESCE(p.text, '') AS text, p.parent_post_id, COALESCE(p.created_at, r.created_at) AS created_at,
       p.edited_at,
-      CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE (SELECT COUNT(*) FROM likes WHERE post_id = p.id) END AS like_count,
       CASE WHEN p.id IS NULL OR p.is_deleted != 0 THEN 0 ELSE
         ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
          (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0))
@@ -1969,11 +2017,10 @@ fn map_post_row(row: &Row<'_>) -> rusqlite::Result<PostRow> {
         parent_post_id: row.get(15)?,
         created_at: row.get(16)?,
         edited_at: row.get(17)?,
-        like_count: row.get(18)?,
-        repost_count: row.get(19)?,
-        reply_count: row.get(20)?,
-        quote_post_id: row.get(21)?,
-        pinned_by_author: row.get::<_, i64>(22)? != 0,
+        repost_count: row.get(18)?,
+        reply_count: row.get(19)?,
+        quote_post_id: row.get(20)?,
+        pinned_by_author: row.get::<_, i64>(21)? != 0,
     })
 }
 
@@ -2006,6 +2053,11 @@ async fn rows_to_posts(
         } else {
             false
         };
+        let like_count = if original_unavailable {
+            0
+        } else {
+            visible_like_count(pool, viewer_id, id).await?
+        };
         let viewer_can_repost =
             viewer_id.is_some_and(|user_id| !original_unavailable && row.user_id != Some(user_id));
         let quote = quote_preview_for_post(pool, row.quote_post_id, viewer_id).await?;
@@ -2027,7 +2079,7 @@ async fn rows_to_posts(
             created_at: row.created_at,
             edited_at: row.edited_at,
             event_created_at: row.event_created_at,
-            like_count: row.like_count,
+            like_count,
             repost_count: row.repost_count,
             reply_count: row.reply_count,
             viewer_liked,
@@ -2045,6 +2097,27 @@ async fn rows_to_posts(
         });
     }
     Ok(posts)
+}
+
+async fn visible_like_count(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    post_id: i64,
+) -> anyhow::Result<i64> {
+    let viewer_id = viewer_id.unwrap_or(-1);
+    pool.call(move |conn| {
+        Ok(conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM likes l
+            JOIN users u ON u.id = l.user_id AND u.is_deleted = 0
+            WHERE l.post_id = ? AND (u.liked_posts_public != 0 OR l.user_id = ?)
+            "#,
+            params![post_id, viewer_id],
+            |row| row.get(0),
+        )?)
+    })
+    .await
 }
 
 async fn quote_preview_for_post(
@@ -2217,10 +2290,22 @@ fn notify_post_owner_tx(
     if let Some(owner) = owner
         && owner != actor_id
         && !is_blocked_tx(tx, owner, actor_id)?
+        && (kind != "like" || likes_public_tx(tx, actor_id)?)
     {
         create_notification_tx(tx, owner, Some(actor_id), Some(link_post_id), kind, message)?;
     }
     Ok(owner)
+}
+
+fn likes_public_tx(tx: &rusqlite::Transaction<'_>, user_id: i64) -> anyhow::Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT liked_posts_public FROM users WHERE id = ? AND is_deleted = 0",
+            [user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some_and(|value| value != 0))
 }
 
 fn notify_mentioned_users_tx(
@@ -2855,6 +2940,9 @@ mod tests {
     #[tokio::test]
     async fn profile_replies_tab_includes_plain_replies() {
         let (pool, settings, alice, bob) = fixture().await;
+        let top_level = create_post(&pool, &settings, Some(bob), "bob original", None, &[])
+            .await
+            .expect("top-level");
         let parent = create_post(&pool, &settings, Some(alice), "alice parent", None, &[])
             .await
             .expect("parent");
@@ -2869,6 +2957,7 @@ mod tests {
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].id, reply);
         assert_eq!(replies[0].parent_post_id, Some(parent));
+        assert!(!replies.iter().any(|post| post.id == top_level));
     }
 
     #[tokio::test]
@@ -2910,6 +2999,14 @@ mod tests {
             .expect("liked media");
         attach_test_media(&pool, alice, liked_media).await;
         like(&pool, bob, liked_media).await.expect("like");
+        let reposted_media =
+            create_post(&pool, &settings, Some(alice), "reposted media", None, &[])
+                .await
+                .expect("reposted media");
+        attach_test_media(&pool, alice, reposted_media).await;
+        repost(&pool, bob, reposted_media)
+            .await
+            .expect("repost media");
 
         let media = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Media)
             .await
@@ -2920,6 +3017,9 @@ mod tests {
         assert!(media.iter().any(|post| post.id == media_reply));
         assert!(!media.iter().any(|post| post.id == plain));
         assert!(!media.iter().any(|post| post.id == liked_media));
+        assert!(media.iter().any(|post| {
+            post.id == reposted_media && post.event_kind == TimelineEventKind::Repost
+        }));
     }
 
     #[tokio::test]
@@ -2941,6 +3041,82 @@ mod tests {
         assert_eq!(likes[0].id, liked);
         assert_eq!(likes[0].user_id, Some(alice));
         assert!(!likes.iter().any(|post| post.id == not_liked));
+    }
+
+    #[tokio::test]
+    async fn profile_tabs_hide_activity_when_profile_user_blocks_viewer() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(&pool, &settings, Some(bob), "blocked original", None, &[])
+            .await
+            .expect("original");
+        let reply_target = create_post(&pool, &settings, Some(alice), "reply target", None, &[])
+            .await
+            .expect("reply target");
+        create_post(
+            &pool,
+            &settings,
+            Some(bob),
+            "blocked reply",
+            Some(reply_target),
+            &[],
+        )
+        .await
+        .expect("reply");
+        let liked = create_post(&pool, &settings, Some(alice), "blocked like", None, &[])
+            .await
+            .expect("liked");
+        like(&pool, bob, liked).await.expect("like");
+        let media_post = create_post(&pool, &settings, Some(bob), "blocked media", None, &[])
+            .await
+            .expect("media");
+        attach_test_media(&pool, bob, media_post).await;
+
+        let visible = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Posts)
+            .await
+            .expect("visible posts");
+        assert!(visible.iter().any(|post| post.id == original));
+
+        block(&pool, bob, alice).await.expect("block viewer");
+
+        for tab in [
+            ProfileTimelineTab::Posts,
+            ProfileTimelineTab::Replies,
+            ProfileTimelineTab::Media,
+            ProfileTimelineTab::Likes,
+        ] {
+            let posts = profile_tab_timeline(&pool, Some(alice), bob, tab)
+                .await
+                .expect("blocked profile tab");
+            assert!(posts.is_empty(), "{tab:?} should be hidden");
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_likes_tab_hides_activity_when_viewer_mutes_profile_user() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let liked = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "muted profile like",
+            None,
+            &[],
+        )
+        .await
+        .expect("liked");
+        like(&pool, bob, liked).await.expect("like");
+
+        let visible = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Likes)
+            .await
+            .expect("visible likes");
+        assert_eq!(visible.len(), 1);
+
+        mute(&pool, alice, bob).await.expect("mute profile");
+
+        let hidden = profile_tab_timeline(&pool, Some(alice), bob, ProfileTimelineTab::Likes)
+            .await
+            .expect("muted likes");
+        assert!(hidden.is_empty());
     }
 
     #[tokio::test]
@@ -3081,6 +3257,102 @@ mod tests {
             .await
             .expect("notification count");
         assert_eq!(notifications, 1);
+    }
+
+    #[tokio::test]
+    async fn private_likes_do_not_create_or_render_like_notifications() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let first_post = create_post(&pool, &settings, Some(alice), "first", None, &[])
+            .await
+            .expect("first post");
+        let second_post = create_post(&pool, &settings, Some(alice), "second", None, &[])
+            .await
+            .expect("second post");
+
+        like(&pool, bob, first_post).await.expect("public like");
+        let public_groups = notification_groups(&pool, alice)
+            .await
+            .expect("public notifications");
+        assert_eq!(public_groups.len(), 1);
+        assert_eq!(public_groups[0].kind, "like");
+        assert_eq!(public_groups[0].total_count, 1);
+
+        pool.call(move |conn| {
+            conn.execute(
+                "UPDATE users SET liked_posts_public = 0 WHERE id = ?",
+                [bob],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("make likes private");
+
+        let hidden_groups = notification_groups(&pool, alice)
+            .await
+            .expect("private notifications");
+        assert!(hidden_groups.is_empty());
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread count"),
+            0
+        );
+
+        like(&pool, bob, second_post).await.expect("private like");
+        let raw_like_notifications = notification_count(&pool, alice, "like")
+            .await
+            .expect("raw notification count");
+        assert_eq!(raw_like_notifications, 1);
+        let hidden_groups = notification_groups(&pool, alice)
+            .await
+            .expect("private notifications after private like");
+        assert!(hidden_groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn private_like_counts_are_visible_only_to_liker() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let post = create_post(&pool, &settings, Some(alice), "private count", None, &[])
+            .await
+            .expect("post");
+        pool.call(move |conn| {
+            conn.execute(
+                "UPDATE users SET liked_posts_public = 0 WHERE id = ?",
+                [bob],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("make likes private");
+        like(&pool, bob, post).await.expect("private like");
+
+        let alice_timeline = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("alice timeline");
+        let alice_post = alice_timeline
+            .iter()
+            .find(|item| item.id == post)
+            .expect("alice post");
+        assert_eq!(alice_post.like_count, 0);
+
+        let anonymous_timeline = timeline(&pool, None, "local", None)
+            .await
+            .expect("anonymous timeline");
+        let anonymous_post = anonymous_timeline
+            .iter()
+            .find(|item| item.id == post)
+            .expect("anonymous post");
+        assert_eq!(anonymous_post.like_count, 0);
+
+        let bob_timeline = timeline(&pool, Some(bob), "local", None)
+            .await
+            .expect("bob timeline");
+        let bob_post = bob_timeline
+            .iter()
+            .find(|item| item.id == post)
+            .expect("bob post");
+        assert_eq!(bob_post.like_count, 1);
+        assert!(bob_post.viewer_liked);
     }
 
     #[tokio::test]

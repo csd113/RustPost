@@ -1501,7 +1501,8 @@ async fn profile(
         SELECT u.id, u.username, u.display_name, u.bio, u.location, u.website,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path,
-          u.liked_posts_public
+          u.liked_posts_public,
+          u.is_suspended
         FROM users u
         LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
         LEFT JOIN media banner ON banner.id = u.banner_media_id
@@ -1519,6 +1520,7 @@ async fn profile(
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, i64>(8)? != 0,
+                        row.get::<_, i64>(9)? != 0,
                     ))
                 },
             )
@@ -1536,19 +1538,26 @@ async fn profile(
         picture_path,
         banner_path,
         liked_posts_public,
+        is_suspended,
     )) = profile
     else {
         return Err(AppError::NotFound);
     };
     let csrf = form_csrf(&state, &headers).await;
     let viewer_id = user.as_ref().map(|u| u.id);
-    let likes_visible = liked_posts_public || viewer_id == Some(profile_id);
-    let pinned_post = if active_tab == social::ProfileTimelineTab::Posts {
+    let owner_or_admin =
+        viewer_id == Some(profile_id) || user.as_ref().is_some_and(|viewer| viewer.is_admin);
+    let activity_visible = (!is_suspended || owner_or_admin)
+        && social::profile_activity_visible(&state.pool, viewer_id, profile_id).await?;
+    let likes_visible = activity_visible && (liked_posts_public || viewer_id == Some(profile_id));
+    let pinned_post = if active_tab == social::ProfileTimelineTab::Posts && activity_visible {
         social::profile_pinned_post(&state.pool, viewer_id, profile_id).await?
     } else {
         None
     };
-    let mut posts = if active_tab == social::ProfileTimelineTab::Likes && !likes_visible {
+    let mut posts = if !activity_visible
+        || (active_tab == social::ProfileTimelineTab::Likes && !likes_visible)
+    {
         Vec::new()
     } else {
         social::profile_tab_timeline(&state.pool, viewer_id, profile_id, active_tab).await?
@@ -1605,7 +1614,16 @@ async fn profile(
         )
     });
     let tabs = render::profile_tabs(&profile_username, active_tab);
-    let timeline = if active_tab == social::ProfileTimelineTab::Likes && !likes_visible {
+    let timeline = if !activity_visible {
+        render::posts_with_controls_empty_state(
+            &posts,
+            user.as_ref(),
+            csrf.as_deref(),
+            blur_nsfw_media(&state, user.as_ref()),
+            state.settings.posts.post_edit_window_seconds,
+            profile_tab_empty_state(active_tab),
+        )
+    } else if active_tab == social::ProfileTimelineTab::Likes && !likes_visible {
         render::empty_state("This user’s likes are private", "")
     } else {
         render::posts_with_controls_empty_state(
@@ -2825,7 +2843,12 @@ async fn post_action_response(
             conn.query_row(
                 r#"
                 SELECT
-                  (SELECT COUNT(*) FROM likes WHERE post_id = p.id),
+                  (
+                    SELECT COUNT(*)
+                    FROM likes l
+                    JOIN users u ON u.id = l.user_id AND u.is_deleted = 0
+                    WHERE l.post_id = p.id AND (u.liked_posts_public != 0 OR l.user_id = ?)
+                  ),
                   ((SELECT COUNT(*) FROM reposts WHERE post_id = p.id) +
                    (SELECT COUNT(*) FROM posts qp WHERE qp.quote_post_id = p.id AND qp.is_deleted = 0)),
                   (SELECT COUNT(*) FROM posts replies WHERE replies.parent_post_id = p.id AND replies.is_deleted = 0),
@@ -2835,7 +2858,7 @@ async fn post_action_response(
                 FROM posts p
                 WHERE p.id = ? AND p.is_deleted = 0
                 "#,
-                params![viewer_id, viewer_id, viewer_id, post_id],
+                params![viewer_id, viewer_id, viewer_id, viewer_id, post_id],
                 |row| {
                     Ok(PostActionResponse {
                         kind: "post-action",
@@ -6118,21 +6141,7 @@ mod tests {
 
     #[tokio::test]
     async fn profile_likes_tab_respects_public_and_private_visibility() {
-        let server = spawn_test_server().await;
-        let alice_cookie = register_test_user(&server, "alice").await;
-        create_text_post(&server, &alice_cookie, "privacy target post").await;
-        let bob_cookie = register_test_user(&server, "bob").await;
-
-        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
-        let csrf = csrf_token(&bob_home.body);
-        let liked = post_form_with_cookie(
-            &server,
-            "/posts/1/like",
-            &bob_cookie,
-            &format!("csrf={csrf}"),
-        )
-        .await;
-        assert_eq!(liked.status, 303);
+        let (server, alice_cookie, bob_cookie) = liked_profile_fixture().await;
 
         let public_likes = get_with_cookie(&server, "/users/bob?tab=likes", &alice_cookie).await;
         assert_eq!(public_likes.status, 200);
@@ -6144,29 +6153,15 @@ mod tests {
         assert!(settings.body.contains(
             r#"id="liked_posts_public" name="liked_posts_public" type="checkbox" value="true" checked"#
         ));
-        let csrf = csrf_token(&settings.body);
-        let saved = request(
-            &server.base_url,
-            "POST",
-            "/settings",
+        let saved = save_profile_settings(
+            &server,
+            &bob_cookie,
             &[
-                ("cookie", &bob_cookie),
-                (
-                    "content-type",
-                    "multipart/form-data; boundary=settings-boundary",
-                ),
+                ("display_name", "bob"),
+                ("bio", ""),
+                ("location", ""),
+                ("website", ""),
             ],
-            multipart_body(
-                "settings-boundary",
-                &[
-                    ("csrf", csrf.as_str()),
-                    ("display_name", "bob"),
-                    ("bio", ""),
-                    ("location", ""),
-                    ("website", ""),
-                ],
-                false,
-            ),
         )
         .await;
         assert_eq!(saved.status, 303);
@@ -6182,6 +6177,261 @@ mod tests {
         assert_eq!(owner_likes.status, 200);
         assert!(owner_likes.body.contains("privacy target post"));
         assert!(!owner_likes.body.contains("This user’s likes are private"));
+
+        let anonymous_likes = request(
+            &server.base_url,
+            "GET",
+            "/users/bob?tab=likes&offset=999",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(anonymous_likes.status, 200);
+        assert_empty_state(&anonymous_likes.body, "This user’s likes are private", "");
+        assert!(!anonymous_likes.body.contains("privacy target post"));
+    }
+
+    #[tokio::test]
+    async fn private_likes_reject_bypass_notifications_and_json_count_leaks() {
+        let (server, alice_cookie, bob_cookie) = liked_profile_fixture().await;
+        let saved = save_profile_settings(
+            &server,
+            &bob_cookie,
+            &[
+                ("display_name", "bob"),
+                ("bio", ""),
+                ("location", ""),
+                ("website", ""),
+            ],
+        )
+        .await;
+        assert_eq!(saved.status, 303);
+
+        for path in [
+            "/users/bob?tab=likes&page=2",
+            "/users/bob?tab=likes&cursor=1",
+        ] {
+            let bypass = get_with_cookie(&server, path, &alice_cookie).await;
+            assert_eq!(bypass.status, 200);
+            assert_empty_state(&bypass.body, "This user’s likes are private", "");
+            assert!(!bypass.body.contains("privacy target post"));
+        }
+
+        let invalid_tab = get_with_cookie(&server, "/users/bob?tab=LIKES", &alice_cookie).await;
+        assert_eq!(invalid_tab.status, 200);
+        assert!(invalid_tab.body.contains("bob fallback post"));
+        assert!(!invalid_tab.body.contains("privacy target post"));
+        assert!(
+            invalid_tab
+                .body
+                .contains(r#"<a href="/users/bob" class="active" aria-current="page">Posts</a>"#)
+        );
+
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert_eq!(notifications.status, 200);
+        assert!(!notifications.body.contains("bob"));
+        assert!(!notifications.body.contains("liked your post"));
+        assert!(!notifications.body.contains("privacy target post"));
+
+        let alice_home = get_with_cookie(&server, "/home", &alice_cookie).await;
+        let csrf = csrf_token(&alice_home.body);
+        let alice_json = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/bookmark",
+            &[
+                ("cookie", &alice_cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("accept", "application/json"),
+                ("x-rustpost-enhance", "1"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(alice_json.status, 200);
+        assert!(alice_json.body.contains(r#""likes":0"#));
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let csrf = csrf_token(&bob_home.body);
+        let bob_json = request(
+            &server.base_url,
+            "POST",
+            "/posts/1/bookmark",
+            &[
+                ("cookie", &bob_cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("accept", "application/json"),
+                ("x-rustpost-enhance", "1"),
+            ],
+            format!("csrf={csrf}").into_bytes(),
+        )
+        .await;
+        assert_eq!(bob_json.status, 200);
+        assert!(bob_json.body.contains(r#""likes":1"#));
+    }
+
+    #[tokio::test]
+    async fn liked_posts_public_setting_persists_without_changing_other_preferences() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+
+        let saved_private = save_profile_settings(
+            &server,
+            &cookie,
+            &[
+                ("dark_mode", "true"),
+                ("nsfw_blur_enabled", "true"),
+                ("display_name", "Alice"),
+                ("bio", "same bio"),
+                ("location", "same place"),
+                ("website", "https://example.test"),
+            ],
+        )
+        .await;
+        assert_eq!(saved_private.status, 303);
+
+        let private_state = user_settings_state(&server, "alice").await;
+        assert_eq!(
+            private_state,
+            (
+                "dark".to_owned(),
+                1,
+                0,
+                "Alice".to_owned(),
+                "same bio".to_owned(),
+                "same place".to_owned(),
+                "https://example.test".to_owned(),
+            )
+        );
+
+        let settings = get_with_cookie(&server, "/settings", &cookie).await;
+        assert_eq!(settings.status, 200);
+        assert!(
+            settings.body.contains(
+                r#"id="dark_mode" name="dark_mode" type="checkbox" value="true" checked"#
+            )
+        );
+        assert!(settings.body.contains(
+            r#"id="nsfw_blur_enabled" name="nsfw_blur_enabled" type="checkbox" value="true" checked"#
+        ));
+        assert!(!settings.body.contains(
+            r#"id="liked_posts_public" name="liked_posts_public" type="checkbox" value="true" checked"#
+        ));
+
+        let saved_public = save_profile_settings(
+            &server,
+            &cookie,
+            &[
+                ("dark_mode", "true"),
+                ("nsfw_blur_enabled", "true"),
+                ("liked_posts_public", "true"),
+                ("display_name", "Alice"),
+                ("bio", "same bio"),
+                ("location", "same place"),
+                ("website", "https://example.test"),
+            ],
+        )
+        .await;
+        assert_eq!(saved_public.status, 303);
+
+        let (theme, nsfw_blur_enabled, liked_posts_public, ..) =
+            user_settings_state(&server, "alice").await;
+        assert_eq!(
+            (theme, nsfw_blur_enabled, liked_posts_public),
+            ("dark".to_owned(), 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_tabs_apply_relationship_and_suspended_visibility() {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "relationship liked target").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+        create_text_post(&server, &bob_cookie, "relationship bob post").await;
+
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let csrf = csrf_token(&bob_home.body);
+        let liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(liked.status, 303);
+
+        let visible_likes = get_with_cookie(&server, "/users/bob?tab=likes", &alice_cookie).await;
+        assert_eq!(visible_likes.status, 200);
+        assert!(visible_likes.body.contains("relationship liked target"));
+
+        let bob_id = server
+            .pool
+            .call(|conn| {
+                conn.query_row(
+                    "SELECT id FROM users WHERE normalized_username = 'bob'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("bob id");
+        let alice_id = server
+            .pool
+            .call(|conn| {
+                conn.query_row(
+                    "SELECT id FROM users WHERE normalized_username = 'alice'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("alice id");
+        social::block(&server.pool, bob_id, alice_id)
+            .await
+            .expect("bob blocks alice");
+
+        let blocked_likes = get_with_cookie(&server, "/users/bob?tab=likes", &alice_cookie).await;
+        assert_eq!(blocked_likes.status, 200);
+        assert!(!blocked_likes.body.contains("relationship liked target"));
+        assert!(!blocked_likes.body.contains("This user’s likes are private"));
+        let blocked_posts = get_with_cookie(&server, "/users/bob", &alice_cookie).await;
+        assert_eq!(blocked_posts.status, 200);
+        assert!(!blocked_posts.body.contains("relationship bob post"));
+
+        server
+            .pool
+            .call(move |conn| {
+                conn.execute(
+                    "DELETE FROM blocks WHERE blocker_id = ? AND blocked_id = ?",
+                    params![bob_id, alice_id],
+                )?;
+                conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [bob_id])?;
+                Ok(())
+            })
+            .await
+            .expect("suspend bob");
+
+        let suspended_likes = request(
+            &server.base_url,
+            "GET",
+            "/users/bob?tab=likes",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(suspended_likes.status, 200);
+        assert!(!suspended_likes.body.contains("relationship liked target"));
+        assert!(
+            !suspended_likes
+                .body
+                .contains("This user’s likes are private")
+        );
+        let suspended_posts = request(&server.base_url, "GET", "/users/bob", &[], Vec::new()).await;
+        assert_eq!(suspended_posts.status, 200);
+        assert!(!suspended_posts.body.contains("relationship bob post"));
     }
 
     #[tokio::test]
@@ -8040,6 +8290,25 @@ mod tests {
         .await
     }
 
+    async fn liked_profile_fixture() -> (TestServer, String, String) {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        create_text_post(&server, &alice_cookie, "privacy target post").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+        create_text_post(&server, &bob_cookie, "bob fallback post").await;
+        let bob_home = get_with_cookie(&server, "/home", &bob_cookie).await;
+        let csrf = csrf_token(&bob_home.body);
+        let liked = post_form_with_cookie(
+            &server,
+            "/posts/1/like",
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(liked.status, 303);
+        (server, alice_cookie, bob_cookie)
+    }
+
     async fn post_form_with_cookie(
         server: &TestServer,
         path: &str,
@@ -8057,6 +8326,64 @@ mod tests {
             body.as_bytes().to_vec(),
         )
         .await
+    }
+
+    async fn save_profile_settings(
+        server: &TestServer,
+        cookie: &str,
+        fields: &[(&str, &str)],
+    ) -> TestResponse {
+        let settings = get_with_cookie(server, "/settings", cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let mut all_fields = Vec::with_capacity(fields.len() + 1);
+        all_fields.push(("csrf", csrf.as_str()));
+        all_fields.extend_from_slice(fields);
+        request(
+            &server.base_url,
+            "POST",
+            "/settings",
+            &[
+                ("cookie", cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=settings-boundary",
+                ),
+            ],
+            multipart_body("settings-boundary", &all_fields, false),
+        )
+        .await
+    }
+
+    async fn user_settings_state(
+        server: &TestServer,
+        username: &str,
+    ) -> (String, i64, i64, String, String, String, String) {
+        let username = username.to_owned();
+        server
+            .pool
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    r#"
+                    SELECT theme, nsfw_blur_enabled, liked_posts_public,
+                      display_name, bio, location, website
+                    FROM users WHERE normalized_username = ?
+                    "#,
+                    [username],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )?)
+            })
+            .await
+            .expect("user settings state")
     }
 
     async fn create_text_post(server: &TestServer, cookie: &str, text: &str) {
