@@ -100,7 +100,9 @@ pub async fn run() -> anyhow::Result<()> {
     config::write_default_if_missing(&settings_path)?;
     let settings = config::Settings::load(&settings_path)?;
     settings.validate()?;
-    paths = paths.with_tor_data_dir(&settings.tor.data_dir);
+    paths = paths
+        .with_tor_data_dir(&settings.tor.data_dir)
+        .with_backup_dir(&settings.backup.backup_dir);
     paths.ensure()?;
     info!(data_dir = %paths.data_dir.display(), settings = %settings_path.display(), "runtime paths ready");
 
@@ -259,7 +261,7 @@ fn restore_command(
     archive: &std::path::Path,
     include_tor_keys: bool,
 ) -> anyhow::Result<()> {
-    backup::restore_backup(paths, archive, include_tor_keys)?;
+    let report = backup::restore_backup(paths, archive, include_tor_keys)?;
     stdout_raw(format_args!(
         "{}",
         terminal::render_command_success(
@@ -267,6 +269,21 @@ fn restore_command(
             &[
                 terminal::row("Archive", archive.display().to_string()),
                 terminal::row("Data directory", paths.data_dir.display().to_string()),
+                terminal::row(
+                    "Pre-restore safety backup",
+                    report.pre_restore_backup.map_or_else(
+                        || "not created".to_owned(),
+                        |path| path.display().to_string()
+                    ),
+                ),
+                terminal::row(
+                    "Tor keys",
+                    if report.tor_keys_restored {
+                        "restored"
+                    } else {
+                        "not restored"
+                    },
+                ),
             ],
         )
     ))?;
@@ -305,6 +322,7 @@ async fn serve(
     let state = server::AppState::new(pool, settings.clone(), paths.clone(), ffmpeg, tor_status);
     let app = server::router(state);
     let shutdown_rx = shutdown_receiver();
+    backup::spawn_automatic_scheduler(paths.clone(), settings_path, shutdown_rx.clone());
 
     if settings.tor.tor_only {
         return serve_tor_only(onion_listener, app, shutdown_rx).await;

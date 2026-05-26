@@ -6,6 +6,8 @@ use std::time::Duration;
 use anyhow::Context as _;
 use rusqlite::{Connection, OptionalExtension as _};
 
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
+
 #[derive(Clone)]
 pub struct Db {
     sender: Arc<mpsc::Sender<Job>>,
@@ -132,9 +134,12 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             tx.execute_batch(MIGRATION_12)?;
             tx.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
         }
-        if applied.unwrap_or(0) < 13 {
+        if applied.unwrap_or(0) < CURRENT_SCHEMA_VERSION {
             tx.execute_batch(MIGRATION_13)?;
-            tx.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?)",
+                [CURRENT_SCHEMA_VERSION],
+            )?;
         }
         tx.commit()?;
         Ok(())

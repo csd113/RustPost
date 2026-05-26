@@ -14,6 +14,8 @@ pub enum AppError {
     #[error("not found")]
     NotFound,
     #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
@@ -32,7 +34,7 @@ impl IntoResponse for AppError {
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_owned()),
             Self::RateLimited(message) => (StatusCode::TOO_MANY_REQUESTS, message),
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_owned()),
-            Self::Sqlite(_) | Self::Anyhow(_) => {
+            Self::Io(_) | Self::Sqlite(_) | Self::Anyhow(_) => {
                 tracing::error!(error = ?self, "request failed");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,

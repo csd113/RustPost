@@ -71,8 +71,8 @@ This repository is a **production-oriented MVP** — not a toy, but not overengi
 |---|---|
 | Database | SQLite with WAL, foreign keys, migrations, FTS5, and timeline indexes |
 | Rate limiting | SQLite-backed per-user and per-IP limits for all write operations |
-| Backups | Tar archive of DB + settings + media + optional Tor keys |
-| Restore | Path validation rejects traversal, symlinks, absolute paths, and Unicode bypass attempts |
+| Backups | Deterministic tar archive with manifest, hashes, DB snapshot, settings, media, assets, and optional Tor keys |
+| Restore | Staged manifest/hash/SQLite/settings validation before runtime file swaps |
 | Admin dashboard | Site health, users, media jobs, conversion state, and backup management |
 | HTTP compression | Browser text responses use gzip when requested; media and binary uploads are intentionally left uncompressed |
 | Tor / Arti | Embedded onion-service startup — clearnet-only, Tor-only, or dual mode |
@@ -360,7 +360,7 @@ rustpost restore archive.tar             # rejects Tor key paths unless flag giv
 rustpost restore archive.tar --include-tor-keys
 ```
 
-Restore path validation rejects: absolute paths, traversal sequences, symlinks/hardlinks, Windows drive prefixes, backslash paths, encoded traversal or slash markers, and slash-like Unicode bypass characters.
+Restore path validation rejects: absolute paths, traversal sequences, symlinks/hardlinks, duplicate entries, duplicate separators, Windows drive prefixes, backslash paths, encoded traversal or slash markers, and slash-like Unicode bypass characters.
 
 ---
 
@@ -385,20 +385,50 @@ Profile pictures and banners follow the same media pipeline as post uploads.
 ## 💾 Backup & Restore
 
 ```sh
-# Create a backup (DB + settings + media)
+# Create a backup (SQLite DB snapshot + settings + media/assets)
 rustpost-cli backup
 
 # Include Tor onion-service keys
 rustpost-cli backup --include-tor-keys
 
 # Restore into a fresh data directory
-rustpost-cli restore rustpost-backup-2026-05-18T....tar
+rustpost-cli restore rustpost-20260526T....tar
 
 # Restore including Tor keys
-rustpost-cli restore rustpost-backup-2026-05-18T....tar --include-tor-keys
+rustpost-cli restore rustpost-20260526T....tar --include-tor-keys
 ```
 
-> Archive names include subsecond precision to avoid same-second collisions.
+Backups are also available from **Admin → Backups**. The page supports manual backup creation, admin-only downloads, restore from uploaded `.tar` archives, automatic backup settings, safe retention controls, recent archive history, and no-JS form flows.
+
+Archive format:
+
+- Tar entries are written in deterministic order with normalized header metadata.
+- `manifest.toml` records the RustPost version, DB schema version, created timestamp, included components, runtime-relative paths, file sizes, SHA-256 hashes, and whether Tor keys are included.
+- The durable runtime state covered by the format is `db/rustpost.sqlite3`, `settings.toml`, `uploads/originals`, `uploads/images`, `uploads/videos`, `uploads/thumbs`, `assets`, and required empty runtime directories.
+- Runtime `tmp`, `logs`, `backups`, cache junk, Playwright artifacts, symlinks, and non-durable files are not included.
+- Tor onion-service private keys are excluded by default. `--include-tor-keys` or the admin checkbox is required to include or restore them. Restored Tor key files are permission-restricted on Unix.
+
+Restore safety:
+
+- Backups are treated as hostile input. RustPost validates the manifest, hashes, entry types, paths, settings file, SQLite integrity, foreign keys, and schema compatibility before touching live runtime files.
+- Restore stages into `tmp/`, creates a pre-restore safety backup, then swaps approved runtime roots. On failure it rolls back moved live paths and leaves the old runtime in place.
+- Concurrent backup/restore attempts are rejected with a lock under `tmp/`.
+- Admin-upload restore writes the restored files for the runtime, but the already-running process keeps its existing SQLite connection. Restart RustPost after a successful admin restore so it reopens the restored database and settings.
+
+Automatic backups:
+
+```toml
+[backup]
+enabled = true
+backup_dir = "backups"
+automatic_enabled = false
+automatic_interval_minutes = 1440
+retention_keep_last = 10
+retention_max_age_days = 30
+automatic_include_tor_keys = false
+```
+
+Automatic backups are disabled by default. Retention deletes only automatic archives (`rustpost-auto-*.tar`), always keeps the newest `retention_keep_last`, and never prunes manual or pre-restore safety backups.
 
 ---
 

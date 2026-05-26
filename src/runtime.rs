@@ -65,6 +65,12 @@ impl RuntimePaths {
         self
     }
 
+    #[must_use]
+    pub fn with_backup_dir(mut self, backup_dir: &str) -> Self {
+        self.backups_dir = self.data_dir.join(backup_dir);
+        self
+    }
+
     pub fn ensure(&self) -> anyhow::Result<()> {
         for path in [
             &self.data_dir,
