@@ -31,7 +31,7 @@ RustPost is a **single-binary, self-hosted microblogging platform** written in R
 
 > **Design philosophy:** Small, auditable modules over framework magic. Security-sensitive behavior centralized. No JavaScript bundler. No cloud dependency. No federation surface.
 
-This repository is a **production-oriented MVP** — not a toy, but not overengineered. The goal is a system you can read end to end, deploy in minutes, and trust.
+This repository is a **production-oriented project** — not a toy, but not overengineered. The goal is a system you can read end to end, deploy in minutes, and trust.
 
 ---
 
@@ -447,7 +447,7 @@ Run the app locally with a disposable data directory:
 
 ```sh
 cargo build --workspace --all-features
-./target/debug/rustpost --data-dir /tmp/rustpost-alpha serve
+./target/debug/rustpost --data-dir /tmp/rustpost-ui serve
 ```
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080). The server initializes the data directory on first boot.
@@ -539,9 +539,9 @@ Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and op
 - **Tor verification requires network access** — may time out in restricted build or CI environments.
 - **Onion virtual port** — HTTP virtual port 80 is mapped to the RustPost listener; custom onion virtual ports are not yet configurable.
 - **Synchronous media conversion** — conversion happens inline during upload; no background queue.
-- **Reports and admin toggles** — present in schema and admin structure but functionality is minimal in the current MVP.
+- **Reports and admin toggles** — present in schema and admin structure but functionality is minimal in this release.
 - **Search** — uses SQLite FTS5 with simple user matching and fixed result limits; no ranking tuning yet.
-- **UI polish** — server-rendered HTML/CSS has been brought to alpha quality, but final visual design and broader accessibility review are still future work.
+- **UI polish** — server-rendered HTML/CSS covers the core flows, but final visual design and broader accessibility review are still future work.
 
 ---
 

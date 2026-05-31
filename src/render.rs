@@ -198,7 +198,7 @@ pub fn layout_with_context(
 <header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}</div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
 <noscript><section class="noscript-banner" role="status"><strong>JavaScript is disabled.</strong> RustPost will use standard links and forms.</section></noscript>
 <main><div class="app-shell" data-testid="app-shell">{}<section class="primary-column" data-testid="primary-column">{} </section>{}</div></main>
-<footer class="site-footer">{} alpha</footer>
+<footer class="site-footer">{}</footer>
 </body>
 </html>"#,
         html_escape::encode_double_quoted_attribute(theme),
@@ -2970,16 +2970,16 @@ mod tests {
         let body = layout(None, "Home Feed", "<p>body</p>", "My Microblog");
         assert!(body.contains("<title>Home Feed - My Microblog</title>"));
         assert!(body.contains("<span>My Microblog</span>"));
-        assert!(body.contains("My Microblog alpha"));
+        assert!(body.contains(r#"<footer class="site-footer">My Microblog</footer>"#));
         assert!(!body.contains("<span>RustPost</span>"));
     }
 
     #[test]
-    fn layout_replaces_alpha_card_with_dashboard() {
+    fn layout_uses_dashboard_side_panel() {
         let body = layout(None, "Home Feed", "<p>body</p>", "My Microblog");
         assert!(body.contains("<h2>Dashboard</h2>"));
         assert!(body.contains("Login required"));
-        assert!(!body.contains("Alpha status"));
+        assert!(!body.contains("Release status"));
         assert!(!body.contains("Self-hosted microblog"));
     }
 
