@@ -558,7 +558,7 @@ fn snapshot_database(source: &Path, destination: &Path) -> anyhow::Result<()> {
         [],
     )
     .with_context(|| "failed to snapshot SQLite database")?;
-    validate_sqlite_database(destination, None)?;
+    validate_and_normalize_sqlite_database(destination, None)?;
     Ok(())
 }
 
@@ -572,7 +572,7 @@ fn database_schema_version(path: &Path) -> anyhow::Result<i64> {
     db::schema_version_from_connection(&conn)
 }
 
-fn validate_sqlite_database(
+fn validate_and_normalize_sqlite_database(
     path: &Path,
     expected_schema_version: Option<i64>,
 ) -> anyhow::Result<()> {
@@ -594,7 +594,7 @@ fn validate_sqlite_database(
     {
         anyhow::bail!("manifest schema version does not match restored database");
     }
-    db::validate_restorable_schema(&conn)?;
+    db::normalize_restorable_schema(&conn)?;
     Ok(())
 }
 
@@ -740,7 +740,7 @@ fn validate_staged_backup(
             }
         }
     }
-    validate_sqlite_database(
+    validate_and_normalize_sqlite_database(
         &staging_dir.join("db/rustpost.sqlite3"),
         manifest.db_schema_version,
     )?;
@@ -1302,6 +1302,62 @@ mod tests {
         let with_tor = create_backup(&paths, true).expect("backup");
         let names = archive_names(&with_tor);
         assert!(names.iter().any(|name| name == "tor/onion-service/secret"));
+    }
+
+    #[test]
+    fn backup_normalizes_valid_pre_release_schema_without_touching_live_database() {
+        let (_temp, paths) = test_paths();
+        let conn = Connection::open(&paths.database_path).expect("live db");
+        conn.execute("DELETE FROM schema_migrations", [])
+            .expect("clear version");
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])
+            .expect("alpha version");
+        drop(conn);
+
+        let archive = create_backup(&paths, false).expect("backup");
+        let manifest = read_manifest_from_archive(&archive).expect("manifest");
+        let live = Connection::open(&paths.database_path).expect("live db");
+        let live_version = db::schema_version_from_connection(&live).expect("live version");
+
+        assert_eq!(manifest.db_schema_version, Some(CURRENT_SCHEMA_VERSION));
+        assert_eq!(live_version, 13);
+    }
+
+    #[test]
+    fn restore_validation_normalizes_valid_pre_release_schema_before_acceptance() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let database = temp.path().join("alpha.sqlite3");
+        test_db(&database, 13);
+
+        validate_and_normalize_sqlite_database(&database, Some(13)).expect("valid alpha schema");
+        let conn = Connection::open(&database).expect("open");
+        let version = db::schema_version_from_connection(&conn).expect("version");
+
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn restore_validation_rejects_unsafe_pre_release_schema_without_normalizing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let database = temp.path().join("unsafe-alpha.sqlite3");
+        test_db(&database, 13);
+        let conn = Connection::open(&database).expect("open");
+        conn.execute("DROP INDEX idx_posts_created", [])
+            .expect("drop index");
+        drop(conn);
+
+        let error =
+            validate_and_normalize_sqlite_database(&database, Some(13)).expect_err("unsafe schema");
+        let conn = Connection::open(&database).expect("open");
+        let version = db::schema_version_from_connection(&conn).expect("version");
+
+        assert!(error.to_string().contains("not structurally compatible"));
+        assert!(
+            error
+                .to_string()
+                .contains("missing index idx_posts_created")
+        );
+        assert_eq!(version, 13);
     }
 
     #[test]

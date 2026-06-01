@@ -6,8 +6,9 @@
 - Squashed the pre-release internal migration chain into a clean first-release SQLite schema baseline at database schema version `1`.
 - Fresh databases are now initialized directly from the baseline instead of replaying alpha development migrations.
 - Existing current alpha databases that structurally match the baseline are marked as baseline version `1` without destructive changes or data loss.
-- Incomplete, unknown, or structurally unsafe old alpha databases now fail closed with administrator guidance to back up/export/recreate/restore instead of attempting blind migration.
+- Incomplete, unknown, or structurally unsafe pre-release databases now fail closed with administrator guidance to back up/export/recreate/restore instead of attempting blind migration.
 - Added stricter schema diagnostics for required tables, columns, indexes, and triggers so startup, backups, restores, and admin health can report incompatible or corrupt database structure clearly.
+- `check` now reports database schema status without creating or migrating the database during diagnostics.
 - Future post-release database changes should use normal forward migrations after baseline version `1`; released migration history must not be squashed or rewritten after the first public release.
 
 ## v0.1.6 - Pinned Profiles

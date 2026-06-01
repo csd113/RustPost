@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use rusqlite::{Connection, OptionalExtension as _};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 
@@ -86,6 +86,26 @@ pub async fn schema_report(pool: &Db) -> anyhow::Result<SchemaReport> {
     pool.call(|conn| inspect_schema(conn)).await
 }
 
+pub fn schema_report_from_path(path: &Path) -> anyhow::Result<SchemaReport> {
+    let conn = open_read_only_connection(path)?;
+    inspect_schema(&conn)
+}
+
+pub fn adoptable_schema_summary_from_path(path: &Path) -> anyhow::Result<Option<String>> {
+    let conn = open_read_only_connection(path)?;
+    if !matches!(migration_state(&conn)?, MigrationState::AlphaLatest) {
+        return Ok(None);
+    }
+
+    let issues = inspect_schema_objects(&conn)?;
+    if issues.is_empty() {
+        return Ok(Some(format!(
+            "pre-release database structurally matches the release baseline; startup will mark it as release baseline schema version {CURRENT_SCHEMA_VERSION} without data loss"
+        )));
+    }
+    Ok(None)
+}
+
 pub fn validate_schema(conn: &Connection) -> anyhow::Result<()> {
     let report = inspect_schema(conn)?;
     if report.is_compatible() {
@@ -98,23 +118,11 @@ pub fn validate_schema(conn: &Connection) -> anyhow::Result<()> {
 }
 
 pub fn validate_restorable_schema(conn: &Connection) -> anyhow::Result<()> {
-    let version = schema_version_from_connection(conn)?;
-    if version == CURRENT_SCHEMA_VERSION {
-        return validate_schema(conn);
-    }
-    if version == OLD_ALPHA_SCHEMA_VERSION {
-        let issues = inspect_schema_objects(conn)?;
-        if issues.is_empty() {
-            return Ok(());
-        }
-        anyhow::bail!(
-            "restored database has incomplete old alpha schema: {}",
-            summarize_issues(&issues)
-        );
-    }
-    anyhow::bail!(
-        "database schema version {version} is not supported by this RustPost release baseline"
-    );
+    validate_or_normalize_restorable_schema(conn, false)
+}
+
+pub fn normalize_restorable_schema(conn: &Connection) -> anyhow::Result<()> {
+    validate_or_normalize_restorable_schema(conn, true)
 }
 
 pub fn schema_version_from_connection(conn: &Connection) -> anyhow::Result<i64> {
@@ -125,6 +133,11 @@ pub fn schema_version_from_connection(conn: &Connection) -> anyhow::Result<i64> 
         .into_iter()
         .max()
         .ok_or_else(|| anyhow::anyhow!("database has no schema migration version"))
+}
+
+fn open_read_only_connection(path: &Path) -> anyhow::Result<Connection> {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to open SQLite database {}", path.display()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +224,38 @@ fn ensure_release_baseline(conn: &Connection) -> anyhow::Result<()> {
     validate_schema(conn).with_context(|| INCOMPATIBLE_DATABASE_HINT)
 }
 
+fn validate_or_normalize_restorable_schema(
+    conn: &Connection,
+    normalize: bool,
+) -> anyhow::Result<()> {
+    match migration_state(conn)? {
+        MigrationState::Baseline => validate_schema(conn),
+        MigrationState::AlphaLatest => {
+            let issues = inspect_schema_objects(conn)?;
+            if !issues.is_empty() {
+                anyhow::bail!(
+                    "pre-release database is not structurally compatible with the release baseline: {}. {}",
+                    summarize_issues(&issues),
+                    INCOMPATIBLE_DATABASE_HINT
+                );
+            }
+            if normalize {
+                reset_schema_migrations(conn)?;
+                validate_schema(conn)?;
+            }
+            Ok(())
+        }
+        MigrationState::Empty => {
+            anyhow::bail!(
+                "database does not contain RustPost schema metadata. {INCOMPATIBLE_DATABASE_HINT}"
+            );
+        }
+        MigrationState::Incompatible(reason) => {
+            anyhow::bail!("{reason}. {INCOMPATIBLE_DATABASE_HINT}");
+        }
+    }
+}
+
 fn migration_state(conn: &Connection) -> anyhow::Result<MigrationState> {
     let schema_objects = user_schema_objects(conn)?;
     if !table_exists(conn, "schema_migrations")? {
@@ -247,9 +292,10 @@ fn migration_state(conn: &Connection) -> anyhow::Result<MigrationState> {
     if latest == OLD_ALPHA_SCHEMA_VERSION {
         return Ok(MigrationState::AlphaLatest);
     }
-    Ok(MigrationState::Incompatible(format!(
-        "database schema version {latest} is not a supported release baseline"
-    )))
+    Ok(MigrationState::Incompatible(
+        "database migration metadata is not compatible with this RustPost release baseline"
+            .to_owned(),
+    ))
 }
 
 fn initialize_release_baseline(conn: &Connection) -> anyhow::Result<()> {
@@ -271,7 +317,7 @@ fn adopt_latest_alpha_schema(conn: &Connection) -> anyhow::Result<()> {
     let issues = inspect_schema_objects(conn)?;
     if !issues.is_empty() {
         anyhow::bail!(
-            "old alpha database is not safe to adopt as release baseline: {}. {}",
+            "pre-release database is not safe to adopt as release baseline: {}. {}",
             summarize_issues(&issues),
             INCOMPATIBLE_DATABASE_HINT
         );
@@ -302,16 +348,7 @@ fn inspect_schema(conn: &Connection) -> anyhow::Result<SchemaReport> {
         version = versions.iter().max().copied();
         if versions != [CURRENT_SCHEMA_VERSION] {
             issues.push(format!(
-                "expected schema_migrations to contain only version {CURRENT_SCHEMA_VERSION}, found {}",
-                if versions.is_empty() {
-                    "none".to_owned()
-                } else {
-                    versions
-                        .iter()
-                        .map(i64::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                }
+                "schema_migrations metadata does not match the release baseline; expected only version {CURRENT_SCHEMA_VERSION}"
             ));
         }
     } else {
@@ -2304,7 +2341,8 @@ mod tests {
             .await
             .expect("users remain");
 
-        assert!(error.to_string().contains("version 12"));
+        assert!(error.to_string().contains("migration metadata"));
+        assert!(!error.to_string().contains("version 12"));
         assert!(error.to_string().contains("blind migration"));
         assert_eq!(remaining_users, 1);
     }
@@ -2359,6 +2397,36 @@ mod tests {
         assert_eq!(report.version(), Some(CURRENT_SCHEMA_VERSION));
         assert!(!report.is_compatible());
         assert!(report.summary().contains("missing index idx_posts_created"));
+    }
+
+    #[test]
+    fn path_schema_report_is_read_only_for_missing_databases() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("missing.sqlite3");
+
+        let error = schema_report_from_path(&path).expect_err("missing database");
+
+        assert!(error.to_string().contains("failed to open SQLite database"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn adoptable_schema_summary_hides_internal_alpha_version_numbers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("alpha.sqlite3");
+        let conn = Connection::open(&path).expect("open");
+        install_latest_alpha_fixture(&conn).expect("alpha fixture");
+        drop(conn);
+
+        let summary = adoptable_schema_summary_from_path(&path)
+            .expect("adoption summary")
+            .expect("adoptable summary");
+        let conn = Connection::open(&path).expect("open");
+        let version = schema_version_from_connection(&conn).expect("version");
+
+        assert!(summary.contains("release baseline schema version 1"));
+        assert!(!summary.contains("version 13"));
+        assert_eq!(version, OLD_ALPHA_SCHEMA_VERSION);
     }
 
     #[tokio::test]

@@ -189,7 +189,7 @@ Replies remain attached to their parent thread. They render inside the thread vi
 
 ```sh
 rustpost init                                       # Initialize data directory
-rustpost check                                      # Validate config and data directory
+rustpost check                                      # Validate config, data directory, and DB schema status
 rustpost create-admin <username> <password>         # Create an admin account
 rustpost create-admin-interactive                   # Create an admin with hidden password prompts
 rustpost reset-admin-password <username> <password> # Reset an admin's password

@@ -3431,9 +3431,13 @@ async fn admin_health(
     let media_jobs = admin::media_jobs_report(&state.pool).await?;
     let jobs = render_media_jobs_report(&media_jobs);
     let schema = crate::db::schema_report(&state.pool).await?;
-    let schema_version = schema
-        .version()
-        .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
+    let schema_version = if schema.is_compatible() {
+        schema
+            .version()
+            .map_or_else(|| "unknown".to_owned(), |version| version.to_string())
+    } else {
+        "incompatible".to_owned()
+    };
     let schema_summary = if schema.is_compatible() {
         schema.summary()
     } else {

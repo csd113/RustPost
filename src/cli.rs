@@ -138,9 +138,10 @@ async fn run_command(
         Command::Check => {
             let ffmpeg = crate::ffmpeg::probe(&settings.media).await;
             let tor_status = tor::validate_startup(&settings.tor);
+            let database_schema = database_schema_status(&paths.database_path);
             stdout_raw(format_args!(
                 "{}",
-                terminal::render_check(&settings, &ffmpeg, &tor_status)
+                terminal::render_check(&settings, &ffmpeg, &tor_status, &database_schema)
             ))?;
             Ok(())
         }
@@ -178,6 +179,33 @@ async fn run_command(
             Ok(())
         }
         Command::Serve => serve(paths, settings_path, settings).await,
+    }
+}
+
+fn database_schema_status(path: &std::path::Path) -> terminal::DatabaseSchemaStatus {
+    if !path.is_file() {
+        return terminal::DatabaseSchemaStatus::Missing;
+    }
+    match db::schema_report_from_path(path) {
+        Ok(report) if report.is_compatible() => terminal::DatabaseSchemaStatus::Present {
+            version: report.version(),
+            compatible: true,
+            summary: report.summary(),
+        },
+        Ok(report) => match db::adoptable_schema_summary_from_path(path) {
+            Ok(Some(summary)) => terminal::DatabaseSchemaStatus::Adoptable { summary },
+            Ok(None) => terminal::DatabaseSchemaStatus::Present {
+                version: report.version(),
+                compatible: false,
+                summary: report.summary(),
+            },
+            Err(error) => terminal::DatabaseSchemaStatus::Unreadable {
+                error: error.to_string(),
+            },
+        },
+        Err(error) => terminal::DatabaseSchemaStatus::Unreadable {
+            error: error.to_string(),
+        },
     }
 }
 
