@@ -32,6 +32,9 @@ pub struct StartupDashboard<'a> {
     pub paths: &'a runtime::RuntimePaths,
     pub settings_path: &'a Path,
     pub settings: &'a config::Settings,
+    pub schema_version: Option<i64>,
+    pub schema_compatible: bool,
+    pub schema_summary: &'a str,
     pub admin_count: i64,
     pub user_count: i64,
     pub post_count: i64,
@@ -49,6 +52,7 @@ pub fn render_startup_dashboard(input: &StartupDashboard<'_>) -> String {
         "Status",
         &[
             row("Version", env!("CARGO_PKG_VERSION")),
+            row("DB schema", schema_status_value(input)),
             row(
                 "Server",
                 status_value(Status::Pending, &bind_address(&input.settings.server)),
@@ -394,6 +398,18 @@ fn ffmpeg_status_value(ffmpeg: &ffmpeg::FfmpegStatus) -> String {
     }
 }
 
+fn schema_status_value(input: &StartupDashboard<'_>) -> String {
+    let version = input
+        .schema_version
+        .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
+    let summary = format!("version {version}; {}", input.schema_summary);
+    if input.schema_compatible {
+        status_value(Status::Ok, &summary)
+    } else {
+        status_value(Status::Warn, &summary)
+    }
+}
+
 fn status_value(status: Status, value: &str) -> String {
     format!("{} {value}", status.label())
 }
@@ -463,6 +479,9 @@ mod tests {
             paths: &paths,
             settings_path: &paths.settings_path,
             settings: &settings,
+            schema_version: Some(1),
+            schema_compatible: true,
+            schema_summary: "release baseline schema version 1",
             admin_count: 0,
             user_count: 2,
             post_count: 3,
@@ -472,6 +491,8 @@ mod tests {
         });
 
         assert!(output.contains("Status"));
+        assert!(output.contains("DB schema"));
+        assert!(output.contains("release baseline schema version 1"));
         assert!(output.contains("Endpoints"));
         assert!(output.contains("Storage"));
         assert!(output.contains("Next commands"));

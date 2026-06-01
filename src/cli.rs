@@ -529,12 +529,17 @@ async fn print_startup_dashboard(
     context: StartupPrintContext<'_>,
 ) -> anyhow::Result<()> {
     let (user_count, post_count) = crate::social::instance_counts(pool).await?;
+    let schema = db::schema_report(pool).await?;
+    let schema_summary = schema.summary();
     stderr_raw(format_args!(
         "{}",
         terminal::render_startup_dashboard(&terminal::StartupDashboard {
             paths: context.paths,
             settings_path: context.settings_path,
             settings: context.settings,
+            schema_version: schema.version(),
+            schema_compatible: schema.is_compatible(),
+            schema_summary: &schema_summary,
             admin_count: context.admin_count,
             user_count,
             post_count,

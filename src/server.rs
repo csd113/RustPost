@@ -3430,6 +3430,15 @@ async fn admin_health(
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let media_jobs = admin::media_jobs_report(&state.pool).await?;
     let jobs = render_media_jobs_report(&media_jobs);
+    let schema = crate::db::schema_report(&state.pool).await?;
+    let schema_version = schema
+        .version()
+        .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
+    let schema_summary = if schema.is_compatible() {
+        schema.summary()
+    } else {
+        format!("INCOMPATIBLE: {}", schema.summary())
+    };
     let onion = state
         .tor
         .onion_address()
@@ -3440,8 +3449,10 @@ async fn admin_health(
         .bootstrap_status()
         .unwrap_or_else(|| "unavailable".to_owned());
     let body = format!(
-        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
+        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>DB schema version</dt><dd>{}</dd><dt>DB diagnostics</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
         html_escape::encode_text(&state.paths.database_path.display().to_string()),
+        html_escape::encode_text(&schema_version),
+        html_escape::encode_text(&schema_summary),
         html_escape::encode_text(&state.paths.uploads_originals.display().to_string()),
         html_escape::encode_text(&state.paths.uploads_images.display().to_string()),
         html_escape::encode_text(&state.paths.logs_dir.display().to_string()),

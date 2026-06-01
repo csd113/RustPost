@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use walkdir::WalkDir;
 
 use crate::config::{BackupSettings, Settings};
-use crate::db::CURRENT_SCHEMA_VERSION;
+use crate::db;
 use crate::runtime::RuntimePaths;
 
 const FORMAT_VERSION: u16 = 1;
@@ -569,7 +569,7 @@ fn sqlite_path_literal(path: &Path) -> String {
 
 fn database_schema_version(path: &Path) -> anyhow::Result<i64> {
     let conn = Connection::open(path)?;
-    schema_version_from_connection(&conn)
+    db::schema_version_from_connection(&conn)
 }
 
 fn validate_sqlite_database(
@@ -588,29 +588,14 @@ fn validate_sqlite_database(
     if foreign_key_problem.is_some() {
         anyhow::bail!("restored database failed foreign_key_check");
     }
-    let schema_version = schema_version_from_connection(&conn)?;
-    if schema_version > CURRENT_SCHEMA_VERSION {
-        anyhow::bail!(
-            "backup schema version {schema_version} is newer than this RustPost ({CURRENT_SCHEMA_VERSION})"
-        );
-    }
+    let schema_version = db::schema_version_from_connection(&conn)?;
     if let Some(expected) = expected_schema_version
         && expected != schema_version
     {
         anyhow::bail!("manifest schema version does not match restored database");
     }
+    db::validate_restorable_schema(&conn)?;
     Ok(())
-}
-
-fn schema_version_from_connection(conn: &Connection) -> anyhow::Result<i64> {
-    let version = conn
-        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
-            row.get::<_, Option<i64>>(0)
-        })
-        .optional()?
-        .flatten()
-        .ok_or_else(|| anyhow::anyhow!("database has no schema migration version"))?;
-    Ok(version)
 }
 
 fn extract_archive_to_stage(
@@ -1244,18 +1229,15 @@ impl Drop for OperationLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::CURRENT_SCHEMA_VERSION;
     use std::thread;
 
     fn test_db(path: &Path, version: i64) {
         let conn = Connection::open(path).expect("open db");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-            INSERT INTO schema_migrations (version) VALUES (1);
-            "#,
-        )
-        .expect("schema");
-        if version != 1 {
+        db::install_release_baseline_for_test(&conn).expect("schema");
+        if version != CURRENT_SCHEMA_VERSION {
+            conn.execute("DELETE FROM schema_migrations", [])
+                .expect("clear version");
             conn.execute(
                 "INSERT INTO schema_migrations (version) VALUES (?)",
                 [version],

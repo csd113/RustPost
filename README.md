@@ -69,7 +69,7 @@ This repository is a **production-oriented project** — not a toy, but not over
 ### Operations
 | Feature | Details |
 |---|---|
-| Database | SQLite with WAL, foreign keys, migrations, FTS5, and timeline indexes |
+| Database | SQLite with WAL, foreign keys, a release schema baseline, FTS5, and timeline indexes |
 | Rate limiting | SQLite-backed per-user and per-IP limits for all write operations |
 | Backups | Deterministic tar archive with manifest, hashes, DB snapshot, settings, media, assets, and optional Tor keys |
 | Restore | Staged manifest/hash/SQLite/settings validation before runtime file swaps |
@@ -484,7 +484,7 @@ Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and op
 |---|---|
 | `axum` | HTTP routing and multipart handling |
 | `tokio` | Async runtime, filesystem, process, and signals |
-| `rusqlite` | SQLite access via a dedicated DB worker; WAL, FK, migrations |
+| `rusqlite` | SQLite access via a dedicated DB worker; WAL, FK, baseline schema plus forward migrations |
 | `argon2` | Argon2id password hashing |
 | `rand_core` + `uuid` | Secure salts and opaque generated tokens/filenames |
 | `infer` | Content-based media type detection |
