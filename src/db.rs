@@ -6,8 +6,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
+const PREVIOUS_RELEASE_SCHEMA_VERSION: i64 = 1;
 const OLD_ALPHA_SCHEMA_VERSION: i64 = 13;
 const INCOMPATIBLE_DATABASE_HINT: &str = "back up or export the instance, recreate a fresh RustPost data directory, and restore from a known-good backup instead of attempting a blind migration";
 
@@ -97,7 +98,7 @@ pub fn adoptable_schema_summary_from_path(path: &Path) -> anyhow::Result<Option<
         return Ok(None);
     }
 
-    let issues = inspect_schema_objects(&conn)?;
+    let issues = inspect_alpha_schema_objects(&conn)?;
     if issues.is_empty() {
         return Ok(Some(format!(
             "pre-release database structurally matches the release baseline; startup will mark it as release baseline schema version {CURRENT_SCHEMA_VERSION} without data loss"
@@ -175,6 +176,7 @@ impl SchemaReport {
 enum MigrationState {
     Empty,
     Baseline,
+    ReleaseVersion1,
     AlphaLatest,
     Incompatible(String),
 }
@@ -215,6 +217,7 @@ fn ensure_release_baseline(conn: &Connection) -> anyhow::Result<()> {
     match migration_state(conn)? {
         MigrationState::Empty => initialize_release_baseline(conn)?,
         MigrationState::Baseline => {}
+        MigrationState::ReleaseVersion1 => migrate_release_v1_to_current(conn)?,
         MigrationState::AlphaLatest => adopt_latest_alpha_schema(conn)?,
         MigrationState::Incompatible(reason) => {
             anyhow::bail!("{reason}. {INCOMPATIBLE_DATABASE_HINT}");
@@ -230,8 +233,17 @@ fn validate_or_normalize_restorable_schema(
 ) -> anyhow::Result<()> {
     match migration_state(conn)? {
         MigrationState::Baseline => validate_schema(conn),
+        MigrationState::ReleaseVersion1 => {
+            if !normalize {
+                anyhow::bail!(
+                    "database schema version {PREVIOUS_RELEASE_SCHEMA_VERSION} requires migration before use"
+                );
+            }
+            migrate_release_v1_to_current(conn)?;
+            validate_schema(conn)
+        }
         MigrationState::AlphaLatest => {
-            let issues = inspect_schema_objects(conn)?;
+            let issues = inspect_alpha_schema_objects(conn)?;
             if !issues.is_empty() {
                 anyhow::bail!(
                     "pre-release database is not structurally compatible with the release baseline: {}. {}",
@@ -240,7 +252,8 @@ fn validate_or_normalize_restorable_schema(
                 );
             }
             if normalize {
-                reset_schema_migrations(conn)?;
+                reset_schema_migrations_to(conn, PREVIOUS_RELEASE_SCHEMA_VERSION)?;
+                migrate_release_v1_to_current(conn)?;
                 validate_schema(conn)?;
             }
             Ok(())
@@ -289,6 +302,9 @@ fn migration_state(conn: &Connection) -> anyhow::Result<MigrationState> {
     if versions == [CURRENT_SCHEMA_VERSION] {
         return Ok(MigrationState::Baseline);
     }
+    if versions == [PREVIOUS_RELEASE_SCHEMA_VERSION] {
+        return Ok(MigrationState::ReleaseVersion1);
+    }
     if latest == OLD_ALPHA_SCHEMA_VERSION {
         return Ok(MigrationState::AlphaLatest);
     }
@@ -314,7 +330,7 @@ pub(crate) fn install_release_baseline_for_test(conn: &Connection) -> anyhow::Re
 }
 
 fn adopt_latest_alpha_schema(conn: &Connection) -> anyhow::Result<()> {
-    let issues = inspect_schema_objects(conn)?;
+    let issues = inspect_alpha_schema_objects(conn)?;
     if !issues.is_empty() {
         anyhow::bail!(
             "pre-release database is not safe to adopt as release baseline: {}. {}",
@@ -322,10 +338,15 @@ fn adopt_latest_alpha_schema(conn: &Connection) -> anyhow::Result<()> {
             INCOMPATIBLE_DATABASE_HINT
         );
     }
-    reset_schema_migrations(conn)
+    reset_schema_migrations_to(conn, PREVIOUS_RELEASE_SCHEMA_VERSION)?;
+    migrate_release_v1_to_current(conn)
 }
 
 fn reset_schema_migrations(conn: &Connection) -> anyhow::Result<()> {
+    reset_schema_migrations_to(conn, CURRENT_SCHEMA_VERSION)
+}
+
+fn reset_schema_migrations_to(conn: &Connection, version: i64) -> anyhow::Result<()> {
     conn.execute_batch(
         r#"
 DROP TABLE IF EXISTS schema_migrations;
@@ -333,10 +354,18 @@ CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-INSERT INTO schema_migrations (version) VALUES (1);
 "#,
     )?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version) VALUES (?)",
+        [version],
+    )?;
     Ok(())
+}
+
+fn migrate_release_v1_to_current(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(YOUTUBE_EMBEDS_SCHEMA)?;
+    reset_schema_migrations(conn)
 }
 
 fn inspect_schema(conn: &Connection) -> anyhow::Result<SchemaReport> {
@@ -389,6 +418,20 @@ fn inspect_schema_objects(conn: &Connection) -> anyhow::Result<Vec<String>> {
     }
 
     Ok(issues)
+}
+
+fn inspect_alpha_schema_objects(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    Ok(inspect_schema_objects(conn)?
+        .into_iter()
+        .filter(|issue| {
+            !matches!(
+                issue.as_str(),
+                "missing table post_embeds"
+                    | "missing index idx_post_embeds_post"
+                    | "missing index idx_post_embeds_video"
+            )
+        })
+        .collect())
 }
 
 fn check_table_columns(
@@ -590,13 +633,35 @@ fn summarize_issues(issues: &[String]) -> String {
     summary
 }
 
+const YOUTUBE_EMBEDS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS post_embeds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL CHECK (provider = 'youtube'),
+    video_id TEXT NOT NULL,
+    original_url TEXT NOT NULL,
+    canonical_url TEXT NOT NULL,
+    title TEXT,
+    thumbnail_url TEXT NOT NULL,
+    embed_url TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    fetched_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(post_id, provider, video_id),
+    UNIQUE(post_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_post_embeds_post ON post_embeds(post_id, position);
+CREATE INDEX IF NOT EXISTS idx_post_embeds_video ON post_embeds(provider, video_id);
+"#;
+
 const BASELINE_SCHEMA: &str = r#"
 CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO schema_migrations (version) VALUES (1);
+INSERT INTO schema_migrations (version) VALUES (2);
 
 CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -676,6 +741,23 @@ CREATE TABLE post_media (
     media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     PRIMARY KEY (post_id, media_id)
+);
+
+CREATE TABLE post_embeds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL CHECK (provider = 'youtube'),
+    video_id TEXT NOT NULL,
+    original_url TEXT NOT NULL,
+    canonical_url TEXT NOT NULL,
+    title TEXT,
+    thumbnail_url TEXT NOT NULL,
+    embed_url TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    fetched_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(post_id, provider, video_id),
+    UNIQUE(post_id, position)
 );
 
 CREATE TABLE reposts (
@@ -789,6 +871,8 @@ CREATE INDEX idx_reposts_post ON reposts(post_id, user_id);
 CREATE INDEX idx_likes_post ON likes(post_id, user_id);
 CREATE INDEX idx_bookmarks_post ON bookmarks(post_id, user_id);
 CREATE INDEX idx_rate_limit_scope_actor_created ON rate_limit_events(scope, actor, created_at);
+CREATE INDEX idx_post_embeds_post ON post_embeds(post_id, position);
+CREATE INDEX idx_post_embeds_video ON post_embeds(provider, video_id);
 CREATE TABLE muted_words (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -873,6 +957,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "posts",
     "media",
     "post_media",
+    "post_embeds",
     "reposts",
     "follows",
     "blocks",
@@ -950,6 +1035,16 @@ const REQUIRED_INDEXES: &[RequiredIndex] = &[
     RequiredIndex {
         table: "rate_limit_events",
         name: "idx_rate_limit_scope_actor_created",
+        unique: false,
+    },
+    RequiredIndex {
+        table: "post_embeds",
+        name: "idx_post_embeds_post",
+        unique: false,
+    },
+    RequiredIndex {
+        table: "post_embeds",
+        name: "idx_post_embeds_video",
         unique: false,
     },
     RequiredIndex {
@@ -1562,6 +1657,102 @@ const REQUIRED_COLUMNS: &[RequiredColumn] = &[
         primary_key_position: 0,
     },
     RequiredColumn {
+        table: "post_embeds",
+        name: "id",
+        type_name: "INTEGER",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 1,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "post_id",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "provider",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "video_id",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "original_url",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "canonical_url",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "title",
+        type_name: "TEXT",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "thumbnail_url",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "embed_url",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "position",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "fetched_at",
+        type_name: "TEXT",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "post_embeds",
+        name: "created_at",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: Some("CURRENT_TIMESTAMP"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
         table: "reposts",
         name: "id",
         type_name: "INTEGER",
@@ -2127,6 +2318,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_version_1_databases_migrate_to_post_embeds() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        pool.call(|conn| {
+            initialize_release_baseline(conn)?;
+            conn.execute("DROP TABLE post_embeds", [])?;
+            reset_schema_migrations_to(conn, PREVIOUS_RELEASE_SCHEMA_VERSION)?;
+            Ok(())
+        })
+        .await
+        .expect("version 1 fixture");
+
+        migrate(&pool).await.expect("migrate version 1");
+
+        let (embed_count, version): (i64, i64) = pool
+            .call(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM post_embeds", [], |row| row.get(0))?,
+                    schema_version_from_connection(conn)?,
+                ))
+            })
+            .await
+            .expect("post embeds");
+        let report = schema_report(&pool).await.expect("schema report");
+
+        assert_eq!(embed_count, 0);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert!(report.is_compatible(), "{}", report.summary());
+    }
+
+    #[tokio::test]
     async fn users_get_empty_location_by_default() {
         let temp = tempfile::tempdir().expect("temp dir");
         let pool = connect(&temp.path().join("test.sqlite3"))
@@ -2262,6 +2486,7 @@ mod tests {
                     "posts",
                     "media",
                     "post_media",
+                    "post_embeds",
                     "reposts",
                     "follows",
                     "blocks",
@@ -2300,7 +2525,7 @@ mod tests {
         assert_eq!(state.versions, [CURRENT_SCHEMA_VERSION]);
         assert_eq!(
             state.counts,
-            [2, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+            [2, 1, 2, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
         );
         assert_eq!(state.privacy, (0, 0));
         assert_eq!(state.media, (1, "/uploads/originals/alpha.png".to_owned()));
@@ -2424,7 +2649,7 @@ mod tests {
         let conn = Connection::open(&path).expect("open");
         let version = schema_version_from_connection(&conn).expect("version");
 
-        assert!(summary.contains("release baseline schema version 1"));
+        assert!(summary.contains("release baseline schema version 2"));
         assert!(!summary.contains("version 13"));
         assert_eq!(version, OLD_ALPHA_SCHEMA_VERSION);
     }

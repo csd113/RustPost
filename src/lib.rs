@@ -39,3 +39,4 @@ pub mod social;
 pub mod terminal;
 pub mod tor;
 pub mod validation;
+pub mod youtube;
