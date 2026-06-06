@@ -250,6 +250,9 @@ pub async fn create_post(
     pool.call(move |conn| {
         let tx = conn.transaction()?;
         let root_post_id = if let Some(parent_id) = parent_post_id {
+            if let Some(actor_id) = user_id {
+                ensure_post_interaction_accessible_tx(&tx, actor_id, parent_id)?;
+            }
             let root = tx
                 .query_row(
                     "SELECT COALESCE(root_post_id, id) FROM posts WHERE id = ? AND is_deleted = 0",
@@ -264,7 +267,7 @@ pub async fn create_post(
         } else {
             None
         };
-        let (image_count, video_count) = media_kind_counts_tx(&tx, &media_ids)?;
+        let (image_count, video_count) = media_kind_counts_tx(&tx, user_id, &media_ids)?;
         if image_count > max_images_per_post {
             anyhow::bail!("too many image attachments");
         }
@@ -307,6 +310,7 @@ pub async fn create_post(
 
 fn media_kind_counts_tx(
     tx: &rusqlite::Transaction<'_>,
+    owner_user_id: Option<i64>,
     media_ids: &[i64],
 ) -> anyhow::Result<(usize, usize)> {
     let mut image_count = 0usize;
@@ -314,8 +318,8 @@ fn media_kind_counts_tx(
     for media_id in media_ids {
         let media_kind = tx
             .query_row(
-                "SELECT media_kind FROM media WHERE id = ?",
-                [media_id],
+                "SELECT media_kind FROM media WHERE id = ? AND owner_user_id IS ?",
+                params![media_id, owner_user_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -564,9 +568,13 @@ pub async fn post_thread(
     };
     let root_id = root;
     let mut sql = base_post_query();
-    sql.push_str(" AND (p.id = ? OR p.root_post_id = ?) ORDER BY p.id ASC LIMIT 200");
+    sql.push_str(" AND (p.id = ? OR p.root_post_id = ?)");
+    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    sql.push_str(" ORDER BY p.id ASC LIMIT 200");
+    let mut bindings = vec![root_id, root_id];
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
     let rows = pool
-        .call(move |conn| query_post_rows(conn, &sql, params![root_id, root_id]))
+        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
         .await?;
     rows_to_posts(pool, rows, viewer_id).await
 }
@@ -574,6 +582,7 @@ pub async fn post_thread(
 pub async fn repost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<bool> {
     pool.call(move |conn| {
         let tx = conn.transaction()?;
+        ensure_post_interaction_accessible_tx(&tx, user_id, post_id)?;
         let owner: Option<i64> = tx
             .query_row(
                 "SELECT user_id FROM posts WHERE id = ? AND is_deleted = 0",
@@ -727,6 +736,9 @@ pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> an
             .unwrap_or(0)
             != 0;
         if !target_available {
+            anyhow::bail!("account cannot be followed");
+        }
+        if blocks_exist_tx(&tx, follower_id, followed_id)? {
             anyhow::bail!("account cannot be followed");
         }
         let changed = tx.execute(
@@ -1165,6 +1177,7 @@ fn clean_muted_word(term: &str) -> anyhow::Result<String> {
 pub async fn like(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<()> {
     pool.call(move |conn| {
         let tx = conn.transaction()?;
+        ensure_post_interaction_accessible_tx(&tx, user_id, post_id)?;
         let owner_exists = tx
             .query_row(
                 "SELECT 1 FROM posts WHERE id = ? AND is_deleted = 0",
@@ -1202,13 +1215,66 @@ pub async fn unlike(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Re
 
 pub async fn bookmark(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<()> {
     pool.call(move |conn| {
-        conn.execute(
+        let tx = conn.transaction()?;
+        ensure_post_interaction_accessible_tx(&tx, user_id, post_id)?;
+        tx.execute(
             "INSERT OR IGNORE INTO bookmarks (user_id, post_id) VALUES (?, ?)",
             params![user_id, post_id],
         )?;
+        tx.commit()?;
         Ok(())
     })
     .await
+}
+
+fn ensure_post_interaction_accessible_tx(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: i64,
+    post_id: i64,
+) -> anyhow::Result<()> {
+    let owner = tx
+        .query_row(
+            r#"
+            SELECT p.user_id
+            FROM posts p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.id = ? AND p.is_deleted = 0
+              AND (p.user_id IS NULL OR (u.is_deleted = 0 AND u.is_suspended = 0))
+            "#,
+            [post_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?;
+    let Some(owner) = owner else {
+        anyhow::bail!("post not found");
+    };
+    if let Some(owner) = owner
+        && owner != user_id
+        && blocks_exist_tx(tx, user_id, owner)?
+    {
+        anyhow::bail!("post not found");
+    }
+    Ok(())
+}
+
+fn blocks_exist_tx(
+    tx: &rusqlite::Transaction<'_>,
+    left_id: i64,
+    right_id: i64,
+) -> anyhow::Result<bool> {
+    Ok(tx
+        .query_row(
+            r#"
+            SELECT 1 FROM blocks
+            WHERE (blocker_id = ? AND blocked_id = ?)
+               OR (blocker_id = ? AND blocked_id = ?)
+            LIMIT 1
+            "#,
+            params![left_id, right_id, right_id, left_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 pub async fn unbookmark(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<()> {
@@ -1358,22 +1424,44 @@ pub async fn search(
                 FROM users u
                 LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
                 WHERE u.is_deleted = 0
+                  AND u.is_suspended = 0
+                  AND (
+                    ? < 0 OR (
+                      u.id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+                      AND u.id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM blocks
+                        WHERE blocker_id = u.id AND blocked_id = ?
+                      )
+                    )
+                  )
                   AND (u.normalized_username LIKE ? OR u.display_name LIKE ?)
                 ORDER BY lower(u.username)
                 LIMIT 20
                 "#,
             )?;
             let rows = stmt
-                .query_map(params![viewer_id, username_query, display_query], |row| {
-                    Ok(AccountView {
-                        id: row.get(0)?,
-                        username: row.get(1)?,
-                        display_name: row.get(2)?,
-                        bio: row.get(3)?,
-                        profile_picture_path: row.get(4)?,
-                        viewer_following: row.get::<_, i64>(5)? != 0,
-                    })
-                })?
+                .query_map(
+                    params![
+                        viewer_id,
+                        viewer_id,
+                        viewer_id,
+                        viewer_id,
+                        viewer_id,
+                        username_query,
+                        display_query
+                    ],
+                    |row| {
+                        Ok(AccountView {
+                            id: row.get(0)?,
+                            username: row.get(1)?,
+                            display_name: row.get(2)?,
+                            bio: row.get(3)?,
+                            profile_picture_path: row.get(4)?,
+                            viewer_following: row.get::<_, i64>(5)? != 0,
+                        })
+                    },
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -1388,7 +1476,7 @@ pub async fn search(
                 query_post_rows(
                     conn,
                     &post_sql,
-                    params![fts_query, viewer_id, viewer_id, viewer_id],
+                    params![fts_query, viewer_id, viewer_id, viewer_id, viewer_id],
                 )
             } else {
                 query_post_rows(conn, &post_sql, params![fts_query])
@@ -1876,6 +1964,7 @@ fn base_post_query() -> String {
     LEFT JOIN users u ON u.id = p.user_id
     LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
     WHERE p.is_deleted = 0
+      AND (p.user_id IS NULL OR (u.is_deleted = 0 AND u.is_suspended = 0))
     "#.to_owned()
 }
 
@@ -1900,7 +1989,8 @@ fn base_repost_query() -> String {
     LEFT JOIN posts p ON p.id = r.post_id
     LEFT JOIN users u ON u.id = p.user_id
     LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
-    WHERE ru.is_deleted = 0
+    WHERE ru.is_deleted = 0 AND ru.is_suspended = 0
+      AND (p.user_id IS NULL OR (u.is_deleted = 0 AND u.is_suspended = 0))
     "#.to_owned()
 }
 
@@ -2071,6 +2161,9 @@ fn append_viewer_filters(sql: &mut String, user_column: &str, viewer_id: Option<
         sql.push_str(&format!(
             " AND ({user_column} IS NULL OR {user_column} NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?))"
         ));
+        sql.push_str(&format!(
+            " AND ({user_column} IS NULL OR NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = {user_column} AND blocked_id = ?))"
+        ));
         sql.push_str(
             " AND NOT EXISTS (SELECT 1 FROM muted_words mw WHERE mw.user_id = ? AND instr(lower(p.text), mw.normalized_term) > 0)",
         );
@@ -2079,6 +2172,7 @@ fn append_viewer_filters(sql: &mut String, user_column: &str, viewer_id: Option<
 
 fn push_viewer_filter_bindings(bindings: &mut Vec<i64>, viewer_id: Option<i64>) {
     if let Some(id) = viewer_id {
+        bindings.push(id);
         bindings.push(id);
         bindings.push(id);
         bindings.push(id);
@@ -2239,6 +2333,7 @@ async fn quote_preview_for_post(
             FROM posts q
             LEFT JOIN users u ON u.id = q.user_id
             WHERE q.id = ? AND q.is_deleted = 0
+              AND (q.user_id IS NULL OR (u.is_deleted = 0 AND u.is_suspended = 0))
         "#
         .to_owned();
         if viewer_id.is_some() {
@@ -2298,7 +2393,13 @@ fn ensure_quote_target_accessible_tx(
 ) -> anyhow::Result<()> {
     let owner: Option<i64> = tx
         .query_row(
-            "SELECT user_id FROM posts WHERE id = ? AND is_deleted = 0",
+            r#"
+            SELECT p.user_id
+            FROM posts p
+            JOIN users u ON u.id = p.user_id
+            WHERE p.id = ? AND p.is_deleted = 0
+              AND u.is_deleted = 0 AND u.is_suspended = 0
+            "#,
             [post_id],
             |row| row.get(0),
         )
@@ -2873,6 +2974,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_post_rejects_media_owned_by_another_user() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let bob_media = insert_test_media_kind(&pool, bob, "image").await;
+
+        let error = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "stolen media",
+            None,
+            &[bob_media],
+        )
+        .await
+        .expect_err("other user's media must be rejected");
+
+        assert_eq!(error.to_string(), "media attachment not found");
+    }
+
+    #[tokio::test]
     async fn youtube_embeds_are_normalized_and_stored_on_create() {
         let (pool, settings, alice, _bob) = fixture().await;
         let post = crate::youtube::with_test_oembed_fetcher(
@@ -3344,6 +3464,134 @@ mod tests {
             create_quote_post(&pool, &settings, bob, original, "muted quote")
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_users_cannot_interact_with_blocker_content_or_account() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(&pool, &settings, Some(alice), "original", None, &[])
+            .await
+            .expect("original");
+        block(&pool, alice, bob).await.expect("block");
+
+        assert!(follow(&pool, bob, alice).await.is_err());
+        assert!(like(&pool, bob, original).await.is_err());
+        assert!(bookmark(&pool, bob, original).await.is_err());
+        assert!(repost(&pool, bob, original).await.is_err());
+        assert!(
+            create_post(
+                &pool,
+                &settings,
+                Some(bob),
+                "blocked reply",
+                Some(original),
+                &[],
+            )
+            .await
+            .is_err()
+        );
+
+        let (follows, likes, bookmarks, reposts, replies): (i64, i64, i64, i64, i64) = pool
+            .call(move |conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM follows", [], |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM likes", [], |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM bookmarks", [], |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM reposts", [], |row| row.get(0))?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM posts WHERE parent_post_id = ?",
+                        [original],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .expect("interaction counts");
+        assert_eq!(
+            (follows, likes, bookmarks, reposts, replies),
+            (0, 0, 0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_users_cannot_recover_blocker_posts_from_feeds_threads_or_search() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "blocked visibility target",
+            None,
+            &[],
+        )
+        .await
+        .expect("original");
+        block(&pool, alice, bob).await.expect("block");
+
+        let timeline = timeline(&pool, Some(bob), "local", None)
+            .await
+            .expect("timeline");
+        let thread = post_thread(&pool, Some(bob), original)
+            .await
+            .expect("thread");
+        let (users, posts) = search(&pool, Some(bob), "alice blocked visibility")
+            .await
+            .expect("search");
+
+        assert!(timeline.iter().all(|post| post.user_id != Some(alice)));
+        assert!(thread.is_empty());
+        assert!(users.iter().all(|user| user.id != alice));
+        assert!(posts.iter().all(|post| post.user_id != Some(alice)));
+    }
+
+    #[tokio::test]
+    async fn suspended_user_posts_are_hidden_and_cannot_receive_interactions() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "suspended visibility target",
+            None,
+            &[],
+        )
+        .await
+        .expect("original");
+        pool.call(move |conn| {
+            conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [alice])?;
+            Ok(())
+        })
+        .await
+        .expect("suspend user");
+
+        let timeline = timeline(&pool, Some(bob), "local", None)
+            .await
+            .expect("timeline");
+        let thread = post_thread(&pool, Some(bob), original)
+            .await
+            .expect("thread");
+        let (users, posts) = search(&pool, Some(bob), "suspended visibility")
+            .await
+            .expect("search");
+
+        assert!(timeline.iter().all(|post| post.user_id != Some(alice)));
+        assert!(thread.is_empty());
+        assert!(users.iter().all(|user| user.id != alice));
+        assert!(posts.iter().all(|post| post.user_id != Some(alice)));
+        assert!(like(&pool, bob, original).await.is_err());
+        assert!(repost(&pool, bob, original).await.is_err());
+        assert!(
+            create_post(
+                &pool,
+                &settings,
+                Some(bob),
+                "reply to suspended post",
+                Some(original),
+                &[],
+            )
+            .await
+            .is_err()
         );
     }
 

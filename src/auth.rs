@@ -189,6 +189,7 @@ pub async fn change_password(
     current_password: &str,
     new_password: &str,
     confirm_new_password: &str,
+    current_session_token: Option<&str>,
 ) -> anyhow::Result<()> {
     if new_password != confirm_new_password {
         anyhow::bail!("new passwords do not match");
@@ -198,11 +199,25 @@ pub async fn change_password(
         anyhow::bail!("current password is incorrect");
     }
     let hash = hash_password(new_password)?;
+    let current_session_hash = current_session_token.map(hash_token);
     pool.call(move |conn| {
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
             params![hash, user_id],
         )?;
+        if let Some(current_session_hash) = current_session_hash {
+            tx.execute(
+                "UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP WHERE user_id = ? AND token_hash != ? AND revoked_at IS NULL",
+                params![user_id, current_session_hash],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP WHERE user_id = ? AND revoked_at IS NULL",
+                [user_id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     })
     .await
@@ -222,7 +237,9 @@ pub async fn current_user(
         SELECT u.id, u.username, u.display_name, u.is_admin, u.is_suspended, u.theme, u.nsfw_blur_enabled
         FROM sessions s
         JOIN users u ON u.id = s.user_id
-        WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP AND u.is_deleted = 0
+        WHERE s.token_hash = ? AND s.revoked_at IS NULL
+          AND datetime(s.expires_at) > CURRENT_TIMESTAMP
+          AND u.is_deleted = 0
         "#,
             [token_hash],
             |row| {
@@ -250,7 +267,7 @@ pub async fn csrf_hashes_for_cookie(
     let token_hash = hash_token(token);
     pool.call(move |conn| {
         conn.query_row(
-            "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
+            "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND datetime(expires_at) > CURRENT_TIMESTAMP",
             [token_hash],
             |row| {
                 let current = row.get::<_, String>(0)?;
@@ -386,6 +403,7 @@ mod tests {
             "very secure password",
             "much better password",
             "much better password",
+            None,
         )
         .await
         .expect("password change");
@@ -401,6 +419,62 @@ mod tests {
                 .await
                 .expect("new login")
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn password_change_revokes_other_sessions_but_keeps_current_session() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        crate::db::migrate(&pool).await.expect("migrate");
+        let settings = Settings::default();
+        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
+            .await
+            .expect("user");
+        let current = create_session(&pool, user_id)
+            .await
+            .expect("current session");
+        let other = create_session(&pool, user_id).await.expect("other session");
+
+        change_password(
+            &pool,
+            &settings,
+            user_id,
+            "very secure password",
+            "much better password",
+            "much better password",
+            Some(&current.token),
+        )
+        .await
+        .expect("password change");
+
+        let mut current_headers = HeaderMap::new();
+        current_headers.insert(
+            axum::http::header::COOKIE,
+            format!("rustpost_session={}", current.token)
+                .parse()
+                .expect("current cookie"),
+        );
+        assert!(
+            current_user(&pool, &current_headers)
+                .await
+                .expect("current user")
+                .is_some()
+        );
+        let mut other_headers = HeaderMap::new();
+        other_headers.insert(
+            axum::http::header::COOKIE,
+            format!("rustpost_session={}", other.token)
+                .parse()
+                .expect("other cookie"),
+        );
+        assert!(
+            current_user(&pool, &other_headers)
+                .await
+                .expect("other user")
+                .is_none()
         );
     }
 
@@ -423,6 +497,7 @@ mod tests {
             "wrong password",
             "much better password",
             "much better password",
+            None,
         )
         .await;
 
@@ -457,12 +532,57 @@ mod tests {
             "very secure password",
             "much better password",
             "different password",
+            None,
         )
         .await;
 
         assert_eq!(
             result.expect_err("password mismatch").to_string(),
             "new passwords do not match"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_rfc3339_session_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        crate::db::migrate(&pool).await.expect("migrate");
+        let settings = Settings::default();
+        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
+            .await
+            .expect("user");
+        let session = create_session(&pool, user_id).await.expect("session");
+        let token_hash = hash_token(&session.token);
+        pool.call(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET expires_at = datetime('now', '-1 minute') || 'Z' WHERE token_hash = ?",
+                [token_hash],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("expire session");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("rustpost_session={}", session.token)
+                .parse()
+                .expect("cookie"),
+        );
+
+        assert!(
+            current_user(&pool, &headers)
+                .await
+                .expect("current user")
+                .is_none()
+        );
+        assert!(
+            csrf_hashes_for_cookie(&pool, &session.token)
+                .await
+                .expect("csrf lookup")
+                .is_none()
         );
     }
 }

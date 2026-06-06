@@ -846,6 +846,7 @@ fn has_parent_component(path: &Path) -> bool {
 
 pub async fn set_profile_media(
     pool: &SqlitePool,
+    paths: &RuntimePaths,
     user_id: i64,
     slot: ProfileMediaSlot,
     media_id: i64,
@@ -862,13 +863,16 @@ pub async fn set_profile_media(
         })
         .await?;
     if media_kind.as_deref() != Some("image") {
-        delete_media(pool, media_id).await?;
+        delete_media(pool, paths, media_id).await?;
         anyhow::bail!("profile media must be an image");
     }
     let select_sql = format!("SELECT {} FROM users WHERE id = ?", slot.column());
     let previous: Option<i64> = pool
         .call(move |conn| Ok(conn.query_row(&select_sql, [user_id], |row| row.get(0))?))
         .await?;
+    if let Some(previous) = previous.filter(|previous| *previous != media_id) {
+        validate_media_deletion_paths(pool, paths, previous).await?;
+    }
     let update_sql = format!(
         "UPDATE users SET {} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         slot.column()
@@ -879,13 +883,14 @@ pub async fn set_profile_media(
     })
     .await?;
     if let Some(previous) = previous.filter(|previous| *previous != media_id) {
-        delete_media(pool, previous).await?;
+        delete_media(pool, paths, previous).await?;
     }
     Ok(())
 }
 
 pub async fn clear_profile_media(
     pool: &SqlitePool,
+    paths: &RuntimePaths,
     user_id: i64,
     slot: ProfileMediaSlot,
 ) -> anyhow::Result<()> {
@@ -893,6 +898,9 @@ pub async fn clear_profile_media(
     let previous: Option<i64> = pool
         .call(move |conn| Ok(conn.query_row(&select_sql, [user_id], |row| row.get(0))?))
         .await?;
+    if let Some(previous) = previous {
+        validate_media_deletion_paths(pool, paths, previous).await?;
+    }
     let update_sql = format!(
         "UPDATE users SET {} = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         slot.column()
@@ -903,12 +911,17 @@ pub async fn clear_profile_media(
     })
     .await?;
     if let Some(previous) = previous {
-        delete_media(pool, previous).await?;
+        delete_media(pool, paths, previous).await?;
     }
     Ok(())
 }
 
-pub async fn delete_media(pool: &SqlitePool, media_id: i64) -> anyhow::Result<()> {
+pub async fn delete_media(
+    pool: &SqlitePool,
+    paths: &RuntimePaths,
+    media_id: i64,
+) -> anyhow::Result<()> {
+    validate_media_deletion_paths(pool, paths, media_id).await?;
     let paths_to_remove = pool
         .call(move |conn| {
             let tx = conn.transaction()?;
@@ -957,6 +970,178 @@ pub async fn delete_media(pool: &SqlitePool, media_id: i64) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+async fn validate_media_deletion_paths(
+    pool: &SqlitePool,
+    paths: &RuntimePaths,
+    media_id: i64,
+) -> anyhow::Result<()> {
+    let media_paths: Option<(Option<String>, String, Option<String>)> = pool
+        .call(move |conn| {
+            conn.query_row(
+                "SELECT original_path, stored_path, thumbnail_path FROM media WHERE id = ?",
+                [media_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?;
+    let Some((original_path, stored_path, thumbnail_path)) = media_paths else {
+        return Ok(());
+    };
+    for path in [original_path, Some(stored_path), thumbnail_path]
+        .into_iter()
+        .flatten()
+        .filter(|path| !path.is_empty())
+    {
+        validate_media_deletion_path(paths, Path::new(&path)).await?;
+    }
+    Ok(())
+}
+
+async fn validate_media_deletion_path(paths: &RuntimePaths, path: &Path) -> anyhow::Result<()> {
+    if !path.is_absolute() || has_parent_component(path) {
+        anyhow::bail!("refusing to delete unsafe media path {}", path.display());
+    }
+    let allowed_roots = [
+        &paths.uploads_originals,
+        &paths.uploads_images,
+        &paths.uploads_videos,
+        &paths.uploads_thumbs,
+    ];
+    let Some(root) = allowed_roots
+        .into_iter()
+        .find(|root| path.starts_with(root))
+    else {
+        anyhow::bail!(
+            "refusing to delete media path outside upload directories: {}",
+            path.display()
+        );
+    };
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("refusing to delete non-file media path {}", path.display());
+    }
+    let canonical_root = tokio::fs::canonicalize(root).await?;
+    let canonical_path = tokio::fs::canonicalize(path).await?;
+    if !canonical_path.starts_with(canonical_root) {
+        anyhow::bail!(
+            "refusing to delete media path outside upload directories: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+pub async fn delete_post_media(
+    pool: &SqlitePool,
+    paths: &RuntimePaths,
+    post_id: i64,
+) -> anyhow::Result<()> {
+    let media_ids = post_media_ids(pool, post_id).await?;
+    for media_id in &media_ids {
+        validate_media_deletion_paths(pool, paths, *media_id).await?;
+    }
+    let paths_to_remove = pool
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM post_media WHERE post_id = ?", [post_id])?;
+            let mut paths = BTreeSet::new();
+            for media_id in media_ids {
+                let referenced: bool = tx.query_row(
+                    r#"
+                    SELECT EXISTS(
+                        SELECT 1 FROM post_media WHERE media_id = ?
+                        UNION ALL
+                        SELECT 1 FROM users
+                        WHERE profile_picture_media_id = ? OR banner_media_id = ?
+                    )
+                    "#,
+                    params![media_id, media_id, media_id],
+                    |row| row.get(0),
+                )?;
+                if referenced {
+                    continue;
+                }
+                let media_paths: Option<(Option<String>, String, Option<String>)> = tx
+                    .query_row(
+                        "SELECT original_path, stored_path, thumbnail_path FROM media WHERE id = ?",
+                        [media_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                let Some((original_path, stored_path, thumbnail_path)) = media_paths else {
+                    continue;
+                };
+                promote_canonical_references(&tx, media_id)?;
+                tx.execute("DELETE FROM media_jobs WHERE media_id = ?", [media_id])?;
+                tx.execute("DELETE FROM media WHERE id = ?", [media_id])?;
+                for path in [original_path, Some(stored_path), thumbnail_path]
+                    .into_iter()
+                    .flatten()
+                    .filter(|path| !path.is_empty())
+                {
+                    let remaining: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM media WHERE original_path = ? OR stored_path = ? OR thumbnail_path = ?",
+                        params![path, path, path],
+                        |row| row.get(0),
+                    )?;
+                    if remaining == 0 {
+                        paths.insert(PathBuf::from(path));
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(paths.into_iter().collect::<Vec<_>>())
+        })
+        .await?;
+    remove_media_files(paths_to_remove, post_id, "post media cleanup").await;
+    Ok(())
+}
+
+pub async fn validate_post_media_deletion(
+    pool: &SqlitePool,
+    paths: &RuntimePaths,
+    post_id: i64,
+) -> anyhow::Result<()> {
+    for media_id in post_media_ids(pool, post_id).await? {
+        validate_media_deletion_paths(pool, paths, media_id).await?;
+    }
+    Ok(())
+}
+
+async fn post_media_ids(pool: &SqlitePool, post_id: i64) -> anyhow::Result<Vec<i64>> {
+    pool.call(move |conn| {
+        let mut stmt =
+            conn.prepare("SELECT media_id FROM post_media WHERE post_id = ? ORDER BY position")?;
+        let ids = stmt
+            .query_map([post_id], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        Ok(ids)
+    })
+    .await
+}
+
+async fn remove_media_files(paths: Vec<PathBuf>, subject_id: i64, operation: &'static str) {
+    for path in paths {
+        if let Err(error) = tokio::fs::remove_file(&path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                subject_id,
+                path = %path.display(),
+                error = %error,
+                operation,
+                "failed to remove unreferenced media file"
+            );
+        }
+    }
 }
 
 fn promote_canonical_references(
@@ -1407,9 +1592,13 @@ mod tests {
         .await;
         let second = insert_duplicate_row(&pool, user_id, first, &shared).await;
 
-        delete_media(&pool, second).await.expect("delete duplicate");
+        delete_media(&pool, &paths, second)
+            .await
+            .expect("delete duplicate");
         assert!(shared.exists());
-        delete_media(&pool, first).await.expect("delete canonical");
+        delete_media(&pool, &paths, first)
+            .await
+            .expect("delete canonical");
         assert!(!shared.exists());
     }
 
@@ -1434,7 +1623,9 @@ mod tests {
         .await;
         let second = insert_duplicate_row(&pool, user_id, first, &shared).await;
 
-        delete_media(&pool, first).await.expect("delete canonical");
+        delete_media(&pool, &paths, first)
+            .await
+            .expect("delete canonical");
 
         assert!(shared.exists());
         let promoted = media_row(&pool, second).await;
@@ -1588,7 +1779,9 @@ mod tests {
     #[tokio::test]
     async fn profile_media_replacement_deletes_previous_file() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
+        let paths = RuntimePaths::from_data_dir(temp.path().join("data"));
+        paths.ensure().expect("paths");
+        let pool = crate::db::connect(&paths.database_path)
             .await
             .expect("connect");
         crate::db::migrate(&pool).await.expect("migrate");
@@ -1597,9 +1790,9 @@ mod tests {
             crate::auth::register_user(&pool, &settings, "alice", "very secure password", false)
                 .await
                 .expect("user");
-        let first = temp.path().join("first.webp");
-        let first_thumb = temp.path().join("first-thumb.webp");
-        let second = temp.path().join("second.webp");
+        let first = paths.uploads_images.join("first.webp");
+        let first_thumb = paths.uploads_thumbs.join("first-thumb.webp");
+        let second = paths.uploads_images.join("second.webp");
         tokio::fs::write(&first, b"first").await.expect("first");
         tokio::fs::write(&first_thumb, b"first-thumb")
             .await
@@ -1609,10 +1802,10 @@ mod tests {
         let second_id = insert_test_media(&pool, user_id, &second, "image").await;
         set_test_thumbnail(&pool, first_id, &first_thumb).await;
 
-        set_profile_media(&pool, user_id, ProfileMediaSlot::Picture, first_id)
+        set_profile_media(&pool, &paths, user_id, ProfileMediaSlot::Picture, first_id)
             .await
             .expect("set first");
-        set_profile_media(&pool, user_id, ProfileMediaSlot::Picture, second_id)
+        set_profile_media(&pool, &paths, user_id, ProfileMediaSlot::Picture, second_id)
             .await
             .expect("set second");
 
@@ -1624,7 +1817,9 @@ mod tests {
     #[tokio::test]
     async fn profile_media_rejects_non_image_and_removes_upload() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
+        let paths = RuntimePaths::from_data_dir(temp.path().join("data"));
+        paths.ensure().expect("paths");
+        let pool = crate::db::connect(&paths.database_path)
             .await
             .expect("connect");
         crate::db::migrate(&pool).await.expect("migrate");
@@ -1633,16 +1828,89 @@ mod tests {
             crate::auth::register_user(&pool, &settings, "alice", "very secure password", false)
                 .await
                 .expect("user");
-        let video = temp.path().join("video.webm");
+        let video = paths.uploads_videos.join("video.webm");
         tokio::fs::write(&video, b"video").await.expect("video");
         let media_id = insert_test_media(&pool, user_id, &video, "video").await;
 
         assert!(
-            set_profile_media(&pool, user_id, ProfileMediaSlot::Picture, media_id)
+            set_profile_media(&pool, &paths, user_id, ProfileMediaSlot::Picture, media_id)
                 .await
                 .is_err()
         );
         assert!(!video.exists());
+    }
+
+    #[tokio::test]
+    async fn media_deletion_rejects_restored_paths_outside_upload_directories() {
+        let (temp, paths, pool, _settings, _ffmpeg, user_id) = media_fixture().await;
+        let outside = temp.path().join("outside.webp");
+        tokio::fs::write(&outside, b"private")
+            .await
+            .expect("outside");
+        let media_id = insert_test_media(&pool, user_id, &outside, "image").await;
+
+        let error = delete_media(&pool, &paths, media_id)
+            .await
+            .expect_err("outside path must be rejected");
+
+        assert!(error.to_string().contains("outside upload directories"));
+        assert!(outside.exists());
+        let row_exists: bool = pool
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM media WHERE id = ?)",
+                    [media_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("media row");
+        assert!(row_exists);
+    }
+
+    #[tokio::test]
+    async fn deleted_post_media_is_removed_only_after_its_last_reference() {
+        let (_temp, paths, pool, _settings, _ffmpeg, user_id) = media_fixture().await;
+        let stored = paths.uploads_images.join("post.webp");
+        tokio::fs::write(&stored, b"post")
+            .await
+            .expect("post media");
+        let media_id = insert_test_media(&pool, user_id, &stored, "image").await;
+        let (first_post, second_post) = pool
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO posts (user_id, text) VALUES (?, 'first')",
+                    [user_id],
+                )?;
+                let first = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO posts (user_id, text) VALUES (?, 'second')",
+                    [user_id],
+                )?;
+                let second = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO post_media (post_id, media_id, position) VALUES (?, ?, 0)",
+                    params![first, media_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO post_media (post_id, media_id, position) VALUES (?, ?, 0)",
+                    params![second, media_id],
+                )?;
+                Ok((first, second))
+            })
+            .await
+            .expect("posts");
+
+        delete_post_media(&pool, &paths, first_post)
+            .await
+            .expect("first cleanup");
+        assert!(stored.exists());
+
+        delete_post_media(&pool, &paths, second_post)
+            .await
+            .expect("second cleanup");
+        assert!(!stored.exists());
     }
 
     #[cfg(unix)]

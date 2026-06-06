@@ -519,8 +519,10 @@ async fn login_form(State(state): State<Arc<AppState>>) -> Html<String> {
 async fn login(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Form(form): Form<AuthForm>,
 ) -> AppResult<Response> {
+    reject_cross_site_form_post(&headers)?;
     let actor = ip_actor(addr);
     rate_limit::ensure_under_limit(
         &state.pool,
@@ -568,8 +570,10 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
 async fn register(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Form(form): Form<RegisterForm>,
 ) -> AppResult<Response> {
+    reject_cross_site_form_post(&headers)?;
     if !state.settings.accounts.registration_enabled {
         return Err(AppError::Forbidden);
     }
@@ -736,6 +740,7 @@ async fn onboarding_update(
     if let Some(media_id) = form.profile_picture_media_id {
         media::set_profile_media(
             &state.pool,
+            &state.paths,
             user.id,
             media::ProfileMediaSlot::Picture,
             media_id,
@@ -755,7 +760,7 @@ async fn onboarding_update(
 
 async fn cleanup_onboarding_uploads(state: &AppState, form: &ParsedOnboardingUpdate) {
     if let Some(media_id) = form.profile_picture_media_id
-        && let Err(error) = media::delete_media(&state.pool, media_id).await
+        && let Err(error) = media::delete_media(&state.pool, &state.paths, media_id).await
     {
         tracing::warn!(
             media_id,
@@ -1321,7 +1326,9 @@ async fn delete_post(
         }
         Err(err) => return Err(err),
     };
+    media::validate_post_media_deletion(&state.pool, &state.paths, id).await?;
     social::delete_post(&state.pool, user.id, id, user.is_admin).await?;
+    media::delete_post_media(&state.pool, &state.paths, id).await?;
     let fallback = if let Some(parent_id) = preview.parent_post_id {
         format!("/posts/{parent_id}#post-{parent_id}")
     } else {
@@ -2344,14 +2351,27 @@ async fn settings_update(
         })
         .await?;
     if form.delete_profile_picture {
-        media::clear_profile_media(&state.pool, user.id, media::ProfileMediaSlot::Picture).await?;
+        media::clear_profile_media(
+            &state.pool,
+            &state.paths,
+            user.id,
+            media::ProfileMediaSlot::Picture,
+        )
+        .await?;
     }
     if form.delete_banner {
-        media::clear_profile_media(&state.pool, user.id, media::ProfileMediaSlot::Banner).await?;
+        media::clear_profile_media(
+            &state.pool,
+            &state.paths,
+            user.id,
+            media::ProfileMediaSlot::Banner,
+        )
+        .await?;
     }
     if let Some(media_id) = form.profile_picture_media_id {
         media::set_profile_media(
             &state.pool,
+            &state.paths,
             user.id,
             media::ProfileMediaSlot::Picture,
             media_id,
@@ -2361,6 +2381,7 @@ async fn settings_update(
     if let Some(media_id) = form.banner_media_id {
         media::set_profile_media(
             &state.pool,
+            &state.paths,
             user.id,
             media::ProfileMediaSlot::Banner,
             media_id,
@@ -2412,6 +2433,7 @@ async fn change_password(
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let current_session_token = auth::session_cookie(&headers);
     match auth::change_password(
         &state.pool,
         &state.settings,
@@ -2419,6 +2441,7 @@ async fn change_password(
         &form.current_password,
         &form.new_password,
         &form.confirm_new_password,
+        current_session_token.as_deref(),
     )
     .await
     {
@@ -3206,6 +3229,36 @@ fn referer_target(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+fn reject_cross_site_form_post(headers: &HeaderMap) -> AppResult<()> {
+    if headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+    {
+        return Err(AppError::Forbidden);
+    }
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(());
+    };
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(AppError::Forbidden);
+    };
+    let origin_host = origin.parse::<Uri>().ok().and_then(|uri| {
+        uri.authority()
+            .map(|authority| authority.as_str().to_owned())
+    });
+    if origin_host.is_none_or(|origin_host| !origin_host.eq_ignore_ascii_case(host)) {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
 async fn bookmarks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -3723,7 +3776,9 @@ async fn admin_delete_post(
 ) -> AppResult<Response> {
     let user = require_admin(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    media::validate_post_media_deletion(&state.pool, &state.paths, id).await?;
     social::delete_post(&state.pool, user.id, id, true).await?;
+    media::delete_post_media(&state.pool, &state.paths, id).await?;
     admin::audit(&state.pool, user.id, "delete_post", &format!("post:{id}")).await?;
     Ok(Redirect::to("/admin").into_response())
 }
@@ -4589,7 +4644,7 @@ async fn require_active_user(state: &AppState, headers: &HeaderMap) -> AppResult
 }
 
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> AppResult<CurrentUser> {
-    let user = require_user(state, headers).await?;
+    let user = require_active_user(state, headers).await?;
     if !user.is_admin {
         return Err(AppError::Forbidden);
     }
@@ -4611,7 +4666,7 @@ async fn form_csrf(state: &AppState, headers: &HeaderMap) -> Option<String> {
             let token_hash = token_hash.clone();
             move |conn| {
                 conn.query_row(
-                    "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
+                    "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND datetime(expires_at) > CURRENT_TIMESTAMP",
                     [token_hash],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -4813,6 +4868,72 @@ mod tests {
         let member_cookie = register_test_user(&server, "member").await;
 
         let response = get_with_cookie(&server, "/admin/users", &member_cookie).await;
+
+        assert_eq!(response.status, 403);
+    }
+
+    #[tokio::test]
+    async fn cross_site_login_and_registration_posts_are_rejected() {
+        let server = spawn_test_server_with_admin().await;
+
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("origin", "https://attacker.example"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+            b"username=siteowner&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let registration = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("origin", "https://attacker.example"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+            b"username=forced&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+
+        assert_eq!(login.status, 403);
+        assert_eq!(registration.status, 403);
+        let forced_accounts: i64 = server
+            .pool
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM users WHERE normalized_username = 'forced'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("forced account count");
+        assert_eq!(forced_accounts, 0);
+    }
+
+    #[tokio::test]
+    async fn suspended_admin_session_cannot_access_admin_routes() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        server
+            .pool
+            .call(|conn| {
+                conn.execute(
+                    "UPDATE users SET is_suspended = 1 WHERE normalized_username = 'siteowner'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("suspend admin");
+
+        let response = get_with_cookie(&server, "/admin/users", &admin_cookie).await;
 
         assert_eq!(response.status, 403);
     }
