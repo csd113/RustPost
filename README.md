@@ -154,7 +154,7 @@ rustpost-data/
 ```
 
 > **Note:** All runtime paths are derived from `--data-dir` (or the executable location as fallback). RustPost does not rely on the current working directory.
-> Runtime data is local operator state. Databases, uploads, logs, backups, Tor key material, and temporary upload files under `rustpost-data/` should not be committed to git.
+> Runtime data is local operator state. Databases, uploads, logs, backups, Tor key material, and temporary upload files under `rustpost-data/` should not be committed to git. On Unix, RustPost restricts the runtime data directory to mode `0700`.
 > Existing data directories that still contain `app.sqlite3` at the data-dir root are migrated to `db/rustpost.sqlite3` on startup. If both old and new database files exist, RustPost stops with a conflict error and does not overwrite either file.
 
 ### Create Your First Admin

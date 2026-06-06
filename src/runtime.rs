@@ -92,6 +92,7 @@ impl RuntimePaths {
             })?;
         }
         self.migrate_legacy_database_layout()?;
+        restrict_dir(&self.data_dir)?;
         restrict_dir(&self.backups_dir)?;
         restrict_dir(&self.tor_dir)?;
         restrict_dir(&self.tor_onion_service_dir)?;
@@ -282,6 +283,7 @@ mod tests {
         paths.ensure().expect("ensure paths");
 
         for path in [
+            &paths.data_dir,
             &paths.backups_dir,
             &paths.tor_dir,
             &paths.tor_onion_service_dir,
