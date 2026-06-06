@@ -3340,7 +3340,7 @@ async fn admin_dashboard(
             "Admin",
             "Manage site health, users, media jobs, settings, and backups."
         ),
-        r#"<section class="grid"><a class="panel admin-card" data-testid="admin-card" href="/admin/health">Site health</a><a class="panel admin-card" data-testid="admin-card" href="/admin/users">Users</a><a class="panel admin-card" data-testid="admin-card" href="/admin/media">Media jobs</a><a class="panel admin-card" data-testid="admin-card" href="/admin/deep-settings">Deep server settings</a><a class="panel admin-card" data-testid="admin-card" href="/admin/backups">Backups</a></section>"#,
+        r#"<section class="grid admin-nav-grid"><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/health">Site health</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/users">Users</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/media">Media jobs</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/deep-settings">Deep server settings</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/backups">Backups</a></section>"#,
         favicon_panel
     );
     Ok(Html(
