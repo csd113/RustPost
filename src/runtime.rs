@@ -92,6 +92,7 @@ impl RuntimePaths {
             })?;
         }
         self.migrate_legacy_database_layout()?;
+        restrict_dir(&self.backups_dir)?;
         restrict_dir(&self.tor_dir)?;
         restrict_dir(&self.tor_onion_service_dir)?;
         Ok(())
@@ -267,6 +268,26 @@ mod tests {
             &paths.logs_dir,
         ] {
             assert!(path.is_dir(), "{} should exist", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_restricts_sensitive_runtime_directories() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = RuntimePaths::from_data_dir(temp.path().join("data"));
+
+        paths.ensure().expect("ensure paths");
+
+        for path in [
+            &paths.backups_dir,
+            &paths.tor_dir,
+            &paths.tor_onion_service_dir,
+        ] {
+            let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} should be private", path.display());
         }
     }
 

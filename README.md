@@ -199,7 +199,7 @@ rustpost backup                                     # Create a backup archive
 rustpost backup --include-tor-keys                  # Backup including Tor private keys
 rustpost restore <archive.tar>                      # Restore from a backup
 rustpost restore <archive.tar> --include-tor-keys   # Restore including Tor keys
-rustpost print-onion-address                        # Print the current .onion hostname
+rustpost print-onion-address                        # Print an active address, or fail clearly if unavailable
 ```
 
 ---
@@ -360,6 +360,7 @@ rustpost restore archive.tar             # rejects Tor key paths unless flag giv
 rustpost restore archive.tar --include-tor-keys
 ```
 
+On Unix, the backup directory is mode `0700` and created backup archives are mode `0600`.
 Restore path validation rejects: absolute paths, traversal sequences, symlinks/hardlinks, duplicate entries, duplicate separators, Windows drive prefixes, backslash paths, encoded traversal or slash markers, and slash-like Unicode bypass characters.
 
 ---

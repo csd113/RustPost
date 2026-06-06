@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Command as ProcessCommand;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -172,10 +173,10 @@ async fn run_command(
         } => restore_command(&paths, &archive, include_tor_keys),
         Command::PrintOnionAddress => {
             let status = tor::validate_startup(&settings.tor);
-            stdout_line(format_args!(
-                "{}",
-                status.onion_address().unwrap_or_default()
-            ))?;
+            let onion = status.onion_address().context(
+                "onion address unavailable: use the running site's public header or admin health",
+            )?;
+            stdout_line(format_args!("{onion}"))?;
             Ok(())
         }
         Command::Serve => serve(paths, settings_path, settings).await,
@@ -522,6 +523,7 @@ fn spawn_onion_forwarding(
         if !started.running() {
             return;
         }
+        spawn_tor_status_sync(tor_status.clone(), started, shutdown_rx.clone());
         let addr = match listener.local_addr() {
             Ok(addr) => addr,
             Err(error) => {
@@ -538,6 +540,27 @@ fn spawn_onion_forwarding(
         .await
         {
             warn!(error = %error, "Tor onion forwarding listener failed");
+        }
+    });
+}
+
+fn spawn_tor_status_sync(
+    visible: tor::TorStatus,
+    running: tor::TorStatus,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    visible.replace_snapshot_with(&running);
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
         }
     });
 }

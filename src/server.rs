@@ -469,10 +469,7 @@ async fn layout_context(
     };
     Ok(render::LayoutContext {
         anonymous_mode_enabled: state.settings.accounts.anonymous_mode_enabled,
-        tor_onion_address: state.tor.onion_address().or_else(|| {
-            (!state.settings.tor.display_onion_address.is_empty())
-                .then(|| state.settings.tor.display_onion_address.clone())
-        }),
+        tor_onion_address: state.tor.onion_address(),
         follower_count: counts.map(|(followers, _following)| followers),
         following_count: counts.map(|(_followers, following)| following),
         notification_unread_count,
@@ -3507,7 +3504,7 @@ async fn admin_health(
         .bootstrap_status()
         .unwrap_or_else(|| "unavailable".to_owned());
     let body = format!(
-        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>DB schema version</dt><dd>{}</dd><dt>DB diagnostics</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
+        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>DB schema version</dt><dd>{}</dd><dt>DB diagnostics</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor service active</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
         html_escape::encode_text(&state.paths.database_path.display().to_string()),
         html_escape::encode_text(&schema_version),
         html_escape::encode_text(&schema_summary),
@@ -5070,6 +5067,21 @@ mod tests {
                 .contains(r#"<button class="auth-submit" type="submit">Log in</button>"#)
         );
         assert!(!response.body.contains("Authentication required"));
+    }
+
+    #[tokio::test]
+    async fn public_layout_does_not_render_configured_onion_fallback() {
+        let mut settings = Settings::default();
+        settings.tor.enabled = true;
+        settings.tor.display_onion_address =
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion".to_owned();
+        let server = spawn_test_server_with_settings(settings).await;
+
+        let response = request(&server.base_url, "GET", "/", &[], Vec::new()).await;
+
+        assert_eq!(response.status, 200);
+        assert!(!response.body.contains("tor-header-indicator"));
+        assert!(!response.body.contains(".onion"));
     }
 
     #[tokio::test]

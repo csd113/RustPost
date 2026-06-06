@@ -383,10 +383,7 @@ fn create_backup_inner(
     let manifest = build_manifest(db_schema_version, include_tor_keys, &directories, &files);
     let manifest_toml = toml::to_string(&manifest)?;
     let archive_path = unique_archive_path(&paths.backups_dir, kind);
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&archive_path)
+    let file = create_private_file(&archive_path)
         .with_context(|| format!("failed to create backup archive {}", archive_path.display()))?;
     let mut builder = Builder::new(file);
     append_bytes(
@@ -404,6 +401,22 @@ fn create_backup_inner(
     }
     builder.finish()?;
     Ok(archive_path)
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 fn append_runtime_dir(
@@ -1302,6 +1315,23 @@ mod tests {
         let with_tor = create_backup(&paths, true).expect("backup");
         let names = archive_names(&with_tor);
         assert!(names.iter().any(|name| name == "tor/onion-service/secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_archive_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_temp, paths) = test_paths();
+
+        let archive = create_backup(&paths, true).expect("backup");
+        let mode = fs::metadata(archive)
+            .expect("archive metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

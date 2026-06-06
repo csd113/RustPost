@@ -141,17 +141,27 @@ impl TorStatus {
     }
 
     pub(crate) fn replace_with(&self, other: &Self) {
-        if let (Ok(mut snapshot), Ok(other_snapshot)) = (self.inner.write(), other.inner.read()) {
-            *snapshot = other_snapshot.clone();
-        }
+        self.replace_snapshot_with(other);
         if let (Ok(mut runtime), Ok(other_runtime)) = (self.runtime.write(), other.runtime.read()) {
             runtime.clone_from(&other_runtime);
+        }
+    }
+
+    pub(crate) fn replace_snapshot_with(&self, other: &Self) {
+        if let (Ok(mut snapshot), Ok(other_snapshot)) = (self.inner.write(), other.inner.read()) {
+            *snapshot = other_snapshot.clone();
         }
     }
 
     fn record_error(&self, message: impl Into<String>) {
         if let Ok(mut snapshot) = self.inner.write() {
             snapshot.error = Some(message.into());
+        }
+    }
+
+    fn record_reachable(&self) {
+        if let Ok(mut snapshot) = self.inner.write() {
+            "reachable".clone_into(&mut snapshot.state);
         }
     }
 
@@ -281,7 +291,7 @@ async fn start_inner(
         enabled: true,
         running: true,
         onion_address: onion_address.clone(),
-        state: "running".to_owned(),
+        state: "service active; external reachability unverified".to_owned(),
         bootstrap_status,
         error: None,
     }));
@@ -296,10 +306,13 @@ async fn start_inner(
         while let Some(request) = stream_requests.next().await {
             let task_status = task_status.clone();
             tokio::spawn(async move {
-                if let Err(error) = forward_stream_request(request, onion_target).await {
-                    let message = error.to_string();
-                    task_status.record_error(message.clone());
-                    warn!(error = %message, "Tor onion stream forwarding failed");
+                match forward_stream_request(request, onion_target).await {
+                    Ok(()) => task_status.record_reachable(),
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        task_status.record_error(message.clone());
+                        warn!(error = %message, "Tor onion stream forwarding failed");
+                    }
                 }
             });
         }
@@ -314,7 +327,7 @@ async fn start_inner(
     }
     info!(
         onion = onion_address.as_deref().unwrap_or("unavailable"),
-        "Arti onion service running"
+        "Arti onion service active; external reachability unverified"
     );
     Ok(TorStatus {
         inner,
@@ -363,10 +376,12 @@ fn is_clean_stream_close(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
             | io::ErrorKind::UnexpectedEof
-    )
+    ) || error.to_string() == "Received an END cell with reason MISC"
 }
 
 fn create_private_dir(path: &Path) -> anyhow::Result<()> {
@@ -477,15 +492,48 @@ mod tests {
     }
 
     #[test]
+    fn status_snapshot_sync_copies_later_runtime_errors() {
+        let visible = TorStatus::starting();
+        let running = TorStatus::new(TorStatusSnapshot {
+            enabled: true,
+            running: true,
+            onion_address: Some("example.onion".to_owned()),
+            state: "service active; external reachability unverified".to_owned(),
+            bootstrap_status: Some("ready".to_owned()),
+            error: None,
+        });
+
+        visible.replace_with(&running);
+        running.record_error("forwarding failed");
+        visible.replace_snapshot_with(&running);
+
+        assert_eq!(visible.error().as_deref(), Some("forwarding failed"));
+    }
+
+    #[test]
+    fn successful_stream_marks_status_reachable() {
+        let status = TorStatus::starting();
+
+        status.record_reachable();
+
+        assert_eq!(status.state(), "reachable");
+    }
+
+    #[test]
     fn common_http_stream_close_errors_are_clean() {
         for kind in [
             io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
             io::ErrorKind::ConnectionReset,
             io::ErrorKind::NotConnected,
+            io::ErrorKind::TimedOut,
             io::ErrorKind::UnexpectedEof,
         ] {
             let error = io::Error::from(kind);
             assert!(is_clean_stream_close(&error));
         }
+        assert!(is_clean_stream_close(&io::Error::other(
+            "Received an END cell with reason MISC"
+        )));
     }
 }
