@@ -11,6 +11,12 @@
 - Enforced configured per-post image and video attachment limits and raised the multipart body limit to cover valid configured media mixes.
 - Corrected generated settings copy for username, display name, and bio limits from bytes to characters.
 
+### Release Validation
+- Updated the ignored local Playwright release harness so it no longer configures the rejected `tor.display_onion_address`; synthetic local Tor-header assertions were removed while opt-in real-onion coverage remains.
+- Documented the accepted v1.0.0 `cargo audit` exception for transitive Arti `rsa 0.9.10` / `RUSTSEC-2023-0071`, for which no fixed upgrade is currently available.
+- Recorded unmaintained transitive Arti dependencies as upstream maintenance caveats rather than RustPost application vulnerabilities.
+- Kept Playwright files and generated artifacts ignored and out of the repository.
+
 ### Database Lineage
 - Squashed the pre-release internal migration chain into a clean first-release SQLite schema baseline at database schema version `1`.
 - Fresh databases are now initialized directly from the baseline instead of replaying alpha development migrations.

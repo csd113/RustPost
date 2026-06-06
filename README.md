@@ -507,6 +507,22 @@ Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and op
 
 *Last sweep: **June 6, 2026***
 
+Release validation distinguishes the required Rust gates from the dependency-advisory review:
+
+```sh
+cargo fmt --all --check
+cargo build --release --bins
+cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::all -D clippy::pedantic -D clippy::nursery -D clippy::cargo
+cargo test --workspace --all-features
+cargo audit
+```
+
+The format, release build, strict Clippy, and test commands must pass. `cargo audit` is reviewed separately and is **not fully clean** for v1.0.0 because of this documented upstream exception:
+
+> **Accepted v1.0.0 upstream audit exception:** `RUSTSEC-2023-0071` affects transitive `rsa 0.9.10` through the Arti 0.42.0 dependency family. The advisory reports a potential key-recovery timing side channel, and no fixed upgrade is currently available. This is an upstream dependency risk, not a verified RustPost application vulnerability. Re-evaluate it when updating Arti or before the next release.
+
+`cargo audit` also reports unmaintained transitive `bincode 2.0.1` (`RUSTSEC-2025-0141`) and `paste 1.0.15` (`RUSTSEC-2024-0436`) dependencies inherited through the Arti dependency family. These are tracked as upstream maintenance caveats, not RustPost application vulnerabilities.
+
 <details>
 <summary>Verified locally</summary>
 
