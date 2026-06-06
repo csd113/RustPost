@@ -124,7 +124,8 @@ async fn fetch_embed_title(mut embed: YoutubeEmbed) -> YoutubeEmbed {
 async fn fetch_oembed_title(video_id: &str) -> Option<String> {
     #[cfg(test)]
     if let Ok(title) = TEST_OEMBED_FETCHER.try_with(|fetcher| fetcher(video_id)) {
-        return title.and_then(|title| sanitize_title(&title));
+        let title = title?;
+        return sanitize_title(&title);
     }
 
     let video_id = video_id.to_owned();
@@ -169,7 +170,8 @@ fn oembed_agent() -> ureq::Agent {
 
 fn parse_oembed_title(body: &str) -> Option<String> {
     let response = serde_json::from_str::<OembedResponse>(body).ok()?;
-    response.title.and_then(|title| sanitize_title(&title))
+    let title = response.title?;
+    sanitize_title(&title)
 }
 
 fn embed_from_url(candidate: &str) -> Option<YoutubeEmbed> {
