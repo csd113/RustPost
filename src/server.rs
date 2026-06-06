@@ -1,9 +1,12 @@
 use std::fmt::Write as _;
+use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
+use axum::body::{Body, Bytes};
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{DefaultBodyLimit, Form, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
@@ -12,8 +15,10 @@ use axum::response::{Html, IntoResponse as _, Redirect, Response};
 use axum::routing::{get, post};
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
 use crate::auth::{self, CurrentUser, Theme};
 use crate::config::Settings;
@@ -119,9 +124,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/favicon", post(admin_favicon_upload))
         .route("/admin/favicon/remove", post(admin_favicon_remove))
+        .route("/admin/backups", get(admin_backups))
+        .route("/admin/backups/create", post(admin_create_backup))
         .route(
-            "/admin/backups",
-            get(admin_backups).post(admin_create_backup),
+            "/admin/backups/download/{filename}",
+            get(admin_download_backup),
+        )
+        .route("/admin/backups/restore", post(admin_restore_backup))
+        .route(
+            "/admin/backups/settings",
+            post(admin_backup_settings_update),
         )
         .nest_service(
             "/uploads/originals",
@@ -3328,7 +3340,7 @@ async fn admin_dashboard(
             "Admin",
             "Manage site health, users, media jobs, settings, and backups."
         ),
-        r#"<section class="grid"><a class="panel admin-card" data-testid="admin-card" href="/admin/health">Site health</a><a class="panel admin-card" data-testid="admin-card" href="/admin/users">Users</a><a class="panel admin-card" data-testid="admin-card" href="/admin/media">Media jobs</a><a class="panel admin-card" data-testid="admin-card" href="/admin/deep-settings">Deep server settings</a><a class="panel admin-card" data-testid="admin-card" href="/admin/backups">Backups</a></section>"#,
+        r#"<section class="grid admin-nav-grid"><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/health">Site health</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/users">Users</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/media">Media jobs</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/deep-settings">Deep server settings</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/backups">Backups</a></section>"#,
         favicon_panel
     );
     Ok(Html(
@@ -3418,6 +3430,19 @@ async fn admin_health(
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
     let media_jobs = admin::media_jobs_report(&state.pool).await?;
     let jobs = render_media_jobs_report(&media_jobs);
+    let schema = crate::db::schema_report(&state.pool).await?;
+    let schema_version = if schema.is_compatible() {
+        schema
+            .version()
+            .map_or_else(|| "unknown".to_owned(), |version| version.to_string())
+    } else {
+        "incompatible".to_owned()
+    };
+    let schema_summary = if schema.is_compatible() {
+        schema.summary()
+    } else {
+        format!("INCOMPATIBLE: {}", schema.summary())
+    };
     let onion = state
         .tor
         .onion_address()
@@ -3428,8 +3453,10 @@ async fn admin_health(
         .bootstrap_status()
         .unwrap_or_else(|| "unavailable".to_owned());
     let body = format!(
-        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
+        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>DB schema version</dt><dd>{}</dd><dt>DB diagnostics</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
         html_escape::encode_text(&state.paths.database_path.display().to_string()),
+        html_escape::encode_text(&schema_version),
+        html_escape::encode_text(&schema_summary),
         html_escape::encode_text(&state.paths.uploads_originals.display().to_string()),
         html_escape::encode_text(&state.paths.uploads_images.display().to_string()),
         html_escape::encode_text(&state.paths.logs_dir.display().to_string()),
@@ -4019,13 +4046,7 @@ async fn admin_backups(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let body = format!(
-        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Backups</h1><form method="post"><input type="hidden" name="csrf" value="{}"><label><input type="checkbox" name="include_tor_keys" value="true"> Include Tor onion-service keys</label><button>Create backup</button></form></section>"#,
-        html_escape::encode_double_quoted_attribute(&csrf)
-    );
-    Ok(Html(
-        page_layout(&state, Some(&user), Some(&csrf), "Backups", &body).await?,
-    ))
+    backups_page(&state, &user, &csrf, None).await
 }
 
 #[derive(Deserialize)]
@@ -4041,23 +4062,456 @@ async fn admin_create_backup(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let settings = load_deep_settings(&state)?;
+    if !settings.backup.enabled {
+        return backups_page(
+            &state,
+            &user,
+            &csrf,
+            Some(("error", "Backups are disabled in settings.toml.")),
+        )
+        .await;
+    }
     let include_tor = form.include_tor_keys.is_some();
-    let archive = backup::create_backup(&state.paths, include_tor)?;
+    let paths = state.paths.clone();
+    let created = tokio::task::spawn_blocking(move || backup::create_backup(&paths, include_tor))
+        .await
+        .map_err(|err| AppError::BadRequest(format!("backup task failed: {err}")))?;
+    let archive = match created {
+        Ok(archive) => archive,
+        Err(err) => {
+            tracing::warn!(error = %err, "manual backup failed");
+            let message = public_backup_error("Backup failed", &err);
+            return backups_page(&state, &user, &csrf, Some(("error", &message))).await;
+        }
+    };
     admin::audit(
         &state.pool,
         user.id,
         "create_backup",
-        archive.to_string_lossy().as_ref(),
+        archive
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("backup"),
     )
     .await?;
-    let body = format!(
-        r#"<section class="panel"><p>Backup created: {}</p></section>"#,
-        html_escape::encode_text(&archive.display().to_string())
+    let message = format!(
+        "Backup created: {}",
+        archive
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("archive")
     );
+    backups_page(&state, &user, &csrf, Some(("success", &message))).await
+}
+
+async fn admin_download_backup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(filename): Path<String>,
+) -> AppResult<Response> {
+    require_admin(&state, &headers).await?;
+    let path = backup::backup_path_for_download(&state.paths, &filename)
+        .map_err(|_err| AppError::NotFound)?;
+    let metadata = tokio::fs::metadata(&path).await?;
+    let file = tokio::fs::File::open(&path).await?;
+    let stream = futures_util::stream::unfold(file, |mut file| async move {
+        let mut buffer = vec![0u8; 64 * 1024];
+        match file.read(&mut buffer).await {
+            Ok(0) => None,
+            Ok(read) => {
+                buffer.truncate(read);
+                Some((Ok::<Bytes, io::Error>(Bytes::from(buffer)), file))
+            }
+            Err(error) => Some((Err(error), file)),
+        }
+    });
+    let disposition = format!("attachment; filename=\"{}\"", filename.replace('"', ""));
+    let mut response = Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-tar"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&metadata.len().to_string())
+            .map_err(|err| AppError::BadRequest(err.to_string()))?,
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition).map_err(|err| AppError::BadRequest(err.to_string()))?,
+    );
+    Ok(response)
+}
+
+async fn admin_backup_settings_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<admin::BackupSettingsForm>,
+) -> AppResult<Html<String>> {
+    let user = require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let current = load_deep_settings(&state)?;
+    let values = match admin::parse_backup_settings_form(&form, &current) {
+        Ok(values) => values,
+        Err(err) => {
+            let message = err.to_string();
+            return backups_page(&state, &user, &csrf, Some(("error", &message))).await;
+        }
+    };
+    let updated = values.apply_to(&current);
+    if let Err(err) = admin::write_backup_settings(&state.paths.settings_path, &updated) {
+        tracing::error!(error = %err, "failed to save backup settings");
+        return backups_page(
+            &state,
+            &user,
+            &csrf,
+            Some((
+                "error",
+                "Backup settings could not be saved. Check the server logs.",
+            )),
+        )
+        .await;
+    }
+    admin::audit(
+        &state.pool,
+        user.id,
+        "update_backup_settings",
+        "settings.toml",
+    )
+    .await?;
+    backups_page(
+        &state,
+        &user,
+        &csrf,
+        Some((
+            "success",
+            "Backup settings saved. The scheduler reads settings.toml on its next check.",
+        )),
+    )
+    .await
+}
+
+async fn admin_restore_backup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> AppResult<Html<String>> {
+    let user = require_admin(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let upload = match parse_restore_upload(&state, &headers, multipart).await {
+        Ok(upload) => upload,
+        Err(err) => {
+            return backups_page(&state, &user, &csrf, Some(("error", &err.to_string()))).await;
+        }
+    };
+    if upload.confirmation != "RESTORE" {
+        let _remove_result = tokio::fs::remove_file(&upload.archive_path).await;
+        return backups_page(
+            &state,
+            &user,
+            &csrf,
+            Some((
+                "error",
+                "Type RESTORE to confirm restoring from an uploaded backup.",
+            )),
+        )
+        .await;
+    }
+    admin::audit(
+        &state.pool,
+        user.id,
+        "restore_backup_upload",
+        &upload.filename,
+    )
+    .await?;
+    let paths = state.paths.clone();
+    let archive_path = upload.archive_path.clone();
+    let include_tor_keys = upload.include_tor_keys;
+    let restored = tokio::task::spawn_blocking(move || {
+        backup::restore_backup(&paths, &archive_path, include_tor_keys)
+    })
+    .await
+    .map_err(|err| AppError::BadRequest(format!("restore task failed: {err}")))?;
+    let _remove_result = tokio::fs::remove_file(&upload.archive_path).await;
+    match restored {
+        Ok(report) => {
+            let safety = report
+                .pre_restore_backup
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("pre-restore backup");
+            let message = format!(
+                "Restore completed. Restart RustPost so the running process reopens the restored database. Safety backup: {safety}."
+            );
+            backups_page(&state, &user, &csrf, Some(("success", &message))).await
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "restore upload failed");
+            let message = public_backup_error("Restore failed", &err);
+            backups_page(&state, &user, &csrf, Some(("error", &message))).await
+        }
+    }
+}
+
+struct ParsedRestoreUpload {
+    archive_path: PathBuf,
+    filename: String,
+    include_tor_keys: bool,
+    confirmation: String,
+}
+
+async fn parse_restore_upload(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut multipart: Multipart,
+) -> AppResult<ParsedRestoreUpload> {
+    let mut csrf_validated = false;
+    let mut include_tor_keys = false;
+    let mut confirmation = String::new();
+    let mut archive_path = None;
+    let mut filename = "uploaded-backup.tar".to_owned();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?
+    {
+        let Some(name) = field.name().map(ToOwned::to_owned) else {
+            continue;
+        };
+        match name.as_str() {
+            "csrf" => {
+                let token = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+                validate_csrf(&state.pool, headers, &token).await?;
+                csrf_validated = true;
+            }
+            "include_tor_keys" => {
+                include_tor_keys = field.text().await.is_ok_and(|value| value == "true");
+            }
+            "restore_confirm" => {
+                confirmation = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            }
+            "backup" if field.file_name().is_some() => {
+                if !csrf_validated {
+                    return Err(AppError::Forbidden);
+                }
+                field
+                    .file_name()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or("uploaded-backup.tar")
+                    .clone_into(&mut filename);
+                if !std::path::Path::new(&filename)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("tar"))
+                {
+                    return Err(AppError::BadRequest(
+                        "Choose a .tar backup archive.".to_owned(),
+                    ));
+                }
+                let path = state
+                    .paths
+                    .tmp_dir
+                    .join(format!("restore-upload-{}.tar", Uuid::new_v4().simple()));
+                write_multipart_field_to_file(field, &path).await?;
+                archive_path = Some(path);
+            }
+            _ => {}
+        }
+    }
+    if !csrf_validated {
+        return Err(AppError::Forbidden);
+    }
+    Ok(ParsedRestoreUpload {
+        archive_path: archive_path.ok_or_else(|| {
+            AppError::BadRequest("Choose a backup archive to restore.".to_owned())
+        })?,
+        filename,
+        include_tor_keys,
+        confirmation,
+    })
+}
+
+async fn write_multipart_field_to_file(
+    mut field: axum::extract::multipart::Field<'_>,
+    path: &std::path::Path,
+) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut output = tokio::fs::File::create(path).await?;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?
+    {
+        output.write_all(&chunk).await?;
+    }
+    output.flush().await?;
+    Ok(())
+}
+
+async fn backups_page(
+    state: &AppState,
+    user: &CurrentUser,
+    csrf: &str,
+    notice: Option<(&str, &str)>,
+) -> AppResult<Html<String>> {
+    let settings = load_deep_settings(state)?;
+    let archives = backup::list_backups(&state.paths)?;
+    let notice_html =
+        notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
+    let body = format!(
+        "{}{}{}{}{}{}",
+        notice_html,
+        render::page_header(
+            "Backups",
+            "Create, download, schedule, and restore full-site runtime backups."
+        ),
+        render_manual_backup_panel(csrf, &settings),
+        render_automatic_backup_panel(csrf, &settings),
+        render_backup_history(&archives, backup::operation_in_progress(&state.paths)),
+        render_restore_panel(csrf),
+    );
     Ok(Html(
-        page_layout(&state, Some(&user), Some(&csrf), "Backup created", &body).await?,
+        page_layout(state, Some(user), Some(csrf), "Backups", &body).await?,
     ))
+}
+
+fn render_manual_backup_panel(csrf: &str, settings: &Settings) -> String {
+    let disabled = if settings.backup.enabled {
+        ""
+    } else {
+        " disabled"
+    };
+    format!(
+        r#"<section class="panel admin-card" data-testid="admin-card"><h2>Manual backup</h2><p class="muted">Archives are written under the private backup directory and are available only to admins.</p><form method="post" action="/admin/backups/create"><input type="hidden" name="csrf" value="{}"><label><input type="checkbox" name="include_tor_keys" value="true"> Include Tor onion-service private keys</label><p class="muted">Leave Tor keys unchecked unless the archive storage is encrypted and access-controlled.</p><button class="primary" type="submit"{disabled}>Create backup</button></form></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+    )
+}
+
+fn render_automatic_backup_panel(csrf: &str, settings: &Settings) -> String {
+    let values = admin::BackupSettingsValues::from_settings(settings);
+    format!(
+        r#"<section class="panel admin-card" data-testid="admin-card"><h2>Automatic backups</h2><form method="post" action="/admin/backups/settings" class="deep-settings-form"><input type="hidden" name="csrf" value="{}"><div class="deep-settings-field"><label for="backup-enabled">Backups enabled</label>{}</div><div class="deep-settings-field"><label for="backup-auto-enabled">Scheduled backups</label>{}</div><div class="deep-settings-field"><label for="backup-interval">Interval minutes</label><input id="backup-interval" name="automatic_interval_minutes" type="text" inputmode="numeric" pattern="[0-9]+" value="{}"></div><div class="deep-settings-field"><label for="backup-keep">Keep newest automatic backups</label><input id="backup-keep" name="retention_keep_last" type="text" inputmode="numeric" pattern="[0-9]+" value="{}"></div><div class="deep-settings-field"><label for="backup-age">Delete automatic backups older than days</label><input id="backup-age" name="retention_max_age_days" type="text" inputmode="numeric" pattern="[0-9]+" value="{}"><p class="muted field-help">Set 0 to disable age cleanup. Manual and pre-restore backups are not pruned.</p></div><div class="deep-settings-field"><label for="backup-auto-tor">Automatic backups include Tor keys</label>{}</div><button class="primary" type="submit">Save backup settings</button></form></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+        bool_select("backup-enabled", "enabled", values.enabled),
+        bool_select(
+            "backup-auto-enabled",
+            "automatic_enabled",
+            values.automatic_enabled
+        ),
+        values.automatic_interval_minutes,
+        values.retention_keep_last,
+        values.retention_max_age_days,
+        bool_select(
+            "backup-auto-tor",
+            "automatic_include_tor_keys",
+            values.automatic_include_tor_keys
+        ),
+    )
+}
+
+fn bool_select(id: &str, name: &str, value: bool) -> String {
+    let true_selected = if value { " selected" } else { "" };
+    let false_selected = if value { "" } else { " selected" };
+    format!(
+        r#"<select id="{}" name="{}"><option value="true"{true_selected}>true</option><option value="false"{false_selected}>false</option></select>"#,
+        html_escape::encode_double_quoted_attribute(id),
+        html_escape::encode_double_quoted_attribute(name),
+    )
+}
+
+fn render_backup_history(
+    archives: &[backup::BackupArchiveInfo],
+    operation_running: bool,
+) -> String {
+    let status = if archives.is_empty() {
+        r#"<p class="muted">No backups have been created yet.</p>"#.to_owned()
+    } else {
+        let rows = archives
+            .iter()
+            .take(20)
+            .map(|archive| {
+                let created = archive.created_at.as_deref().unwrap_or("unknown");
+                let tor_keys = archive
+                    .tor_keys_included
+                    .map_or("unknown", |included| if included { "included" } else { "excluded" });
+                let kind = if archive.automatic { "automatic" } else { "manual" };
+                let manifest = if archive.manifest_valid { "valid" } else { "unreadable" };
+                format!(
+                    r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a class="button-link" href="/admin/backups/download/{}">Download</a></td></tr>"#,
+                    html_escape::encode_text(&archive.filename),
+                    html_escape::encode_text(kind),
+                    html_escape::encode_text(created),
+                    format_bytes(archive.size),
+                    html_escape::encode_text(tor_keys),
+                    html_escape::encode_text(manifest),
+                    html_escape::encode_double_quoted_attribute(&archive.filename),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            r#"<table><thead><tr><th>Archive</th><th>Kind</th><th>Created</th><th>Size</th><th>Tor keys</th><th>Manifest</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table>"#
+        )
+    };
+    let running = if operation_running {
+        render::notice(
+            "info",
+            "A backup or restore operation is currently running.",
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<section class="panel admin-card" data-testid="admin-card"><h2>Recent backups</h2>{running}{status}</section>"#
+    )
+}
+
+fn render_restore_panel(csrf: &str) -> String {
+    format!(
+        r#"<section class="panel admin-card danger-zone" data-testid="admin-card"><h2>Danger area</h2><h3>Restore from upload</h3><p class="muted">Restore validates the manifest, hashes, paths, settings, and SQLite integrity in a staging directory before replacing live runtime files. A pre-restore safety backup is created first.</p><form method="post" action="/admin/backups/restore" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="backup-upload">Backup archive</label><input id="backup-upload" name="backup" type="file" accept=".tar" required><label><input type="checkbox" name="include_tor_keys" value="true"> Restore Tor onion-service private keys if present</label><label for="restore-confirm">Type RESTORE to confirm</label><input id="restore-confirm" name="restore_confirm" autocomplete="off" required><button class="danger" type="submit">Restore backup</button></form></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+    )
+}
+
+fn public_backup_error(prefix: &str, error: &anyhow::Error) -> String {
+    let detail = error.to_string();
+    if detail.contains('/') || detail.contains('\\') {
+        format!("{prefix}. Check the server logs for details.")
+    } else {
+        format!("{prefix}: {detail}")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        return format_scaled_bytes(bytes, GIB, "GiB");
+    }
+    if bytes >= MIB {
+        return format_scaled_bytes(bytes, MIB, "MiB");
+    }
+    if bytes >= KIB {
+        return format_scaled_bytes(bytes, KIB, "KiB");
+    }
+    format!("{bytes} B")
+}
+
+fn format_scaled_bytes(bytes: u64, unit: u64, suffix: &str) -> String {
+    let tenths = u128::from(bytes) * 10 / u128::from(unit);
+    format!("{}.{:01} {suffix}", tenths / 10, tenths % 10)
 }
 
 fn small_form(action: &str, csrf: &str, label: &str, title: &str) -> String {
@@ -4177,7 +4631,6 @@ mod tests {
     use flate2::read::GzDecoder;
     use std::io::Read as _;
     use std::path::PathBuf;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     struct TestServer {
         base_url: String,
@@ -8622,7 +9075,9 @@ mod tests {
 
     async fn spawn_test_server_inner(create_admin: bool, settings: Settings) -> TestServer {
         let temp = tempfile::tempdir().expect("temp dir");
-        let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf());
+        let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf())
+            .with_tor_data_dir(&settings.tor.data_dir)
+            .with_backup_dir(&settings.backup.backup_dir);
         paths.ensure().expect("paths");
         crate::config::write_default_if_missing(&paths.settings_path).expect("settings");
         std::fs::write(

@@ -1,10 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::{Connection, OptionalExtension as _, Row, params, params_from_iter};
 
 use crate::config::Settings;
 use crate::db::SqlitePool;
 use crate::validation::clean_post_text;
+use crate::youtube::YoutubeEmbed;
 
 #[derive(Debug, Clone)]
 pub struct AccountView {
@@ -46,6 +47,7 @@ pub struct PostView {
     pub reposted_at: Option<String>,
     pub quote: Option<QuotePreview>,
     pub media: Vec<MediaView>,
+    pub youtube_embeds: Vec<YoutubeEmbed>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +242,7 @@ pub async fn create_post(
         anyhow::bail!("too many media attachments");
     }
     let text = clean_post_text(text, settings.posts.max_text_chars, media_ids.len())?;
+    let youtube_embeds = crate::youtube::metadata_for_text(&text).await;
     let allow_mentions = settings.posts.allow_mentions;
     let media_ids = media_ids.to_vec();
     pool.call(move |conn| {
@@ -265,6 +268,7 @@ pub async fn create_post(
             params![user_id, anonymous_label, text, parent_post_id, root_post_id],
         )?;
         let post_id = tx.last_insert_rowid();
+        replace_youtube_embeds_tx(&tx, post_id, &youtube_embeds)?;
         for (position, media_id) in media_ids.iter().enumerate() {
             tx.execute(
                 "INSERT INTO post_media (post_id, media_id, position) VALUES (?, ?, ?)",
@@ -302,24 +306,24 @@ pub async fn edit_post(
     let max_text_chars = settings.posts.max_text_chars;
     let edit_window_modifier = edit_window_modifier(settings.posts.post_edit_window_seconds);
     let raw_text = text.to_owned();
-    pool.call(move |conn| {
-        let result: Result<bool, EditPostError> = (|| {
-            let tx = conn.transaction()?;
-            let row = tx
+    let edit_window_for_check = edit_window_modifier.clone();
+    let row = pool
+        .call(move |conn| {
+            let row = conn
                 .query_row(
                     r#"
-                    SELECT p.user_id, p.text,
-                      CASE
-                        WHEN ? IS NULL THEN 0
-                        ELSE p.created_at >= datetime('now', ?)
-                      END AS within_window,
-                      (SELECT COUNT(*) FROM post_media WHERE post_id = p.id) AS media_count
-                    FROM posts p
-                    WHERE p.id = ? AND p.is_deleted = 0
-                    "#,
+                SELECT p.user_id, p.text,
+                  CASE
+                    WHEN ? IS NULL THEN 0
+                    ELSE p.created_at >= datetime('now', ?)
+                  END AS within_window,
+                  (SELECT COUNT(*) FROM post_media WHERE post_id = p.id) AS media_count
+                FROM posts p
+                WHERE p.id = ? AND p.is_deleted = 0
+                "#,
                     params![
-                        edit_window_modifier.clone(),
-                        edit_window_modifier,
+                        edit_window_for_check.clone(),
+                        edit_window_for_check,
                         post_id
                     ],
                     |row| {
@@ -332,30 +336,63 @@ pub async fn edit_post(
                     },
                 )
                 .optional()?;
-            let Some((owner, current_text, within_window, media_count)) = row else {
-                return Err(EditPostError::NotFound);
+            let existing_youtube_embeds = if row.is_some() {
+                youtube_embeds_for_post_conn(conn, post_id)?
+            } else {
+                Vec::new()
             };
-            if owner != Some(user_id) {
-                return Err(EditPostError::Forbidden);
-            }
-            if !within_window {
-                return Err(EditPostError::WindowExpired);
-            }
-            let media_count = usize::try_from(media_count).unwrap_or(usize::MAX);
-            let text = clean_post_text(&raw_text, max_text_chars, media_count)
-                .map_err(|err| EditPostError::Validation(err.to_string()))?;
-            if text == current_text {
-                tx.commit()?;
-                return Ok(false);
-            }
-            tx.execute(
-                "UPDATE posts SET text = ?, edited_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ? AND is_deleted = 0",
-                params![text, post_id, user_id],
-            )?;
+            Ok(row.map(|(owner, text, within_window, media_count)| {
+                (
+                    owner,
+                    text,
+                    within_window,
+                    media_count,
+                    existing_youtube_embeds,
+                )
+            }))
+        })
+        .await
+        .map_err(|err| EditPostError::Database(err.to_string()))?;
+    let Some((owner, current_text, within_window, media_count, existing_youtube_embeds)) = row
+    else {
+        return Err(EditPostError::NotFound);
+    };
+    if owner != Some(user_id) {
+        return Err(EditPostError::Forbidden);
+    }
+    if !within_window {
+        return Err(EditPostError::WindowExpired);
+    }
+    let media_count = usize::try_from(media_count).unwrap_or(usize::MAX);
+    let text = clean_post_text(&raw_text, max_text_chars, media_count)
+        .map_err(|err| EditPostError::Validation(err.to_string()))?;
+    if text == current_text {
+        return Ok(false);
+    }
+    let mut youtube_embeds = crate::youtube::embeds_for_text(&text);
+    reuse_stored_youtube_metadata(&mut youtube_embeds, &existing_youtube_embeds);
+    let youtube_embeds = crate::youtube::metadata_for_embeds(youtube_embeds).await;
+    pool.call(move |conn| {
+        let tx = conn.transaction()?;
+        let Some(edit_window_modifier) = edit_window_modifier else {
             tx.commit()?;
-            Ok(true)
-        })();
-        Ok(result)
+            return Ok(Err(EditPostError::WindowExpired));
+        };
+        let changed = tx.execute(
+            r#"
+            UPDATE posts
+            SET text = ?, edited_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND user_id = ? AND is_deleted = 0 AND created_at >= datetime('now', ?)
+            "#,
+            params![text, post_id, user_id, edit_window_modifier],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(Err(EditPostError::WindowExpired));
+        }
+        replace_youtube_embeds_tx(&tx, post_id, &youtube_embeds)?;
+        tx.commit()?;
+        Ok(Ok(true))
     })
     .await
     .map_err(|err| EditPostError::Database(err.to_string()))?
@@ -547,6 +584,34 @@ pub async fn create_quote_post(
     text: &str,
 ) -> anyhow::Result<QuotePostOutcome> {
     let text = clean_post_text(text, settings.posts.max_text_chars, 0)?;
+    let duplicate_text = text.clone();
+    let existing_post_id = pool
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            ensure_quote_target_accessible_tx(&tx, user_id, quote_post_id)?;
+            let existing_post_id = tx
+                .query_row(
+                    r#"
+                    SELECT id FROM posts
+                    WHERE user_id = ? AND quote_post_id = ? AND text = ? AND is_deleted = 0
+                    ORDER BY id DESC LIMIT 1
+                    "#,
+                    params![user_id, quote_post_id, duplicate_text],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            tx.commit()?;
+            Ok(existing_post_id)
+        })
+        .await?;
+    if let Some(post_id) = existing_post_id {
+        return Ok(QuotePostOutcome {
+            post_id,
+            created: false,
+        });
+    }
+
+    let youtube_embeds = crate::youtube::metadata_for_text(&text).await;
     let allow_mentions = settings.posts.allow_mentions;
     pool.call(move |conn| {
         let tx = conn.transaction()?;
@@ -569,6 +634,7 @@ pub async fn create_quote_post(
             )?
         };
         if changed > 0 {
+            replace_youtube_embeds_tx(&tx, post_id, &youtube_embeds)?;
             let quote_owner = notify_post_owner_tx(
                 &tx,
                 quote_post_id,
@@ -1960,7 +2026,7 @@ async fn repost_events(
 
 fn media_surface_condition(post_id_column: &str, text_column: &str) -> String {
     format!(
-        "(EXISTS (SELECT 1 FROM post_media pm WHERE pm.post_id = {post_id_column}) OR instr(lower({text_column}), 'youtube.com/') > 0 OR instr(lower({text_column}), 'youtu.be/') > 0)"
+        "(EXISTS (SELECT 1 FROM post_media pm WHERE pm.post_id = {post_id_column}) OR EXISTS (SELECT 1 FROM post_embeds pe WHERE pe.post_id = {post_id_column} AND pe.provider = 'youtube') OR instr(lower({text_column}), 'youtube.com/') > 0 OR instr(lower({text_column}), 'youtu.be/') > 0 OR instr(lower({text_column}), 'youtube-nocookie.com/') > 0)"
     )
 }
 
@@ -2038,6 +2104,11 @@ async fn rows_to_posts(
         } else {
             media_for_post(pool, id).await?
         };
+        let youtube_embeds = if original_unavailable {
+            Vec::new()
+        } else {
+            youtube_embeds_for_post(pool, id).await?
+        };
         let viewer_liked = if let Some(user_id) = viewer_id {
             !original_unavailable && relation_exists(pool, "likes", user_id, id).await?
         } else {
@@ -2094,6 +2165,7 @@ async fn rows_to_posts(
             reposted_at: row.repost_created_at,
             quote,
             media,
+            youtube_embeds,
         });
     }
     Ok(posts)
@@ -2270,6 +2342,95 @@ async fn media_for_post(pool: &SqlitePool, post_id: i64) -> anyhow::Result<Vec<M
         Ok(rows)
     })
     .await
+}
+
+async fn youtube_embeds_for_post(
+    pool: &SqlitePool,
+    post_id: i64,
+) -> anyhow::Result<Vec<YoutubeEmbed>> {
+    pool.call(move |conn| youtube_embeds_for_post_conn(conn, post_id).map_err(Into::into))
+        .await
+}
+
+fn youtube_embeds_for_post_conn(
+    conn: &Connection,
+    post_id: i64,
+) -> rusqlite::Result<Vec<YoutubeEmbed>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT video_id, title
+        FROM post_embeds
+        WHERE post_id = ? AND provider = 'youtube'
+        ORDER BY position ASC, id ASC
+        "#,
+    )?;
+    let rows = stmt
+        .query_map([post_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(video_id, title)| crate::youtube::embed_from_stored(&video_id, title))
+        .collect())
+}
+
+fn reuse_stored_youtube_metadata(embeds: &mut [YoutubeEmbed], stored: &[YoutubeEmbed]) {
+    let stored_titles = stored
+        .iter()
+        .filter_map(|embed| {
+            embed
+                .title
+                .as_deref()
+                .map(|title| (embed.video_id.as_str(), title))
+        })
+        .collect::<HashMap<_, _>>();
+    for embed in embeds {
+        if let Some(title) = stored_titles.get(embed.video_id.as_str()) {
+            embed.title = Some((*title).to_owned());
+        }
+    }
+}
+
+fn replace_youtube_embeds_tx(
+    tx: &rusqlite::Transaction<'_>,
+    post_id: i64,
+    embeds: &[YoutubeEmbed],
+) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM post_embeds WHERE post_id = ?", [post_id])?;
+    for (position, embed) in embeds.iter().enumerate() {
+        let position = i64::try_from(position)?;
+        let title = embed.title.as_deref();
+        tx.execute(
+            r#"
+            INSERT INTO post_embeds (
+                post_id,
+                provider,
+                video_id,
+                original_url,
+                canonical_url,
+                title,
+                thumbnail_url,
+                embed_url,
+                position,
+                fetched_at
+            )
+            VALUES (?, 'youtube', ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END)
+            "#,
+            params![
+                post_id,
+                &embed.video_id,
+                &embed.source_url,
+                &embed.canonical_url,
+                title,
+                &embed.thumbnail_url,
+                &embed.embed_url,
+                position,
+                title
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn notify_post_owner_tx(
@@ -2632,6 +2793,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn youtube_embeds_are_normalized_and_stored_on_create() {
+        let (pool, settings, alice, _bob) = fixture().await;
+        let post = crate::youtube::with_test_oembed_fetcher(
+            |video_id| {
+                assert_eq!(video_id, "dQw4w9WgXcQ");
+                Some("Fetched <Title>".to_owned())
+            },
+            create_post(
+                &pool,
+                &settings,
+                Some(alice),
+                "clip https://youtu.be/dQw4w9WgXcQ?t=12",
+                None,
+                &[],
+            ),
+        )
+        .await
+        .expect("post");
+
+        let stored: (String, String, String, String, Option<String>) = pool
+            .call(move |conn| {
+                conn.query_row(
+                    r#"
+                    SELECT video_id, canonical_url, thumbnail_url, embed_url, title
+                    FROM post_embeds
+                    WHERE post_id = ? AND provider = 'youtube'
+                    "#,
+                    [post],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("stored embed");
+        let timeline_posts = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("timeline");
+        let rendered_post = timeline_posts
+            .iter()
+            .find(|timeline_post| timeline_post.id == post)
+            .expect("post in timeline");
+
+        assert_eq!(stored.0, "dQw4w9WgXcQ");
+        assert_eq!(stored.1, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        assert_eq!(stored.2, "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg");
+        assert_eq!(
+            stored.3,
+            "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ"
+        );
+        assert_eq!(stored.4.as_deref(), Some("Fetched <Title>"));
+        assert_eq!(rendered_post.youtube_embeds.len(), 1);
+        assert_eq!(rendered_post.youtube_embeds[0].video_id, "dQw4w9WgXcQ");
+        assert_eq!(
+            rendered_post.youtube_embeds[0].display_title(),
+            "Fetched <Title>"
+        );
+    }
+
+    #[tokio::test]
+    async fn posting_youtube_embed_succeeds_when_metadata_fetch_fails() {
+        let (pool, settings, alice, _bob) = fixture().await;
+        let post = crate::youtube::with_test_oembed_fetcher(
+            |_video_id| None,
+            create_post(
+                &pool,
+                &settings,
+                Some(alice),
+                "clip https://youtu.be/dQw4w9WgXcQ",
+                None,
+                &[],
+            ),
+        )
+        .await
+        .expect("post");
+
+        let stored_title: Option<String> = pool
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT title FROM post_embeds WHERE post_id = ? AND provider = 'youtube'",
+                    [post],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("stored title");
+        let timeline_posts = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("timeline");
+        let rendered_post = timeline_posts
+            .iter()
+            .find(|timeline_post| timeline_post.id == post)
+            .expect("post in timeline");
+
+        assert_eq!(stored_title, None);
+        assert_eq!(rendered_post.youtube_embeds.len(), 1);
+        assert_eq!(
+            rendered_post.youtube_embeds[0].display_title(),
+            crate::youtube::FALLBACK_TITLE
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_youtube_like_urls_do_not_store_embeds() {
+        let (pool, settings, alice, _bob) = fixture().await;
+        let post = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "spoof https://youtube.com.evil/watch?v=dQw4w9WgXcQ",
+            None,
+            &[],
+        )
+        .await
+        .expect("post");
+
+        let count: i64 = pool
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM post_embeds WHERE post_id = ?",
+                    [post],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("embed count");
+
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn editing_post_replaces_youtube_embed_rows() {
+        let (pool, settings, alice, _bob) = fixture().await;
+        let post = crate::youtube::with_test_oembed_fetcher(
+            |_video_id| None,
+            create_post(
+                &pool,
+                &settings,
+                Some(alice),
+                "first https://youtu.be/dQw4w9WgXcQ",
+                None,
+                &[],
+            ),
+        )
+        .await
+        .expect("post");
+
+        let changed = crate::youtube::with_test_oembed_fetcher(
+            |_video_id| None,
+            edit_post(
+                &pool,
+                &settings,
+                alice,
+                post,
+                "second https://www.youtube.com/shorts/aaaaaaaaaaa",
+            ),
+        )
+        .await
+        .expect("edit");
+        let rows: Vec<String> = pool
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT video_id FROM post_embeds WHERE post_id = ? ORDER BY position",
+                )?;
+                let rows = stmt
+                    .query_map([post], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .expect("embed rows");
+
+        assert!(changed);
+        assert_eq!(rows, vec!["aaaaaaaaaaa".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn editing_post_reuses_stored_youtube_title_for_same_video() {
+        let (pool, settings, alice, _bob) = fixture().await;
+        let post = crate::youtube::with_test_oembed_fetcher(
+            |_video_id| Some("Stored Title".to_owned()),
+            create_post(
+                &pool,
+                &settings,
+                Some(alice),
+                "first https://youtu.be/dQw4w9WgXcQ",
+                None,
+                &[],
+            ),
+        )
+        .await
+        .expect("post");
+
+        let changed = crate::youtube::with_test_oembed_fetcher(
+            |_video_id| panic!("metadata should not be refetched for an unchanged video id"),
+            edit_post(
+                &pool,
+                &settings,
+                alice,
+                post,
+                "second https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            ),
+        )
+        .await
+        .expect("edit");
+        let title: Option<String> = pool
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT title FROM post_embeds WHERE post_id = ? AND provider = 'youtube'",
+                    [post],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("stored title");
+
+        assert!(changed);
+        assert_eq!(title.as_deref(), Some("Stored Title"));
+    }
+
+    #[tokio::test]
     async fn muted_users_can_be_listed_and_removed() {
         let (pool, _settings, alice, bob) = fixture().await;
 
@@ -2773,6 +3165,55 @@ mod tests {
             .find(|event| event.event_kind == TimelineEventKind::Post && event.id == original)
             .expect("original post");
         assert_eq!(original_post.repost_count, 1);
+    }
+
+    #[tokio::test]
+    async fn quote_post_succeeds_when_youtube_metadata_fetch_fails() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(&pool, &settings, Some(alice), "original", None, &[])
+            .await
+            .expect("original");
+
+        let quote = crate::youtube::with_test_oembed_fetcher(
+            |_video_id| None,
+            create_quote_post(
+                &pool,
+                &settings,
+                bob,
+                original,
+                "context https://youtu.be/dQw4w9WgXcQ",
+            ),
+        )
+        .await
+        .expect("quote");
+        let duplicate = crate::youtube::with_test_oembed_fetcher(
+            |_video_id| panic!("duplicate quote should not refetch YouTube metadata"),
+            create_quote_post(
+                &pool,
+                &settings,
+                bob,
+                original,
+                "context https://youtu.be/dQw4w9WgXcQ",
+            ),
+        )
+        .await
+        .expect("duplicate quote");
+        let stored_title: Option<String> = pool
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT title FROM post_embeds WHERE post_id = ? AND provider = 'youtube'",
+                    [quote.post_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("stored title");
+
+        assert!(quote.created);
+        assert!(!duplicate.created);
+        assert_eq!(duplicate.post_id, quote.post_id);
+        assert_eq!(stored_title, None);
     }
 
     #[tokio::test]

@@ -32,12 +32,31 @@ pub struct StartupDashboard<'a> {
     pub paths: &'a runtime::RuntimePaths,
     pub settings_path: &'a Path,
     pub settings: &'a config::Settings,
+    pub schema_version: Option<i64>,
+    pub schema_compatible: bool,
+    pub schema_summary: &'a str,
     pub admin_count: i64,
     pub user_count: i64,
     pub post_count: i64,
     pub ffmpeg: &'a ffmpeg::FfmpegStatus,
     pub tor_status: &'a tor::TorStatus,
     pub onion_target: Option<SocketAddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatabaseSchemaStatus {
+    Missing,
+    Adoptable {
+        summary: String,
+    },
+    Present {
+        version: Option<i64>,
+        compatible: bool,
+        summary: String,
+    },
+    Unreadable {
+        error: String,
+    },
 }
 
 #[must_use]
@@ -49,6 +68,7 @@ pub fn render_startup_dashboard(input: &StartupDashboard<'_>) -> String {
         "Status",
         &[
             row("Version", env!("CARGO_PKG_VERSION")),
+            row("DB schema", schema_status_value(input)),
             row(
                 "Server",
                 status_value(Status::Pending, &bind_address(&input.settings.server)),
@@ -110,6 +130,7 @@ pub fn render_check(
     settings: &config::Settings,
     ffmpeg: &ffmpeg::FfmpegStatus,
     tor_status: &tor::TorStatus,
+    database_schema: &DatabaseSchemaStatus,
 ) -> String {
     let mut out = String::with_capacity(512);
     push_header(&mut out, "RustPost configuration check");
@@ -118,6 +139,7 @@ pub fn render_check(
         "Result",
         &[
             row("Configuration", status_value(Status::Ok, "valid")),
+            row("DB schema", database_schema_status_value(database_schema)),
             row("Bind address", bind_address(&settings.server)),
             row("Public URL", public_url(settings)),
             row(
@@ -394,6 +416,51 @@ fn ffmpeg_status_value(ffmpeg: &ffmpeg::FfmpegStatus) -> String {
     }
 }
 
+fn schema_status_value(input: &StartupDashboard<'_>) -> String {
+    let summary = schema_status_summary(
+        input.schema_version,
+        input.schema_compatible,
+        input.schema_summary,
+    );
+    if input.schema_compatible {
+        status_value(Status::Ok, &summary)
+    } else {
+        status_value(Status::Warn, &summary)
+    }
+}
+
+fn database_schema_status_value(status: &DatabaseSchemaStatus) -> String {
+    match status {
+        DatabaseSchemaStatus::Missing => status_value(Status::Pending, "not created yet"),
+        DatabaseSchemaStatus::Adoptable { summary } => status_value(Status::Ok, summary),
+        DatabaseSchemaStatus::Present {
+            version,
+            compatible,
+            summary,
+        } => {
+            let summary = schema_status_summary(*version, *compatible, summary);
+            if *compatible {
+                status_value(Status::Ok, &summary)
+            } else {
+                status_value(Status::Warn, &summary)
+            }
+        }
+        DatabaseSchemaStatus::Unreadable { error } => {
+            status_value(Status::Warn, &format!("unreadable; {error}"))
+        }
+    }
+}
+
+fn schema_status_summary(version: Option<i64>, compatible: bool, summary: &str) -> String {
+    if compatible {
+        return version.map_or_else(
+            || summary.to_owned(),
+            |version| format!("version {version}; {summary}"),
+        );
+    }
+    summary.to_owned()
+}
+
 fn status_value(status: Status, value: &str) -> String {
     format!("{} {value}", status.label())
 }
@@ -463,6 +530,9 @@ mod tests {
             paths: &paths,
             settings_path: &paths.settings_path,
             settings: &settings,
+            schema_version: Some(1),
+            schema_compatible: true,
+            schema_summary: "release baseline schema version 1",
             admin_count: 0,
             user_count: 2,
             post_count: 3,
@@ -472,6 +542,8 @@ mod tests {
         });
 
         assert!(output.contains("Status"));
+        assert!(output.contains("DB schema"));
+        assert!(output.contains("release baseline schema version 1"));
         assert!(output.contains("Endpoints"));
         assert!(output.contains("Storage"));
         assert!(output.contains("Next commands"));
@@ -488,6 +560,57 @@ mod tests {
         )));
         assert!(output.contains("FFmpeg"));
         assert!(output.contains("[WARN] unavailable"));
+    }
+
+    #[test]
+    fn check_output_reports_database_schema_status() {
+        let settings = Settings::default();
+        let ffmpeg = FfmpegStatus {
+            available: false,
+            version: String::new(),
+            supports_webp: false,
+            supports_vp9: false,
+            error: Some("ffmpeg command not found".to_owned()),
+        };
+        let tor_status = tor::validate_startup(&settings.tor);
+        let output = render_check(
+            &settings,
+            &ffmpeg,
+            &tor_status,
+            &DatabaseSchemaStatus::Present {
+                version: Some(1),
+                compatible: true,
+                summary: "release baseline schema version 1".to_owned(),
+            },
+        );
+
+        assert!(output.contains("DB schema"));
+        assert!(output.contains("[OK] version 1; release baseline schema version 1"));
+    }
+
+    #[test]
+    fn check_output_avoids_internal_alpha_version_wording() {
+        let settings = Settings::default();
+        let ffmpeg = FfmpegStatus {
+            available: true,
+            version: "ffmpeg 8.1.1".to_owned(),
+            supports_webp: true,
+            supports_vp9: true,
+            error: None,
+        };
+        let tor_status = tor::validate_startup(&settings.tor);
+        let output = render_check(
+            &settings,
+            &ffmpeg,
+            &tor_status,
+            &DatabaseSchemaStatus::Adoptable {
+                summary: "pre-release database structurally matches the release baseline; startup will mark it as release baseline schema version 1 without data loss".to_owned(),
+            },
+        );
+
+        assert!(output.contains("release baseline schema version 1"));
+        assert!(!output.contains("version 13"));
+        assert!(!output.contains("version 12"));
     }
 
     #[test]

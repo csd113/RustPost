@@ -17,6 +17,7 @@ pub struct Settings {
     pub tor: TorSettings,
     pub moderation: ModerationSettings,
     pub admin: AdminSettings,
+    #[serde(default)]
     pub backup: BackupSettings,
 }
 
@@ -120,8 +121,34 @@ pub struct AdminSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupSettings {
+    #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
     pub backup_dir: String,
+    #[serde(default)]
+    pub automatic_enabled: bool,
+    #[serde(default = "default_automatic_interval_minutes")]
+    pub automatic_interval_minutes: u64,
+    #[serde(default = "default_retention_keep_last")]
+    pub retention_keep_last: usize,
+    #[serde(default = "default_retention_max_age_days")]
+    pub retention_max_age_days: u64,
+    #[serde(default)]
+    pub automatic_include_tor_keys: bool,
+}
+
+impl Default for BackupSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backup_dir: "backups".to_owned(),
+            automatic_enabled: false,
+            automatic_interval_minutes: default_automatic_interval_minutes(),
+            retention_keep_last: default_retention_keep_last(),
+            retention_max_age_days: default_retention_max_age_days(),
+            automatic_include_tor_keys: false,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -204,10 +231,7 @@ impl Default for Settings {
             admin: AdminSettings {
                 create_admin_on_first_boot: true,
             },
-            backup: BackupSettings {
-                enabled: true,
-                backup_dir: "backups".to_owned(),
-            },
+            backup: BackupSettings::default(),
         }
     }
 }
@@ -228,6 +252,18 @@ impl Settings {
         }
         validate_relative_path(&self.tor.data_dir, "tor.data_dir")?;
         validate_relative_path(&self.backup.backup_dir, "backup.backup_dir")?;
+        if self.backup.automatic_interval_minutes == 0 {
+            anyhow::bail!("backup.automatic_interval_minutes must be at least 1");
+        }
+        if self.backup.retention_keep_last == 0 {
+            anyhow::bail!("backup.retention_keep_last must be at least 1");
+        }
+        if self.backup.retention_keep_last > 10_000 {
+            anyhow::bail!("backup.retention_keep_last is too large");
+        }
+        if self.backup.retention_max_age_days > 3_650 {
+            anyhow::bail!("backup.retention_max_age_days must be 3650 days or less");
+        }
         if self.tor.tor_only && !self.tor.enabled {
             anyhow::bail!("tor.tor_only requires tor.enabled");
         }
@@ -484,6 +520,23 @@ enabled = {backup_enabled}
 
 # SECURITY: Relative directory for backup archives under the RustPost data directory.
 backup_dir = {backup_dir}
+
+# Create scheduled automatic backups. Manual backups remain available when backup.enabled is true.
+automatic_enabled = {backup_automatic_enabled}
+
+# Interval between automatic backup attempts. The scheduler checks periodically and runs when due.
+automatic_interval_minutes = {backup_automatic_interval_minutes}
+
+# Safe retention for automatic backups. Manual and pre-restore backups are never pruned.
+retention_keep_last = {backup_retention_keep_last}
+
+# Delete automatic backups older than this many days after retaining the newest backups.
+# Set 0 to disable age-based cleanup.
+retention_max_age_days = {backup_retention_max_age_days}
+
+# SECURITY: Include onion service keys in automatic backups.
+# Keep false unless automatic backup storage is encrypted and access-controlled.
+automatic_include_tor_keys = {backup_automatic_include_tor_keys}
 "#,
         site_name = toml_string(&settings.site.name),
         server_host = toml_string(&settings.server.host),
@@ -542,6 +595,11 @@ backup_dir = {backup_dir}
         create_admin_on_first_boot = settings.admin.create_admin_on_first_boot,
         backup_enabled = settings.backup.enabled,
         backup_dir = toml_string(&settings.backup.backup_dir),
+        backup_automatic_enabled = settings.backup.automatic_enabled,
+        backup_automatic_interval_minutes = settings.backup.automatic_interval_minutes,
+        backup_retention_keep_last = settings.backup.retention_keep_last,
+        backup_retention_max_age_days = settings.backup.retention_max_age_days,
+        backup_automatic_include_tor_keys = settings.backup.automatic_include_tor_keys,
     )
 }
 
@@ -620,6 +678,18 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_automatic_interval_minutes() -> u64 {
+    1_440
+}
+
+const fn default_retention_keep_last() -> usize {
+    10
+}
+
+const fn default_retention_max_age_days() -> u64 {
+    30
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +752,47 @@ mod tests {
             DEFAULT_POST_EDIT_WINDOW_SECONDS
         );
         parsed.validate().expect("defaulted setting validates");
+    }
+
+    #[test]
+    fn missing_backup_schedule_settings_default_safely_disabled() {
+        let raw = toml::to_string(&Settings::default())
+            .expect("settings toml")
+            .lines()
+            .filter(|line| {
+                ![
+                    "automatic_enabled",
+                    "automatic_interval_minutes",
+                    "retention_keep_last",
+                    "retention_max_age_days",
+                    "automatic_include_tor_keys",
+                ]
+                .iter()
+                .any(|key| line.trim_start().starts_with(key))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Settings = toml::from_str(&raw).expect("legacy backup settings parse");
+
+        assert!(!parsed.backup.automatic_enabled);
+        assert_eq!(parsed.backup.automatic_interval_minutes, 1_440);
+        assert_eq!(parsed.backup.retention_keep_last, 10);
+        assert_eq!(parsed.backup.retention_max_age_days, 30);
+        assert!(!parsed.backup.automatic_include_tor_keys);
+        parsed
+            .validate()
+            .expect("defaulted backup settings validate");
+    }
+
+    #[test]
+    fn rejects_unsafe_backup_retention_settings() {
+        let mut settings = Settings::default();
+        settings.backup.automatic_interval_minutes = 0;
+        assert!(settings.validate().is_err());
+
+        let mut settings = Settings::default();
+        settings.backup.retention_keep_last = 0;
+        assert!(settings.validate().is_err());
     }
 
     #[test]

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased - First-Release Database Baseline
+
+### Database Lineage
+- Squashed the pre-release internal migration chain into a clean first-release SQLite schema baseline at database schema version `1`.
+- Fresh databases are now initialized directly from the baseline instead of replaying alpha development migrations.
+- Existing current alpha databases that structurally match the baseline are marked as baseline version `1` without destructive changes or data loss.
+- Incomplete, unknown, or structurally unsafe pre-release databases now fail closed with administrator guidance to back up/export/recreate/restore instead of attempting blind migration.
+- Added stricter schema diagnostics for required tables, columns, indexes, and triggers so startup, backups, restores, and admin health can report incompatible or corrupt database structure clearly.
+- `check` now reports database schema status without creating or migrating the database during diagnostics.
+- Future post-release database changes should use normal forward migrations after baseline version `1`; released migration history must not be squashed or rewritten after the first public release.
+
 ## v0.1.6 - Pinned Profiles
 
 ### Profiles and Timelines
@@ -19,8 +30,11 @@
 
 ### Admin, Settings, and Operations
 - Added `posts.post_edit_window_seconds` to settings and deep server settings, including validation from `0` to `300` seconds.
-- Added an admin backups page for creating backup archives from the web UI.
-- Refactored the backup restore workflow around staged extraction and clearer restore handling.
+- Rebuilt backup archives around deterministic tar output plus `manifest.toml` with RustPost version, DB schema version, component paths, sizes, SHA-256 hashes, timestamps, and Tor-key inclusion state.
+- Added full-site backup coverage for SQLite, settings, media variants, thumbnails/transcodes, assets, required runtime directories, and opt-in Tor onion-service keys.
+- Added admin backup creation, admin-only archive downloads, restore-from-upload with confirmation, automatic backup settings, safe retention controls, and recent backup history/status.
+- Added scheduled automatic backups, disabled by default, with settings.toml/admin configuration and retention that only prunes automatic archives.
+- Hardened restore with staged extraction, manifest/hash verification, SQLite integrity and schema checks, hostile path rejection, pre-restore safety backups, rollback on install failure, operation locking, and strict restored Tor-key permissions.
 
 ### Privacy, Security, and UI Fixes
 - Hardened mention suggestions so wildcard characters cannot broaden searches and unavailable or hidden users stay excluded.

@@ -7,7 +7,7 @@ use rusqlite::{Row, params, params_from_iter};
 use serde::Deserialize;
 
 use crate::auth;
-use crate::config::{MAX_POST_EDIT_WINDOW_SECONDS, Settings};
+use crate::config::{BackupSettings, MAX_POST_EDIT_WINDOW_SECONDS, Settings};
 use crate::db::SqlitePool;
 
 const MIB: u64 = 1024 * 1024;
@@ -110,6 +110,27 @@ pub struct DeepSettingsChange {
     pub label: &'static str,
     pub old_value: String,
     pub new_value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackupSettingsForm {
+    pub csrf: String,
+    pub enabled: String,
+    pub automatic_enabled: String,
+    pub automatic_interval_minutes: String,
+    pub retention_keep_last: String,
+    pub retention_max_age_days: String,
+    pub automatic_include_tor_keys: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupSettingsValues {
+    pub enabled: bool,
+    pub automatic_enabled: bool,
+    pub automatic_interval_minutes: u64,
+    pub retention_keep_last: usize,
+    pub retention_max_age_days: u64,
+    pub automatic_include_tor_keys: bool,
 }
 
 impl DeepSettingsField {
@@ -442,6 +463,60 @@ impl DeepSettingsValues {
     }
 }
 
+impl BackupSettingsValues {
+    #[must_use]
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            enabled: settings.backup.enabled,
+            automatic_enabled: settings.backup.automatic_enabled,
+            automatic_interval_minutes: settings.backup.automatic_interval_minutes,
+            retention_keep_last: settings.backup.retention_keep_last,
+            retention_max_age_days: settings.backup.retention_max_age_days,
+            automatic_include_tor_keys: settings.backup.automatic_include_tor_keys,
+        }
+    }
+
+    #[must_use]
+    pub fn apply_to(&self, current: &Settings) -> Settings {
+        let mut updated = current.clone();
+        updated.backup = BackupSettings {
+            enabled: self.enabled,
+            backup_dir: current.backup.backup_dir.clone(),
+            automatic_enabled: self.automatic_enabled,
+            automatic_interval_minutes: self.automatic_interval_minutes,
+            retention_keep_last: self.retention_keep_last,
+            retention_max_age_days: self.retention_max_age_days,
+            automatic_include_tor_keys: self.automatic_include_tor_keys,
+        };
+        updated
+    }
+}
+
+pub fn parse_backup_settings_form(
+    form: &BackupSettingsForm,
+    current: &Settings,
+) -> anyhow::Result<BackupSettingsValues> {
+    let values = BackupSettingsValues {
+        enabled: parse_named_bool(&form.enabled, "Backups enabled")?,
+        automatic_enabled: parse_named_bool(&form.automatic_enabled, "Automatic backups enabled")?,
+        automatic_interval_minutes: parse_named_u64(
+            &form.automatic_interval_minutes,
+            "Automatic backup interval",
+        )?,
+        retention_keep_last: parse_named_usize(&form.retention_keep_last, "Backups to keep")?,
+        retention_max_age_days: parse_named_u64(
+            &form.retention_max_age_days,
+            "Maximum automatic backup age",
+        )?,
+        automatic_include_tor_keys: parse_named_bool(
+            &form.automatic_include_tor_keys,
+            "Automatic Tor key backup",
+        )?,
+    };
+    values.apply_to(current).validate()?;
+    Ok(values)
+}
+
 pub fn parse_deep_settings_form(
     form: &DeepSettingsForm,
     current: &Settings,
@@ -535,6 +610,17 @@ pub fn write_deep_settings(path: &Path, updated: &Settings) -> anyhow::Result<()
     write_atomic(path, rewritten.as_bytes())
 }
 
+pub fn write_backup_settings(path: &Path, updated: &Settings) -> anyhow::Result<()> {
+    updated.validate()?;
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read settings file {}", path.display()))?;
+    let rewritten = rewrite_backup_settings_toml(&raw, &updated.backup);
+    let parsed: Settings = toml::from_str(&rewritten)
+        .with_context(|| "rewritten settings.toml did not parse as settings")?;
+    parsed.validate()?;
+    write_atomic(path, rewritten.as_bytes())
+}
+
 fn parse_bool(value: &str, field: DeepSettingsField) -> anyhow::Result<bool> {
     match value {
         "true" => Ok(true),
@@ -587,6 +673,32 @@ fn parse_mb(value: &str, field: DeepSettingsField) -> anyhow::Result<u64> {
     mb.checked_mul(MIB)
         .with_context(|| format!("{} is too large to convert from MB", field.label()))?;
     Ok(mb)
+}
+
+fn parse_named_bool(value: &str, label: &str) -> anyhow::Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => anyhow::bail!("{label} must be true or false"),
+    }
+}
+
+fn parse_named_u64(value: &str, label: &str) -> anyhow::Result<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{label} is required");
+    }
+    if trimmed.starts_with('-') {
+        anyhow::bail!("{label} must not be negative");
+    }
+    trimmed
+        .parse::<u64>()
+        .with_context(|| format!("{label} must be a whole number"))
+}
+
+fn parse_named_usize(value: &str, label: &str) -> anyhow::Result<usize> {
+    let parsed = parse_named_u64(value, label)?;
+    usize::try_from(parsed).with_context(|| format!("{label} is too large"))
 }
 
 fn bytes_to_mb(bytes: u64) -> u64 {
@@ -650,6 +762,95 @@ fn rewrite_deep_settings_toml(raw: &str, settings: &Settings) -> String {
         rewritten.push('\n');
     }
     rewritten
+}
+
+fn rewrite_backup_settings_toml(raw: &str, settings: &BackupSettings) -> String {
+    let mut output = Vec::new();
+    let mut current_section: Option<&str> = None;
+    let mut found = vec![false; BACKUP_SETTING_KEYS.len()];
+    let mut backup_section_seen = false;
+
+    for line in raw.lines() {
+        if let Some(section) = parse_section_header(line) {
+            append_missing_backup_settings(&mut output, current_section, &mut found, settings);
+            if section == "backup" {
+                backup_section_seen = true;
+            }
+            current_section = Some(section);
+            output.push(line.to_owned());
+            continue;
+        }
+
+        if current_section == Some("backup")
+            && let Some((index, key)) = BACKUP_SETTING_KEYS
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, key)| line_assigns_key(line, key))
+        {
+            found[index] = true;
+            output.push(format!(
+                "{}{} = {}",
+                leading_whitespace(line),
+                key,
+                backup_toml_value(key, settings)
+            ));
+            continue;
+        }
+
+        output.push(line.to_owned());
+    }
+
+    append_missing_backup_settings(&mut output, current_section, &mut found, settings);
+    if !backup_section_seen {
+        output.push(String::new());
+        output.push("[backup]".to_owned());
+        append_missing_backup_settings(&mut output, Some("backup"), &mut found, settings);
+    }
+
+    let mut rewritten = output.join("\n");
+    if raw.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    rewritten
+}
+
+const BACKUP_SETTING_KEYS: [&str; 6] = [
+    "enabled",
+    "automatic_enabled",
+    "automatic_interval_minutes",
+    "retention_keep_last",
+    "retention_max_age_days",
+    "automatic_include_tor_keys",
+];
+
+fn append_missing_backup_settings(
+    output: &mut Vec<String>,
+    section: Option<&str>,
+    found: &mut [bool],
+    settings: &BackupSettings,
+) {
+    if section != Some("backup") {
+        return;
+    }
+    for (index, key) in BACKUP_SETTING_KEYS.iter().copied().enumerate() {
+        if !found[index] {
+            found[index] = true;
+            output.push(format!("{key} = {}", backup_toml_value(key, settings)));
+        }
+    }
+}
+
+fn backup_toml_value(key: &str, settings: &BackupSettings) -> String {
+    match key {
+        "enabled" => settings.enabled.to_string(),
+        "automatic_enabled" => settings.automatic_enabled.to_string(),
+        "automatic_interval_minutes" => settings.automatic_interval_minutes.to_string(),
+        "retention_keep_last" => settings.retention_keep_last.to_string(),
+        "retention_max_age_days" => settings.retention_max_age_days.to_string(),
+        "automatic_include_tor_keys" => settings.automatic_include_tor_keys.to_string(),
+        _ => String::new(),
+    }
 }
 
 fn append_missing_for_section(
