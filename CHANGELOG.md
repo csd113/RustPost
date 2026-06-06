@@ -1,11 +1,12 @@
 # Changelog
 
-## v1.0.0-rc.1 - First-Release Hardening
+## v1.0.0 - First Release
 
 ### Release Blockers Fixed
-- Added the documented primary `rustpost` binary alongside `rustpost-cli` for release builds.
-- Bumped the crate version to `1.0.0-rc.1` and refreshed `Cargo.lock`.
-- Updated first-run command hints to use the primary `rustpost` binary.
+- Standardized the release artifact, install docs, CI, and operator commands on the single `rustpost-cli` binary.
+- Bumped the crate version to `1.0.0` and refreshed `Cargo.lock`.
+- Updated first-run command hints to use the canonical `rustpost-cli` binary.
+- Removed the nonfunctional standalone `print-onion-address` command; active onion addresses are reported by the running service.
 - Fixed login so existing stored passwords continue to work after an operator raises the configured minimum password length.
 - Rejected unsafe profile website URL schemes server-side and stopped rendering unsafe legacy profile website values as links.
 - Enforced configured per-post image and video attachment limits and raised the multipart body limit to cover valid configured media mixes.
@@ -16,15 +17,16 @@
 - Documented the accepted v1.0.0 `cargo audit` exception for transitive Arti `rsa 0.9.10` / `RUSTSEC-2023-0071`, for which no fixed upgrade is currently available.
 - Recorded unmaintained transitive Arti dependencies as upstream maintenance caveats rather than RustPost application vulnerabilities.
 - Kept Playwright files and generated artifacts ignored and out of the repository.
+- Audited the release build, clean temporary-runtime first-run flow, restart persistence, backup/restore behavior, runtime permissions, and operator documentation before tagging.
 
 ### Database Lineage
-- Squashed the pre-release internal migration chain into a clean first-release SQLite schema baseline at database schema version `1`.
+- Squashed the pre-release internal migration chain into a clean first-release SQLite schema baseline at database schema version `2`.
 - Fresh databases are now initialized directly from the baseline instead of replaying alpha development migrations.
-- Existing current alpha databases that structurally match the baseline are marked as baseline version `1` without destructive changes or data loss.
+- Existing current alpha databases that structurally match the baseline are marked as baseline version `2` without destructive changes or data loss.
 - Incomplete, unknown, or structurally unsafe pre-release databases now fail closed with administrator guidance to back up/export/recreate/restore instead of attempting blind migration.
 - Added stricter schema diagnostics for required tables, columns, indexes, and triggers so startup, backups, restores, and admin health can report incompatible or corrupt database structure clearly.
 - `check` now reports database schema status without creating or migrating the database during diagnostics.
-- Future post-release database changes should use normal forward migrations after baseline version `1`; released migration history must not be squashed or rewritten after the first public release.
+- Future post-release database changes should use normal forward migrations after baseline version `2`; released migration history must not be squashed or rewritten after the first public release.
 
 ## v0.1.6 - Pinned Profiles
 

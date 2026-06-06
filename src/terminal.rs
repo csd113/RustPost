@@ -157,7 +157,7 @@ pub fn render_check(
     push_section(
         &mut out,
         "Next commands",
-        &[row("Start server", "rustpost serve")],
+        &[row("Start server", "rustpost-cli serve")],
     );
     out.push_str(RULE);
     out.push('\n');
@@ -187,14 +187,14 @@ pub fn render_init(paths: &runtime::RuntimePaths, settings_path: &Path) -> Strin
             row(
                 "Create admin",
                 format!(
-                    "rustpost --data-dir {} create-admin-interactive",
+                    "rustpost-cli --data-dir {} create-admin-interactive",
                     display(paths.data_dir.as_path())
                 ),
             ),
             row(
                 "Start server",
                 format!(
-                    "rustpost --data-dir {} serve",
+                    "rustpost-cli --data-dir {} serve",
                     display(paths.data_dir.as_path())
                 ),
             ),
@@ -246,14 +246,14 @@ pub fn render_first_admin_non_interactive(paths: &runtime::RuntimePaths) -> Stri
             row(
                 "Create admin",
                 format!(
-                    "rustpost --data-dir {} create-admin-interactive",
+                    "rustpost-cli --data-dir {} create-admin-interactive",
                     display(paths.data_dir.as_path())
                 ),
             ),
             row(
                 "Alternative",
                 format!(
-                    "rustpost --data-dir {} create-admin <username> <password>",
+                    "rustpost-cli --data-dir {} create-admin <username> <password>",
                     display(paths.data_dir.as_path())
                 ),
             ),
@@ -342,7 +342,7 @@ fn next_command_rows(input: &StartupDashboard<'_>) -> Vec<Row> {
         rows.push(row(
             "Create admin",
             format!(
-                "rustpost --data-dir {} create-admin-interactive",
+                "rustpost-cli --data-dir {} create-admin-interactive",
                 display(input.paths.data_dir.as_path())
             ),
         ));
@@ -350,7 +350,7 @@ fn next_command_rows(input: &StartupDashboard<'_>) -> Vec<Row> {
     rows.push(row(
         "Check config",
         format!(
-            "rustpost --data-dir {} check",
+            "rustpost-cli --data-dir {} check",
             display(input.paths.data_dir.as_path())
         ),
     ));
@@ -556,7 +556,7 @@ mod tests {
         assert!(output.contains(&logs_dir));
         assert!(output.contains(&backups_dir));
         assert!(output.contains(&format!(
-            "rustpost --data-dir {data_dir} create-admin-interactive"
+            "rustpost-cli --data-dir {data_dir} create-admin-interactive"
         )));
         assert!(output.contains("FFmpeg"));
         assert!(output.contains("[WARN] unavailable"));

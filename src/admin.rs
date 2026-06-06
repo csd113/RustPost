@@ -1208,7 +1208,7 @@ pub async fn ensure_first_boot_admin_hint(pool: &SqlitePool) -> anyhow::Result<(
     let count = admin_count(pool).await?;
     if count == 0 {
         tracing::warn!(
-            "no admin account exists; run `rustpost create-admin-interactive` or `rustpost create-admin <username> <password>`"
+            "no admin account exists; run `rustpost-cli create-admin-interactive` or `rustpost-cli create-admin <username> <password>`"
         );
     }
     Ok(())

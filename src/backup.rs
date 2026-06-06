@@ -1037,6 +1037,9 @@ fn validate_archive_path_text(
 }
 
 fn validate_allowed_archive_path(path: &str, include_tor_keys: bool) -> anyhow::Result<()> {
+    if !include_tor_keys && (path == "tor" || path.starts_with("tor/")) {
+        anyhow::bail!("archive contains Tor keys but restore did not opt in");
+    }
     if path == MANIFEST_PATH
         || path == "settings.toml"
         || path == "db"
@@ -1288,6 +1291,9 @@ mod tests {
         assert!(validate_archive_path(Path::new("uploads/∕/x"), false).is_err());
         assert!(validate_archive_path(Path::new("tor/onion-service/key"), false).is_err());
         assert!(validate_archive_path(Path::new("tor/onion-service/key"), true).is_ok());
+        let tor_error =
+            validate_allowed_archive_path("tor/onion-service", false).expect_err("Tor opt-in");
+        assert!(tor_error.to_string().contains("restore did not opt in"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "rustpost"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 description = "A single-binary self-hosted microblogging app"
@@ -9,10 +9,6 @@ rust-version = "1.90"
 keywords = ["microblog", "self-hosted", "sqlite", "axum"]
 categories = ["web-programming::http-server"]
 autobins = false
-
-[[bin]]
-name = "rustpost"
-path = "src/bin/rustpost.rs"
 
 [[bin]]
 name = "rustpost-cli"

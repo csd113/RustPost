@@ -16,7 +16,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/csd113/RustPost/ci.yml?branch=main&style=flat-square&label=CI&logo=github)](https://github.com/csd113/RustPost/actions)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![SQLite](https://img.shields.io/badge/database-SQLite-blue?style=flat-square&logo=sqlite)](https://www.sqlite.org/)
-[![Tor Ready](https://img.shields.io/badge/Tor-Arti%200.42.0-7D4698?style=flat-square&logo=torproject)](https://www.torproject.org/)
+[![Embedded Arti](https://img.shields.io/badge/embedded%20Arti-0.42.0-7D4698?style=flat-square&logo=torproject)](https://www.torproject.org/)
 [![License](https://img.shields.io/badge/license-see%20LICENSE-green?style=flat-square)](./LICENSE)
 
 [**Getting Started**](#-getting-started) · [**Configuration**](#-configuration) · [**CLI Reference**](#-cli-reference) · [**Security**](#-security-model) · [**Tor / Arti**](#-tor--arti)
@@ -31,7 +31,7 @@ RustPost is a **single-binary, self-hosted microblogging platform** written in R
 
 > **Design philosophy:** Small, auditable modules over framework magic. Security-sensitive behavior centralized. No JavaScript bundler. No cloud dependency. No federation surface.
 
-This repository is a **production-oriented project** — not a toy, but not overengineered. The goal is a system you can read end to end, deploy in minutes, and trust.
+This repository is intended for operators who want a small, understandable self-hosted service. Operators remain responsible for deployment hardening, monitoring, backups, upgrades, and deciding whether RustPost is appropriate for their environment.
 
 ---
 
@@ -106,27 +106,43 @@ The screenshots above were captured from a local generated demo instance with fi
 - **Rust 1.90+** — install via [rustup](https://rustup.rs/)
 - **ffmpeg** *(optional)* — enables image and video conversion. RustPost boots and runs without it.
 
-### Build
+### Build from source
 
 ```sh
 cargo build --release
 ```
 
-This produces two binaries in `target/release/`:
+This produces the release binary in `target/release/`:
 
 | Binary | Purpose |
 |---|---|
-| `rustpost` | Primary server + CLI |
-| `rustpost-cli` | Identical CLI surface — useful for running admin commands while the server is managed separately |
+| `rustpost-cli` | Server and administration CLI |
+
+### Install a release archive
+
+Download the archive and matching `.sha256` file for your platform from the GitHub release, verify the checksum, then extract it. Unix archives contain `rustpost/rustpost-cli`; the Windows archive contains `rustpost/rustpost-cli.exe`.
+
+Example Unix user-local install:
+
+```sh
+# Linux checksum verification
+sha256sum -c rustpost-linux-x86_64.tar.gz.sha256
+# macOS checksum verification uses: shasum -a 256 -c <archive>.sha256
+tar -xzf rustpost-linux-x86_64.tar.gz
+install -m 0755 rustpost/rustpost-cli "$HOME/.local/bin/rustpost-cli"
+rustpost-cli --version
+```
+
+Use an explicit `--data-dir` for installed deployments. Without it, RustPost places `rustpost-data` beside the executable.
 
 ### First Run
 
 ```sh
 # Linux / macOS
-./target/release/rustpost --data-dir ./rustpost-data serve
+./target/release/rustpost-cli --data-dir ./rustpost-data serve
 
 # Windows (PowerShell)
-.\target\release\rustpost.exe --data-dir .\rustpost-data serve
+.\target\release\rustpost-cli.exe --data-dir .\rustpost-data serve
 ```
 
 > If no subcommand is provided, `serve` is assumed.
@@ -145,6 +161,7 @@ rustpost-data/
 │   ├── images/
 │   ├── videos/
 │   └── thumbs/
+├── assets/
 ├── tmp/
 │   └── uploads/           ← interrupted upload staging only
 ├── backups/
@@ -159,18 +176,18 @@ rustpost-data/
 
 ### Create Your First Admin
 
-When `serve` starts, RustPost prints the data directory, settings path, database path, upload/media paths, log path, backup path, bind address, and whether an admin account exists. If `admin.create_admin_on_first_boot` is enabled and no admin exists, interactive startup enters a `Create admin account` step before the server begins accepting requests. If stdin is not interactive, RustPost prints the bootstrap commands instead of waiting for input.
+If `admin.create_admin_on_first_boot` is enabled and no admin exists, interactive `serve` startup enters a `Create admin account` step before the server begins accepting requests. If stdin is not interactive, RustPost prints the bootstrap commands instead of waiting for input. Startup then prints the data directory, settings path, database path, upload/media paths, log path, backup path, bind address, local URL, and whether an admin account exists.
 
 You can also create the first admin explicitly. The preferred local setup path hides the password while you type:
 
 ```sh
-./target/release/rustpost --data-dir ./rustpost-data create-admin-interactive
+./target/release/rustpost-cli --data-dir ./rustpost-data create-admin-interactive
 ```
 
-For scripted deployments, the non-interactive command is still available. Be aware that command-line arguments can be visible to other local processes on some systems:
+For scripted deployments, the non-interactive command is still available. After setting `RUSTPOST_ADMIN_PASSWORD` from the deployment's secret source, run the following. Be aware that command-line arguments can be visible to other local processes on some systems:
 
 ```sh
-./target/release/rustpost --data-dir ./rustpost-data create-admin alice s3cr3tpassword
+./target/release/rustpost-cli --data-dir ./rustpost-data create-admin alice "$RUSTPOST_ADMIN_PASSWORD"
 ```
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080) and log in.
@@ -188,18 +205,17 @@ Replies remain attached to their parent thread. They render inside the thread vi
 ## 🖥 CLI Reference
 
 ```sh
-rustpost init                                       # Initialize data directory
-rustpost check                                      # Validate config, data directory, and DB schema status
-rustpost create-admin <username> <password>         # Create an admin account
-rustpost create-admin-interactive                   # Create an admin with hidden password prompts
-rustpost reset-admin-password <username> <password> # Reset an admin's password
-rustpost seed-demo                                  # Seed a guarded local demo instance under target/debug/rustpost-demo
-rustpost serve                                      # Start the HTTP server (default)
-rustpost backup                                     # Create a backup archive
-rustpost backup --include-tor-keys                  # Backup including Tor private keys
-rustpost restore <archive.tar>                      # Restore from a backup
-rustpost restore <archive.tar> --include-tor-keys   # Restore including Tor keys
-rustpost print-onion-address                        # Print an active address, or fail clearly if unavailable
+rustpost-cli init                                       # Initialize data directory
+rustpost-cli check                                      # Validate config, data directory, and DB schema status
+rustpost-cli create-admin <username> <password>         # Create an admin account
+rustpost-cli create-admin-interactive                   # Create an admin with hidden password prompts
+rustpost-cli reset-admin-password <username> <password> # Reset an admin's password
+rustpost-cli seed-demo                                  # Seed a guarded local demo instance under target/debug/rustpost-demo
+rustpost-cli serve                                      # Start the HTTP server (default)
+rustpost-cli backup                                     # Create a backup archive
+rustpost-cli backup --include-tor-keys                  # Backup including Tor private keys
+rustpost-cli restore <archive.tar>                      # Restore from a backup
+rustpost-cli restore <archive.tar> --include-tor-keys   # Restore including Tor keys
 ```
 
 ---
@@ -217,7 +233,7 @@ The visible site name is configured in `settings.toml`:
 name = "RustPost"
 ```
 
-Changing `site.name` updates the rendered browser title, header brand, footer, and user-facing site copy. Binary names, package names, cookie names, and data paths remain `rustpost` for compatibility.
+Changing `site.name` updates the rendered browser title, header brand, footer, and user-facing site copy. The executable remains `rustpost-cli`; package names, cookie names, and data paths remain `rustpost` for compatibility.
 
 ### Account creation
 
@@ -321,6 +337,9 @@ anonymous_posts_per_ip_per_hour     = 10
 
 RustPost embeds [Arti](https://gitlab.torproject.org/tpo/core/arti) (the Rust Tor implementation) directly in the binary. No external `tor` daemon required.
 
+Embedded Arti provides an onion-service transport option, not an anonymity or security guarantee. Real onion reachability depends on Tor network access, bootstrap, descriptor publication, and client routing; verify reachability from a separate Tor client before relying on it.
+The active onion address is shown by the running server in its startup/status output, public header, and admin health page; it is not derived from configuration alone.
+
 **Behavior by config:**
 
 | `tor.enabled` | `tor_only` | Behavior |
@@ -329,7 +348,7 @@ RustPost embeds [Arti](https://gitlab.torproject.org/tpo/core/arti) (the Rust To
 | `true` | `false` | Clearnet binds immediately. Arti onion service starts in background. If Tor fails, clearnet keeps running and admin health reports the error. |
 | `true` | `true` | Only a loopback listener is bound for Arti forwarding. Startup **fails** if Arti/onion startup fails. |
 
-**Arti crate versions (Arti 2.3.0 / 2026-05-07):**
+**Pinned Arti crate versions:**
 
 ```
 arti-client      = 0.42.0   # bootstraps the embedded Tor client and onion service
@@ -340,7 +359,7 @@ tor-rtcompat     = 0.42.0   # Tokio-compatible Arti runtime
 rustls           = 0.23     # ring crypto provider required by Arti's rustls stack
 ```
 
-> **Dependency note:** `cargo tree -i libsqlite3-sys` should show exactly one version. RustPost uses `rusqlite` rather than `sqlx 0.9` (alpha) specifically to keep the `libsqlite3-sys` dependency unified with the Arti family.
+> **Dependency note:** `cargo tree -i libsqlite3-sys` should show exactly one version. RustPost uses `rusqlite` specifically to keep the `libsqlite3-sys` dependency unified with the Arti family.
 
 **Tor data layout:**
 
@@ -354,10 +373,10 @@ rustpost-data/tor/
 **Backups and Tor keys:**
 
 ```sh
-rustpost backup                          # excludes Tor keys (safe default)
-rustpost backup --include-tor-keys       # opt-in to include keys
-rustpost restore archive.tar             # rejects Tor key paths unless flag given
-rustpost restore archive.tar --include-tor-keys
+rustpost-cli backup                          # excludes Tor keys (safe default)
+rustpost-cli backup --include-tor-keys       # opt-in to include keys
+rustpost-cli restore archive.tar             # rejects Tor key paths unless flag given
+rustpost-cli restore archive.tar --include-tor-keys
 ```
 
 On Unix, the backup directory is mode `0700` and created backup archives are mode `0600`.
@@ -387,16 +406,16 @@ Profile pictures and banners follow the same media pipeline as post uploads.
 
 ```sh
 # Create a backup (SQLite DB snapshot + settings + media/assets)
-rustpost backup
+rustpost-cli backup
 
 # Include Tor onion-service keys
-rustpost backup --include-tor-keys
+rustpost-cli backup --include-tor-keys
 
 # Restore into a fresh data directory
-rustpost restore rustpost-20260526T....tar
+rustpost-cli restore rustpost-20260526T....tar
 
 # Restore including Tor keys
-rustpost restore rustpost-20260526T....tar --include-tor-keys
+rustpost-cli restore rustpost-20260526T....tar --include-tor-keys
 ```
 
 Backups are also available from **Admin → Backups**. The page supports manual backup creation, admin-only downloads, restore from uploaded `.tar` archives, automatic backup settings, safe retention controls, recent archive history, and no-JS form flows.
@@ -448,7 +467,7 @@ Run the app locally with a disposable data directory:
 
 ```sh
 cargo build --workspace --all-features
-./target/debug/rustpost --data-dir /tmp/rustpost-ui serve
+./target/debug/rustpost-cli --data-dir /tmp/rustpost-ui serve
 ```
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080). The server initializes the data directory on first boot.
@@ -475,7 +494,7 @@ rustpost-macos-aarch64.tar.gz
 rustpost-windows-x86_64.zip
 ```
 
-Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and optional notice files. A `.sha256` checksum is generated for each archive. Runtime data (databases, uploads, backups, logs, Tor keys) is never included.
+Each archive contains `rustpost-cli` (`rustpost-cli.exe` on Windows), `README.md`, `LICENSE`, and optional notice files. A `.sha256` checksum is generated for each archive. Runtime data (databases, uploads, backups, logs, Tor keys) is never included.
 
 ---
 
@@ -527,7 +546,7 @@ The format, release build, strict Clippy, and test commands must pass. `cargo au
 <summary>Verified locally</summary>
 
 - Fresh `--data-dir` boot creates `settings.toml`, `db/rustpost.sqlite3`, upload roots, temp upload staging, backup/log dirs, and Tor state dirs.
-- `rustpost check` passes on a fresh data directory with `tor.enabled = false`.
+- `rustpost-cli check` passes on a fresh data directory with `tor.enabled = false`.
 - Clearnet serving on `127.0.0.1:8080` loads `/home`.
 - Registration with CAPTCHA, login, post creation, replies, quote reposts, repost rendering, likes, bookmarks, followers/following pages, notifications, admin health, and CSRF-protected logout all work through live HTTP/browser flows.
 - Anonymous posting is disabled by default — anonymous users cannot see the composer and anonymous post attempts are rejected.
@@ -536,7 +555,7 @@ The format, release build, strict Clippy, and test commands must pass. `cargo au
 - Normal backups include DB, settings, and media; exclude Tor keys. `--include-tor-keys` includes them only when explicitly requested. Restores into fresh data directories completed and `check` passed with and without controlled test Tor key material.
 - Backup archive names include subsecond precision — no same-second overwrite collisions.
 - Tor health/status fields render in admin health with Tor disabled in the current local sweep.
-- Both `rustpost` and `rustpost-cli` pass `check` on a fresh data directory.
+- `rustpost-cli --version`, `rustpost-cli --help`, and `rustpost-cli check` report the final release CLI and pass on a fresh data directory.
 
 </details>
 

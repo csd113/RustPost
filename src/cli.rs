@@ -14,8 +14,10 @@ use crate::{admin, backup, config, db, demo_seed, logging, runtime, server, term
 
 #[derive(Debug, Parser)]
 #[command(
+    name = "rustpost-cli",
+    version,
     about = "Single-binary self-hosted microblog",
-    after_help = "Common first run:\n  rustpost init\n  rustpost create-admin-interactive\n  rustpost serve"
+    after_help = "Common first run:\n  rustpost-cli init\n  rustpost-cli create-admin-interactive\n  rustpost-cli serve"
 )]
 struct Cli {
     /// Path to settings.toml. Defaults to <data-dir>/settings.toml.
@@ -81,10 +83,6 @@ enum Command {
         #[arg(long, help = "Allow restoring Tor onion service keys")]
         include_tor_keys: bool,
     },
-
-    /// Print only the configured onion address when one is available.
-    #[command(about = "Print the onion address when one is available")]
-    PrintOnionAddress,
 
     /// Start the `RustPost` web server.
     #[command(about = "Start the RustPost web server")]
@@ -171,14 +169,6 @@ async fn run_command(
             archive,
             include_tor_keys,
         } => restore_command(&paths, &archive, include_tor_keys),
-        Command::PrintOnionAddress => {
-            let status = tor::validate_startup(&settings.tor);
-            let onion = status.onion_address().context(
-                "onion address unavailable: use the running site's public header or admin health",
-            )?;
-            stdout_line(format_args!("{onion}"))?;
-            Ok(())
-        }
         Command::Serve => serve(paths, settings_path, settings).await,
     }
 }
@@ -232,7 +222,7 @@ async fn create_admin_command(
                 terminal::row(
                     "Next command",
                     format!(
-                        "rustpost --data-dir {} serve",
+                        "rustpost-cli --data-dir {} serve",
                         database.paths.data_dir.display()
                     ),
                 ),
