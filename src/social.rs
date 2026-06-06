@@ -241,6 +241,8 @@ pub async fn create_post(
     if media_ids.len() > settings.posts.max_media_per_post {
         anyhow::bail!("too many media attachments");
     }
+    let max_images_per_post = settings.posts.max_images_per_post;
+    let max_videos_per_post = settings.posts.max_videos_per_post;
     let text = clean_post_text(text, settings.posts.max_text_chars, media_ids.len())?;
     let youtube_embeds = crate::youtube::metadata_for_text(&text).await;
     let allow_mentions = settings.posts.allow_mentions;
@@ -262,6 +264,13 @@ pub async fn create_post(
         } else {
             None
         };
+        let (image_count, video_count) = media_kind_counts_tx(&tx, &media_ids)?;
+        if image_count > max_images_per_post {
+            anyhow::bail!("too many image attachments");
+        }
+        if video_count > max_videos_per_post {
+            anyhow::bail!("too many video attachments");
+        }
         let anonymous_label = user_id.is_none().then_some("Anonymous");
         tx.execute(
             "INSERT INTO posts (user_id, anonymous_label, text, parent_post_id, root_post_id) VALUES (?, ?, ?, ?, ?)",
@@ -294,6 +303,30 @@ pub async fn create_post(
         Ok(post_id)
     })
     .await
+}
+
+fn media_kind_counts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    media_ids: &[i64],
+) -> anyhow::Result<(usize, usize)> {
+    let mut image_count = 0usize;
+    let mut video_count = 0usize;
+    for media_id in media_ids {
+        let media_kind = tx
+            .query_row(
+                "SELECT media_kind FROM media WHERE id = ?",
+                [media_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match media_kind.as_deref() {
+            Some("image") => image_count += 1,
+            Some("video") => video_count += 1,
+            Some(_) => anyhow::bail!("media attachment has unsupported kind"),
+            None => anyhow::bail!("media attachment not found"),
+        }
+    }
+    Ok((image_count, video_count))
 }
 
 pub async fn edit_post(
@@ -2793,6 +2826,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_post_enforces_image_and_video_attachment_limits() {
+        let (pool, mut settings, alice, _bob) = fixture().await;
+        settings.posts.max_media_per_post = 4;
+        settings.posts.max_images_per_post = 1;
+        settings.posts.max_videos_per_post = 1;
+        let first_image = insert_test_media_kind(&pool, alice, "image").await;
+        let second_image = insert_test_media_kind(&pool, alice, "image").await;
+        let first_video = insert_test_media_kind(&pool, alice, "video").await;
+        let second_video = insert_test_media_kind(&pool, alice, "video").await;
+
+        let too_many_images = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "image limit",
+            None,
+            &[first_image, second_image],
+        )
+        .await
+        .expect_err("image limit");
+        assert_eq!(too_many_images.to_string(), "too many image attachments");
+
+        let too_many_videos = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "video limit",
+            None,
+            &[first_video, second_video],
+        )
+        .await
+        .expect_err("video limit");
+        assert_eq!(too_many_videos.to_string(), "too many video attachments");
+
+        create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "mixed media within limits",
+            None,
+            &[first_image, first_video],
+        )
+        .await
+        .expect("mixed media post");
+    }
+
+    #[tokio::test]
     async fn youtube_embeds_are_normalized_and_stored_on_create() {
         let (pool, settings, alice, _bob) = fixture().await;
         let post = crate::youtube::with_test_oembed_fetcher(
@@ -3621,6 +3701,36 @@ mod tests {
         })
         .await
         .expect("attach media");
+    }
+
+    async fn insert_test_media_kind(
+        pool: &SqlitePool,
+        owner_user_id: i64,
+        media_kind: &str,
+    ) -> i64 {
+        let media_kind = media_kind.to_owned();
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let extension = if media_kind == "video" {
+            "webm"
+        } else {
+            "webp"
+        };
+        let mime_type = if media_kind == "video" {
+            "video/webm"
+        } else {
+            "image/webp"
+        };
+        let stored_path = format!("/tmp/rustpost-test-{id}.{extension}");
+        let public_path = format!("/uploads/{media_kind}s/rustpost-test-{id}.{extension}");
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'media', ?, ?, ?, ?, 1)",
+                params![owner_user_id, stored_path, public_path, mime_type, media_kind],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .expect("test media")
     }
 
     async fn notification_count(

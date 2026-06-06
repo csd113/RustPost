@@ -14,7 +14,7 @@ use crate::{admin, backup, config, db, demo_seed, logging, runtime, server, term
 #[derive(Debug, Parser)]
 #[command(
     about = "Single-binary self-hosted microblog",
-    after_help = "Common first run:\n  rustpost-cli init\n  rustpost-cli create-admin-interactive\n  rustpost-cli serve"
+    after_help = "Common first run:\n  rustpost init\n  rustpost create-admin-interactive\n  rustpost serve"
 )]
 struct Cli {
     /// Path to settings.toml. Defaults to <data-dir>/settings.toml.
@@ -231,7 +231,7 @@ async fn create_admin_command(
                 terminal::row(
                     "Next command",
                     format!(
-                        "rustpost-cli --data-dir {} serve",
+                        "rustpost --data-dir {} serve",
                         database.paths.data_dir.display()
                     ),
                 ),

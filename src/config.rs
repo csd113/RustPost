@@ -354,13 +354,13 @@ anonymous_mode_enabled = {anonymous_mode_enabled}
 # Minimum account password length. Recommended default is 10.
 min_password_length = {min_password_length}
 
-# Maximum username length in bytes. Usernames are also format-validated.
+# Maximum username length in characters. Usernames are also format-validated.
 max_username_len = {max_username_len}
 
-# Maximum display-name length in bytes.
+# Maximum display-name length in characters.
 max_display_name_len = {max_display_name_len}
 
-# Maximum profile bio length in bytes.
+# Maximum profile bio length in characters.
 max_bio_len = {max_bio_len}
 
 # Allow users to upload profile banner images.

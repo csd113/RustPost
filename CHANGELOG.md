@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased - First-Release Database Baseline
+## v1.0.0-rc.1 - First-Release Hardening
+
+### Release Blockers Fixed
+- Added the documented primary `rustpost` binary alongside `rustpost-cli` for release builds.
+- Bumped the crate version to `1.0.0-rc.1` and refreshed `Cargo.lock`.
+- Updated first-run command hints to use the primary `rustpost` binary.
+- Fixed login so existing stored passwords continue to work after an operator raises the configured minimum password length.
+- Rejected unsafe profile website URL schemes server-side and stopped rendering unsafe legacy profile website values as links.
+- Enforced configured per-post image and video attachment limits and raised the multipart body limit to cover valid configured media mixes.
+- Corrected generated settings copy for username, display name, and bio limits from bytes to characters.
 
 ### Database Lineage
 - Squashed the pre-release internal migration chain into a clean first-release SQLite schema baseline at database schema version `1`.

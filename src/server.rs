@@ -160,11 +160,37 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 fn upload_body_limit(settings: &Settings) -> usize {
-    let limit = settings.media.max_video_size.saturating_add(1024 * 1024);
+    let limit = upload_payload_limit(settings).saturating_add(1024 * 1024);
     match usize::try_from(limit) {
         Ok(limit) => limit,
         Err(_overflow) => usize::MAX,
     }
+}
+
+fn upload_payload_limit(settings: &Settings) -> u64 {
+    let max_media = settings.posts.max_media_per_post;
+    if settings.media.max_video_size >= settings.media.max_image_size {
+        let videos = settings.posts.max_videos_per_post.min(max_media);
+        let images = settings
+            .posts
+            .max_images_per_post
+            .min(max_media.saturating_sub(videos));
+        return attachment_bytes(videos, settings.media.max_video_size)
+            .saturating_add(attachment_bytes(images, settings.media.max_image_size));
+    }
+    let images = settings.posts.max_images_per_post.min(max_media);
+    let videos = settings
+        .posts
+        .max_videos_per_post
+        .min(max_media.saturating_sub(images));
+    attachment_bytes(images, settings.media.max_image_size)
+        .saturating_add(attachment_bytes(videos, settings.media.max_video_size))
+}
+
+fn attachment_bytes(count: usize, max_size: u64) -> u64 {
+    u64::try_from(count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(max_size)
 }
 
 async fn client_script() -> Response {
@@ -508,10 +534,6 @@ async fn login(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
-    if let Err(err) = crate::validation::validate_password(&form.password, &state.settings) {
-        rate_limit::record(&state.pool, rate_limit::Scope::FailedLogin, &actor).await?;
-        return auth_form_response(&state, StatusCode::BAD_REQUEST, &err.to_string()).await;
-    }
     let session = match auth::login(&state.pool, &form.username, &form.password).await? {
         Ok(session) => session,
         Err(failure) => {
@@ -1599,15 +1621,7 @@ async fn profile(
             )
         },
     );
-    let website_link = if website.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            r#"<p><a href="{}">{}</a></p>"#,
-            html_escape::encode_double_quoted_attribute(website.as_str()),
-            html_escape::encode_text(website.as_str())
-        )
-    };
+    let website_link = render_profile_website_link(&website);
     let location_line = if location.trim().is_empty() {
         String::new()
     } else {
@@ -2109,6 +2123,45 @@ fn validate_profile_location(location: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn validate_profile_website(website: &str) -> AppResult<()> {
+    let website = website.trim();
+    if website.is_empty() {
+        return Ok(());
+    }
+    if website.chars().count() > 2_048 {
+        return Err(AppError::BadRequest("website URL is too long".to_owned()));
+    }
+    if website.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "website URL contains unsupported control characters".to_owned(),
+        ));
+    }
+    if !is_safe_profile_website_url(website) {
+        return Err(AppError::BadRequest(
+            "website URL must start with http:// or https://".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_safe_profile_website_url(website: &str) -> bool {
+    website.parse::<Uri>().is_ok_and(|uri| {
+        matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some()
+    })
+}
+
+fn render_profile_website_link(website: &str) -> String {
+    let website = website.trim();
+    if website.is_empty() || !is_safe_profile_website_url(website) {
+        return String::new();
+    }
+    format!(
+        r#"<p><a href="{}">{}</a></p>"#,
+        html_escape::encode_double_quoted_attribute(website),
+        html_escape::encode_text(website)
+    )
+}
+
 async fn mute(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2266,6 +2319,7 @@ async fn settings_update(
     validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
     crate::validation::validate_profile_text(&form.display_name, &form.bio, &state.settings)?;
     validate_profile_location(&form.location)?;
+    validate_profile_website(&form.website)?;
     let display_name = form.display_name.trim().to_owned();
     let bio = form.bio.trim().to_owned();
     let location = form.location.trim().to_owned();
@@ -4665,6 +4719,21 @@ mod tests {
     }
 
     #[test]
+    fn upload_body_limit_covers_configured_media_mix() {
+        let settings = Settings::default();
+        let remaining_media =
+            u64::try_from(settings.posts.max_media_per_post.saturating_sub(1)).unwrap_or(u64::MAX);
+        let expected_payload = settings.media.max_video_size.saturating_add(
+            settings
+                .media
+                .max_image_size
+                .saturating_mul(remaining_media),
+        );
+
+        assert!(u64::try_from(upload_body_limit(&settings)).unwrap_or(0) > expected_payload);
+    }
+
+    #[test]
     fn compact_text_collapses_whitespace_and_truncates() {
         let compact = compact_text(
             "/uploads/originals/a/very/long/path.png\nffmpeg stderr repeated detail",
@@ -5033,18 +5102,6 @@ mod tests {
                 .contains(r#"aria-describedby="confirm-password-requirement""#)
         );
 
-        let short_login = request(
-            &server.base_url,
-            "POST",
-            "/login",
-            &[("content-type", "application/x-www-form-urlencoded")],
-            b"username=alice&password=short".to_vec(),
-        )
-        .await;
-        assert_eq!(short_login.status, 400);
-        assert!(short_login.body.contains("<h1>Log in</h1>"));
-        assert!(short_login.body.contains("password is too short"));
-
         let short_register = request(
             &server.base_url,
             "POST",
@@ -5056,6 +5113,28 @@ mod tests {
         assert_eq!(short_register.status, 400);
         assert!(short_register.body.contains("<h1>Create account</h1>"));
         assert!(short_register.body.contains("password is too short"));
+    }
+
+    #[tokio::test]
+    async fn login_allows_existing_password_after_policy_increase() {
+        let server = spawn_test_server().await;
+        let mut permissive_settings = Settings::default();
+        permissive_settings.accounts.min_password_length = 0;
+        auth::register_user(&server.pool, &permissive_settings, "shorty", "short", false)
+            .await
+            .expect("register short password user");
+
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=shorty&password=short".to_vec(),
+        )
+        .await;
+
+        assert_eq!(login.status, 303);
+        assert!(header_value(&login, "set-cookie").is_some());
     }
 
     #[tokio::test]
@@ -6937,6 +7016,66 @@ mod tests {
             (theme, nsfw_blur_enabled, liked_posts_public),
             ("dark".to_owned(), 1, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn profile_website_rejects_unsafe_schemes_and_hides_legacy_values() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+
+        let unsafe_saved = save_profile_settings(
+            &server,
+            &cookie,
+            &[
+                ("display_name", "Alice"),
+                ("bio", ""),
+                ("location", ""),
+                ("website", "javascript:alert(1)"),
+            ],
+        )
+        .await;
+        assert_eq!(unsafe_saved.status, 400);
+        assert!(
+            unsafe_saved
+                .body
+                .contains("website URL must start with http:// or https://")
+        );
+        let (_, _, _, _, _, _, website) = user_settings_state(&server, "alice").await;
+        assert_eq!(website, "");
+
+        server
+            .pool
+            .call(|conn| {
+                conn.execute(
+                    "UPDATE users SET website = 'javascript:alert(1)' WHERE normalized_username = 'alice'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("write legacy unsafe website");
+
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        assert_eq!(profile.status, 200);
+        assert!(!profile.body.contains("javascript:alert"));
+        assert!(!profile.body.contains(r#"href="javascript:"#));
+
+        let safe_saved = save_profile_settings(
+            &server,
+            &cookie,
+            &[
+                ("display_name", "Alice"),
+                ("bio", ""),
+                ("location", ""),
+                ("website", "https://example.test/profile"),
+            ],
+        )
+        .await;
+        assert_eq!(safe_saved.status, 303);
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        assert!(profile.body.contains(
+            r#"<p><a href="https://example.test/profile">https://example.test/profile</a></p>"#
+        ));
     }
 
     #[tokio::test]

@@ -386,16 +386,16 @@ Profile pictures and banners follow the same media pipeline as post uploads.
 
 ```sh
 # Create a backup (SQLite DB snapshot + settings + media/assets)
-rustpost-cli backup
+rustpost backup
 
 # Include Tor onion-service keys
-rustpost-cli backup --include-tor-keys
+rustpost backup --include-tor-keys
 
 # Restore into a fresh data directory
-rustpost-cli restore rustpost-20260526T....tar
+rustpost restore rustpost-20260526T....tar
 
 # Restore including Tor keys
-rustpost-cli restore rustpost-20260526T....tar --include-tor-keys
+rustpost restore rustpost-20260526T....tar --include-tor-keys
 ```
 
 Backups are also available from **Admin → Backups**. The page supports manual backup creation, admin-only downloads, restore from uploaded `.tar` archives, automatic backup settings, safe retention controls, recent archive history, and no-JS form flows.
@@ -504,22 +504,21 @@ Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and op
 
 ## ✅ Release Verification
 
-*Last sweep: **May 18, 2026***
+*Last sweep: **June 6, 2026***
 
 <details>
 <summary>Verified locally</summary>
 
 - Fresh `--data-dir` boot creates `settings.toml`, `db/rustpost.sqlite3`, upload roots, temp upload staging, backup/log dirs, and Tor state dirs.
-- `rustpost-cli check` passes on a fresh data directory with `tor.enabled = false`.
+- `rustpost check` passes on a fresh data directory with `tor.enabled = false`.
 - Clearnet serving on `127.0.0.1:8080` loads `/home`.
-- Registration, login, post creation, replies, repost rendering, likes, bookmarks, follows, notifications, admin health, and CSRF-protected logout all work through live HTTP requests.
+- Registration with CAPTCHA, login, post creation, replies, quote reposts, repost rendering, likes, bookmarks, followers/following pages, notifications, admin health, and CSRF-protected logout all work through live HTTP/browser flows.
 - Anonymous posting is disabled by default — anonymous users cannot see the composer and anonymous post attempts are rejected.
 - Non-admin users cannot access admin health; anonymous users cannot access authenticated pages.
 - `ffmpeg` 8.1.1 detected with WebP and VP9 support. Image, profile picture/banner, and small video uploads live-tested; WebP and WebM outputs produced; admin media/health pages reported conversion state correctly.
-- Normal backups include DB, settings, and media; exclude Tor keys. `--include-tor-keys` includes them only when explicitly requested. Restore into a fresh data directory completed and `check` passed.
+- Normal backups include DB, settings, and media; exclude Tor keys. `--include-tor-keys` includes them only when explicitly requested. Restores into fresh data directories completed and `check` passed with and without controlled test Tor key material.
 - Backup archive names include subsecond precision — no same-second overwrite collisions.
-- `tor_only = false` live-tested: clearnet bound quickly, Arti produced a real `.onion` hostname, Tor Browser reached `/home` through the onion.
-- `tor_only = true` live-tested: no clearnet listener exposed, loopback-only binding confirmed, real `.onion` hostname produced and reached via Tor Browser.
+- Tor health/status fields render in admin health with Tor disabled in the current local sweep.
 - Both `rustpost` and `rustpost-cli` pass `check` on a fresh data directory.
 
 </details>
@@ -527,7 +526,7 @@ Each archive contains `rustpost`, `rustpost-cli`, `README.md`, `LICENSE`, and op
 <details>
 <summary>Partially verified / environment-dependent</summary>
 
-- Live Tor reachability depends on Tor network access and descriptor publication time. The May 2026 sweep succeeded with a temporary onion identity; future release checks should repeat with a non-temporary identity if a stable onion address is required.
+- Live Tor reachability depends on Tor network access and descriptor publication time. The June 2026 sweep did not repeat real onion reachability testing.
 - Tor private key material was not rendered in admin health or normal logs during the sweep. Operational text may reference key paths or the `--include-tor-keys` flag but does not print key contents.
 
 </details>
