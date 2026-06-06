@@ -4304,11 +4304,11 @@ async fn parse_restore_upload(
                 if !csrf_validated {
                     return Err(AppError::Forbidden);
                 }
-                filename = field
+                field
                     .file_name()
                     .filter(|name| !name.trim().is_empty())
                     .unwrap_or("uploaded-backup.tar")
-                    .to_owned();
+                    .clone_into(&mut filename);
                 if !std::path::Path::new(&filename)
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("tar"))
