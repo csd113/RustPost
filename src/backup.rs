@@ -1205,7 +1205,17 @@ fn hash_file(path: &Path) -> anyhow::Result<(u64, String)> {
         total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
         hasher.update(&buffer[..read]);
     }
-    Ok((total, format!("{:x}", hasher.finalize())))
+    Ok((total, hex_lower(hasher.finalize().as_ref())))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {

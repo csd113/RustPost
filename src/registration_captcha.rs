@@ -6,7 +6,6 @@ use anyhow::Context as _;
 use base64::Engine as _;
 use captcha::Captcha;
 use captcha::filters::{Dots, Noise, Wave};
-use rand_core::{OsRng, RngCore as _};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -62,7 +61,7 @@ struct StoredChallenge {
 impl RegistrationCaptchaStore {
     pub async fn create_challenge(&self) -> anyhow::Result<RegistrationCaptchaChallenge> {
         let token = Uuid::new_v4().to_string();
-        let answer = challenge_answer();
+        let answer = challenge_answer()?;
         let image_data_uri = captcha_image_data_uri(&answer)?;
         let expires_at = Instant::now() + CAPTCHA_TTL;
         let answer_digest = answer_digest(&token, &answer);
@@ -129,23 +128,23 @@ impl RegistrationCaptchaStore {
     }
 }
 
-fn challenge_answer() -> String {
+fn challenge_answer() -> anyhow::Result<String> {
     #[cfg(debug_assertions)]
     if let Ok(answer) = std::env::var(CAPTCHA_E2E_ANSWER_ENV) {
         let normalized = normalize_answer(&answer);
         if normalized.len() == CAPTCHA_LENGTH
             && normalized.bytes().all(|byte| CAPTCHA_CHARS.contains(&byte))
         {
-            return normalized;
+            return Ok(normalized);
         }
     }
 
     let mut bytes = [0_u8; CAPTCHA_LENGTH];
-    OsRng.fill_bytes(&mut bytes);
-    bytes
+    getrandom::fill(&mut bytes).context("failed to generate CAPTCHA randomness")?;
+    Ok(bytes
         .iter()
         .map(|byte| CAPTCHA_CHARS[usize::from(*byte) % CAPTCHA_CHARS.len()] as char)
-        .collect()
+        .collect())
 }
 
 fn captcha_image_data_uri(answer: &str) -> anyhow::Result<String> {

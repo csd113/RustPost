@@ -762,7 +762,17 @@ async fn hash_file(path: &Path) -> anyhow::Result<String> {
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hex_lower(hasher.finalize().as_ref())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn stable_media_basename(original_filename: &str, original_sha256: &str) -> String {
