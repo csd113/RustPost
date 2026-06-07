@@ -264,7 +264,6 @@ async fn start_inner(
         )
     })?
     .context("bootstrap Arti client")?;
-    let client = Arc::new(client);
     let bootstrap_status = Some(format!("{:?}", client.bootstrap_status()));
 
     let nickname = HsNickname::new(settings.onion_service_name.clone())
