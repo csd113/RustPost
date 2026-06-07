@@ -16,7 +16,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/csd113/RustPost/ci.yml?branch=main&style=flat-square&label=CI&logo=github)](https://github.com/csd113/RustPost/actions)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![SQLite](https://img.shields.io/badge/database-SQLite-blue?style=flat-square&logo=sqlite)](https://www.sqlite.org/)
-[![Embedded Arti](https://img.shields.io/badge/embedded%20Arti-0.42.0-7D4698?style=flat-square&logo=torproject)](https://www.torproject.org/)
+[![Embedded Arti](https://img.shields.io/badge/embedded%20Arti-0.43.0-7D4698?style=flat-square&logo=torproject)](https://www.torproject.org/)
 [![License](https://img.shields.io/badge/license-see%20LICENSE-green?style=flat-square)](./LICENSE)
 
 [**Getting Started**](#-getting-started) · [**Configuration**](#-configuration) · [**CLI Reference**](#-cli-reference) · [**Security**](#-security-model) · [**Tor / Arti**](#-tor--arti)
@@ -348,14 +348,14 @@ The active onion address is shown by the running server in its startup/status ou
 | `true` | `false` | Clearnet binds immediately. Arti onion service starts in background. If Tor fails, clearnet keeps running and admin health reports the error. |
 | `true` | `true` | Only a loopback listener is bound for Arti forwarding. Startup **fails** if Arti/onion startup fails. |
 
-**Pinned Arti crate versions:**
+**Current pinned Arti/Tor crates in `Cargo.toml`:**
 
 ```
-arti-client      = 0.42.0   # bootstraps the embedded Tor client and onion service
-tor-hsservice    = 0.42.0   # onion-service config, handle, and rendezvous streams
-tor-proto        = 0.42.0   # inspect and accept incoming onion stream requests
-tor-cell         = 0.42.0   # cell-level protocol handling
-tor-rtcompat     = 0.42.0   # Tokio-compatible Arti runtime
+arti-client      = 0.43.0   # bootstraps the embedded Tor client and onion service
+tor-hsservice    = 0.43.0   # onion-service config, handle, and rendezvous streams
+tor-proto        = 0.43.0   # inspect and accept incoming onion stream requests
+tor-cell         = 0.43.0   # cell-level protocol handling
+tor-rtcompat     = 0.43.0   # Tokio-compatible Arti runtime
 rustls           = 0.23     # ring crypto provider required by Arti's rustls stack
 ```
 
@@ -381,6 +381,29 @@ rustpost-cli restore archive.tar --include-tor-keys
 
 On Unix, the backup directory is mode `0700` and created backup archives are mode `0600`.
 Restore path validation rejects: absolute paths, traversal sequences, symlinks/hardlinks, duplicate entries, duplicate separators, Windows drive prefixes, backslash paths, encoded traversal or slash markers, and slash-like Unicode bypass characters.
+
+**Live/local Tor smoke validation:**
+
+- Start dual mode with a fresh explicit `--data-dir`, then confirm Arti bootstrap and onion descriptor publication in the logs.
+- Valid public local smoke endpoints are `/`, `/home`, `/login`, and `/register`. RustPost does not implement `/healthz` or `/readyz`; use the startup/status output and authenticated `/admin/health` page for operational status.
+- The active v3 onion hostname must contain 56 characters followed by `.onion`, and the same address must appear in startup/status output and the public Tor pill.
+- Confirm the printed loopback Arti forwarder target serves the same local page as the clearnet listener.
+- Onion-routed validation requires a reachable SOCKS proxy. Prefer Tor Browser at `127.0.0.1:9150`, then system Tor at `127.0.0.1:9050`:
+
+```sh
+if nc -z 127.0.0.1 9150; then
+  socks_proxy=127.0.0.1:9150
+elif nc -z 127.0.0.1 9050; then
+  socks_proxy=127.0.0.1:9050
+else
+  echo "SOCKS unavailable"
+fi
+
+test -n "${socks_proxy:-}" &&
+  curl --socks5-hostname "$socks_proxy" -fsS "http://<56-character-v3-address>.onion/"
+```
+
+No available SOCKS proxy is an environment limitation, not a RustPost product failure. The smoke can still validate Arti bootstrap, descriptor publication, UI onion-address consistency, local HTTP, and the loopback Arti forwarder.
 
 ---
 
@@ -538,7 +561,7 @@ cargo audit
 
 The format, release build, strict Clippy, and test commands must pass. `cargo audit` is reviewed separately and is **not fully clean** for v1.0.0 because of this documented upstream exception:
 
-> **Accepted v1.0.0 upstream audit exception:** `RUSTSEC-2023-0071` affects transitive `rsa 0.9.10` through the Arti 0.42.0 dependency family. The advisory reports a potential key-recovery timing side channel, and no fixed upgrade is currently available. This is an upstream dependency risk, not a verified RustPost application vulnerability. Re-evaluate it when updating Arti or before the next release.
+> **Accepted v1.0.0 upstream audit exception:** `RUSTSEC-2023-0071` affects transitive `rsa 0.9.10` through the current pinned Arti/Tor dependency family. The advisory reports a potential key-recovery timing side channel, and no fixed upgrade is currently available. This is an upstream dependency risk, not a verified RustPost application vulnerability. Re-evaluate it when updating Arti or before the next release.
 
 `cargo audit` also reports unmaintained transitive `bincode 2.0.1` (`RUSTSEC-2025-0141`) and `paste 1.0.15` (`RUSTSEC-2024-0436`) dependencies inherited through the Arti dependency family. These are tracked as upstream maintenance caveats, not RustPost application vulnerabilities.
 
@@ -562,7 +585,7 @@ The format, release build, strict Clippy, and test commands must pass. `cargo au
 <details>
 <summary>Partially verified / environment-dependent</summary>
 
-- Live Tor reachability depends on Tor network access and descriptor publication time. The June 2026 sweep did not repeat real onion reachability testing.
+- Live Tor reachability depends on Tor network access, descriptor publication time, and a separate Tor client. The June 2026 live/local smoke verified embedded Arti bootstrap and descriptor publication; onion-over-SOCKS reachability remained untested because no local SOCKS proxy was available.
 - Tor private key material was not rendered in admin health or normal logs during the sweep. Operational text may reference key paths or the `--include-tor-keys` flag but does not print key contents.
 
 </details>
