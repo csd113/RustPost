@@ -10,9 +10,12 @@
 - Fixed login so existing stored passwords continue to work after an operator raises the configured minimum password length.
 - Rejected unsafe profile website URL schemes server-side and stopped rendering unsafe legacy profile website values as links.
 - Enforced configured per-post image and video attachment limits and raised the multipart body limit to cover valid configured media mixes.
+- Hardened invalid upload cleanup with a cancellation-safe staged-file guard so rejected malformed, oversized, or staging-error uploads do not leave orphaned files under `tmp/uploads`.
 - Corrected generated settings copy for username, display name, and bio limits from bytes to characters.
 
 ### Release Validation
+- Added regression coverage for malformed and oversized rejected upload cleanup, guard-drop cleanup, and successful durable-media handoff.
+- Completed a focused invalid-upload cleanup probe and three live disposable stress reruns across public browsing, auth, social, media, admin/diagnostics, and no-JS/Tor-like browser behavior with no pending staged uploads.
 - Updated the ignored local Playwright release harness so it no longer configures the rejected `tor.display_onion_address`; synthetic local Tor-header assertions were removed while opt-in real-onion coverage remains.
 - Documented the accepted v1.0.0 `cargo audit` exception for transitive Arti `rsa 0.9.10` / `RUSTSEC-2023-0071`, for which no fixed upgrade is currently available.
 - Recorded unmaintained transitive Arti dependencies as upstream maintenance caveats rather than RustPost application vulnerabilities.

@@ -69,18 +69,60 @@ struct UploadContext<'a> {
 struct StagedUpload {
     owner_user_id: Option<i64>,
     original_filename: String,
-    staging: PathBuf,
+    staging: StagedUploadGuard,
     bytes: u64,
 }
 
 struct PreparedUpload {
     owner_user_id: Option<i64>,
     original_filename: String,
-    staging: PathBuf,
+    staging: StagedUploadGuard,
     bytes: u64,
     mime: String,
     media_kind: MediaKind,
     original_sha256: String,
+}
+
+struct StagedUploadGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StagedUploadGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn remove(&mut self) {
+        if remove_staged_upload(&self.path).await {
+            self.disarm();
+        }
+    }
+}
+
+impl Drop for StagedUploadGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                path = %self.path.display(),
+                error = %error,
+                "failed to remove staged upload during guard drop"
+            );
+        }
+    }
 }
 
 struct NewMediaRecord {
@@ -140,8 +182,8 @@ async fn save_upload_inner(
     let original_filename = field.file_name().unwrap_or("upload").to_owned();
     reject_path_tricks(&original_filename)?;
     let id = Uuid::new_v4().simple().to_string();
-    let staging = paths.staged_upload_path(&id);
-    let bytes = write_upload_to_staging(settings, &staging, &mut field).await?;
+    let staging = StagedUploadGuard::new(paths.staged_upload_path(&id));
+    let bytes = write_upload_to_staging(settings, staging.path(), &mut field).await?;
     let context = UploadContext {
         pool,
         settings,
@@ -166,11 +208,18 @@ async fn save_staged_upload(
     upload: StagedUpload,
     required_image_label: Option<&'static str>,
 ) -> anyhow::Result<i64> {
-    let prepared = prepare_staged_upload(context.settings, upload).await?;
+    save_staged_upload_inner(context, upload, required_image_label).await
+}
+
+async fn save_staged_upload_inner(
+    context: &UploadContext<'_>,
+    upload: StagedUpload,
+    required_image_label: Option<&'static str>,
+) -> anyhow::Result<i64> {
+    let mut prepared = prepare_staged_upload(context.settings, upload).await?;
     if let Some(label) = required_image_label
         && prepared.media_kind != MediaKind::Image
     {
-        remove_staged_upload(&prepared.staging).await;
         anyhow::bail!("{label} must be an image");
     }
     if let Some(media_id) = try_insert_duplicate(
@@ -181,7 +230,7 @@ async fn save_staged_upload(
     )
     .await?
     {
-        remove_staged_upload(&prepared.staging).await;
+        prepared.staging.remove().await;
         return Ok(media_id);
     }
     store_new_upload(context, prepared).await
@@ -191,19 +240,12 @@ async fn prepare_staged_upload(
     settings: &Settings,
     upload: StagedUpload,
 ) -> anyhow::Result<PreparedUpload> {
-    let data = tokio::fs::read(&upload.staging).await?;
+    let data = tokio::fs::read(upload.staging.path()).await?;
     let Some(kind) = infer::get(&data) else {
-        remove_staged_upload(&upload.staging).await;
         anyhow::bail!("unsupported media type");
     };
     let mime = kind.mime_type().to_owned();
-    let media_kind = match classify(settings, &mime, upload.bytes) {
-        Ok(media_kind) => media_kind,
-        Err(error) => {
-            remove_staged_upload(&upload.staging).await;
-            return Err(error);
-        }
-    };
+    let media_kind = classify(settings, &mime, upload.bytes)?;
     Ok(PreparedUpload {
         owner_user_id: upload.owner_user_id,
         original_filename: upload.original_filename,
@@ -252,7 +294,7 @@ async fn try_insert_duplicate(
 
 async fn store_new_upload(
     context: &UploadContext<'_>,
-    upload: PreparedUpload,
+    mut upload: PreparedUpload,
 ) -> anyhow::Result<i64> {
     let ext = safe_extension(&upload.mime, upload.media_kind);
     let mut basename = stable_media_basename(&upload.original_filename, &upload.original_sha256);
@@ -261,7 +303,8 @@ async fn store_new_upload(
         stem.clone_into(&mut basename);
     }
     let original_public_path = public_upload_path(context.paths, &original_path)?;
-    tokio::fs::rename(&upload.staging, &original_path).await?;
+    tokio::fs::rename(upload.staging.path(), &original_path).await?;
+    upload.staging.disarm();
     let stored = convert_or_original(
         context.settings,
         context.paths,
@@ -448,12 +491,23 @@ async fn write_upload_to_staging(
     staging: &Path,
     field: &mut Field<'_>,
 ) -> anyhow::Result<u64> {
+    let result = write_upload_to_staging_inner(settings, staging, field).await;
+    if result.is_err() {
+        remove_staged_upload(staging).await;
+    }
+    result
+}
+
+async fn write_upload_to_staging_inner(
+    settings: &Settings,
+    staging: &Path,
+    field: &mut Field<'_>,
+) -> anyhow::Result<u64> {
     let mut file = tokio::fs::File::create(staging).await?;
     let mut bytes = 0_u64;
     while let Some(chunk) = field.chunk().await? {
         bytes += u64::try_from(chunk.len())?;
         if bytes > settings.media.max_video_size {
-            remove_staged_upload(staging).await;
             anyhow::bail!("upload exceeds maximum size");
         }
         file.write_all(&chunk).await?;
@@ -550,9 +604,14 @@ async fn generate_profile_picture_thumbnail(
     Ok(())
 }
 
-async fn remove_staged_upload(path: &Path) {
-    if let Err(error) = tokio::fs::remove_file(path).await {
-        tracing::debug!(error = %error, "failed to remove rejected staged upload");
+async fn remove_staged_upload(path: &Path) -> bool {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::debug!(error = %error, "failed to remove rejected staged upload");
+            false
+        }
     }
 }
 
@@ -1388,6 +1447,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_malformed_upload_removes_staging_file() {
+        let (_temp, paths, pool, settings, ffmpeg, user_id) = media_fixture().await;
+        let bytes = b"not a supported media file";
+        let staging = paths.staged_upload_path(&Uuid::new_v4().simple().to_string());
+        tokio::fs::write(&staging, bytes).await.expect("staging");
+        let context = UploadContext {
+            pool: &pool,
+            settings: &settings,
+            paths: &paths,
+            ffmpeg: &ffmpeg,
+        };
+
+        let error = save_staged_upload(
+            &context,
+            StagedUpload {
+                owner_user_id: Some(user_id),
+                original_filename: "malformed.png".to_owned(),
+                staging: StagedUploadGuard::new(staging.clone()),
+                bytes: u64::try_from(bytes.len()).expect("byte len"),
+            },
+            None,
+        )
+        .await
+        .expect_err("malformed upload must be rejected");
+
+        assert!(error.to_string().contains("unsupported media type"));
+        assert!(!staging.exists());
+        assert_eq!(media_count(&pool).await, 0);
+        assert_tmp_uploads_empty(&paths).await;
+    }
+
+    #[tokio::test]
+    async fn rejected_oversize_image_removes_staging_file() {
+        let (_temp, paths, pool, mut settings, ffmpeg, user_id) = media_fixture().await;
+        let bytes = tiny_png_bytes();
+        settings.media.max_image_size =
+            u64::try_from(bytes.len().saturating_sub(1)).expect("image size");
+        let staging = paths.staged_upload_path(&Uuid::new_v4().simple().to_string());
+        tokio::fs::write(&staging, &bytes).await.expect("staging");
+        let context = UploadContext {
+            pool: &pool,
+            settings: &settings,
+            paths: &paths,
+            ffmpeg: &ffmpeg,
+        };
+
+        let error = save_staged_upload(
+            &context,
+            StagedUpload {
+                owner_user_id: Some(user_id),
+                original_filename: "large.png".to_owned(),
+                staging: StagedUploadGuard::new(staging.clone()),
+                bytes: u64::try_from(bytes.len()).expect("byte len"),
+            },
+            None,
+        )
+        .await
+        .expect_err("oversize image must be rejected");
+
+        assert!(error.to_string().contains("image exceeds maximum size"));
+        assert!(!staging.exists());
+        assert_eq!(media_count(&pool).await, 0);
+        assert_tmp_uploads_empty(&paths).await;
+    }
+
+    #[test]
+    fn staged_upload_guard_drop_removes_armed_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("upload.tmp");
+        std::fs::write(&staging, b"partial upload").expect("staging");
+
+        {
+            let _guard = StagedUploadGuard::new(staging.clone());
+        }
+
+        assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn successful_upload_disarms_guard_and_keeps_durable_media() {
+        let (_temp, paths, pool, settings, ffmpeg, user_id) = media_fixture().await;
+
+        let media_id = save_test_upload(
+            &pool,
+            &settings,
+            &paths,
+            &ffmpeg,
+            user_id,
+            "Photo.PNG",
+            &tiny_png_bytes(),
+        )
+        .await;
+
+        let row = media_row(&pool, media_id).await;
+        assert!(Path::new(&row.stored_path).exists());
+        assert_tmp_uploads_empty(&paths).await;
+    }
+
+    #[tokio::test]
     async fn exact_same_file_uploaded_twice_reuses_canonical_media() {
         let (_temp, paths, pool, settings, ffmpeg, user_id) = media_fixture().await;
 
@@ -2081,7 +2239,7 @@ mod tests {
             StagedUpload {
                 owner_user_id: Some(user_id),
                 original_filename: filename.to_owned(),
-                staging,
+                staging: StagedUploadGuard::new(staging),
                 bytes: u64::try_from(bytes.len()).expect("byte len"),
             },
             None,
@@ -2113,6 +2271,23 @@ mod tests {
         })
         .await
         .expect("media row")
+    }
+
+    async fn media_count(pool: &SqlitePool) -> i64 {
+        pool.call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?))
+            .await
+            .expect("media count")
+    }
+
+    async fn assert_tmp_uploads_empty(paths: &RuntimePaths) {
+        let mut entries = tokio::fs::read_dir(&paths.tmp_uploads)
+            .await
+            .expect("tmp uploads dir");
+        let mut leftovers = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("tmp upload entry") {
+            leftovers.push(entry.path());
+        }
+        assert!(leftovers.is_empty(), "leftover tmp uploads: {leftovers:?}");
     }
 
     struct TestCanonicalMedia<'a> {
