@@ -12,7 +12,7 @@ use safelog::DisplayRedacted as _;
 use tokio::net::TcpStream;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{HsNickname, RunningOnionService};
-use tor_proto::client::stream::IncomingStreamRequest;
+use tor_proto::stream::IncomingStreamRequest;
 use tracing::{info, warn};
 
 use crate::config::TorSettings;

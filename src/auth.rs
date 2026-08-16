@@ -1,8 +1,8 @@
+use anyhow::Context as _;
 use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
-use rand_core::OsRng;
 use rusqlite::{OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -325,7 +325,10 @@ fn cookie_value(name: &str, value: &str, secure: bool, max_age: Option<u64>) -> 
 }
 
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
+    let mut salt_bytes = [0_u8; 16];
+    getrandom::fill(&mut salt_bytes).context("generate password salt")?;
+    let salt = SaltString::encode_b64(&salt_bytes)
+        .map_err(|err| anyhow::anyhow!("encode password salt: {err}"))?;
     let params = Params::new(19_456, 2, 1, None)
         .map_err(|err| anyhow::anyhow!("invalid argon2 params: {err}"))?;
     Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params)

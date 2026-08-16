@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 const CAPTCHA_CHARS: &[u8] = b"123456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const CAPTCHA_LENGTH: usize = 5;
-const CAPTCHA_TTL: Duration = Duration::from_secs(10 * 60);
+const CAPTCHA_TTL: Duration = Duration::from_mins(10);
 #[cfg(debug_assertions)]
 const CAPTCHA_E2E_ANSWER_ENV: &str = "RUSTPOST_E2E_CAPTCHA_ANSWER";
 

@@ -84,7 +84,7 @@ pub async fn convert_image_to_webp(
     output: &Path,
 ) -> anyhow::Result<String> {
     let args = image_webp_args(settings, input, output);
-    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_secs(120)).await?;
+    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_mins(2)).await?;
     if result.status.success() {
         Ok(stderr_summary(&result.stderr))
     } else {
@@ -99,7 +99,7 @@ pub async fn convert_image_to_webp_thumbnail(
     size: u16,
 ) -> anyhow::Result<String> {
     let args = image_webp_thumbnail_args(settings, input, output, size);
-    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_secs(120)).await?;
+    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_mins(2)).await?;
     if result.status.success() {
         Ok(stderr_summary(&result.stderr))
     } else {
@@ -113,7 +113,7 @@ pub async fn convert_video_to_webm(
     output: &Path,
 ) -> anyhow::Result<String> {
     let args = video_webm_args(settings, input, output);
-    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_secs(300)).await?;
+    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_mins(5)).await?;
     if result.status.success() {
         Ok(stderr_summary(&result.stderr))
     } else {

@@ -14,9 +14,9 @@
 **A single-binary, self-hosted microblog — yours alone, with no cloud required.**
 
 [![CI](https://img.shields.io/github/actions/workflow/status/csd113/RustPost/ci.yml?branch=main&style=flat-square&label=CI&logo=github)](https://github.com/csd113/RustPost/actions)
-[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![SQLite](https://img.shields.io/badge/database-SQLite-blue?style=flat-square&logo=sqlite)](https://www.sqlite.org/)
-[![Embedded Arti](https://img.shields.io/badge/embedded%20Arti-0.43.0-7D4698?style=flat-square&logo=torproject)](https://www.torproject.org/)
+[![Embedded Arti](https://img.shields.io/badge/embedded%20Arti-0.45.0-7D4698?style=flat-square&logo=torproject)](https://www.torproject.org/)
 [![License](https://img.shields.io/badge/license-see%20LICENSE-green?style=flat-square)](./LICENSE)
 
 [**Getting Started**](#-getting-started) · [**Configuration**](#-configuration) · [**CLI Reference**](#-cli-reference) · [**Security**](#-security-model) · [**Tor / Arti**](#-tor--arti)
@@ -103,7 +103,7 @@ The screenshots above were captured from a local generated demo instance with fi
 
 ### Prerequisites
 
-- **Rust 1.90+** — install via [rustup](https://rustup.rs/)
+- **Rust 1.91+** — install via [rustup](https://rustup.rs/)
 - **ffmpeg** *(optional)* — enables image and video conversion. RustPost boots and runs without it.
 
 ### Build from source
@@ -495,7 +495,7 @@ cargo build --workspace --all-features
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080). The server initializes the data directory on first boot.
 
-**CI matrix** (GitHub Actions, Rust 1.90):
+**CI matrix** (GitHub Actions, Rust 1.91):
 
 | Platform | Arch |
 |---|---|

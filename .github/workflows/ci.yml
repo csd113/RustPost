@@ -19,8 +19,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Rust 1.90
-        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: rustfmt
       - name: Check formatting
@@ -34,8 +34,8 @@ jobs:
         uses: actions/checkout@v4
       - name: Install Linux build tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config
-      - name: Install Rust 1.90
-        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: clippy
       - name: Cache Cargo
@@ -53,8 +53,8 @@ jobs:
         uses: actions/checkout@v4
       - name: Install Linux build tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config
-      - name: Install Rust 1.90
-        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: clippy
       - name: Cache Cargo
@@ -85,8 +85,8 @@ jobs:
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config
-      - name: Install Rust 1.90
-        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91.0
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
