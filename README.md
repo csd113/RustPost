@@ -351,11 +351,11 @@ The active onion address is shown by the running server in its startup/status ou
 **Current pinned Arti/Tor crates in `Cargo.toml`:**
 
 ```
-arti-client      = 0.43.0   # bootstraps the embedded Tor client and onion service
-tor-hsservice    = 0.43.0   # onion-service config, handle, and rendezvous streams
-tor-proto        = 0.43.0   # inspect and accept incoming onion stream requests
-tor-cell         = 0.43.0   # cell-level protocol handling
-tor-rtcompat     = 0.43.0   # Tokio-compatible Arti runtime
+arti-client      = 0.45.0   # bootstraps the embedded Tor client and onion service
+tor-hsservice    = 0.45.0   # onion-service config, handle, and rendezvous streams
+tor-proto        = 0.45.0   # inspect and accept incoming onion stream requests
+tor-cell         = 0.45.0   # cell-level protocol handling
+tor-rtcompat     = 0.45.0   # Tokio-compatible Arti runtime
 rustls           = 0.23     # ring crypto provider required by Arti's rustls stack
 ```
 
@@ -508,7 +508,7 @@ CI runs: format check → Clippy → tests → release build. A separate strict 
 
 ### Release Artifacts
 
-Tagged releases matching `v*` produce:
+For this release, tag `v1.0.0`. Tagged releases matching `v*` produce:
 
 ```
 rustpost-linux-x86_64.tar.gz
@@ -529,7 +529,7 @@ Each archive contains `rustpost-cli` (`rustpost-cli.exe` on Windows), `README.md
 | `tokio` | Async runtime, filesystem, process, and signals |
 | `rusqlite` | SQLite access via a dedicated DB worker; WAL, FK, baseline schema plus forward migrations |
 | `argon2` | Argon2id password hashing |
-| `rand_core` + `uuid` | Secure salts and opaque generated tokens/filenames |
+| `getrandom` + `uuid` | OS-generated password salts and opaque generated tokens/filenames |
 | `infer` | Content-based media type detection |
 | `flate2` | Gzip response compression for browser text responses |
 | `tower-http` | Static upload serving and HTTP tracing |
@@ -547,7 +547,7 @@ Each archive contains `rustpost-cli` (`rustpost-cli.exe` on Windows), `README.md
 
 ## ✅ Release Verification
 
-*Last sweep: **June 6, 2026***
+*Last sweep: **August 15, 2026***
 
 Release validation distinguishes the required Rust gates from the dependency-advisory review:
 

@@ -2,6 +2,12 @@
 
 ## v1.0.0 - First Release
 
+### Runtime and Dependency Baseline
+- Raised the minimum supported Rust version to `1.91` and updated local, CI, and release-build documentation accordingly.
+- Upgraded the embedded Arti and Tor crate family to `0.45.0`, including the onion-stream API migration required by that release.
+- Updated direct dependencies to their latest compatible releases, including `base64 0.23`, `tower-http 0.7`, `infer 0.22`, and `ureq 3.4`.
+- Kept `rusqlite` at `0.36` so Cargo resolves a single compatible `libsqlite3-sys` version with Arti `0.45.0`.
+
 ### Release Blockers Fixed
 - Standardized the release artifact, install docs, CI, and operator commands on the single `rustpost-cli` binary.
 - Bumped the crate version to `1.0.0` and refreshed `Cargo.lock`.
