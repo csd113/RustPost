@@ -290,12 +290,20 @@ mod tests {
 
     #[tokio::test]
     async fn ffmpeg_timeout_is_reported() {
-        let result = super::run_ffmpeg(
-            "sh",
-            &["-c".to_owned(), "sleep 2".to_owned()],
-            std::time::Duration::from_millis(50),
-        )
-        .await;
+        #[cfg(windows)]
+        let (program, args) = (
+            "powershell.exe",
+            vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                "Start-Sleep -Seconds 2".to_owned(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", vec!["-c".to_owned(), "sleep 2".to_owned()]);
+
+        let result = super::run_ffmpeg(program, &args, std::time::Duration::from_millis(50)).await;
         assert!(result.is_err());
         assert!(
             result
