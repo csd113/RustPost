@@ -6,9 +6,12 @@ use std::time::Duration;
 use anyhow::Context as _;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
-const PREVIOUS_RELEASE_SCHEMA_VERSION: i64 = 1;
+/// Pre-1.0 release schema version 1 (without the YouTube embed tables).
+const RELEASE_V1_SCHEMA_VERSION: i64 = 1;
+/// Release 1.0.0 shipped schema version 2 (the YouTube embed tables).
+const RELEASE_V2_SCHEMA_VERSION: i64 = 2;
 const OLD_ALPHA_SCHEMA_VERSION: i64 = 13;
 const INCOMPATIBLE_DATABASE_HINT: &str = "back up or export the instance, recreate a fresh RustPost data directory, and restore from a known-good backup instead of attempting a blind migration";
 
@@ -70,7 +73,33 @@ fn open_connection(path: &Path) -> anyhow::Result<Connection> {
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    register_sql_helpers(&conn)?;
     Ok(conn)
+}
+
+/// Registers the Rust-backed SQL helpers used by application queries.
+///
+/// `rustpost_muted_word_match(text, term)` performs a Unicode-aware,
+/// case-insensitive substring test. SQLite's built-in `lower()` only folds
+/// ASCII characters, which made muted-word matching miss uppercase accented
+/// text. Registering this on the connection keeps the check inside SQL so
+/// muted rows are filtered before `LIMIT` is applied.
+fn register_sql_helpers(conn: &Connection) -> anyhow::Result<()> {
+    conn.create_scalar_function(
+        "rustpost_muted_word_match",
+        2,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let text = context.get::<Option<String>>(0)?.unwrap_or_default();
+            let term = context.get::<Option<String>>(1)?.unwrap_or_default();
+            if term.is_empty() {
+                return Ok(false);
+            }
+            Ok(text.to_lowercase().contains(&term.to_lowercase()))
+        },
+    )?;
+    Ok(())
 }
 
 pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
@@ -176,6 +205,7 @@ impl SchemaReport {
 enum MigrationState {
     Empty,
     Baseline,
+    ReleaseVersion2,
     ReleaseVersion1,
     AlphaLatest,
     Incompatible(String),
@@ -217,6 +247,7 @@ fn ensure_release_baseline(conn: &Connection) -> anyhow::Result<()> {
     match migration_state(conn)? {
         MigrationState::Empty => initialize_release_baseline(conn)?,
         MigrationState::Baseline => {}
+        MigrationState::ReleaseVersion2 => migrate_release_v2_to_current(conn)?,
         MigrationState::ReleaseVersion1 => migrate_release_v1_to_current(conn)?,
         MigrationState::AlphaLatest => adopt_latest_alpha_schema(conn)?,
         MigrationState::Incompatible(reason) => {
@@ -233,10 +264,19 @@ fn validate_or_normalize_restorable_schema(
 ) -> anyhow::Result<()> {
     match migration_state(conn)? {
         MigrationState::Baseline => validate_schema(conn),
+        MigrationState::ReleaseVersion2 => {
+            if !normalize {
+                anyhow::bail!(
+                    "database schema version {RELEASE_V2_SCHEMA_VERSION} requires migration before use"
+                );
+            }
+            migrate_release_v2_to_current(conn)?;
+            validate_schema(conn)
+        }
         MigrationState::ReleaseVersion1 => {
             if !normalize {
                 anyhow::bail!(
-                    "database schema version {PREVIOUS_RELEASE_SCHEMA_VERSION} requires migration before use"
+                    "database schema version {RELEASE_V1_SCHEMA_VERSION} requires migration before use"
                 );
             }
             migrate_release_v1_to_current(conn)?;
@@ -252,7 +292,7 @@ fn validate_or_normalize_restorable_schema(
                 );
             }
             if normalize {
-                reset_schema_migrations_to(conn, PREVIOUS_RELEASE_SCHEMA_VERSION)?;
+                reset_schema_migrations_to(conn, RELEASE_V1_SCHEMA_VERSION)?;
                 migrate_release_v1_to_current(conn)?;
                 validate_schema(conn)?;
             }
@@ -302,7 +342,10 @@ fn migration_state(conn: &Connection) -> anyhow::Result<MigrationState> {
     if versions == [CURRENT_SCHEMA_VERSION] {
         return Ok(MigrationState::Baseline);
     }
-    if versions == [PREVIOUS_RELEASE_SCHEMA_VERSION] {
+    if versions == [RELEASE_V2_SCHEMA_VERSION] {
+        return Ok(MigrationState::ReleaseVersion2);
+    }
+    if versions == [RELEASE_V1_SCHEMA_VERSION] {
         return Ok(MigrationState::ReleaseVersion1);
     }
     if latest == OLD_ALPHA_SCHEMA_VERSION {
@@ -338,7 +381,7 @@ fn adopt_latest_alpha_schema(conn: &Connection) -> anyhow::Result<()> {
             INCOMPATIBLE_DATABASE_HINT
         );
     }
-    reset_schema_migrations_to(conn, PREVIOUS_RELEASE_SCHEMA_VERSION)?;
+    reset_schema_migrations_to(conn, RELEASE_V1_SCHEMA_VERSION)?;
     migrate_release_v1_to_current(conn)
 }
 
@@ -365,6 +408,14 @@ CREATE TABLE schema_migrations (
 
 fn migrate_release_v1_to_current(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(YOUTUBE_EMBEDS_SCHEMA)?;
+    reset_schema_migrations_to(conn, RELEASE_V2_SCHEMA_VERSION)?;
+    migrate_release_v2_to_current(conn)
+}
+
+/// Adds the release 1.0.x indexes used by thread assembly, media ownership,
+/// session revocation, media reference checks, and rate-limit pruning.
+fn migrate_release_v2_to_current(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(RELEASE_V3_INDEXES)?;
     reset_schema_migrations(conn)
 }
 
@@ -421,6 +472,8 @@ fn inspect_schema_objects(conn: &Connection) -> anyhow::Result<Vec<String>> {
 }
 
 fn inspect_alpha_schema_objects(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    // Objects introduced after the alpha schema are reported as missing here
+    // but are created by the migration chain during adoption.
     Ok(inspect_schema_objects(conn)?
         .into_iter()
         .filter(|issue| {
@@ -429,6 +482,11 @@ fn inspect_alpha_schema_objects(conn: &Connection) -> anyhow::Result<Vec<String>
                 "missing table post_embeds"
                     | "missing index idx_post_embeds_post"
                     | "missing index idx_post_embeds_video"
+                    | "missing index idx_posts_root"
+                    | "missing index idx_media_owner"
+                    | "missing index idx_sessions_user"
+                    | "missing index idx_post_media_media"
+                    | "missing index idx_rate_limit_created"
             )
         })
         .collect())
@@ -633,6 +691,16 @@ fn summarize_issues(issues: &[String]) -> String {
     summary
 }
 
+/// Schema additions introduced with schema version 3. Applied on top of a
+/// version 2 database; every statement is idempotent.
+const RELEASE_V3_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_posts_root ON posts(root_post_id);
+CREATE INDEX IF NOT EXISTS idx_media_owner ON media(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_post_media_media ON post_media(media_id);
+CREATE INDEX IF NOT EXISTS idx_rate_limit_created ON rate_limit_events(created_at);
+"#;
+
 const YOUTUBE_EMBEDS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS post_embeds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -661,7 +729,7 @@ CREATE TABLE schema_migrations (
     applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO schema_migrations (version) VALUES (2);
+INSERT INTO schema_migrations (version) VALUES (3);
 
 CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -863,6 +931,7 @@ END;
 CREATE INDEX idx_posts_created ON posts(created_at DESC, id DESC);
 CREATE INDEX idx_posts_user_created ON posts(user_id, created_at DESC, id DESC);
 CREATE INDEX idx_posts_parent ON posts(parent_post_id, created_at ASC, id ASC);
+CREATE INDEX idx_posts_root ON posts(root_post_id);
 CREATE INDEX idx_follows_followed ON follows(followed_id, follower_id);
 CREATE INDEX idx_blocks_blocked ON blocks(blocked_id, blocker_id);
 CREATE INDEX idx_mutes_muted ON mutes(muted_id, muter_id);
@@ -893,6 +962,10 @@ CREATE INDEX idx_notifications_user_id_desc ON notifications(user_id, id DESC);
 CREATE INDEX idx_notifications_dedupe ON notifications(user_id, actor_user_id, post_id, kind);
 
 CREATE INDEX idx_media_is_nsfw ON media(is_nsfw);
+CREATE INDEX idx_media_owner ON media(owner_user_id);
+CREATE INDEX idx_sessions_user ON sessions(user_id);
+CREATE INDEX idx_post_media_media ON post_media(media_id);
+CREATE INDEX idx_rate_limit_created ON rate_limit_events(created_at);
 
 CREATE INDEX idx_media_original_sha256
     ON media(media_kind, original_sha256)
@@ -995,6 +1068,31 @@ const REQUIRED_INDEXES: &[RequiredIndex] = &[
     RequiredIndex {
         table: "posts",
         name: "idx_posts_parent",
+        unique: false,
+    },
+    RequiredIndex {
+        table: "posts",
+        name: "idx_posts_root",
+        unique: false,
+    },
+    RequiredIndex {
+        table: "media",
+        name: "idx_media_owner",
+        unique: false,
+    },
+    RequiredIndex {
+        table: "sessions",
+        name: "idx_sessions_user",
+        unique: false,
+    },
+    RequiredIndex {
+        table: "post_media",
+        name: "idx_post_media_media",
+        unique: false,
+    },
+    RequiredIndex {
+        table: "rate_limit_events",
+        name: "idx_rate_limit_created",
         unique: false,
     },
     RequiredIndex {
@@ -2326,7 +2424,7 @@ mod tests {
         pool.call(|conn| {
             initialize_release_baseline(conn)?;
             conn.execute("DROP TABLE post_embeds", [])?;
-            reset_schema_migrations_to(conn, PREVIOUS_RELEASE_SCHEMA_VERSION)?;
+            reset_schema_migrations_to(conn, RELEASE_V1_SCHEMA_VERSION)?;
             Ok(())
         })
         .await
@@ -2347,6 +2445,55 @@ mod tests {
 
         assert_eq!(embed_count, 0);
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert!(report.is_compatible(), "{}", report.summary());
+    }
+
+    #[tokio::test]
+    async fn release_version_2_databases_gain_release_indexes_without_data_loss() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        pool.call(|conn| {
+            initialize_release_baseline(conn)?;
+            conn.execute(
+                "INSERT INTO users (username, normalized_username, password_hash, display_name) VALUES ('Alice', 'alice', 'hash', 'Alice')",
+                [],
+            )?;
+            for index in [
+                "idx_posts_root",
+                "idx_media_owner",
+                "idx_sessions_user",
+                "idx_post_media_media",
+                "idx_rate_limit_created",
+            ] {
+                conn.execute(&format!("DROP INDEX {index}"), [])?;
+            }
+            reset_schema_migrations_to(conn, RELEASE_V2_SCHEMA_VERSION)?;
+            Ok(())
+        })
+        .await
+        .expect("version 2 fixture");
+
+        migrate(&pool).await.expect("migrate version 2");
+
+        let (version, users, root_index) = pool
+            .call(|conn| {
+                Ok((
+                    schema_version_from_connection(conn)?,
+                    conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))?,
+                    table_indexes(conn, "posts")?
+                        .iter()
+                        .any(|(name, _unique)| name == "idx_posts_root"),
+                ))
+            })
+            .await
+            .expect("post-migration state");
+        let report = schema_report(&pool).await.expect("schema report");
+
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(users, 1);
+        assert!(root_index);
         assert!(report.is_compatible(), "{}", report.summary());
     }
 
@@ -2458,6 +2605,36 @@ mod tests {
             .expect("liked posts visibility");
 
         assert_eq!(liked_posts_public, 1);
+    }
+
+    #[tokio::test]
+    async fn alpha_schema_missing_release_objects_is_adopted_and_backfilled() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        pool.call(|conn| {
+            install_latest_alpha_fixture(conn)?;
+            conn.execute("DROP TABLE post_embeds", [])?;
+            for index in [
+                "idx_posts_root",
+                "idx_media_owner",
+                "idx_sessions_user",
+                "idx_post_media_media",
+                "idx_rate_limit_created",
+            ] {
+                conn.execute(&format!("DROP INDEX {index}"), [])?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("alpha fixture without release objects");
+
+        migrate(&pool).await.expect("adopt alpha schema");
+        let report = schema_report(&pool).await.expect("schema report");
+
+        assert_eq!(report.version(), Some(CURRENT_SCHEMA_VERSION));
+        assert!(report.is_compatible(), "{}", report.summary());
     }
 
     #[tokio::test]
@@ -2649,7 +2826,9 @@ mod tests {
         let conn = Connection::open(&path).expect("open");
         let version = schema_version_from_connection(&conn).expect("version");
 
-        assert!(summary.contains("release baseline schema version 2"));
+        assert!(summary.contains(&format!(
+            "release baseline schema version {CURRENT_SCHEMA_VERSION}"
+        )));
         assert!(!summary.contains("version 13"));
         assert_eq!(version, OLD_ALPHA_SCHEMA_VERSION);
     }

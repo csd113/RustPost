@@ -71,7 +71,7 @@ pub async fn register_user(
 ) -> anyhow::Result<i64> {
     let normalized = normalize_username(username, settings.accounts.max_username_len)?;
     validate_password(password, settings)?;
-    let hash = hash_password(password)?;
+    let hash = hash_password_async(password.to_owned()).await?;
     let username = username.trim().to_owned();
     pool.call(move |conn| {
         let existing = conn
@@ -124,7 +124,7 @@ pub async fn login(
     if row.2 != 0 || row.3 != 0 {
         return Ok(Err(LoginFailure::UnavailableAccount));
     }
-    if !verify_password(password, &row.1)? {
+    if !verify_password_async(password.to_owned(), row.1.clone()).await? {
         return Ok(Err(LoginFailure::InvalidPassword));
     }
     create_session(pool, row.0).await.map(Ok)
@@ -146,6 +146,23 @@ pub async fn create_session(pool: &SqlitePool, user_id: i64) -> anyhow::Result<S
     })
     .await?;
     Ok(Session { token, csrf_token })
+}
+
+/// Deletes sessions that expired or were revoked more than `grace_days` ago.
+pub async fn prune_stale_sessions(pool: &SqlitePool, grace_days: i64) -> anyhow::Result<usize> {
+    let modifier = format!("-{grace_days} days");
+    pool.call(move |conn| {
+        let changed = conn.execute(
+            r#"
+            DELETE FROM sessions
+            WHERE (revoked_at IS NOT NULL AND datetime(revoked_at) < datetime('now', ?1))
+               OR datetime(expires_at) < datetime('now', ?1)
+            "#,
+            [modifier],
+        )?;
+        Ok(changed)
+    })
+    .await
 }
 
 pub async fn revoke_session(pool: &SqlitePool, token: &str) -> anyhow::Result<()> {
@@ -179,7 +196,21 @@ pub async fn verify_user_password(
     let Some(hash) = hash else {
         return Ok(false);
     };
-    verify_password(password, &hash)
+    verify_password_async(password.to_owned(), hash).await
+}
+
+/// Argon2id hashing is intentionally CPU and memory heavy; run it on the
+/// blocking pool so it cannot stall the async runtime under load.
+pub async fn hash_password_async(password: String) -> anyhow::Result<String> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .context("password hashing task failed")?
+}
+
+async fn verify_password_async(password: String, encoded_hash: String) -> anyhow::Result<bool> {
+    tokio::task::spawn_blocking(move || verify_password(&password, &encoded_hash))
+        .await
+        .context("password verification task failed")?
 }
 
 pub async fn change_password(
@@ -198,7 +229,7 @@ pub async fn change_password(
     if !verify_user_password(pool, user_id, current_password).await? {
         anyhow::bail!("current password is incorrect");
     }
-    let hash = hash_password(new_password)?;
+    let hash = hash_password_async(new_password.to_owned()).await?;
     let current_session_hash = current_session_token.map(hash_token);
     pool.call(move |conn| {
         let tx = conn.transaction()?;

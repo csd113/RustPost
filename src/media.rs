@@ -42,6 +42,7 @@ struct StoredMedia {
     media_kind: String,
     original_sha256: String,
     normalized_sha256: Option<String>,
+    is_nsfw: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -240,12 +241,20 @@ async fn prepare_staged_upload(
     settings: &Settings,
     upload: StagedUpload,
 ) -> anyhow::Result<PreparedUpload> {
-    let data = tokio::fs::read(upload.staging.path()).await?;
-    let Some(kind) = infer::get(&data) else {
+    let (kind, original_sha256, prefix) = sniff_and_hash(upload.staging.path()).await?;
+    let Some(kind) = kind else {
         anyhow::bail!("unsupported media type");
     };
     let mime = kind.mime_type().to_owned();
     let media_kind = classify(settings, &mime, upload.bytes)?;
+    if media_kind == MediaKind::Image
+        && let Some((width, height)) = image_dimensions(&prefix)
+    {
+        let pixels = u64::from(width).saturating_mul(u64::from(height));
+        if pixels > MAX_IMAGE_PIXELS {
+            anyhow::bail!("image dimensions exceed the maximum supported size");
+        }
+    }
     Ok(PreparedUpload {
         owner_user_id: upload.owner_user_id,
         original_filename: upload.original_filename,
@@ -253,8 +262,135 @@ async fn prepare_staged_upload(
         bytes: upload.bytes,
         mime,
         media_kind,
-        original_sha256: sha256_hex(&data),
+        original_sha256,
     })
+}
+
+/// Upper bound used to reject decompression-bomb style images before ffmpeg
+/// decodes them. 100 megapixels is far above any realistic profile or post
+/// image while keeping a full RGBA decode under ~400 MB.
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+
+/// Reads width/height from the headers of the image formats RustPost accepts.
+/// Returns `None` for unknown or truncated headers.
+fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if data.starts_with(PNG_SIGNATURE) {
+        let width = read_be_u32(data, 16)?;
+        let height = read_be_u32(data, 20)?;
+        return Some((width, height));
+    }
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        let width = read_le_u16(data, 6)?;
+        let height = read_le_u16(data, 8)?;
+        return Some((u32::from(width), u32::from(height)));
+    }
+    if data.starts_with(&[0xFF, 0xD8]) {
+        return jpeg_dimensions(data);
+    }
+    if data.len() >= 30 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        return match &data[12..16] {
+            b"VP8X" => {
+                let width = read_le_u24(data, 24)? + 1;
+                let height = read_le_u24(data, 27)? + 1;
+                Some((width, height))
+            }
+            b"VP8 " => {
+                let width = u32::from(read_le_u16(data, 26)? & 0x3FFF);
+                let height = u32::from(read_le_u16(data, 28)? & 0x3FFF);
+                Some((width, height))
+            }
+            b"VP8L" => {
+                let bits = read_le_u32(data, 21)?;
+                let width = (bits & 0x3FFF) + 1;
+                let height = ((bits >> 14) & 0x3FFF) + 1;
+                Some((width, height))
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+fn read_be_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+fn read_le_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_le_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let bytes = data.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_le_u24(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 3)?;
+    Some(u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16))
+}
+
+fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    let mut index = 2usize;
+    while index + 9 < data.len() {
+        if data[index] != 0xFF {
+            index += 1;
+            continue;
+        }
+        let marker = data[index + 1];
+        if matches!(marker, 0xD8 | 0xD9 | 0x01) || (0xD0..=0xD7).contains(&marker) {
+            index += 2;
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes([data[index + 2], data[index + 3]]));
+        if length < 2 {
+            return None;
+        }
+        // Start-of-frame markers (excluding DHT/JPG/DAC at C4/C8/CC).
+        let is_sof = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
+        if is_sof {
+            let height = u32::from(u16::from_be_bytes([data[index + 5], data[index + 6]]));
+            let width = u32::from(u16::from_be_bytes([data[index + 7], data[index + 8]]));
+            return Some((width, height));
+        }
+        index += 2 + length;
+    }
+    None
+}
+
+/// Number of leading bytes inspected for content-based media type detection.
+///
+/// The `infer` signatures are all at the start of a file, so a bounded prefix
+/// is enough and avoids loading an entire upload (potentially hundreds of
+/// megabytes of video) into memory.
+const MEDIA_SNIFF_PREFIX_BYTES: usize = 64 * 1024;
+
+/// Streams a staged upload once, sniffing its magic bytes and hashing it
+/// without buffering the whole file. The bounded prefix is also reused for
+/// image dimension checks.
+async fn sniff_and_hash(path: &Path) -> anyhow::Result<(Option<infer::Type>, String, Vec<u8>)> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buffer = vec![0_u8; MEDIA_SNIFF_PREFIX_BYTES];
+    let mut prefix = Vec::with_capacity(MEDIA_SNIFF_PREFIX_BYTES);
+    let mut hasher = Sha256::new();
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        if prefix.len() < MEDIA_SNIFF_PREFIX_BYTES {
+            let take = (MEDIA_SNIFF_PREFIX_BYTES - prefix.len()).min(read);
+            prefix.extend_from_slice(&buffer[..take]);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let kind = infer::get(&prefix);
+    let hash = hex_lower(hasher.finalize().as_ref());
+    Ok((kind, hash, prefix))
 }
 
 async fn try_insert_duplicate(
@@ -315,7 +451,13 @@ async fn store_new_upload(
         &upload.mime,
     )
     .await;
-    let normalized_sha256 = hash_file(&stored.path).await?;
+    let normalized_sha256 = match hash_file(&stored.path).await {
+        Ok(hash) => hash,
+        Err(error) => {
+            cleanup_unreferenced_uploads(context.pool, [&original_path, &stored.path]).await;
+            return Err(error);
+        }
+    };
     if stored.state == "converted" && !context.settings.media.keep_original_uploads {
         let _ = tokio::fs::remove_file(&original_path).await;
     }
@@ -328,7 +470,7 @@ async fn store_new_upload(
     )
     .await?
     {
-        cleanup_unreferenced_uploads([&original_path, &stored.path]).await;
+        cleanup_unreferenced_uploads(context.pool, [&original_path, &stored.path]).await;
         return Ok(media_id);
     }
 
@@ -367,10 +509,12 @@ async fn store_new_upload(
                 try_insert_duplicate_after_canonical_conflict(context, &upload, &normalized_sha256)
                     .await?
             {
-                cleanup_unreferenced_uploads([&cleanup_paths[0], &cleanup_paths[1]]).await;
+                cleanup_unreferenced_uploads(context.pool, [&cleanup_paths[0], &cleanup_paths[1]])
+                    .await;
                 return Ok(media_id);
             }
-            cleanup_unreferenced_uploads([&cleanup_paths[0], &cleanup_paths[1]]).await;
+            cleanup_unreferenced_uploads(context.pool, [&cleanup_paths[0], &cleanup_paths[1]])
+                .await;
             return Err(error);
         }
     };
@@ -467,7 +611,7 @@ async fn insert_duplicate_media(
         .filter(|hash| !hash.is_empty());
     pool.call(move |conn| {
         conn.execute(
-            "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, conversion_state, original_sha256, normalized_sha256, canonical_media_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate', ?, ?, ?)",
+            "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, conversion_state, original_sha256, normalized_sha256, canonical_media_id, is_nsfw) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate', ?, ?, ?, ?)",
             params![
                 owner_user_id,
                 original_filename,
@@ -479,6 +623,7 @@ async fn insert_duplicate_media(
                 original_sha256,
                 normalized_sha256,
                 canonical.id,
+                i64::from(canonical.is_nsfw),
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -514,6 +659,26 @@ async fn write_upload_to_staging_inner(
     }
     file.flush().await?;
     Ok(bytes)
+}
+
+pub async fn save_banner_upload(
+    pool: &SqlitePool,
+    settings: &Settings,
+    paths: &RuntimePaths,
+    ffmpeg: &FfmpegStatus,
+    owner_user_id: i64,
+    field: Field<'_>,
+) -> anyhow::Result<i64> {
+    save_upload_inner(
+        pool,
+        settings,
+        paths,
+        ffmpeg,
+        Some(owner_user_id),
+        field,
+        Some("profile banner"),
+    )
+    .await
 }
 
 pub async fn save_profile_picture_upload(
@@ -615,9 +780,30 @@ async fn remove_staged_upload(path: &Path) -> bool {
     }
 }
 
-async fn cleanup_unreferenced_uploads<const N: usize>(paths: [&Path; N]) {
+/// Removes upload scratch files that are not referenced by any `media` row.
+///
+/// The reference check protects a concurrently committed canonical row from
+/// having its file removed by a duplicate-upload cleanup path.
+async fn cleanup_unreferenced_uploads<const N: usize>(pool: &SqlitePool, paths: [&Path; N]) {
     let unique_paths = paths.into_iter().collect::<BTreeSet<_>>();
     for path in unique_paths {
+        let path_string = path.to_string_lossy().to_string();
+        let referenced = pool
+            .call(move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT 1 FROM media WHERE original_path = ? OR stored_path = ? OR thumbnail_path = ? LIMIT 1",
+                        params![path_string, path_string, path_string],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some())
+            })
+            .await
+            .unwrap_or(true);
+        if referenced {
+            continue;
+        }
         if let Err(error) = tokio::fs::remove_file(path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -644,10 +830,10 @@ async fn find_duplicate_media(
         .call(move |conn| {
             let sql = match hash_kind {
                 MediaHashKind::Original => {
-                    "SELECT id, stored_path, public_path, mime_type, media_kind, original_sha256, normalized_sha256 FROM media WHERE canonical_media_id IS NULL AND media_kind = ? AND original_sha256 = ? ORDER BY id ASC LIMIT 8"
+                    "SELECT id, stored_path, public_path, mime_type, media_kind, original_sha256, normalized_sha256, is_nsfw FROM media WHERE canonical_media_id IS NULL AND media_kind = ? AND original_sha256 = ? ORDER BY id ASC LIMIT 8"
                 }
                 MediaHashKind::Normalized => {
-                    "SELECT id, stored_path, public_path, mime_type, media_kind, original_sha256, normalized_sha256 FROM media WHERE canonical_media_id IS NULL AND media_kind = ? AND normalized_sha256 = ? ORDER BY id ASC LIMIT 8"
+                    "SELECT id, stored_path, public_path, mime_type, media_kind, original_sha256, normalized_sha256, is_nsfw FROM media WHERE canonical_media_id IS NULL AND media_kind = ? AND normalized_sha256 = ? ORDER BY id ASC LIMIT 8"
                 }
             };
             let mut stmt = conn.prepare(sql)?;
@@ -661,6 +847,7 @@ async fn find_duplicate_media(
                         media_kind: row.get(4)?,
                         original_sha256: row.get(5)?,
                         normalized_sha256: row.get(6)?,
+                        is_nsfw: row.get::<_, i64>(7)? != 0,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -814,10 +1001,22 @@ fn mime_matches_kind(mime_type: &str, media_kind: MediaKind) -> bool {
 }
 
 async fn hash_file(path: &Path) -> anyhow::Result<String> {
-    let data = tokio::fs::read(path).await?;
-    Ok(sha256_hex(&data))
+    use tokio::io::AsyncReadExt as _;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buffer = vec![0_u8; MEDIA_SNIFF_PREFIX_BYTES];
+    let mut hasher = Sha256::new();
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_lower(hasher.finalize().as_ref()))
 }
 
+#[cfg(test)]
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -875,17 +1074,35 @@ fn stable_media_basename(original_filename: &str, original_sha256: &str) -> Stri
     format!("{}-{}", sanitized, &original_sha256[..prefix_len])
 }
 
+/// Picks an unused output path and claims it atomically.
+///
+/// Concurrent uploads of identical bytes derive the same basename, so a plain
+/// `exists()` check would let two conversions target the same file. Creating
+/// the file with `create_new` claims the name at the filesystem level; callers
+/// overwrite or rename over the claimed (empty) file.
 fn unique_media_path(dir: &Path, basename: &str, extension: &str) -> PathBuf {
-    let path = dir.join(format!("{basename}.{extension}"));
-    if !path.exists() {
-        return path;
-    }
-    dir.join(format!(
+    let fallback = dir.join(format!(
         "{}-{}.{}",
         basename,
         Uuid::new_v4().simple(),
         extension
-    ))
+    ));
+    let candidates = std::iter::once(dir.join(format!("{basename}.{extension}")))
+        .chain(std::iter::once(fallback.clone()));
+    for candidate in candidates {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_claim) => return candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // The directory may be missing or read-only; return the intended
+            // path so the caller surfaces the real I/O error.
+            Err(_error) => return candidate,
+        }
+    }
+    fallback
 }
 
 fn public_upload_path(paths: &RuntimePaths, path: &Path) -> anyhow::Result<String> {
@@ -994,6 +1211,21 @@ pub async fn delete_media(
     let paths_to_remove = pool
         .call(move |conn| {
             let tx = conn.transaction()?;
+            let referenced: bool = tx.query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM post_media WHERE media_id = ?
+                    UNION ALL
+                    SELECT 1 FROM users
+                    WHERE profile_picture_media_id = ? OR banner_media_id = ?
+                )
+                "#,
+                params![media_id, media_id, media_id],
+                |row| row.get(0),
+            )?;
+            if referenced {
+                anyhow::bail!("media is still referenced by a post or profile");
+            }
             let media_paths: Option<(Option<String>, String, Option<String>)> = tx
                 .query_row(
                     "SELECT original_path, stored_path, thumbnail_path FROM media WHERE id = ?",
@@ -1319,6 +1551,7 @@ async fn convert_or_original(
                         };
                     }
                     Err(err) => {
+                        remove_partial_conversion(&out).await;
                         return original_fallback(
                             original,
                             paths,
@@ -1344,6 +1577,7 @@ async fn convert_or_original(
                         };
                     }
                     Err(err) => {
+                        remove_partial_conversion(&out).await;
                         return original_fallback(
                             original,
                             paths,
@@ -1359,6 +1593,20 @@ async fn convert_or_original(
         }
     }
     original_fallback(original, paths, media_kind, original_mime, "original", "")
+}
+
+/// Removes a partially written conversion output after an ffmpeg failure or
+/// timeout. Missing files are fine.
+async fn remove_partial_conversion(path: &Path) {
+    if let Err(error) = tokio::fs::remove_file(path).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "failed to remove partial media conversion output"
+        );
+    }
 }
 
 fn original_fallback(
@@ -1435,6 +1683,28 @@ mod tests {
         assert!(reject_path_tricks("../photo.png").is_err());
         assert!(reject_path_tricks("a/b.png").is_err());
         assert!(reject_path_tricks("C:\\x.png").is_err());
+    }
+
+    #[test]
+    fn image_dimension_probe_reads_headers() {
+        let png = tiny_png_bytes();
+        assert_eq!(image_dimensions(&png), Some((1, 1)));
+
+        let mut oversized = png.clone();
+        oversized[16..20].copy_from_slice(&40_000_u32.to_be_bytes());
+        oversized[20..24].copy_from_slice(&40_000_u32.to_be_bytes());
+        let (width, height) = image_dimensions(&oversized).expect("png dimensions");
+        assert_eq!((width, height), (40_000, 40_000));
+        assert!(u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS);
+
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&640u16.to_le_bytes());
+        gif.extend_from_slice(&480u16.to_le_bytes());
+        gif.extend_from_slice(&[0; 8]);
+        assert_eq!(image_dimensions(&gif), Some((640, 480)));
+
+        assert_eq!(image_dimensions(b"not an image"), None);
+        assert_eq!(image_dimensions(&[0xFF, 0xD8]), None);
     }
 
     #[test]

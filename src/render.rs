@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use crate::auth::{CurrentUser, Theme};
 use crate::social::{
     AccountView, MediaView, NotificationGroupView, PostView, ProfileTimelineTab, QuotePreview,
@@ -278,6 +280,11 @@ fn notification_nav_link(unread_count: i64) -> String {
     }
 }
 
+/// Picks the singular or plural label for a count.
+fn plural<'a>(count: i64, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
+}
+
 fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> String {
     let posting = if context.anonymous_mode_enabled {
         "Signed-in and anonymous posting"
@@ -302,8 +309,9 @@ fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> Strin
             user.map_or_else(String::new, |user| {
                 let username = html_escape::encode_double_quoted_attribute(&user.username);
                 let display_name = html_escape::encode_double_quoted_attribute(&user.display_name);
+                let follower_label = plural(followers, "follower", "followers");
                 format!(
-                    r#"<dt>Social</dt><dd><a data-testid="dashboard-followers-link" href="/users/{username}/followers" aria-label="View followers for {display_name}">{followers} followers</a><br><a data-testid="dashboard-following-link" href="/users/{username}/following" aria-label="View users {display_name} follows">{following} following</a></dd>"#
+                    r#"<dt>Social</dt><dd><a data-testid="dashboard-followers-link" href="/users/{username}/followers" aria-label="View followers for {display_name}">{followers} {follower_label}</a><br><a data-testid="dashboard-following-link" href="/users/{username}/following" aria-label="View users {display_name} follows">{following} following</a></dd>"#
                 )
             })
         }
@@ -1051,6 +1059,36 @@ function setButtonState(button, active, label) {
   }
 }
 
+function clearFormError(form) {
+  const existing = form.querySelector("[data-form-error]");
+  if (existing) {
+    existing.remove();
+  }
+}
+
+function showFormError(form, message) {
+  clearFormError(form);
+  const notice = document.createElement("p");
+  notice.className = "notice error";
+  notice.setAttribute("role", "alert");
+  notice.setAttribute("data-form-error", "");
+  notice.textContent = message;
+  form.prepend(notice);
+}
+
+function enhancedErrorMessage(status) {
+  if (status === 429) {
+    return "Too many requests. Please wait a moment and try again.";
+  }
+  if (status === 400 || status === 422) {
+    return "That submission was rejected. Check the text and any attached media, then try again.";
+  }
+  if (status === 401 || status === 403) {
+    return "Your session may have expired. Reload the page and sign in again.";
+  }
+  return "Something went wrong. Please try again.";
+}
+
 document.addEventListener("submit", async (event) => {
   const form = event.target.closest("form[data-enhance]");
   if (!form || !window.fetch) {
@@ -1061,6 +1099,7 @@ document.addEventListener("submit", async (event) => {
     return;
   }
   form.dataset.submitting = "true";
+  form.setAttribute("aria-busy", "true");
   const submitter = event.submitter || form.querySelector("button[type=submit]");
   if (submitter) {
     submitter.disabled = true;
@@ -1075,9 +1114,10 @@ document.addEventListener("submit", async (event) => {
       credentials: "same-origin"
     });
     if (!response.ok) {
-      HTMLFormElement.prototype.submit.call(form);
+      showFormError(form, enhancedErrorMessage(response.status));
       return;
     }
+    clearFormError(form);
     const data = await response.json();
     if (data.kind === "follow") {
       const followForm = document.querySelector(`[data-follow-user="${data.user_id}"]`);
@@ -1093,7 +1133,7 @@ document.addEventListener("submit", async (event) => {
         }
       }
       document.querySelectorAll(`[data-profile-followers="${data.user_id}"]`).forEach((node) => {
-        node.textContent = `${data.followers} followers`;
+        node.textContent = `${data.followers} ${data.followers === 1 ? "follower" : "followers"}`;
       });
       document.querySelectorAll(`[data-profile-following="${data.user_id}"]`).forEach((node) => {
         node.textContent = `${data.following_count} following`;
@@ -1103,10 +1143,10 @@ document.addEventListener("submit", async (event) => {
         const likes = post.querySelector('[data-count="likes"]');
         const reposts = post.querySelector('[data-count="reposts"]');
         if (likes) {
-          likes.textContent = `${data.likes} likes`;
+          likes.textContent = `${data.likes} ${data.likes === 1 ? "like" : "likes"}`;
         }
         if (reposts) {
-          reposts.textContent = `${data.reposts} reposts`;
+          reposts.textContent = `${data.reposts} ${data.reposts === 1 ? "repost" : "reposts"}`;
         }
         const liked = post.querySelector('[data-action-kind="like"]');
         const bookmarked = post.querySelector('[data-action-kind="bookmark"]');
@@ -1137,7 +1177,7 @@ document.addEventListener("submit", async (event) => {
         document.querySelectorAll(`[data-post-id="${data.parent_post_id}"] [data-count="replies"]`).forEach((node) => {
           const current = Number.parseInt(node.textContent || "0", 10);
           const next = Number.isFinite(current) ? current + 1 : 1;
-          node.textContent = `${next} replies`;
+          node.textContent = `${next} ${next === 1 ? "reply" : "replies"}`;
         });
       }
       const created = document.getElementById(`post-${data.post_id}`);
@@ -1153,9 +1193,15 @@ document.addEventListener("submit", async (event) => {
       form.querySelectorAll("input[type=file][data-composer-media]").forEach(updateComposerMedia);
     }
   } catch (_err) {
-    form.submit();
+    // Do not silently re-POST: the first request may have been committed even
+    // though the response was lost.
+    showFormError(
+      form,
+      "Network problem. Reload the page to check whether your submission was saved before trying again."
+    );
   } finally {
     delete form.dataset.submitting;
+    form.removeAttribute("aria-busy");
     if (submitter) {
       submitter.disabled = false;
     }
@@ -2111,7 +2157,7 @@ fn post_card_with_options(
         .as_ref()
         .map_or_else(String::new, quote_preview_card);
     format!(
-        r#"<article class="{}" data-testid="post-card" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}{}{}<div class="counts"><span data-count="likes">{} likes</span><span data-count="reposts">{} reposts</span><span data-count="replies">{} replies</span>{}{}</div>{}</article>"#,
+        r#"<article class="{}" data-testid="post-card" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}{}{}<div class="counts"><span data-count="likes">{} {}</span><span data-count="reposts">{} {}</span><span data-count="replies">{} {}</span>{}{}</div>{}</article>"#,
         post_class,
         post.id,
         post.id,
@@ -2127,8 +2173,11 @@ fn post_card_with_options(
         media,
         quote,
         post.like_count,
+        plural(post.like_count, "like", "likes"),
         post.repost_count,
+        plural(post.repost_count, "repost", "reposts"),
         post.reply_count,
+        plural(post.reply_count, "reply", "replies"),
         edited,
         permalink,
         controls
@@ -2381,28 +2430,87 @@ fn render_youtube_preview_card(preview: &YoutubeEmbed) -> String {
     )
 }
 
+/// Escapes post text and turns `#tags`, `@mentions`, and plain URLs into links.
+///
+/// Whitespace, including newlines, is preserved so multi-line posts render the
+/// way they were composed.
 pub fn linkify(text: &str) -> String {
-    html_escape::encode_text(text)
-        .split_whitespace()
-        .map(|word| {
-            if let Some(tag) = word.strip_prefix('#').filter(|value| !value.is_empty()) {
-                format!(
-                    r##"<a href="/tags/{}">#{}</a>"##,
-                    html_escape::encode_double_quoted_attribute(tag),
-                    html_escape::encode_text(tag)
-                )
-            } else if let Some(name) = word.strip_prefix('@').filter(|value| !value.is_empty()) {
-                format!(
-                    r#"<a href="/users/{}">@{}</a>"#,
-                    html_escape::encode_double_quoted_attribute(name),
-                    html_escape::encode_text(name)
-                )
-            } else {
-                word.to_owned()
-            }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let whitespace_run = rest.chars().next().is_some_and(char::is_whitespace);
+        let end = rest
+            .find(|ch: char| ch.is_whitespace() != whitespace_run)
+            .unwrap_or(rest.len());
+        let (chunk, tail) = rest.split_at(end);
+        if whitespace_run {
+            out.push_str(&html_escape::encode_text(chunk));
+        } else {
+            out.push_str(&linkify_token(chunk));
+        }
+        rest = tail;
+    }
+    out
+}
+
+fn linkify_token(token: &str) -> String {
+    let leading_len = token
+        .find(|ch: char| !matches!(ch, '(' | '[' | '{' | '"' | '\'' | '<' | '“' | '‘'))
+        .unwrap_or(token.len());
+    let (leading, remainder) = token.split_at(leading_len);
+    let core_len = remainder
+        .trim_end_matches(|ch: char| {
+            matches!(
+                ch,
+                '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"' | '\'' | '”' | '’'
+            )
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .len();
+    let (core, trailing) = remainder.split_at(core_len);
+    let mut out = html_escape::encode_text(leading).into_owned();
+    if let Some(tag) = core
+        .strip_prefix('#')
+        .filter(|value| !value.is_empty() && value.chars().any(char::is_alphanumeric))
+    {
+        let _ = write!(
+            out,
+            r##"<a href="/tags/{}">#{}</a>"##,
+            html_escape::encode_double_quoted_attribute(tag),
+            html_escape::encode_text(tag)
+        );
+    } else if let Some(name) = core
+        .strip_prefix('@')
+        .filter(|value| !value.is_empty() && value.chars().any(char::is_alphanumeric))
+    {
+        let _ = write!(
+            out,
+            r#"<a href="/users/{}">@{}</a>"#,
+            html_escape::encode_double_quoted_attribute(name),
+            html_escape::encode_text(name)
+        );
+    } else if is_linkable_url(core) {
+        let _ = write!(
+            out,
+            r#"<a href="{}" rel="noopener noreferrer nofollow">{}</a>"#,
+            html_escape::encode_double_quoted_attribute(core),
+            html_escape::encode_text(core)
+        );
+    } else {
+        out.push_str(&html_escape::encode_text(core));
+    }
+    out.push_str(&html_escape::encode_text(trailing));
+    out
+}
+
+fn is_linkable_url(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    host.contains('.') && !host.starts_with('.') && !host.ends_with('.')
 }
 
 pub fn empty_state(title: &str, message: &str) -> String {
@@ -2823,8 +2931,9 @@ pub fn thread_back_control() -> String {
 }
 
 pub fn notice(kind: &str, message: &str) -> String {
+    let role = if kind == "error" { "alert" } else { "status" };
     format!(
-        r#"<section class="notice {}"><p>{}</p></section>"#,
+        r#"<section class="notice {}" role="{role}"><p>{}</p></section>"#,
         html_escape::encode_double_quoted_attribute(kind),
         html_escape::encode_text(message)
     )
@@ -2853,7 +2962,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
 }
 
 const CSS: &str = r#"
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;line-height:1.5;--bg:#f5f6f1;--surface:#fff;--surface-subtle:#fbfcfa;--surface-muted:#f4f5f2;--header-bg:rgba(255,255,255,.96);--text:#202124;--text-strong:#172017;--muted:#667064;--muted-strong:#59625a;--border:#dfe4dc;--border-strong:#b9c2b8;--link:#1f5f8b;--link-strong:#24445f;--brand:#163b2f;--brand-hover:#235544;--brand-text:#fff;--hover:#eef3f0;--focus:#93c5fd;--shadow:rgba(20,35,30,.04);--reply-border:#c8d8d0;--avatar-bg:#eef3f0;--warning:#9a5a00;--danger:#8a3d2d;--danger-strong:#6f2f22;--danger-bg:#fff8f5;--danger-border:#e6b8a8;--success-bg:#f4fbf5;--success-border:#add7b4;--media-bg:#f6f7f4;--card-gap:.5rem;--section-gap:.75rem;--shell-side:240px;--shell-primary:680px;--shell-gap:1.25rem;--shell-max:1220px;--header-padding-y:.8rem;--header-brand-size:2rem;--hairline:1px;--rail-sticky-top:calc(var(--header-brand-size) + var(--header-padding-y) + var(--header-padding-y) + var(--shell-gap) + var(--hairline))}
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;line-height:1.5;--bg:#f5f6f1;--surface:#fff;--surface-subtle:#fbfcfa;--surface-muted:#f4f5f2;--header-bg:rgba(255,255,255,.96);--text:#202124;--text-strong:#172017;--muted:#667064;--muted-strong:#59625a;--border:#dfe4dc;--border-strong:#b9c2b8;--link:#1f5f8b;--link-strong:#24445f;--brand:#163b2f;--brand-hover:#235544;--brand-text:#fff;--hover:#eef3f0;--focus:#2563eb;--shadow:rgba(20,35,30,.04);--reply-border:#c8d8d0;--avatar-bg:#eef3f0;--warning:#9a5a00;--danger:#8a3d2d;--danger-strong:#6f2f22;--danger-bg:#fff8f5;--danger-border:#e6b8a8;--success-bg:#f4fbf5;--success-border:#add7b4;--media-bg:#f6f7f4;--card-gap:.5rem;--section-gap:.75rem;--shell-side:240px;--shell-primary:680px;--shell-gap:1.25rem;--shell-max:1220px;--header-padding-y:.8rem;--header-brand-size:2rem;--hairline:1px;--rail-sticky-top:calc(var(--header-brand-size) + var(--header-padding-y) + var(--header-padding-y) + var(--shell-gap) + var(--hairline))}
 :root[data-theme="dark"]{color-scheme:dark;--bg:#111827;--surface:#182231;--surface-subtle:#1d2939;--surface-muted:#233044;--header-bg:rgba(17,24,39,.96);--text:#eef4fb;--text-strong:#f8fafc;--muted:#c3cfdd;--muted-strong:#d4deea;--border:#344256;--border-strong:#596b83;--link:#8fc7ff;--link-strong:#badcff;--brand:#4f8fc7;--brand-hover:#6aa8df;--brand-text:#06111f;--hover:#243349;--focus:#fbbf24;--shadow:rgba(0,0,0,.26);--reply-border:#4f6680;--avatar-bg:#243349;--warning:#f6c36b;--danger:#ffb4a2;--danger-strong:#ffd2c7;--danger-bg:#3a2020;--danger-border:#8f4d43;--success-bg:#163321;--success-border:#4c8a61;--media-bg:#0f172a}
 *{box-sizing:border-box}body{margin:0;min-width:320px;color:var(--text);background:var(--bg)}a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
 .site-header{position:sticky;top:0;z-index:10;background:var(--header-bg);border-bottom:1px solid var(--border);backdrop-filter:blur(8px)}
@@ -2883,6 +2992,10 @@ nav button{border-color:transparent;background:transparent;color:var(--link-stro
 .settings-media-frame{position:relative;min-width:0}.settings-picture-row{display:flex;align-items:flex-end;gap:0}.settings-picture-wrap{display:inline-block;max-width:100%;line-height:0}.settings-picture-preview{display:block}.settings-media-actions{position:absolute;z-index:2;display:flex;gap:.35rem;align-items:center}.settings-banner-actions{top:.55rem;right:.55rem}.settings-picture-actions{left:50%;bottom:.45rem;transform:translateX(-50%)}.settings-media-control{position:relative;display:inline-flex}.settings-media-input,.settings-media-delete-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.settings-media-icon-button{display:inline-flex;align-items:center;justify-content:center;width:2rem;height:2rem;margin:0;border:1px solid rgba(255,255,255,.62);border-radius:999px;background:rgba(23,32,23,.56);color:#fff;padding:0;box-shadow:0 1px 4px rgba(0,0,0,.22);cursor:pointer;opacity:.72;transition:opacity .15s ease,background-color .15s ease,border-color .15s ease,transform .15s ease}.settings-media-icon-button svg{width:1rem;height:1rem;fill:currentColor}.settings-media-frame:hover .settings-media-icon-button,.settings-media-frame:focus-within .settings-media-icon-button,.settings-media-icon-button:hover{opacity:1}.settings-media-icon-button:hover{background:rgba(23,32,23,.82);text-decoration:none}.settings-media-input:focus-visible+.settings-media-icon-button,.settings-media-delete-input:focus-visible+.settings-media-icon-button{outline:3px solid var(--focus);outline-offset:2px;opacity:1}.settings-media-delete-input:checked+.settings-media-icon-button,.settings-media-removing .settings-media-remove{background:var(--danger);border-color:var(--danger-border);color:var(--brand-text);opacity:1}.settings-media-has-file .settings-media-change{background:var(--brand);border-color:rgba(255,255,255,.72);color:var(--brand-text);opacity:1}.settings-media-disabled{position:absolute;right:.55rem;bottom:.55rem;max-width:calc(100% - 1.1rem);margin:0;border:1px solid rgba(255,255,255,.5);border-radius:999px;background:rgba(23,32,23,.62);color:#fff;padding:.22rem .55rem;font-size:.82rem;font-weight:800;line-height:1.2;overflow-wrap:anywhere}
 .notification-row:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.notification-open{min-height:2.25rem;padding:.35rem .6rem}.notification-actors summary{min-height:2.1rem}.post-permalink{font-weight:700;color:var(--link-strong)}.js-enabled .post-permalink{display:inline-flex}.js-enabled .post-permalink:not(:focus-visible){position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.js-enabled .post-permalink:focus-visible{display:inline-flex;align-items:center;position:absolute;right:.85rem;bottom:.85rem;z-index:2;min-height:2.25rem;border:1px solid var(--border-strong);border-radius:999px;background:var(--surface);padding:.3rem .65rem;box-shadow:0 6px 18px var(--shadow);text-decoration:none}.icon-button{width:2.45rem;height:2.45rem}.admin-nsfw-button{min-height:2.45rem;padding:.35rem .6rem}.thread-back{width:2.4rem;height:2.4rem}button,.primary{min-height:2.5rem;padding:.52rem .82rem}input[type=checkbox]{width:1.05rem;height:1.05rem;accent-color:var(--brand)}input[type=file]{max-width:100%;color:var(--muted-strong)}input[type=file]::file-selector-button{min-height:2.15rem;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.34rem .58rem;font-weight:800;cursor:pointer}input[type=file]::file-selector-button:hover{background:var(--hover);color:var(--text-strong)}label:has(>input[type=checkbox]){display:flex;align-items:flex-start;gap:.55rem;min-height:2.4rem;margin:.75rem 0 .35rem}label:has(>input[type=checkbox]) input[type=checkbox]{flex:0 0 auto;margin-top:.22rem}.empty-state{padding:2.2rem 1rem}.danger-zone{border-color:var(--danger-border);background:var(--danger-bg)}.danger-zone h2,.danger-zone h3{color:var(--danger-strong)}.admin-nav-grid{grid-template-columns:repeat(auto-fit,minmax(13rem,1fr))}.admin-nav-card{position:relative;display:grid;align-content:center;min-height:4.2rem;padding-right:2.3rem;color:var(--link-strong);font-weight:850}.admin-nav-card::after{content:"";position:absolute;right:1rem;top:50%;width:.48rem;height:.48rem;border-top:2px solid currentColor;border-right:2px solid currentColor;transform:translateY(-50%) rotate(45deg);opacity:.62}.admin-nav-card:hover{border-color:var(--border-strong);background:var(--hover);text-decoration:none}.admin-nav-card:focus-visible::after,.admin-nav-card:hover::after{opacity:1}
 .profile-secondary button{min-height:2.4rem}.settings-media-icon-button{width:2.25rem;height:2.25rem}.settings-media-icon-button svg{width:1.08rem;height:1.08rem}
+.counts a{color:var(--muted);font-weight:700;text-decoration:none}.counts a:hover{color:var(--link-strong);text-decoration:underline}
+.profile-title-row>div{min-width:0}.profile-title-row h1{margin:0;overflow-wrap:anywhere}.profile-bio{margin:.55rem 0 0;overflow-wrap:anywhere}.profile-state-note{color:var(--muted-strong);font-weight:700}
+.notice.info{border-color:var(--border-strong);background:var(--surface-subtle)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms !important;animation-duration:.01ms !important}}
 @media (max-width:1100px){.app-shell{--shell-side:220px;--shell-max:880px;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary))}.right-rail{display:none}}
 @media (max-width:820px){.app-shell{grid-template-columns:minmax(0,680px)}.left-rail,.right-rail{display:none}.mobile-nav{display:flex}}
 @media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.header-brand-row{align-items:center;width:100%;gap:.55rem}.tor-indicator{max-width:calc(100% - 7rem);margin-left:auto}.tor-details{left:auto;right:0;max-width:calc(100vw - 1.5rem)}.site-header{position:static}nav{justify-content:flex-start}.mobile-nav{width:100%}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group,.admin-user-search,.admin-user-row,.onboarding-media-row{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar,.notifications-hero{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.composer-footer,.composer-media-selection{align-items:flex-start;flex-direction:column}.composer-file-input{max-width:100%}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-switch-row{grid-template-columns:1fr;gap:.55rem}.settings-switch-toggle,.settings-switch-control{justify-self:start}.settings-form-actions{justify-content:stretch}.settings-form-actions button,.settings-danger-action .button-link{width:100%;justify-content:center}.settings-item-list li{align-items:stretch;flex-direction:column}.admin-user-search-actions,.admin-user-actions{align-items:stretch;flex-direction:column}.admin-user-search-actions button,.admin-user-search-actions .button-link,.admin-user-actions button{width:100%;justify-content:center}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1,.notifications-hero h1{font-size:1.25rem}.notification-row{grid-template-columns:auto minmax(0,1fr);gap:.6rem}.unread-dot{position:absolute;right:.75rem;top:.75rem;margin:0}.notification-preview{padding:.5rem}}
@@ -3531,8 +3644,25 @@ mod tests {
 
         assert!(!body.contains("youtube-preview-card"));
         assert!(body.contains(
-            r#"<div class="text">hello https://example.com/watch?v=dQw4w9WgXcQ <a href="/tags/rust">#rust</a></div>"#
+            r#"<div class="text">hello <a href="https://example.com/watch?v=dQw4w9WgXcQ" rel="noopener noreferrer nofollow">https://example.com/watch?v=dQw4w9WgXcQ</a> <a href="/tags/rust">#rust</a></div>"#
         ));
+    }
+
+    #[test]
+    fn linkify_preserves_newlines_and_trims_trailing_punctuation() {
+        assert_eq!(
+            linkify("first line\nsecond #rust, line"),
+            "first line\nsecond <a href=\"/tags/rust\">#rust</a>, line"
+        );
+        assert_eq!(linkify("  spaced  \n\ntext  "), "  spaced  \n\ntext  ");
+        assert_eq!(
+            linkify("see (https://example.test/a)."),
+            "see (<a href=\"https://example.test/a\" rel=\"noopener noreferrer nofollow\">https://example.test/a</a>)."
+        );
+        assert_eq!(linkify("#"), "#");
+        assert_eq!(linkify("@"), "@");
+        assert_eq!(linkify("no links here"), "no links here");
+        assert_eq!(linkify("hello@example.test"), "hello@example.test");
     }
 
     #[test]

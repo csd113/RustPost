@@ -54,8 +54,21 @@ This repository is intended for operators who want a small, understandable self-
 | Follows, Blocks & Mutes | Standard social graph primitives |
 | Likes & Bookmarks | Likes are public; bookmarks are private |
 | Notifications | In-app notification feed |
+| Muted words | Per-user phrase list applied server-side |
 | Search | Full-text search via SQLite FTS5 + user matching |
 | Anonymous posting | Supported but **disabled by default** |
+
+### Blocking, muting, and muted words
+
+RustPost enforces these rules in the database and query layer, not only in the UI.
+
+| Action | Effect |
+|---|---|
+| Block | Removes follow relationships in both directions. The blocker and the blocked account cannot follow, reply to, quote, like, repost, bookmark, or mention each other's content, and neither account's posts appear in the other's feeds, threads, search results, mention suggestions, or notifications. The blocked account sees the profile without activity; neither account's display name, bio, or counts are removed from the database. Unblocking restores normal visibility and interactions. |
+| Mute | Hides the muted account's posts from the muter's feeds, search, mention suggestions, notifications, and profile activity. Mutes do not notify the muted account. |
+| Muted words | Per-user list, editable in Settings. Matching is case-insensitive (Unicode-aware), does not use regular expressions, and matches anywhere in the post text, so muting `cat` also hides `concatenate`. Matching applies to home, profile, media, likes, search, and quote previews, and to notification previews for other people's posts. Your own posts are never hidden by your own muted words. |
+
+Block and mute rows are deleted when either account is deleted, and deleting a post or account removes the associated media files once no other row references them.
 
 ### Media Pipeline
 | Feature | Details |

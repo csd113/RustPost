@@ -454,14 +454,31 @@ pub async fn timeline(
     if mode != "bookmarks" {
         posts.extend(repost_events(pool, viewer_id, mode, None).await?);
     }
+    sort_events_newest_first(&mut posts);
+    posts.truncate(40);
+    Ok(posts)
+}
+
+/// Orders merged post/repost events newest first.
+///
+/// Timestamps have second granularity, so the tie-break uses the numeric row
+/// id rather than the `p:`/`r:` prefixed event id string (which would order
+/// `p:9` before `p:10`).
+fn sort_events_newest_first(posts: &mut [PostView]) {
     posts.sort_by(|left, right| {
         right
             .event_created_at
             .cmp(&left.event_created_at)
-            .then_with(|| right.event_id.cmp(&left.event_id))
+            .then_with(|| event_sort_key(right).cmp(&event_sort_key(left)))
     });
-    posts.truncate(40);
-    Ok(posts)
+}
+
+fn event_sort_key(post: &PostView) -> i64 {
+    post.event_id
+        .rsplit(':')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 pub async fn profile_timeline(
@@ -490,12 +507,7 @@ pub async fn profile_tab_timeline(
     if matches!(tab, ProfileTimelineTab::Posts | ProfileTimelineTab::Media) {
         posts.extend(repost_events(pool, viewer_id, tab.repost_mode(), Some(user_id)).await?);
     }
-    posts.sort_by(|left, right| {
-        right
-            .event_created_at
-            .cmp(&left.event_created_at)
-            .then_with(|| right.event_id.cmp(&left.event_id))
-    });
+    sort_events_newest_first(&mut posts);
     posts.truncate(40);
     Ok(posts)
 }
@@ -536,7 +548,7 @@ pub async fn profile_pinned_post(
     sql.push_str(
         " AND p.id = (SELECT pinned_post_id FROM users WHERE id = ? AND is_deleted = 0) AND p.user_id = ?",
     );
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(" LIMIT 1");
     let mut bindings = vec![user_id, user_id];
     push_viewer_filter_bindings(&mut bindings, viewer_id);
@@ -569,14 +581,22 @@ pub async fn post_thread(
     let root_id = root;
     let mut sql = base_post_query();
     sql.push_str(" AND (p.id = ? OR p.root_post_id = ?)");
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(" ORDER BY p.id ASC LIMIT 200");
     let mut bindings = vec![root_id, root_id];
     push_viewer_filter_bindings(&mut bindings, viewer_id);
     let rows = pool
         .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
         .await?;
-    rows_to_posts(pool, rows, viewer_id).await
+    let posts = rows_to_posts(pool, rows, viewer_id).await?;
+    // The requested post can be hidden by a block, mute, suspension, or
+    // deletion while visible replies remain. Treat that as "not found" rather
+    // than rendering an orphaned reply branch.
+    if posts.iter().any(|post| post.id == post_id) {
+        Ok(posts)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 pub async fn repost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<bool> {
@@ -703,10 +723,14 @@ pub async fn quote_target_preview(
     viewer_id: Option<i64>,
     post_id: i64,
 ) -> anyhow::Result<QuotePreview> {
-    let preview = quote_preview_for_post(pool, Some(post_id), viewer_id)
-        .await?
-        .filter(|preview| !preview.unavailable);
-    preview.ok_or_else(|| anyhow::anyhow!("post not found"))
+    let previews = pool
+        .call(move |conn| quote_previews(conn, viewer_id, &[post_id]))
+        .await?;
+    previews
+        .get(&post_id)
+        .filter(|preview| !preview.unavailable)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("post not found"))
 }
 
 pub async fn unrepost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<bool> {
@@ -806,6 +830,60 @@ pub async fn unfollow(
     .await
 }
 
+/// The viewer's relationship to a profile, used to render accurate controls
+/// and profile states instead of always showing unused actions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProfileRelationship {
+    pub following: bool,
+    pub blocked: bool,
+    pub muted: bool,
+    pub blocks_viewer: bool,
+}
+
+impl ProfileRelationship {
+    #[must_use]
+    pub const fn has_block(self) -> bool {
+        self.blocked || self.blocks_viewer
+    }
+}
+
+pub async fn profile_relationship(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    profile_id: i64,
+) -> anyhow::Result<ProfileRelationship> {
+    let Some(viewer_id) = viewer_id else {
+        return Ok(ProfileRelationship::default());
+    };
+    if viewer_id == profile_id {
+        return Ok(ProfileRelationship::default());
+    }
+    pool.call(move |conn| {
+        Ok(conn.query_row(
+            r#"
+            SELECT
+              EXISTS(SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?),
+              EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?),
+              EXISTS(SELECT 1 FROM mutes WHERE muter_id = ? AND muted_id = ?),
+              EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?)
+            "#,
+            params![
+                viewer_id, profile_id, viewer_id, profile_id, viewer_id, profile_id, profile_id,
+                viewer_id
+            ],
+            |row| {
+                Ok(ProfileRelationship {
+                    following: row.get::<_, i64>(0)? != 0,
+                    blocked: row.get::<_, i64>(1)? != 0,
+                    muted: row.get::<_, i64>(2)? != 0,
+                    blocks_viewer: row.get::<_, i64>(3)? != 0,
+                })
+            },
+        )?)
+    })
+    .await
+}
+
 pub async fn is_following(
     pool: &SqlitePool,
     follower_id: i64,
@@ -856,36 +934,104 @@ pub async fn instance_counts(pool: &SqlitePool) -> anyhow::Result<(i64, i64)> {
     .await
 }
 
-pub async fn following_accounts(
+/// Maximum accounts rendered per follower/following page.
+pub const ACCOUNT_LIST_PAGE_SIZE: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowEdge {
+    Followers,
+    Following,
+}
+
+/// Shared follower/following list query with keyset pagination and viewer
+/// visibility filtering. Returns the page and whether more accounts follow.
+async fn follow_account_list(
     pool: &SqlitePool,
-    viewer_id: i64,
-) -> anyhow::Result<Vec<AccountView>> {
-    pool.call(move |conn| {
-        let mut stmt = conn.prepare(
+    account_id: i64,
+    viewer_id: Option<i64>,
+    edge: FollowEdge,
+    after: Option<String>,
+) -> anyhow::Result<(Vec<AccountView>, bool)> {
+    let (edge_column, anchor_column) = match edge {
+        FollowEdge::Followers => ("follower_id", "followed_id"),
+        FollowEdge::Following => ("followed_id", "follower_id"),
+    };
+    let mut sql = format!(
+        r#"
+        SELECT u.id, u.username, u.display_name, u.bio,
+          COALESCE(pic.thumbnail_public_path, pic.public_path),
+          EXISTS(
+            SELECT 1 FROM follows vf
+            WHERE vf.follower_id = ? AND vf.followed_id = u.id
+          )
+        FROM follows f
+        JOIN users u ON u.id = f.{edge_column}
+        LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+        WHERE f.{anchor_column} = ? AND u.is_deleted = 0 AND u.is_suspended = 0
+        "#
+    );
+    let mut bindings = vec![
+        rusqlite::types::Value::Integer(viewer_id.unwrap_or(0)),
+        rusqlite::types::Value::Integer(account_id),
+    ];
+    if let Some(cursor) = &after {
+        sql.push_str(" AND u.normalized_username > ?");
+        bindings.push(rusqlite::types::Value::Text(cursor.to_ascii_lowercase()));
+    }
+    if viewer_id.is_some() {
+        sql.push_str(
             r#"
-            SELECT u.id, u.username, u.display_name, u.bio,
-              COALESCE(pic.thumbnail_public_path, pic.public_path)
-            FROM follows f
-            JOIN users u ON u.id = f.followed_id
-            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
-            WHERE f.follower_id = ? AND u.is_deleted = 0
-            ORDER BY lower(u.username)
+            AND u.id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+            AND u.id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)
+            AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = u.id AND blocked_id = ?)
             "#,
-        )?;
+        );
+        if let Some(viewer_id) = viewer_id {
+            bindings.extend(std::iter::repeat_n(
+                rusqlite::types::Value::Integer(viewer_id),
+                3,
+            ));
+        }
+    }
+    sql.push_str(" ORDER BY u.normalized_username ASC LIMIT ?");
+    let limit = i64::try_from(ACCOUNT_LIST_PAGE_SIZE + 1)?;
+    bindings.push(rusqlite::types::Value::Integer(limit));
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([viewer_id], |row| {
+            .query_map(params_from_iter(bindings), |row| {
                 Ok(AccountView {
                     id: row.get(0)?,
                     username: row.get(1)?,
                     display_name: row.get(2)?,
                     bio: row.get(3)?,
                     profile_picture_path: row.get(4)?,
-                    viewer_following: true,
+                    viewer_following: row.get::<_, i64>(5)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })
+    .await
+    .map(|mut accounts| {
+        let has_more = accounts.len() > ACCOUNT_LIST_PAGE_SIZE;
+        accounts.truncate(ACCOUNT_LIST_PAGE_SIZE);
+        (accounts, has_more)
+    })
+}
+
+pub async fn following_accounts(
+    pool: &SqlitePool,
+    viewer_id: i64,
+    after: Option<String>,
+) -> anyhow::Result<(Vec<AccountView>, bool)> {
+    follow_account_list(
+        pool,
+        viewer_id,
+        Some(viewer_id),
+        FollowEdge::Following,
+        after,
+    )
     .await
 }
 
@@ -909,21 +1055,27 @@ pub async fn onboarding_suggestions(
             WHERE u.id != ?
               AND u.is_deleted = 0
               AND u.is_suspended = 0
+              AND u.id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+              AND u.id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = u.id AND blocked_id = ?)
             ORDER BY lower(u.username), u.id
             LIMIT ?
             "#,
         )?;
         let rows = stmt
-            .query_map(params![viewer_id, viewer_id, limit], |row| {
-                Ok(AccountView {
-                    id: row.get(0)?,
-                    username: row.get(1)?,
-                    display_name: row.get(2)?,
-                    bio: row.get(3)?,
-                    profile_picture_path: row.get(4)?,
-                    viewer_following: row.get::<_, i64>(5)? != 0,
-                })
-            })?
+            .query_map(
+                params![viewer_id, viewer_id, viewer_id, viewer_id, viewer_id, limit],
+                |row| {
+                    Ok(AccountView {
+                        id: row.get(0)?,
+                        username: row.get(1)?,
+                        display_name: row.get(2)?,
+                        bio: row.get(3)?,
+                        profile_picture_path: row.get(4)?,
+                        viewer_following: row.get::<_, i64>(5)? != 0,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })
@@ -934,78 +1086,18 @@ pub async fn followers_accounts(
     pool: &SqlitePool,
     account_id: i64,
     viewer_id: Option<i64>,
-) -> anyhow::Result<Vec<AccountView>> {
-    let viewer_id = viewer_id.unwrap_or(0);
-    pool.call(move |conn| {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT u.id, u.username, u.display_name, u.bio,
-              COALESCE(pic.thumbnail_public_path, pic.public_path),
-              EXISTS(
-                SELECT 1 FROM follows vf
-                WHERE vf.follower_id = ? AND vf.followed_id = u.id
-              )
-            FROM follows f
-            JOIN users u ON u.id = f.follower_id
-            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
-            WHERE f.followed_id = ? AND u.is_deleted = 0
-            ORDER BY lower(u.username)
-            "#,
-        )?;
-        let rows = stmt
-            .query_map(params![viewer_id, account_id], |row| {
-                Ok(AccountView {
-                    id: row.get(0)?,
-                    username: row.get(1)?,
-                    display_name: row.get(2)?,
-                    bio: row.get(3)?,
-                    profile_picture_path: row.get(4)?,
-                    viewer_following: row.get::<_, i64>(5)? != 0,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })
-    .await
+    after: Option<String>,
+) -> anyhow::Result<(Vec<AccountView>, bool)> {
+    follow_account_list(pool, account_id, viewer_id, FollowEdge::Followers, after).await
 }
 
 pub async fn following_accounts_for_profile(
     pool: &SqlitePool,
     account_id: i64,
     viewer_id: Option<i64>,
-) -> anyhow::Result<Vec<AccountView>> {
-    let viewer_id = viewer_id.unwrap_or(0);
-    pool.call(move |conn| {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT u.id, u.username, u.display_name, u.bio,
-              COALESCE(pic.thumbnail_public_path, pic.public_path),
-              EXISTS(
-                SELECT 1 FROM follows vf
-                WHERE vf.follower_id = ? AND vf.followed_id = u.id
-              )
-            FROM follows f
-            JOIN users u ON u.id = f.followed_id
-            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
-            WHERE f.follower_id = ? AND u.is_deleted = 0
-            ORDER BY lower(u.username)
-            "#,
-        )?;
-        let rows = stmt
-            .query_map(params![viewer_id, account_id], |row| {
-                Ok(AccountView {
-                    id: row.get(0)?,
-                    username: row.get(1)?,
-                    display_name: row.get(2)?,
-                    bio: row.get(3)?,
-                    profile_picture_path: row.get(4)?,
-                    viewer_following: row.get::<_, i64>(5)? != 0,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })
-    .await
+    after: Option<String>,
+) -> anyhow::Result<(Vec<AccountView>, bool)> {
+    follow_account_list(pool, account_id, viewer_id, FollowEdge::Following, after).await
 }
 
 pub async fn block(pool: &SqlitePool, blocker_id: i64, blocked_id: i64) -> anyhow::Result<()> {
@@ -1014,6 +1106,7 @@ pub async fn block(pool: &SqlitePool, blocker_id: i64, blocked_id: i64) -> anyho
     }
     pool.call(move |conn| {
         let tx = conn.transaction()?;
+        ensure_account_actionable_tx(&tx, blocked_id)?;
         tx.execute(
             "INSERT OR IGNORE INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
             params![blocker_id, blocked_id],
@@ -1068,13 +1161,37 @@ pub async fn mute(pool: &SqlitePool, muter_id: i64, muted_id: i64) -> anyhow::Re
         anyhow::bail!("cannot mute yourself");
     }
     pool.call(move |conn| {
-        conn.execute(
+        let tx = conn.transaction()?;
+        ensure_account_actionable_tx(&tx, muted_id)?;
+        tx.execute(
             "INSERT OR IGNORE INTO mutes (muter_id, muted_id) VALUES (?, ?)",
             params![muter_id, muted_id],
         )?;
+        tx.commit()?;
         Ok(())
     })
     .await
+}
+
+/// Rejects block/mute targets that do not exist or were deleted, mirroring the
+/// follow target check so deleted accounts cannot accumulate invisible rows.
+fn ensure_account_actionable_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: i64,
+) -> anyhow::Result<()> {
+    let available = tx
+        .query_row(
+            "SELECT is_deleted = 0 FROM users WHERE id = ?",
+            [account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0)
+        != 0;
+    if !available {
+        anyhow::bail!("account not found");
+    }
+    Ok(())
 }
 
 pub async fn unmute(pool: &SqlitePool, muter_id: i64, muted_id: i64) -> anyhow::Result<()> {
@@ -1114,7 +1231,7 @@ pub async fn muted_users(
 
 pub async fn add_muted_word(pool: &SqlitePool, user_id: i64, term: &str) -> anyhow::Result<()> {
     let term = clean_muted_word(term)?;
-    let normalized = term.to_ascii_lowercase();
+    let normalized = term.to_lowercase();
     pool.call(move |conn| {
         conn.execute(
             "INSERT OR IGNORE INTO muted_words (user_id, term, normalized_term) VALUES (?, ?, ?)",
@@ -1364,14 +1481,16 @@ pub async fn delete_post(
         anyhow::bail!("cannot delete this post");
     }
     pool.call(move |conn| {
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE posts SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
             [post_id],
         )?;
-        conn.execute(
+        tx.execute(
             "UPDATE users SET pinned_post_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE pinned_post_id = ?",
             [post_id],
         )?;
+        tx.commit()?;
         Ok(())
     })
     .await
@@ -1469,14 +1588,16 @@ pub async fn search(
     let rows = if let Some(fts_query) = fts_query_from_user_input(query) {
         let mut post_sql = base_post_query();
         post_sql.push_str(" AND p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?)");
-        append_viewer_filters(&mut post_sql, "p.user_id", viewer_id);
+        append_viewer_filters(&mut post_sql, "p.user_id", "p.text", viewer_id);
         post_sql.push_str(" LIMIT 40");
         pool.call(move |conn| {
             if let Some(viewer_id) = viewer_id {
                 query_post_rows(
                     conn,
                     &post_sql,
-                    params![fts_query, viewer_id, viewer_id, viewer_id, viewer_id],
+                    params![
+                        fts_query, viewer_id, viewer_id, viewer_id, viewer_id, viewer_id
+                    ],
                 )
             } else {
                 query_post_rows(conn, &post_sql, params![fts_query])
@@ -1620,12 +1741,37 @@ fn fts_query_from_user_input(query: &str) -> Option<String> {
     }
 }
 
+/// SQL fragment that hides notifications whose actor is blocked in either
+/// direction, muted, or whose post text matches one of the recipient's muted
+/// words. Binds `VIEWER_FILTER_BINDINGS` copies of the recipient's user id.
+const NOTIFICATION_VISIBLE_SQL: &str = r#"
+  AND (
+    n.actor_user_id IS NULL
+    OR (
+      n.actor_user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+      AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = n.actor_user_id AND blocked_id = ?)
+      AND n.actor_user_id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)
+    )
+  )
+  AND (
+    p.user_id = ?
+    OR NOT EXISTS (
+      SELECT 1 FROM muted_words mw
+      WHERE mw.user_id = ? AND rustpost_muted_word_match(COALESCE(p.text, ''), mw.normalized_term)
+    )
+  )
+"#;
+
+fn push_notification_filter_bindings(bindings: &mut Vec<i64>, user_id: i64) {
+    bindings.extend(std::iter::repeat_n(user_id, VIEWER_FILTER_BINDINGS));
+}
+
 pub async fn notifications(
     pool: &SqlitePool,
     user_id: i64,
 ) -> anyhow::Result<Vec<NotificationView>> {
     pool.call(move |conn| {
-        let mut stmt = conn.prepare(
+        let sql = format!(
             r#"
             SELECT n.id, n.kind, n.actor_user_id, u.username, u.display_name,
               n.post_id, p.text, p.is_deleted, p.parent_post_id, p.quote_post_id,
@@ -1639,12 +1785,16 @@ pub async fn notifications(
                 OR n.actor_user_id IS NULL
                 OR COALESCE(u.liked_posts_public, 0) != 0
               )
+              {NOTIFICATION_VISIBLE_SQL}
             ORDER BY n.id DESC
             LIMIT 80
             "#,
-        )?;
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bindings = vec![user_id];
+        push_notification_filter_bindings(&mut bindings, user_id);
         let rows = stmt
-            .query_map([user_id], |row| {
+            .query_map(params_from_iter(bindings), |row| {
                 let kind = row.get::<_, String>(1)?;
                 let post_id = row.get::<_, Option<i64>>(5)?;
                 let post_is_deleted = row
@@ -1771,21 +1921,24 @@ fn push_notification_group_item(
 
 pub async fn unread_notification_count(pool: &SqlitePool, user_id: i64) -> anyhow::Result<i64> {
     pool.call(move |conn| {
-        Ok(conn.query_row(
+        let sql = format!(
             r#"
             SELECT COUNT(*)
             FROM notifications n
             LEFT JOIN users u ON u.id = n.actor_user_id AND u.is_deleted = 0
+            LEFT JOIN posts p ON p.id = n.post_id
             WHERE n.user_id = ? AND n.read_at IS NULL
               AND (
                 n.kind != 'like'
                 OR n.actor_user_id IS NULL
                 OR COALESCE(u.liked_posts_public, 0) != 0
               )
+              {NOTIFICATION_VISIBLE_SQL}
             "#,
-            [user_id],
-            |row| row.get(0),
-        )?)
+        );
+        let mut bindings = vec![user_id];
+        push_notification_filter_bindings(&mut bindings, user_id);
+        Ok(conn.query_row(&sql, params_from_iter(bindings), |row| row.get(0))?)
     })
     .await
 }
@@ -1850,15 +2003,21 @@ fn notification_group_counts_tx(
     target_post_id: Option<i64>,
 ) -> anyhow::Result<(i64, i64)> {
     if kind == "follow" {
-        return Ok(conn.query_row(
+        let sql = format!(
             r#"
-            SELECT COUNT(*), COALESCE(SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END), 0)
-            FROM notifications
-            WHERE user_id = ? AND kind = 'follow'
-            "#,
-            [user_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?);
+            SELECT COUNT(*), COALESCE(SUM(CASE WHEN n.read_at IS NULL THEN 1 ELSE 0 END), 0)
+            FROM notifications n
+            LEFT JOIN users actor ON actor.id = n.actor_user_id AND actor.is_deleted = 0
+            LEFT JOIN posts p ON p.id = n.post_id
+            WHERE n.user_id = ? AND n.kind = 'follow'
+              {NOTIFICATION_VISIBLE_SQL}
+            "#
+        );
+        let mut bindings = vec![user_id];
+        push_notification_filter_bindings(&mut bindings, user_id);
+        return Ok(conn.query_row(&sql, params_from_iter(bindings), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?);
     }
     let Some(target_expr) = notification_group_target_expr(kind) else {
         return Ok((0, 0));
@@ -1878,13 +2037,21 @@ fn notification_group_counts_tx(
             OR n.actor_user_id IS NULL
             OR COALESCE(actor.liked_posts_public, 0) != 0
           )
+          {NOTIFICATION_VISIBLE_SQL}
         "#
     );
-    Ok(
-        conn.query_row(&sql, params![user_id, kind, target_post_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?,
-    )
+    let mut bindings = vec![
+        rusqlite::types::Value::Integer(user_id),
+        rusqlite::types::Value::Text(kind.to_owned()),
+        rusqlite::types::Value::Integer(target_post_id),
+    ];
+    bindings.extend(std::iter::repeat_n(
+        rusqlite::types::Value::Integer(user_id),
+        VIEWER_FILTER_BINDINGS,
+    ));
+    Ok(conn.query_row(&sql, params_from_iter(bindings), |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?)
 }
 
 fn notification_group_target_expr(kind: &str) -> Option<&'static str> {
@@ -2011,7 +2178,7 @@ async fn post_events(
     if matches!(mode, "home" | "bookmarks") {
         sql.push_str(" AND p.parent_post_id IS NULL");
     }
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     if let Some(cursor) = cursor {
         sql.push_str(" AND p.id < ");
         sql.push_str(&cursor.to_string());
@@ -2039,7 +2206,7 @@ async fn post_events_for_user(
 ) -> anyhow::Result<Vec<PostView>> {
     let mut sql = base_post_query();
     sql.push_str(" AND p.user_id = ? AND p.parent_post_id IS NULL");
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(" ORDER BY p.id DESC LIMIT 40");
     let mut bindings = vec![user_id];
     push_viewer_filter_bindings(&mut bindings, viewer_id);
@@ -2056,7 +2223,7 @@ async fn reply_events_for_user(
 ) -> anyhow::Result<Vec<PostView>> {
     let mut sql = base_post_query();
     sql.push_str(" AND p.user_id = ? AND p.parent_post_id IS NOT NULL");
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(" ORDER BY p.id DESC LIMIT 40");
     let mut bindings = vec![user_id];
     push_viewer_filter_bindings(&mut bindings, viewer_id);
@@ -2074,7 +2241,7 @@ async fn media_events_for_user(
     let mut sql = base_post_query();
     sql.push_str(" AND p.user_id = ? AND ");
     sql.push_str(&media_surface_condition("p.id", "p.text"));
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(" ORDER BY p.id DESC LIMIT 40");
     let mut bindings = vec![user_id];
     push_viewer_filter_bindings(&mut bindings, viewer_id);
@@ -2091,7 +2258,7 @@ async fn liked_events_for_user(
 ) -> anyhow::Result<Vec<PostView>> {
     let mut sql = base_post_query();
     sql.push_str(" AND p.id IN (SELECT post_id FROM likes WHERE user_id = ?)");
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(
         " ORDER BY (SELECT created_at FROM likes WHERE user_id = ? AND post_id = p.id) DESC, p.id DESC LIMIT 40",
     );
@@ -2125,7 +2292,7 @@ async fn repost_events(
     if viewer_id.is_some() {
         sql.push_str(" AND r.user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)");
         sql.push_str(" AND r.user_id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)");
-        append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+        append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     }
     sql.push_str(" ORDER BY r.id DESC LIMIT 40");
     let mut bindings = Vec::new();
@@ -2153,7 +2320,19 @@ fn media_surface_condition(post_id_column: &str, text_column: &str) -> String {
     )
 }
 
-fn append_viewer_filters(sql: &mut String, user_column: &str, viewer_id: Option<i64>) {
+/// Number of bound parameters added by [`append_viewer_filters`].
+const VIEWER_FILTER_BINDINGS: usize = 5;
+
+/// Appends the standard viewer visibility predicates: accounts the viewer
+/// blocked, accounts that blocked the viewer, accounts the viewer muted, and
+/// the viewer's muted words. The viewer's own posts are never hidden by their
+/// own muted words.
+fn append_viewer_filters(
+    sql: &mut String,
+    user_column: &str,
+    text_column: &str,
+    viewer_id: Option<i64>,
+) {
     if viewer_id.is_some() {
         sql.push_str(&format!(
             " AND ({user_column} IS NULL OR {user_column} NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?))"
@@ -2164,18 +2343,15 @@ fn append_viewer_filters(sql: &mut String, user_column: &str, viewer_id: Option<
         sql.push_str(&format!(
             " AND ({user_column} IS NULL OR NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = {user_column} AND blocked_id = ?))"
         ));
-        sql.push_str(
-            " AND NOT EXISTS (SELECT 1 FROM muted_words mw WHERE mw.user_id = ? AND instr(lower(p.text), mw.normalized_term) > 0)",
-        );
+        sql.push_str(&format!(
+            " AND ({user_column} IS NULL OR {user_column} = ? OR NOT EXISTS (SELECT 1 FROM muted_words mw WHERE mw.user_id = ? AND rustpost_muted_word_match({text_column}, mw.normalized_term)))"
+        ));
     }
 }
 
 fn push_viewer_filter_bindings(bindings: &mut Vec<i64>, viewer_id: Option<i64>) {
     if let Some(id) = viewer_id {
-        bindings.push(id);
-        bindings.push(id);
-        bindings.push(id);
-        bindings.push(id);
+        bindings.extend(std::iter::repeat_n(id, VIEWER_FILTER_BINDINGS));
     }
 }
 
@@ -2217,48 +2393,59 @@ fn map_post_row(row: &Row<'_>) -> rusqlite::Result<PostRow> {
     })
 }
 
+/// Enriches pre-fetched post rows with media, embeds, viewer state, counts,
+/// and quote previews using a fixed number of batched queries.
+///
+/// This replaced a per-row enrichment loop that issued up to seven queries per
+/// post, which meant hundreds of round trips for a single 40-post timeline.
 async fn rows_to_posts(
     pool: &SqlitePool,
     rows: Vec<PostRow>,
     viewer_id: Option<i64>,
 ) -> anyhow::Result<Vec<PostView>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    pool.call(move |conn| enrich_posts(conn, rows, viewer_id))
+        .await
+}
+
+fn enrich_posts(
+    conn: &Connection,
+    rows: Vec<PostRow>,
+    viewer_id: Option<i64>,
+) -> anyhow::Result<Vec<PostView>> {
+    let visible_ids = rows
+        .iter()
+        .filter(|row| !row.original_unavailable)
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+    let media = media_for_posts(conn, &visible_ids)?;
+    let embeds = youtube_embeds_for_posts(conn, &visible_ids)?;
+    let viewer_likes = viewer_relation_ids(conn, viewer_id, ViewerRelation::Likes, &visible_ids)?;
+    let viewer_bookmarks =
+        viewer_relation_ids(conn, viewer_id, ViewerRelation::Bookmarks, &visible_ids)?;
+    let viewer_reposts =
+        viewer_relation_ids(conn, viewer_id, ViewerRelation::Reposts, &visible_ids)?;
+    let like_counts = visible_like_counts(conn, viewer_id, &visible_ids)?;
+    let quote_ids = rows
+        .iter()
+        .filter_map(|row| row.quote_post_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let quotes = quote_previews(conn, viewer_id, &quote_ids)?;
+
     let mut posts = Vec::with_capacity(rows.len());
     for row in rows {
+        let unavailable = row.original_unavailable;
         let id = row.id;
-        let original_unavailable = row.original_unavailable;
-        let media = if original_unavailable {
-            Vec::new()
-        } else {
-            media_for_post(pool, id).await?
-        };
-        let youtube_embeds = if original_unavailable {
-            Vec::new()
-        } else {
-            youtube_embeds_for_post(pool, id).await?
-        };
-        let viewer_liked = if let Some(user_id) = viewer_id {
-            !original_unavailable && relation_exists(pool, "likes", user_id, id).await?
-        } else {
-            false
-        };
-        let viewer_bookmarked = if let Some(user_id) = viewer_id {
-            !original_unavailable && relation_exists(pool, "bookmarks", user_id, id).await?
-        } else {
-            false
-        };
-        let viewer_reposted = if let Some(user_id) = viewer_id {
-            !original_unavailable && relation_exists(pool, "reposts", user_id, id).await?
-        } else {
-            false
-        };
-        let like_count = if original_unavailable {
-            0
-        } else {
-            visible_like_count(pool, viewer_id, id).await?
-        };
-        let viewer_can_repost =
-            viewer_id.is_some_and(|user_id| !original_unavailable && row.user_id != Some(user_id));
-        let quote = quote_preview_for_post(pool, row.quote_post_id, viewer_id).await?;
+        let quote = row.quote_post_id.map(|quote_id| {
+            quotes
+                .get(&quote_id)
+                .cloned()
+                .unwrap_or_else(|| unavailable_quote_preview(quote_id))
+        });
         posts.push(PostView {
             event_id: row.event_id,
             event_kind: if row.event_kind == "repost" {
@@ -2277,101 +2464,219 @@ async fn rows_to_posts(
             created_at: row.created_at,
             edited_at: row.edited_at,
             event_created_at: row.event_created_at,
-            like_count,
+            like_count: if unavailable {
+                0
+            } else {
+                like_counts.get(&id).copied().unwrap_or(0)
+            },
             repost_count: row.repost_count,
             reply_count: row.reply_count,
-            viewer_liked,
-            viewer_bookmarked,
-            viewer_reposted,
-            viewer_can_repost,
+            viewer_liked: viewer_likes.contains(&id),
+            viewer_bookmarked: viewer_bookmarks.contains(&id),
+            viewer_reposted: viewer_reposts.contains(&id),
+            viewer_can_repost: viewer_id
+                .is_some_and(|user_id| !unavailable && row.user_id != Some(user_id)),
             pinned_by_author: row.pinned_by_author,
-            original_unavailable,
+            original_unavailable: unavailable,
             reposted_by_user_id: row.repost_user_id,
             reposted_by_username: row.repost_username,
             reposted_by_display_name: row.repost_display_name,
             reposted_at: row.repost_created_at,
             quote,
-            media,
-            youtube_embeds,
+            media: media.get(&id).cloned().unwrap_or_default(),
+            youtube_embeds: embeds.get(&id).cloned().unwrap_or_default(),
         });
     }
     Ok(posts)
 }
 
-async fn visible_like_count(
-    pool: &SqlitePool,
-    viewer_id: Option<i64>,
-    post_id: i64,
-) -> anyhow::Result<i64> {
-    let viewer_id = viewer_id.unwrap_or(-1);
-    pool.call(move |conn| {
-        Ok(conn.query_row(
-            r#"
-            SELECT COUNT(*)
-            FROM likes l
-            JOIN users u ON u.id = l.user_id AND u.is_deleted = 0
-            WHERE l.post_id = ? AND (u.liked_posts_public != 0 OR l.user_id = ?)
-            "#,
-            params![post_id, viewer_id],
-            |row| row.get(0),
-        )?)
-    })
-    .await
+fn unavailable_quote_preview(quote_post_id: i64) -> QuotePreview {
+    QuotePreview {
+        id: quote_post_id,
+        username: None,
+        display_name: None,
+        anonymous_label: None,
+        text: String::new(),
+        created_at: String::new(),
+        unavailable: true,
+    }
 }
 
-async fn quote_preview_for_post(
-    pool: &SqlitePool,
-    quote_post_id: Option<i64>,
-    viewer_id: Option<i64>,
-) -> anyhow::Result<Option<QuotePreview>> {
-    let Some(quote_post_id) = quote_post_id else {
-        return Ok(None);
-    };
-    pool.call(move |conn| {
-        let mut sql = r#"
-            SELECT q.id, q.user_id, u.username, u.display_name, q.anonymous_label, q.text, q.created_at
-            FROM posts q
-            LEFT JOIN users u ON u.id = q.user_id
-            WHERE q.id = ? AND q.is_deleted = 0
-              AND (q.user_id IS NULL OR (u.is_deleted = 0 AND u.is_suspended = 0))
-        "#
-        .to_owned();
-        if viewer_id.is_some() {
-            sql.push_str(
-                " AND (q.user_id IS NULL OR q.user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?))",
-            );
-            sql.push_str(
-                " AND (q.user_id IS NULL OR q.user_id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?))",
-            );
-            sql.push_str(
-                " AND (q.user_id IS NULL OR NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = q.user_id AND blocked_id = ?))",
-            );
-            sql.push_str(
-                " AND NOT EXISTS (SELECT 1 FROM muted_words mw WHERE mw.user_id = ? AND instr(lower(q.text), mw.normalized_term) > 0)",
-            );
+fn sql_placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn media_for_posts(
+    conn: &Connection,
+    post_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, Vec<MediaView>>> {
+    if post_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = format!(
+        r#"
+        SELECT pm.post_id, m.public_path, m.mime_type, m.media_kind, m.alt_text, m.is_nsfw
+        FROM post_media pm
+        JOIN media m ON m.id = pm.media_id
+        WHERE pm.post_id IN ({})
+        ORDER BY pm.post_id ASC, pm.position ASC
+        "#,
+        sql_placeholders(post_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(post_ids.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            MediaView {
+                public_path: row.get(1)?,
+                mime_type: row.get(2)?,
+                media_kind: row.get(3)?,
+                alt_text: row.get(4)?,
+                is_nsfw: row.get::<_, i64>(5)? != 0,
+            },
+        ))
+    })?;
+    let mut media: HashMap<i64, Vec<MediaView>> = HashMap::new();
+    for row in rows {
+        let (post_id, view) = row?;
+        media.entry(post_id).or_default().push(view);
+    }
+    Ok(media)
+}
+
+fn youtube_embeds_for_posts(
+    conn: &Connection,
+    post_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, Vec<YoutubeEmbed>>> {
+    if post_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = format!(
+        r#"
+        SELECT post_id, video_id, title
+        FROM post_embeds
+        WHERE provider = 'youtube' AND post_id IN ({})
+        ORDER BY post_id ASC, position ASC, id ASC
+        "#,
+        sql_placeholders(post_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(post_ids.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut embeds: HashMap<i64, Vec<YoutubeEmbed>> = HashMap::new();
+    for row in rows {
+        let (post_id, video_id, title) = row?;
+        if let Some(embed) = crate::youtube::embed_from_stored(&video_id, title) {
+            embeds.entry(post_id).or_default().push(embed);
         }
-        let preview = if let Some(viewer_id) = viewer_id {
-            conn.query_row(
-                &sql,
-                params![quote_post_id, viewer_id, viewer_id, viewer_id, viewer_id],
-                map_quote_preview_row,
-            )
-            .optional()?
-        } else {
-            conn.query_row(&sql, params![quote_post_id], map_quote_preview_row)
-                .optional()?
-        };
-        Ok(Some(preview.unwrap_or_else(|| QuotePreview {
-            id: quote_post_id,
-            username: None,
-            display_name: None,
-            anonymous_label: None,
-            text: String::new(),
-            created_at: String::new(),
-            unavailable: true,
-        })))
-    })
-    .await
+    }
+    Ok(embeds)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ViewerRelation {
+    Likes,
+    Bookmarks,
+    Reposts,
+}
+
+impl ViewerRelation {
+    const fn table(self) -> &'static str {
+        match self {
+            Self::Likes => "likes",
+            Self::Bookmarks => "bookmarks",
+            Self::Reposts => "reposts",
+        }
+    }
+}
+
+fn viewer_relation_ids(
+    conn: &Connection,
+    viewer_id: Option<i64>,
+    relation: ViewerRelation,
+    post_ids: &[i64],
+) -> anyhow::Result<BTreeSet<i64>> {
+    let Some(viewer_id) = viewer_id else {
+        return Ok(BTreeSet::new());
+    };
+    if post_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let sql = format!(
+        "SELECT post_id FROM {} WHERE user_id = ? AND post_id IN ({})",
+        relation.table(),
+        sql_placeholders(post_ids.len())
+    );
+    let mut bindings = Vec::with_capacity(post_ids.len() + 1);
+    bindings.push(viewer_id);
+    bindings.extend_from_slice(post_ids);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(bindings), |row| row.get::<_, i64>(0))?;
+    Ok(rows.collect::<Result<BTreeSet<_>, _>>()?)
+}
+
+fn visible_like_counts(
+    conn: &Connection,
+    viewer_id: Option<i64>,
+    post_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, i64>> {
+    if post_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = format!(
+        r#"
+        SELECT l.post_id, COUNT(*)
+        FROM likes l
+        JOIN users u ON u.id = l.user_id AND u.is_deleted = 0
+        WHERE l.post_id IN ({}) AND (u.liked_posts_public != 0 OR l.user_id = ?)
+        GROUP BY l.post_id
+        "#,
+        sql_placeholders(post_ids.len())
+    );
+    let mut bindings = Vec::with_capacity(post_ids.len() + 1);
+    bindings.extend_from_slice(post_ids);
+    bindings.push(viewer_id.unwrap_or(-1));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(bindings), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+}
+
+fn quote_previews(
+    conn: &Connection,
+    viewer_id: Option<i64>,
+    quote_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, QuotePreview>> {
+    if quote_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut sql = format!(
+        r#"
+        SELECT q.id, q.user_id, u.username, u.display_name, q.anonymous_label, q.text, q.created_at
+        FROM posts q
+        LEFT JOIN users u ON u.id = q.user_id
+        WHERE q.id IN ({}) AND q.is_deleted = 0
+          AND (q.user_id IS NULL OR (u.is_deleted = 0 AND u.is_suspended = 0))
+        "#,
+        sql_placeholders(quote_ids.len())
+    );
+    append_viewer_filters(&mut sql, "q.user_id", "q.text", viewer_id);
+    let mut bindings = quote_ids.to_vec();
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(bindings), |row| {
+        let preview = map_quote_preview_row(row)?;
+        Ok((preview.id, preview))
+    })?;
+    Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
 }
 
 fn map_quote_preview_row(row: &Row<'_>) -> rusqlite::Result<QuotePreview> {
@@ -2435,55 +2740,6 @@ fn user_relation_exists_tx(
         .query_row(&sql, params![left_id, right_id], |_| Ok(()))
         .optional()?
         .is_some())
-}
-
-async fn relation_exists(
-    pool: &SqlitePool,
-    table: &str,
-    user_id: i64,
-    post_id: i64,
-) -> anyhow::Result<bool> {
-    let sql = format!("SELECT 1 FROM {table} WHERE user_id = ? AND post_id = ?");
-    pool.call(move |conn| {
-        Ok(conn
-            .query_row(&sql, params![user_id, post_id], |_| Ok(()))
-            .optional()?
-            .is_some())
-    })
-    .await
-}
-
-async fn media_for_post(pool: &SqlitePool, post_id: i64) -> anyhow::Result<Vec<MediaView>> {
-    pool.call(move |conn| {
-        let mut stmt = conn.prepare(
-            r#"
-        SELECT m.public_path, m.mime_type, m.media_kind, m.alt_text, m.is_nsfw
-        FROM post_media pm JOIN media m ON m.id = pm.media_id
-        WHERE pm.post_id = ? ORDER BY pm.position ASC
-        "#,
-        )?;
-        let rows = stmt
-            .query_map([post_id], |row| {
-                Ok(MediaView {
-                    public_path: row.get(0)?,
-                    mime_type: row.get(1)?,
-                    media_kind: row.get(2)?,
-                    alt_text: row.get(3)?,
-                    is_nsfw: row.get::<_, i64>(4)? != 0,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })
-    .await
-}
-
-async fn youtube_embeds_for_post(
-    pool: &SqlitePool,
-    post_id: i64,
-) -> anyhow::Result<Vec<YoutubeEmbed>> {
-    pool.call(move |conn| youtube_embeds_for_post_conn(conn, post_id).map_err(Into::into))
-        .await
 }
 
 fn youtube_embeds_for_post_conn(
@@ -3650,7 +3906,9 @@ mod tests {
         let (pool, _settings, alice, bob) = fixture().await;
         follow(&pool, bob, alice).await.expect("follow");
 
-        let accounts = following_accounts(&pool, bob).await.expect("accounts");
+        let (accounts, _) = following_accounts(&pool, bob, None)
+            .await
+            .expect("accounts");
 
         assert_eq!(accounts.len(), 1);
         assert!(accounts[0].profile_picture_path.is_none());
@@ -4617,12 +4875,289 @@ mod tests {
             .await
             .expect("carol follows alice");
 
-        let accounts = following_accounts(&pool, alice)
+        let (accounts, _) = following_accounts(&pool, alice, None)
             .await
             .expect("following accounts");
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id, bob);
         assert_eq!(accounts[0].username, "bob");
         assert!(accounts[0].viewer_following);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_posts_all_commit_with_unique_ids() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let mut handles = Vec::new();
+        for index in 0..24 {
+            let pool = pool.clone();
+            let settings = settings.clone();
+            let author = if index % 2 == 0 { alice } else { bob };
+            handles.push(tokio::spawn(async move {
+                create_post(
+                    &pool,
+                    &settings,
+                    Some(author),
+                    &format!("concurrent post {index}"),
+                    None,
+                    &[],
+                )
+                .await
+            }));
+        }
+        let mut ids = BTreeSet::new();
+        for handle in handles {
+            let id = handle.await.expect("task").expect("concurrent post");
+            ids.insert(id);
+        }
+        assert_eq!(ids.len(), 24);
+        let count: i64 = pool
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM posts WHERE is_deleted = 0",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("post count");
+        assert_eq!(count, 24);
+
+        // All 24 posts share one-second timestamps; the merged timeline must
+        // still be ordered by numeric id, not by the "p:<id>" event string.
+        let timeline = timeline(&pool, None, "local", None)
+            .await
+            .expect("timeline");
+        let ids = timeline.iter().map(|post| post.id).collect::<Vec<_>>();
+        let mut newest_first = ids.clone();
+        newest_first.sort_unstable_by(|left, right| right.cmp(left));
+        assert_eq!(ids, newest_first);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rate_limit_checks_record_at_most_the_limit() {
+        let (pool, _settings, alice, _bob) = fixture().await;
+        let actor = format!("user:{alice}");
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let pool = pool.clone();
+            let actor = actor.clone();
+            handles.push(tokio::spawn(async move {
+                crate::rate_limit::check_and_record(
+                    &pool,
+                    crate::rate_limit::Scope::Post,
+                    &actor,
+                    3,
+                    60,
+                )
+                .await
+            }));
+        }
+        let mut accepted = 0;
+        for handle in handles {
+            if handle.await.expect("task").is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_follows_create_one_relationship() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move { follow(&pool, alice, bob).await }));
+        }
+        for handle in handles {
+            handle.await.expect("task").expect("follow");
+        }
+        let rows: i64 = pool
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM follows WHERE follower_id = ? AND followed_id = ?",
+                    params![alice, bob],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("follow count");
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_block_and_unblock_leave_consistent_state() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        follow(&pool, alice, bob).await.expect("follow");
+        let mut handles = Vec::new();
+        for index in 0..20 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                if index % 2 == 0 {
+                    block(&pool, alice, bob).await
+                } else {
+                    unblock(&pool, alice, bob).await
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task").expect("block toggle");
+        }
+        let (blocks, follows): (i64, i64) = pool
+            .call(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM blocks WHERE blocker_id = ? AND blocked_id = ?",
+                        params![alice, bob],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM follows WHERE (follower_id = ? AND followed_id = ?) OR (follower_id = ? AND followed_id = ?)",
+                        params![alice, bob, bob, alice],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .expect("state");
+        // A block must never coexist with a follow relationship.
+        assert!(
+            blocks == 0 || follows == 0,
+            "blocks={blocks} follows={follows}"
+        );
+    }
+
+    #[tokio::test]
+    async fn muted_words_are_case_insensitive_unicode_and_exempt_own_posts() {
+        let (pool, settings, alice, bob) = fixture().await;
+        add_muted_word(&pool, alice, "CAFÉ").await.expect("mute");
+        add_muted_word(&pool, alice, "breaking news")
+            .await
+            .expect("mute phrase");
+        add_muted_word(&pool, alice, "cat").await.expect("mute");
+        // Duplicates (case-insensitive) collapse to one row.
+        add_muted_word(&pool, alice, "café")
+            .await
+            .expect("dup mute");
+        let stored = muted_words(&pool, alice).await.expect("list");
+        assert_eq!(stored.len(), 3);
+        for invalid in ["", "   ", "\n"] {
+            assert!(add_muted_word(&pool, alice, invalid).await.is_err());
+        }
+        assert!(
+            add_muted_word(&pool, alice, &"x".repeat(101))
+                .await
+                .is_err()
+        );
+
+        let hidden = [
+            "CAFÉ is open",
+            "a café visit",
+            "Breaking NEWS today",
+            "concatenate the strings",
+            "the cat sat down",
+        ];
+        for text in hidden {
+            create_post(&pool, &settings, Some(bob), text, None, &[])
+                .await
+                .expect("hidden post");
+        }
+        create_post(&pool, &settings, Some(bob), "a dog appears", None, &[])
+            .await
+            .expect("visible post");
+        create_post(&pool, &settings, Some(alice), "my own CAFÉ cat", None, &[])
+            .await
+            .expect("own post");
+
+        let timeline = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("timeline");
+        let texts = timeline
+            .iter()
+            .map(|post| post.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(texts.contains(&"a dog appears"));
+        assert!(texts.contains(&"my own CAFÉ cat"));
+        assert_eq!(timeline.len(), 2, "unexpected timeline: {texts:?}");
+
+        let (_, search_posts) = search(&pool, Some(alice), "concatenate")
+            .await
+            .expect("search");
+        assert!(search_posts.is_empty());
+
+        remove_muted_word(&pool, alice, stored[0].id)
+            .await
+            .expect("remove");
+        assert_eq!(muted_words(&pool, alice).await.expect("list").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn notifications_hide_blocked_muted_and_muted_word_content() {
+        let (pool, settings, alice, bob) = fixture().await;
+        create_post(
+            &pool,
+            &settings,
+            Some(bob),
+            "spoilers ahead @alice",
+            None,
+            &[],
+        )
+        .await
+        .expect("mention post");
+        assert_eq!(
+            notifications(&pool, alice)
+                .await
+                .expect("notifications")
+                .len(),
+            1
+        );
+
+        add_muted_word(&pool, alice, "spoilers")
+            .await
+            .expect("mute word");
+        assert!(
+            notifications(&pool, alice)
+                .await
+                .expect("notifications")
+                .is_empty()
+        );
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread"),
+            0
+        );
+
+        remove_muted_word(
+            &pool,
+            alice,
+            muted_words(&pool, alice).await.expect("list")[0].id,
+        )
+        .await
+        .expect("unmute word");
+        follow(&pool, bob, alice).await.expect("follow");
+        assert_eq!(
+            notifications(&pool, alice)
+                .await
+                .expect("notifications")
+                .len(),
+            2
+        );
+
+        block(&pool, alice, bob).await.expect("block");
+        assert!(
+            notifications(&pool, alice)
+                .await
+                .expect("notifications")
+                .is_empty()
+        );
+        unblock(&pool, alice, bob).await.expect("unblock");
+        assert_eq!(
+            notifications(&pool, alice)
+                .await
+                .expect("notifications")
+                .len(),
+            2
+        );
     }
 }

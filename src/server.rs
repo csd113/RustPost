@@ -39,6 +39,14 @@ pub struct AppState {
     pub ffmpeg: FfmpegStatus,
     pub tor: crate::tor::TorStatus,
     pub registration_captcha: RegistrationCaptchaStore,
+    /// Cached `media.nsfw_blur_enabled` so page rendering does not read and
+    /// parse `settings.toml` on every request. Updated when an admin saves
+    /// deep settings.
+    pub nsfw_blur_default: Arc<std::sync::atomic::AtomicBool>,
+    /// Set after an in-process restore swaps the runtime directories. The
+    /// running process still holds the previous SQLite connection, so writes
+    /// are refused until the operator restarts RustPost.
+    pub restart_required: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -50,6 +58,7 @@ impl AppState {
         ffmpeg: FfmpegStatus,
         tor: crate::tor::TorStatus,
     ) -> Arc<Self> {
+        let nsfw_blur_default = settings.media.nsfw_blur_enabled;
         Arc::new(Self {
             pool,
             settings,
@@ -57,8 +66,86 @@ impl AppState {
             ffmpeg,
             tor,
             registration_captcha: RegistrationCaptchaStore::default(),
+            nsfw_blur_default: Arc::new(std::sync::atomic::AtomicBool::new(nsfw_blur_default)),
+            restart_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
+}
+
+/// Refuses state-changing requests after an in-process restore, because the
+/// running process would write them to the replaced (unlinked) database file.
+async fn restart_required_guard(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    use axum::http::Method;
+
+    if state
+        .restart_required
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        )
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(render::error_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "A backup was restored. Restart RustPost before making changes so your data is written to the restored database.",
+            )),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Periodically prunes expired operational rows and abandoned temp files.
+///
+/// Startup performs an aggressive temp cleanup (nothing can be in flight yet);
+/// later cycles keep a grace period so active uploads are never removed.
+pub fn spawn_maintenance_scheduler(
+    pool: SqlitePool,
+    paths: RuntimePaths,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        // The longest configured rate-limit window is one hour; keep two hours.
+        const RATE_LIMIT_RETENTION_SECS: i64 = 2 * 60 * 60;
+        const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+        let mut first_cycle = true;
+        loop {
+            let max_temp_age = if first_cycle {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_secs(60 * 60)
+            };
+            match paths.cleanup_stale_temp_files(max_temp_age) {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "removed stale upload staging files"),
+                Err(error) => tracing::warn!(error = %error, "temp file cleanup failed"),
+            }
+            if let Err(error) = crate::rate_limit::prune_old(&pool, RATE_LIMIT_RETENTION_SECS).await
+            {
+                tracing::warn!(error = %error, "rate limit event pruning failed");
+            }
+            match crate::auth::prune_stale_sessions(&pool, 7).await {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "removed stale sessions"),
+                Err(error) => tracing::warn!(error = %error, "session pruning failed"),
+            }
+            first_cycle = false;
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(MAINTENANCE_INTERVAL) => {}
+            }
+        }
+    });
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -152,6 +239,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             ServeDir::new(state.paths.uploads_thumbs.clone()),
         )
         .layer(DefaultBodyLimit::max(upload_body_limit))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            restart_required_guard,
+        ))
         .layer(middleware::from_fn(
             crate::compression::response_compression,
         ))
@@ -278,6 +369,11 @@ struct SearchQuery {
 #[derive(Deserialize)]
 struct ProfileQuery {
     tab: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AccountListQuery {
+    after: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -496,10 +592,9 @@ async fn page_layout(
 }
 
 fn blur_nsfw_media(state: &AppState, user: Option<&CurrentUser>) -> bool {
-    let global_blur = Settings::load(&state.paths.settings_path)
-        .map_or(state.settings.media.nsfw_blur_enabled, |settings| {
-            settings.media.nsfw_blur_enabled
-        });
+    let global_blur = state
+        .nsfw_blur_default
+        .load(std::sync::atomic::Ordering::Relaxed);
     global_blur && user.is_none_or(|user| user.nsfw_blur_enabled)
 }
 
@@ -995,16 +1090,31 @@ async fn create_post(
         }
         Err(err) => return Err(err),
     };
+    let outcome = finish_post_create(&state, &headers, addr, user.as_ref(), &form).await;
+    if outcome.is_err() {
+        cleanup_post_uploads(&state, &form.media_ids).await;
+    }
+    outcome
+}
+
+async fn finish_post_create(
+    state: &AppState,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    user: Option<&CurrentUser>,
+    form: &ParsedPostCreate,
+) -> AppResult<Response> {
     if let Some(parent_id) = form.parent_post_id {
         ensure_parent_post_exists(&state.pool, parent_id).await?;
     }
     if user.is_some() {
-        validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
+        validate_csrf(&state.pool, headers, &form.csrf_token).await?;
     }
     if form.is_nsfw {
         media::set_media_nsfw(&state.pool, &form.media_ids, true).await?;
     }
-    let (scope, actor, max_events, window_secs) = if user.is_none() {
+    let viewer_id = user.map(|user| user.id);
+    let (scope, actor, max_events, window_secs) = if viewer_id.is_none() {
         (
             rate_limit::Scope::AnonymousPost,
             ip_actor(addr),
@@ -1014,14 +1124,14 @@ async fn create_post(
     } else if form.parent_post_id.is_some() {
         (
             rate_limit::Scope::Reply,
-            user_actor(user.as_ref().map(|u| u.id).unwrap_or_default()),
+            user_actor(viewer_id.unwrap_or_default()),
             state.settings.moderation.replies_per_minute,
             60,
         )
     } else {
         (
             rate_limit::Scope::Post,
-            user_actor(user.as_ref().map(|u| u.id).unwrap_or_default()),
+            user_actor(viewer_id.unwrap_or_default()),
             state.settings.moderation.posts_per_minute,
             60,
         )
@@ -1032,7 +1142,7 @@ async fn create_post(
     let post_id = social::create_post(
         &state.pool,
         &state.settings,
-        user.as_ref().map(|u| u.id),
+        viewer_id,
         &form.text,
         form.parent_post_id,
         &form.media_ids,
@@ -1043,8 +1153,8 @@ async fn create_post(
         || format!("/home#post-{post_id}"),
         |_| format!("/posts/{post_id}#reply-{post_id}"),
     );
-    if enhanced_request(&headers) {
-        let posts = social::post_thread(&state.pool, user.as_ref().map(|u| u.id), post_id).await?;
+    if enhanced_request(headers) {
+        let posts = social::post_thread(&state.pool, viewer_id, post_id).await?;
         let post = posts
             .iter()
             .find(|post| post.id == post_id)
@@ -1057,17 +1167,17 @@ async fn create_post(
             html: if form.parent_post_id.is_some() {
                 render::thread_post_card_with_controls(
                     post,
-                    user.as_ref(),
-                    form_csrf(&state, &headers).await.as_deref(),
-                    blur_nsfw_media(&state, user.as_ref()),
+                    user,
+                    form_csrf(state, headers).await.as_deref(),
+                    blur_nsfw_media(state, user),
                     state.settings.posts.post_edit_window_seconds,
                 )
             } else {
                 render::post_card_with_controls(
                     post,
-                    user.as_ref(),
-                    form_csrf(&state, &headers).await.as_deref(),
-                    blur_nsfw_media(&state, user.as_ref()),
+                    user,
+                    form_csrf(state, headers).await.as_deref(),
+                    blur_nsfw_media(state, user),
                     state.settings.posts.post_edit_window_seconds,
                 )
             },
@@ -1077,10 +1187,24 @@ async fn create_post(
     Ok(Redirect::to(&redirect).into_response())
 }
 
+/// Deletes media rows and files that were uploaded for a post that was never
+/// created, so rejected or failed submissions do not leave orphaned uploads.
+async fn cleanup_post_uploads(state: &AppState, media_ids: &[i64]) {
+    for media_id in media_ids {
+        if let Err(error) = media::delete_media(&state.pool, &state.paths, *media_id).await {
+            tracing::warn!(
+                media_id,
+                error = %error,
+                "failed to clean up media uploaded for a rejected post"
+            );
+        }
+    }
+}
+
 async fn parse_post_create(
     state: &AppState,
     user_id: Option<i64>,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> AppResult<ParsedPostCreate> {
     let mut form = ParsedPostCreate {
         csrf_token: String::new(),
@@ -1089,6 +1213,19 @@ async fn parse_post_create(
         media_ids: Vec::new(),
         is_nsfw: false,
     };
+    let outcome = fill_post_create_form(state, user_id, multipart, &mut form).await;
+    if outcome.is_err() {
+        cleanup_post_uploads(state, &form.media_ids).await;
+    }
+    outcome.map(|()| form)
+}
+
+async fn fill_post_create_form(
+    state: &AppState,
+    user_id: Option<i64>,
+    mut multipart: Multipart,
+    form: &mut ParsedPostCreate,
+) -> AppResult<()> {
     while let Some(field) = multipart
         .next_field()
         .await
@@ -1139,6 +1276,11 @@ async fn parse_post_create(
                     .file_name()
                     .is_some_and(|name| !name.trim().is_empty()) =>
             {
+                if form.media_ids.len() >= state.settings.posts.max_media_per_post {
+                    return Err(AppError::BadRequest(
+                        "too many media attachments".to_owned(),
+                    ));
+                }
                 form.media_ids.push(
                     media::save_upload(
                         &state.pool,
@@ -1155,7 +1297,7 @@ async fn parse_post_create(
             _ => {}
         }
     }
-    Ok(form)
+    Ok(())
 }
 
 async fn bad_request_page(
@@ -1328,7 +1470,11 @@ async fn delete_post(
     };
     media::validate_post_media_deletion(&state.pool, &state.paths, id).await?;
     social::delete_post(&state.pool, user.id, id, user.is_admin).await?;
-    media::delete_post_media(&state.pool, &state.paths, id).await?;
+    // The post is already deleted; a media cleanup failure should not turn a
+    // successful deletion into an error page.
+    if let Err(error) = media::delete_post_media(&state.pool, &state.paths, id).await {
+        tracing::warn!(post_id = id, error = %error, "post deleted but media cleanup failed");
+    }
     let fallback = if let Some(parent_id) = preview.parent_post_id {
         format!("/posts/{parent_id}#post-{parent_id}")
     } else {
@@ -1585,6 +1731,7 @@ async fn profile(
     let viewer_id = user.as_ref().map(|u| u.id);
     let owner_or_admin =
         viewer_id == Some(profile_id) || user.as_ref().is_some_and(|viewer| viewer.is_admin);
+    let relationship = social::profile_relationship(&state.pool, viewer_id, profile_id).await?;
     let activity_visible = (!is_suspended || owner_or_admin)
         && social::profile_activity_visible(&state.pool, viewer_id, profile_id).await?;
     let likes_visible = activity_visible && (liked_posts_public || viewer_id == Some(profile_id));
@@ -1606,7 +1753,7 @@ async fn profile(
         });
     }
     let (followers, following) = social::follow_counts(&state.pool, profile_id).await?;
-    let controls = profile_controls(&state, user.as_ref(), csrf.as_deref(), profile_id).await?;
+    let controls = profile_controls(user.as_ref(), csrf.as_deref(), profile_id, relationship);
     let picture = picture_path.map_or_else(
         || r#"<div class="profile-picture" aria-hidden="true"></div>"#.to_owned(),
         |path| {
@@ -1634,6 +1781,25 @@ async fn profile(
             html_escape::encode_text(location.as_str())
         )
     };
+    let bio_line = if bio.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="profile-bio">{}</p>"#,
+            html_escape::encode_text(bio.as_str())
+        )
+    };
+    let profile_state_note =
+        profile_state_note(is_suspended, owner_or_admin, relationship, activity_visible);
+    let counts = format!(
+        r#"<p class="counts"><a href="/users/{}/followers" data-profile-followers="{}">{}</a><a href="/users/{}/following" data-profile-following="{}">{}</a></p>"#,
+        html_escape::encode_double_quoted_attribute(&profile_username),
+        profile_id,
+        count_label(followers, "follower", "followers"),
+        html_escape::encode_double_quoted_attribute(&profile_username),
+        profile_id,
+        count_label(following, "following", "following"),
+    );
     let pinned = pinned_post.as_ref().map_or_else(String::new, |post| {
         render::pinned_post_with_controls(
             post,
@@ -1645,14 +1811,17 @@ async fn profile(
     });
     let tabs = render::profile_tabs(&profile_username, active_tab);
     let timeline = if !activity_visible {
-        render::posts_with_controls_empty_state(
-            &posts,
-            user.as_ref(),
-            csrf.as_deref(),
-            blur_nsfw_media(&state, user.as_ref()),
-            state.settings.posts.post_edit_window_seconds,
-            profile_tab_empty_state(active_tab),
-        )
+        match profile_state_note {
+            Some((title, message)) => render::empty_state(title, message),
+            None => render::posts_with_controls_empty_state(
+                &posts,
+                user.as_ref(),
+                csrf.as_deref(),
+                blur_nsfw_media(&state, user.as_ref()),
+                state.settings.posts.post_edit_window_seconds,
+                profile_tab_empty_state(active_tab),
+            ),
+        }
     } else if active_tab == social::ProfileTimelineTab::Likes && !likes_visible {
         render::empty_state("This user’s likes are private", "")
     } else {
@@ -1666,18 +1835,15 @@ async fn profile(
         )
     };
     let body = format!(
-        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p>{}<p>{}</p>{}</div></div></section>{}{}{}"#,
+        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div>{}{}{}{}</div></div></section>{}{}{}"#,
         banner,
         picture,
         html_escape::encode_text(display_name.as_str()),
         html_escape::encode_text(profile_username.as_str()),
         controls,
-        profile_id,
-        followers,
-        profile_id,
-        following,
+        counts,
+        bio_line,
         location_line,
-        html_escape::encode_text(bio.as_str()),
         website_link,
         pinned,
         tabs,
@@ -1693,6 +1859,52 @@ async fn profile(
         )
         .await?,
     ))
+}
+
+/// A human-readable explanation for why a profile's activity is hidden.
+fn profile_state_note(
+    is_suspended: bool,
+    owner_or_admin: bool,
+    relationship: social::ProfileRelationship,
+    activity_visible: bool,
+) -> Option<(&'static str, &'static str)> {
+    if activity_visible || owner_or_admin {
+        return None;
+    }
+    if relationship.blocked {
+        return Some((
+            "You blocked this account",
+            "Unblock this account to see their posts and interact again.",
+        ));
+    }
+    if relationship.blocks_viewer {
+        return Some((
+            "Activity unavailable",
+            "This account's posts and replies are not visible to you.",
+        ));
+    }
+    if relationship.muted {
+        return Some((
+            "You muted this account",
+            "Their posts stay hidden from your feeds until you unmute them.",
+        ));
+    }
+    if is_suspended {
+        return Some((
+            "Account suspended",
+            "This account's posts and replies are not visible.",
+        ));
+    }
+    None
+}
+
+/// Renders "1 follower" / "2 followers" without a separate plural forms crate.
+fn count_label(count: i64, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
 }
 
 async fn profile_identity(
@@ -1720,6 +1932,7 @@ async fn profile_followers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(username): Path<String>,
+    Query(query): Query<AccountListQuery>,
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await;
@@ -1728,11 +1941,15 @@ async fn profile_followers(
     else {
         return Err(AppError::NotFound);
     };
-    let accounts =
-        social::followers_accounts(&state.pool, profile_id, user.as_ref().map(|user| user.id))
-            .await?;
+    let (accounts, has_more) = social::followers_accounts(
+        &state.pool,
+        profile_id,
+        user.as_ref().map(|user| user.id),
+        query.after,
+    )
+    .await?;
     let body = format!(
-        "{}{}",
+        "{}{}{}",
         render::page_header(
             &format!("{display_name} followers"),
             &format!("Users who follow @{profile_username}.")
@@ -1740,6 +1957,11 @@ async fn profile_followers(
         render::account_links_with_empty_state(
             &accounts,
             render::EmptyState::new("No followers yet.", "Followers will appear here.",),
+        ),
+        account_list_next_link(
+            &format!("/users/{profile_username}/followers"),
+            &accounts,
+            has_more
         )
     );
     Ok(Html(
@@ -1758,6 +1980,7 @@ async fn profile_following(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(username): Path<String>,
+    Query(query): Query<AccountListQuery>,
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await;
@@ -1766,14 +1989,15 @@ async fn profile_following(
     else {
         return Err(AppError::NotFound);
     };
-    let accounts = social::following_accounts_for_profile(
+    let (accounts, has_more) = social::following_accounts_for_profile(
         &state.pool,
         profile_id,
         user.as_ref().map(|user| user.id),
+        query.after,
     )
     .await?;
     let body = format!(
-        "{}{}",
+        "{}{}{}",
         render::page_header(
             &format!("{display_name} following"),
             &format!("Users @{profile_username} follows.")
@@ -1784,6 +2008,11 @@ async fn profile_following(
                 "Not following anyone yet.",
                 "Followed accounts will appear here.",
             ),
+        ),
+        account_list_next_link(
+            &format!("/users/{profile_username}/following"),
+            &accounts,
+            has_more
         )
     );
     Ok(Html(
@@ -1798,27 +2027,67 @@ async fn profile_following(
     ))
 }
 
-async fn profile_controls(
-    state: &AppState,
+/// Renders the "Show more" link for keyset-paginated account lists.
+fn account_list_next_link(base: &str, accounts: &[social::AccountView], has_more: bool) -> String {
+    if !has_more {
+        return String::new();
+    }
+    let Some(last) = accounts.last() else {
+        return String::new();
+    };
+    let cursor = last.username.to_ascii_lowercase();
+    let cursor = html_escape::encode_double_quoted_attribute(&cursor);
+    let base = html_escape::encode_double_quoted_attribute(base);
+    format!(
+        r#"<p class="account-list-more"><a class="button-link" href="{base}?after={cursor}">Show more accounts</a></p>"#
+    )
+}
+
+fn profile_controls(
     user: Option<&CurrentUser>,
     csrf: Option<&str>,
     profile_id: i64,
-) -> AppResult<String> {
+    relationship: social::ProfileRelationship,
+) -> String {
     let (Some(viewer), Some(csrf)) = (user, csrf) else {
-        return Ok(String::new());
+        return String::new();
     };
     if viewer.id == profile_id {
-        return Ok(
-            r#"<div class="actions profile-actions"><a class="button-link" href="/settings">Settings</a></div>"#
-                .to_owned(),
+        return r#"<div class="actions profile-actions"><a class="button-link" href="/settings">Settings</a></div>"#
+            .to_owned();
+    }
+    if relationship.blocks_viewer {
+        return r#"<div class="actions profile-actions"><span class="profile-state-note">This account blocked you.</span></div>"#
+            .to_owned();
+    }
+    if relationship.blocked {
+        return format!(
+            r#"<div class="actions profile-actions"><span class="profile-state-note">You blocked this account.</span><span class="actions profile-secondary">{}</span></div>"#,
+            small_form(
+                &format!("/users/{profile_id}/unblock"),
+                csrf,
+                "Unblock",
+                "Unblock this account"
+            )
         );
     }
-    let follow_action = render::follow_form(
-        profile_id,
-        csrf,
-        social::is_following(&state.pool, viewer.id, profile_id).await?,
-    );
-    Ok(format!(
+    let follow_action = render::follow_form(profile_id, csrf, relationship.following);
+    let mute_action = if relationship.muted {
+        small_form(
+            &format!("/users/{profile_id}/unmute"),
+            csrf,
+            "Unmute",
+            "Unmute this account",
+        )
+    } else {
+        small_form(
+            &format!("/users/{profile_id}/mute"),
+            csrf,
+            "Mute",
+            "Mute this account",
+        )
+    };
+    format!(
         r#"<div class="actions profile-actions">{}<span class="actions profile-secondary">{}{}</span></div>"#,
         follow_action,
         small_form(
@@ -1827,13 +2096,8 @@ async fn profile_controls(
             "Block",
             "Block this account"
         ),
-        small_form(
-            &format!("/users/{profile_id}/mute"),
-            csrf,
-            "Mute",
-            "Mute this account"
-        )
-    ))
+        mute_action
+    )
 }
 
 async fn follow(
@@ -2160,7 +2424,7 @@ fn render_profile_website_link(website: &str) -> String {
         return String::new();
     }
     format!(
-        r#"<p><a href="{}">{}</a></p>"#,
+        r#"<p class="profile-meta profile-website"><a href="{}" rel="noopener noreferrer nofollow">{}</a></p>"#,
         html_escape::encode_double_quoted_attribute(website),
         html_escape::encode_text(website)
     )
@@ -2320,7 +2584,20 @@ async fn settings_update(
 ) -> AppResult<Response> {
     let user = require_user(&state, &headers).await?;
     let form = parse_profile_update(&state, user.id, multipart).await?;
-    validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
+    let outcome = apply_profile_update(&state, &headers, &user, &form).await;
+    if outcome.is_err() {
+        cleanup_profile_uploads(&state, &form).await;
+    }
+    outcome
+}
+
+async fn apply_profile_update(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &CurrentUser,
+    form: &ParsedProfileUpdate,
+) -> AppResult<Response> {
+    validate_csrf(&state.pool, headers, &form.csrf_token).await?;
     crate::validation::validate_profile_text(&form.display_name, &form.bio, &state.settings)?;
     validate_profile_location(&form.location)?;
     validate_profile_website(&form.website)?;
@@ -2331,6 +2608,7 @@ async fn settings_update(
     let theme = form.theme.as_str().to_owned();
     let nsfw_blur_enabled = i64::from(form.nsfw_blur_enabled);
     let liked_posts_public = i64::from(form.liked_posts_public);
+    let user_id = user.id;
     state
         .pool
         .call(move |conn| {
@@ -2344,7 +2622,7 @@ async fn settings_update(
                     theme,
                     nsfw_blur_enabled,
                     liked_posts_public,
-                    user.id
+                    user_id
                 ],
             )?;
             Ok(())
@@ -2682,7 +2960,7 @@ fn render_delete_account_final_warning(
 ) -> String {
     let notice = error.map_or_else(String::new, |message| render::notice("error", message));
     format!(
-        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="delete_intent" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
+        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="delete_intent" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
         html_escape::encode_double_quoted_attribute(csrf),
         html_escape::encode_double_quoted_attribute(delete_intent)
     )
@@ -2690,14 +2968,10 @@ fn render_delete_account_final_warning(
 
 // Multipart parsing is kept in one place so uploaded profile media and text
 // fields share one validation path before any database updates happen.
-#[expect(
-    clippy::too_many_lines,
-    reason = "multipart profile parsing keeps validation and file handling in one transaction-sized flow"
-)]
 async fn parse_profile_update(
     state: &AppState,
     user_id: i64,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> AppResult<ParsedProfileUpdate> {
     let mut form = ParsedProfileUpdate {
         csrf_token: String::new(),
@@ -2713,6 +2987,19 @@ async fn parse_profile_update(
         profile_picture_media_id: None,
         banner_media_id: None,
     };
+    let outcome = fill_profile_update_form(state, user_id, multipart, &mut form).await;
+    if outcome.is_err() {
+        cleanup_profile_uploads(state, &form).await;
+    }
+    outcome.map(|()| form)
+}
+
+async fn fill_profile_update_form(
+    state: &AppState,
+    user_id: i64,
+    mut multipart: Multipart,
+    form: &mut ParsedProfileUpdate,
+) -> AppResult<()> {
     while let Some(field) = multipart
         .next_field()
         .await
@@ -2798,12 +3085,12 @@ async fn parse_profile_update(
                     continue;
                 }
                 form.banner_media_id = Some(
-                    media::save_upload(
+                    media::save_banner_upload(
                         &state.pool,
                         &state.settings,
                         &state.paths,
                         &state.ffmpeg,
-                        Some(user_id),
+                        user_id,
                         field,
                     )
                     .await
@@ -2816,7 +3103,24 @@ async fn parse_profile_update(
             _ => {}
         }
     }
-    Ok(form)
+    Ok(())
+}
+
+/// Deletes profile media that was uploaded for a settings save that did not
+/// complete, so rejected saves do not leave orphaned uploads behind.
+async fn cleanup_profile_uploads(state: &AppState, form: &ParsedProfileUpdate) {
+    for media_id in [form.profile_picture_media_id, form.banner_media_id]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(error) = media::delete_media(&state.pool, &state.paths, media_id).await {
+            tracing::warn!(
+                media_id,
+                error = %error,
+                "failed to clean up media uploaded for a rejected settings save"
+            );
+        }
+    }
 }
 
 async fn ensure_parent_post_exists(pool: &SqlitePool, parent_id: i64) -> AppResult<()> {
@@ -3015,9 +3319,22 @@ async fn post_action_response(
                   EXISTS(SELECT 1 FROM bookmarks WHERE user_id = ? AND post_id = p.id),
                   EXISTS(SELECT 1 FROM reposts WHERE user_id = ? AND post_id = p.id)
                 FROM posts p
+                LEFT JOIN users author ON author.id = p.user_id
                 WHERE p.id = ? AND p.is_deleted = 0
+                  AND (p.user_id IS NULL OR (author.is_deleted = 0 AND author.is_suspended = 0))
+                  AND (
+                    p.user_id IS NULL
+                    OR p.user_id = ?
+                    OR (
+                      p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+                      AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = p.user_id AND blocked_id = ?)
+                    )
+                  )
                 "#,
-                params![viewer_id, viewer_id, viewer_id, viewer_id, post_id],
+                params![
+                    viewer_id, viewer_id, viewer_id, viewer_id, post_id, viewer_id, viewer_id,
+                    viewer_id
+                ],
                 |row| {
                     Ok(PostActionResponse {
                         kind: "post-action",
@@ -3286,14 +3603,17 @@ async fn bookmarks(
 async fn following(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<AccountListQuery>,
 ) -> AppResult<Html<String>> {
     let user = require_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let accounts = social::following_accounts(&state.pool, user.id).await?;
+    let (accounts, has_more) =
+        social::following_accounts(&state.pool, user.id, query.after).await?;
     let body = format!(
-        "{}{}",
+        "{}{}{}",
         render::page_header("Following", "Accounts you follow."),
-        render::accounts(&accounts, &csrf)
+        render::accounts(&accounts, &csrf),
+        account_list_next_link("/following", &accounts, has_more)
     );
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Following", &body).await?,
@@ -3778,7 +4098,9 @@ async fn admin_delete_post(
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     media::validate_post_media_deletion(&state.pool, &state.paths, id).await?;
     social::delete_post(&state.pool, user.id, id, true).await?;
-    media::delete_post_media(&state.pool, &state.paths, id).await?;
+    if let Err(error) = media::delete_post_media(&state.pool, &state.paths, id).await {
+        tracing::warn!(post_id = id, error = %error, "post deleted but media cleanup failed");
+    }
     admin::audit(&state.pool, user.id, "delete_post", &format!("post:{id}")).await?;
     Ok(Redirect::to("/admin").into_response())
 }
@@ -3898,6 +4220,10 @@ async fn admin_deep_settings_update(
             );
             return deep_settings_html(&state, &user, &csrf, &body).await;
         }
+        state.nsfw_blur_default.store(
+            updated.media.nsfw_blur_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         admin::audit(
             &state.pool,
             user.id,
@@ -4344,6 +4670,9 @@ async fn admin_restore_backup(
     let _remove_result = tokio::fs::remove_file(&upload.archive_path).await;
     match restored {
         Ok(report) => {
+            state
+                .restart_required
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let safety = report
                 .pre_restore_backup
                 .as_ref()
@@ -4657,40 +4986,52 @@ async fn validate_csrf(pool: &SqlitePool, headers: &HeaderMap, token: &str) -> A
         .map_err(|_csrf_err| AppError::Forbidden)
 }
 
+/// Reads the session's current CSRF token and rotates it for the next form.
+///
+/// Two concurrent page loads for one session can both read the same stored
+/// hash; only one optimistic update wins. Retrying lets the loser read the new
+/// hash and rotate again instead of rendering a form with no token.
 async fn form_csrf(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    const ROTATION_ATTEMPTS: usize = 3;
     let token = auth::session_cookie(headers)?;
     let token_hash = auth::hash_token(&token);
-    let (stored_hash, previous_hashes): (String, Option<String>) = state
-        .pool
-        .call({
-            let token_hash = token_hash.clone();
-            move |conn| {
-                conn.query_row(
-                    "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND datetime(expires_at) > CURRENT_TIMESTAMP",
-                    [token_hash],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(Into::into)
-            }
-        })
-        .await
-        .ok()??;
-    let previous_hashes = csrf_history_with(&stored_hash, previous_hashes.as_deref());
-    let plain = auth::secure_token();
-    let new_hash = auth::hash_token(&plain);
-    let updated = state
-        .pool
-        .call(move |conn| {
-            let changed = conn.execute(
-                "UPDATE sessions SET csrf_token_hash = ?, previous_csrf_token_hash = ? WHERE token_hash = ? AND csrf_token_hash = ?",
-                params![new_hash, previous_hashes, token_hash, stored_hash],
-            )?;
-            Ok(changed == 1)
-        })
-        .await
-        .ok()?;
-    updated.then_some(plain)
+    for _attempt in 0..ROTATION_ATTEMPTS {
+        let (stored_hash, previous_hashes): (String, Option<String>) = state
+            .pool
+            .call({
+                let token_hash = token_hash.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND datetime(expires_at) > CURRENT_TIMESTAMP",
+                        [token_hash],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(Into::into)
+                }
+            })
+            .await
+            .ok()??;
+        let previous_hashes = csrf_history_with(&stored_hash, previous_hashes.as_deref());
+        let plain = auth::secure_token();
+        let new_hash = auth::hash_token(&plain);
+        let session_token_hash = token_hash.clone();
+        let updated = state
+            .pool
+            .call(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE sessions SET csrf_token_hash = ?, previous_csrf_token_hash = ? WHERE token_hash = ? AND csrf_token_hash = ?",
+                    params![new_hash, previous_hashes, session_token_hash, stored_hash],
+                )?;
+                Ok(changed == 1)
+            })
+            .await
+            .ok()?;
+        if updated {
+            return Some(plain);
+        }
+    }
+    None
 }
 
 fn csrf_history_with(current_hash: &str, previous_hashes: Option<&str>) -> String {
@@ -6824,7 +7165,7 @@ mod tests {
         assert!(
             profile
                 .body
-                .contains(r#"data-profile-followers="1">1 followers"#)
+                .contains(r#"data-profile-followers="1">1 follower"#)
         );
         assert!(!profile.body.contains(">Unfollow</button>"));
     }
@@ -7207,7 +7548,7 @@ mod tests {
         assert_eq!(safe_saved.status, 303);
         let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
         assert!(profile.body.contains(
-            r#"<p><a href="https://example.test/profile">https://example.test/profile</a></p>"#
+            r#"<a href="https://example.test/profile" rel="noopener noreferrer nofollow">https://example.test/profile</a>"#
         ));
     }
 
@@ -8169,6 +8510,9 @@ mod tests {
         let logged_out = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
         assert!(logged_out.body.contains(r#"data-testid="nsfw-media""#));
 
+        // The running server uses the setting it loaded at startup. Editing
+        // settings.toml directly takes effect on restart (documented behavior),
+        // and page rendering no longer re-reads and re-parses the file.
         let mut settings = Settings::load(&server.data_dir.join("settings.toml")).expect("load");
         settings.media.nsfw_blur_enabled = false;
         std::fs::write(
@@ -8176,17 +8520,47 @@ mod tests {
             toml::to_string(&settings).expect("settings toml"),
         )
         .expect("write settings");
-        let unblurred = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
-        assert!(!unblurred.body.contains(r#"data-testid="nsfw-media""#));
+        let still_blurred = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(still_blurred.body.contains(r#"data-testid="nsfw-media""#));
+    }
 
-        settings.media.nsfw_blur_enabled = true;
-        std::fs::write(
-            server.data_dir.join("settings.toml"),
-            toml::to_string(&settings).expect("settings toml"),
+    #[tokio::test]
+    async fn global_nsfw_blur_default_applies_from_loaded_settings() {
+        let mut settings = Settings::default();
+        settings.media.nsfw_blur_enabled = false;
+        let server = spawn_test_server_with_settings(settings).await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("text", "unblurred by default"),
+                    ("nsfw", "true"),
+                ],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
         )
-        .expect("write settings");
-        let safe_again = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
-        assert!(safe_again.body.contains(r#"data-testid="nsfw-media""#));
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let logged_out = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(!logged_out.body.contains(r#"data-testid="nsfw-media""#));
     }
 
     #[tokio::test]
@@ -9031,6 +9405,368 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
             .expect("users count");
         assert_eq!(users, 0);
+    }
+
+    async fn user_id_for(server: &TestServer, username: &str) -> i64 {
+        let username = username.to_owned();
+        server
+            .pool
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT id FROM users WHERE normalized_username = ?",
+                    [username],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("user id")
+    }
+
+    /// End-to-end backup/restore: creates representative data through the HTTP
+    /// API, snapshots it, restores into a fresh data directory, and verifies
+    /// the restored database and media files.
+    #[tokio::test]
+    async fn backup_restore_round_trips_accounts_graph_muted_words_and_media() {
+        let server = spawn_test_server().await;
+        let alice = register_test_user(&server, "alice").await;
+        let bob = register_test_user(&server, "bob").await;
+        let _carol = register_test_user(&server, "carol").await;
+
+        create_text_post(&server, &alice, "alice first post").await;
+        create_text_post(&server, &bob, "bob first post").await;
+
+        // Media upload from bob.
+        let bob_csrf = csrf_token(&get_with_cookie(&server, "/home", &bob).await.body);
+        let upload = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", bob.as_str()),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=media-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "media-boundary",
+                &[("csrf", bob_csrf.as_str()), ("text", "bob photo post")],
+                "media",
+                "holiday.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(upload.status, 303);
+
+        // Alice follows bob; bob blocks carol; alice mutes a word.
+        let bob_id = user_id_for(&server, "bob").await;
+        let carol_id = user_id_for(&server, "carol").await;
+        let alice_csrf = csrf_token(&get_with_cookie(&server, "/home", &alice).await.body);
+        let followed = post_form_with_cookie(
+            &server,
+            &format!("/users/{bob_id}/follow"),
+            &alice,
+            &format!("csrf={alice_csrf}"),
+        )
+        .await;
+        assert_eq!(followed.status, 303);
+        let bob_settings_csrf = csrf_token(&get_with_cookie(&server, "/settings", &bob).await.body);
+        let blocked = post_form_with_cookie(
+            &server,
+            &format!("/users/{carol_id}/block"),
+            &bob,
+            &format!("csrf={bob_settings_csrf}"),
+        )
+        .await;
+        assert_eq!(blocked.status, 303);
+        let alice_settings_csrf =
+            csrf_token(&get_with_cookie(&server, "/settings", &alice).await.body);
+        let muted = post_form_with_cookie(
+            &server,
+            "/settings/muted-words",
+            &alice,
+            &format!("csrf={alice_settings_csrf}&term=spoilers"),
+        )
+        .await;
+        assert_eq!(muted.status, 303);
+
+        let source_paths = RuntimePaths::from_data_dir(server.data_dir.clone());
+        let archive = backup::create_backup(&source_paths, false).expect("create backup");
+        assert!(archive.is_file());
+
+        let target_temp = tempfile::tempdir().expect("target temp dir");
+        let target_paths = RuntimePaths::from_data_dir(target_temp.path().to_path_buf());
+        target_paths.ensure().expect("target paths");
+        let report =
+            backup::restore_backup(&target_paths, &archive, false).expect("restore backup");
+        assert!(report.pre_restore_backup.is_some());
+
+        let restored =
+            rusqlite::Connection::open(&target_paths.database_path).expect("restored database");
+        let count = |table: &str| -> i64 {
+            restored
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count")
+        };
+        assert_eq!(count("users"), 3);
+        assert_eq!(count("posts"), 3);
+        assert_eq!(count("follows"), 1);
+        assert_eq!(count("blocks"), 1);
+        assert_eq!(count("muted_words"), 1);
+        assert_eq!(count("media"), 1);
+        let (stored_path, public_path): (String, String) = restored
+            .query_row(
+                "SELECT stored_path, public_path FROM media LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("media row");
+        // Restore rewrites absolute media paths for the destination data dir.
+        let target_prefix = target_paths.data_dir.to_string_lossy().to_string();
+        assert!(
+            stored_path.starts_with(&target_prefix),
+            "restored media path {stored_path} still points outside {target_prefix}"
+        );
+        let file_name = std::path::Path::new(&stored_path)
+            .file_name()
+            .expect("media file name");
+        assert!(
+            target_paths.uploads_originals.join(file_name).is_file(),
+            "restored media file is missing for {public_path}"
+        );
+        assert!(target_paths.settings_path.is_file());
+        crate::db::validate_schema(&restored).expect("restored schema validates");
+        let restored_post_id: i64 = restored
+            .query_row("SELECT post_id FROM post_media LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("post media");
+        drop(restored);
+
+        // Media cleanup must work against the restored paths.
+        let restored_pool = crate::db::connect(&target_paths.database_path)
+            .await
+            .expect("restored pool");
+        crate::media::delete_post_media(&restored_pool, &target_paths, restored_post_id)
+            .await
+            .expect("delete restored media");
+        assert!(!target_paths.uploads_originals.join(file_name).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_page_loads_each_render_a_csrf_token() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let base_url = server.base_url.clone();
+            let cookie = cookie.clone();
+            handles.push(tokio::spawn(async move {
+                request(
+                    &base_url,
+                    "GET",
+                    "/home",
+                    &[("cookie", &cookie)],
+                    Vec::new(),
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            let response = handle.await.expect("task");
+            assert_eq!(response.status, 200);
+            assert!(
+                response.body.contains(r#"name="csrf""#),
+                "concurrent page load rendered a form without a CSRF token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_image_headers_are_rejected_before_conversion() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+
+        let mut oversized = tiny_png_bytes();
+        oversized[16..20].copy_from_slice(&40_000_u32.to_be_bytes());
+        oversized[20..24].copy_from_slice(&40_000_u32.to_be_bytes());
+        let body = multipart_body_with_file(
+            "post-boundary",
+            &[("csrf", csrf.as_str()), ("text", "huge image")],
+            "media",
+            "huge.png",
+            "image/png",
+            &oversized,
+        );
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", cookie.as_str()),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("dimensions"));
+        let media = media_row_count(&server).await;
+        assert_eq!(media, 0, "rejected image must not leave a media row");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_post_submissions_each_create_exactly_one_post() {
+        let mut settings = Settings::default();
+        settings.moderation.posts_per_minute = 50;
+        let server = spawn_test_server_with_settings(settings).await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+
+        let mut handles = Vec::new();
+        for index in 0..10 {
+            let base_url = server.base_url.clone();
+            let cookie = cookie.clone();
+            let csrf = csrf.clone();
+            handles.push(tokio::spawn(async move {
+                request(
+                    &base_url,
+                    "POST",
+                    "/posts",
+                    &[
+                        ("cookie", cookie.as_str()),
+                        (
+                            "content-type",
+                            "multipart/form-data; boundary=post-boundary",
+                        ),
+                    ],
+                    multipart_body(
+                        "post-boundary",
+                        &[
+                            ("csrf", csrf.as_str()),
+                            ("text", &format!("concurrent submission {index}")),
+                        ],
+                        false,
+                    ),
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await.expect("task").status, 303);
+        }
+
+        let (count, distinct): (i64, i64) = server
+            .pool
+            .call(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM posts WHERE is_deleted = 0",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(DISTINCT text) FROM posts WHERE is_deleted = 0",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .expect("post stats");
+        assert_eq!(count, 10);
+        assert_eq!(distinct, 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_identical_media_uploads_keep_files_intact() {
+        let mut settings = Settings::default();
+        settings.moderation.posts_per_minute = 50;
+        let server = spawn_test_server_with_settings(settings).await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+
+        let mut handles = Vec::new();
+        for index in 0..6 {
+            let base_url = server.base_url.clone();
+            let cookie = cookie.clone();
+            let csrf = csrf.clone();
+            handles.push(tokio::spawn(async move {
+                let body = multipart_body_with_file(
+                    "media-boundary",
+                    &[
+                        ("csrf", csrf.as_str()),
+                        ("text", &format!("concurrent photo {index}")),
+                    ],
+                    "media",
+                    "same.png",
+                    "image/png",
+                    &tiny_png_bytes(),
+                );
+                request(
+                    &base_url,
+                    "POST",
+                    "/posts",
+                    &[
+                        ("cookie", cookie.as_str()),
+                        (
+                            "content-type",
+                            "multipart/form-data; boundary=media-boundary",
+                        ),
+                    ],
+                    body,
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            let response = handle.await.expect("task");
+            assert_eq!(response.status, 303);
+        }
+
+        let rows: Vec<(String, Option<i64>)> = server
+            .pool
+            .call(|conn| {
+                let mut stmt = conn.prepare("SELECT stored_path, canonical_media_id FROM media")?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .expect("media rows");
+        assert_eq!(rows.len(), 6);
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, canonical)| canonical.is_none())
+                .count(),
+            1,
+            "identical uploads must share one canonical row"
+        );
+        let mut distinct_paths = std::collections::BTreeSet::new();
+        for (stored_path, _canonical) in &rows {
+            let path = std::path::Path::new(stored_path);
+            assert!(path.is_file(), "missing media file {stored_path}");
+            assert_eq!(
+                std::fs::read(path).expect("read media"),
+                tiny_png_bytes(),
+                "media file content changed under concurrent uploads"
+            );
+            distinct_paths.insert(stored_path.clone());
+        }
+        assert_eq!(distinct_paths.len(), 1);
     }
 
     fn multipart_body(

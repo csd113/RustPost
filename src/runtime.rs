@@ -192,6 +192,46 @@ impl RuntimePaths {
     pub fn database_sidecar_path(&self, suffix: &str) -> PathBuf {
         self.db_dir.join(format!("rustpost.sqlite3-{suffix}"))
     }
+
+    /// Removes leftover upload staging files and abandoned restore uploads
+    /// older than `max_age`. Called with a zero age during startup, where no
+    /// request can be in flight, and with a grace period while running.
+    pub fn cleanup_stale_temp_files(&self, max_age: std::time::Duration) -> anyhow::Result<usize> {
+        let mut removed = 0usize;
+        let entries = match fs::read_dir(&self.tmp_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read temp directory {}", self.tmp_dir.display())
+                });
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !(name.ends_with(".upload") || name.starts_with("restore-upload-")) {
+                continue;
+            }
+            let stale = match fs::metadata(&path).and_then(|metadata| metadata.modified()) {
+                Ok(modified) => modified
+                    .elapsed()
+                    .map(|age| age >= max_age)
+                    .unwrap_or(false),
+                Err(_error) => false,
+            };
+            if stale && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
 }
 
 #[cfg(unix)]

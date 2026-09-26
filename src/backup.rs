@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension as _};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tar::{Archive, Builder, EntryType, Header};
@@ -109,6 +109,7 @@ pub fn restore_backup(
     let staged = extract_archive_to_stage(archive_path, staging.path(), include_tor_keys)
         .with_context(|| "backup archive failed validation")?;
     validate_staged_backup(staging.path(), &staged, include_tor_keys)?;
+    rewrite_restored_media_paths(&staging.path().join("db/rustpost.sqlite3"), paths)?;
     let pre_restore_backup =
         create_backup_inner(paths, include_tor_keys, BackupKind::PreRestore, false)
             .with_context(|| "failed to create pre-restore safety backup")?;
@@ -720,6 +721,17 @@ fn validate_staged_backup(
     }
     require_manifest_file(&manifest_entries, "db/rustpost.sqlite3")?;
     require_manifest_file(&manifest_entries, "settings.toml")?;
+    // Require the upload directories even when they are empty. Restore replaces
+    // the live upload roots, so an archive that silently omits them would wipe
+    // every media file referenced by the restored database.
+    for dir in [
+        "uploads/originals",
+        "uploads/images",
+        "uploads/videos",
+        "uploads/thumbs",
+    ] {
+        require_manifest_directory(&manifest_entries, dir)?;
+    }
 
     for (path, manifest_entry) in manifest_entries {
         let extracted = staged
@@ -800,6 +812,99 @@ fn require_manifest_file(
         anyhow::bail!("backup manifest is missing required file {path}");
     }
     Ok(())
+}
+
+fn require_manifest_directory(
+    manifest_entries: &BTreeMap<String, &ManifestEntry>,
+    path: &str,
+) -> anyhow::Result<()> {
+    if manifest_entries
+        .get(path)
+        .is_none_or(|entry| entry.kind != ManifestEntryKind::Directory)
+    {
+        anyhow::bail!("backup manifest is missing required directory {path}");
+    }
+    Ok(())
+}
+
+/// Rewrites absolute media paths in the staged database so they point at the
+/// destination data directory.
+///
+/// Media rows store absolute host paths. Restoring to a different data
+/// directory would otherwise leave every path pointing at the source machine's
+/// filesystem, which breaks media deletion, dedupe, and account deletion even
+/// though the files themselves were restored correctly.
+fn rewrite_restored_media_paths(database_path: &Path, paths: &RuntimePaths) -> anyhow::Result<()> {
+    let mut conn = Connection::open(database_path).with_context(|| {
+        format!(
+            "failed to open restored database {}",
+            database_path.display()
+        )
+    })?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let roots = [
+        ("/uploads/originals/", &paths.uploads_originals),
+        ("/uploads/images/", &paths.uploads_images),
+        ("/uploads/videos/", &paths.uploads_videos),
+        ("/uploads/thumbs/", &paths.uploads_thumbs),
+    ];
+    let tx = conn.transaction()?;
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT id, original_path, stored_path, thumbnail_path FROM media ORDER BY id",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut rewritten = 0usize;
+    for (id, original_path, stored_path, thumbnail_path) in rows {
+        let new_original = original_path
+            .as_deref()
+            .map(|path| remap_media_path(path, &roots));
+        let new_stored = remap_media_path(&stored_path, &roots);
+        let new_thumbnail = thumbnail_path
+            .as_deref()
+            .map(|path| remap_media_path(path, &roots));
+        if new_original.as_deref() == original_path.as_deref()
+            && new_stored == stored_path
+            && new_thumbnail.as_deref() == thumbnail_path.as_deref()
+        {
+            continue;
+        }
+        tx.execute(
+            "UPDATE media SET original_path = ?, stored_path = ?, thumbnail_path = ? WHERE id = ?",
+            params![new_original, new_stored, new_thumbnail, id],
+        )?;
+        rewritten += 1;
+    }
+    tx.commit()?;
+    if rewritten > 0 {
+        tracing::info!(
+            rewritten,
+            "rewrote restored media paths for the destination data directory"
+        );
+    }
+    Ok(())
+}
+
+fn remap_media_path(path: &str, roots: &[(&str, &PathBuf)]) -> String {
+    for (marker, root) in roots {
+        if let Some(index) = path.find(marker) {
+            let relative = &path[index + marker.len()..];
+            if relative.is_empty() {
+                return path.to_owned();
+            }
+            return root.join(relative).to_string_lossy().to_string();
+        }
+    }
+    path.to_owned()
 }
 
 fn swap_staged_runtime(
@@ -1290,6 +1395,29 @@ mod tests {
     }
 
     #[test]
+    fn restored_media_paths_are_remapped_to_the_destination() {
+        let originals = PathBuf::from("/new/data/uploads/originals");
+        let roots: [(&str, &PathBuf); 1] = [("/uploads/originals/", &originals)];
+
+        assert_eq!(
+            remap_media_path("/old/data/uploads/originals/a.png", &roots),
+            "/new/data/uploads/originals/a.png"
+        );
+        assert_eq!(
+            remap_media_path("/new/data/uploads/originals/a.png", &roots),
+            "/new/data/uploads/originals/a.png"
+        );
+        assert_eq!(
+            remap_media_path("/unrelated/place/a.png", &roots),
+            "/unrelated/place/a.png"
+        );
+        assert_eq!(
+            remap_media_path("/old/data/uploads/originals/", &roots),
+            "/old/data/uploads/originals/"
+        );
+    }
+
+    #[test]
     fn backup_path_safety() {
         assert!(validate_archive_path(Path::new("uploads/images/a.webp"), false).is_ok());
         assert!(validate_archive_path(Path::new("../settings.toml"), false).is_err());
@@ -1530,6 +1658,32 @@ mod tests {
         let error = create_backup(&paths, false).expect_err("locked");
 
         assert!(error.to_string().contains("already running"));
+    }
+
+    #[test]
+    fn restore_rejects_archives_that_omit_upload_directories() {
+        let source_temp = tempfile::tempdir().expect("source");
+        let source = RuntimePaths::from_data_dir(source_temp.path().join("source"));
+        source.ensure().expect("source ensure");
+        test_db(&source.database_path, CURRENT_SCHEMA_VERSION);
+        test_settings(&source.settings_path);
+        let archive = create_backup(&source, false).expect("backup");
+
+        let staging = tempfile::tempdir().expect("staging");
+        let mut staged =
+            extract_archive_to_stage(&archive, staging.path(), false).expect("extract");
+        assert!(staged.entries.remove("uploads/images").is_some());
+        staged
+            .manifest
+            .components
+            .retain(|entry| entry.archive_path != "uploads/images");
+
+        let error = validate_staged_backup(staging.path(), &staged, false)
+            .expect_err("missing upload directory must be rejected");
+        assert!(
+            error.to_string().contains("uploads/images"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

@@ -102,6 +102,9 @@ pub async fn run() -> anyhow::Result<()> {
     paths = paths
         .with_tor_data_dir(&settings.tor.data_dir)
         .with_backup_dir(&settings.backup.backup_dir);
+    // Keep backup and restore pointed at the settings file the operator
+    // actually loaded, including an explicit --config path.
+    paths.settings_path = settings_path.clone();
     paths.ensure()?;
     info!(data_dir = %paths.data_dir.display(), settings = %settings_path.display(), "runtime paths ready");
 
@@ -338,10 +341,17 @@ async fn serve(
         },
     )
     .await?;
-    let state = server::AppState::new(pool, settings.clone(), paths.clone(), ffmpeg, tor_status);
+    let state = server::AppState::new(
+        pool.clone(),
+        settings.clone(),
+        paths.clone(),
+        ffmpeg,
+        tor_status,
+    );
     let app = server::router(state);
     let shutdown_rx = shutdown_receiver();
     backup::spawn_automatic_scheduler(paths.clone(), settings_path, shutdown_rx.clone());
+    server::spawn_maintenance_scheduler(pool, paths.clone(), shutdown_rx.clone());
 
     if settings.tor.tor_only {
         return serve_tor_only(onion_listener, app, shutdown_rx).await;
