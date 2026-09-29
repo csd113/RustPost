@@ -241,6 +241,8 @@ pub async fn create_post(
     if media_ids.len() > settings.posts.max_media_per_post {
         anyhow::bail!("too many media attachments");
     }
+    let max_images_per_post = settings.posts.max_images_per_post;
+    let max_videos_per_post = settings.posts.max_videos_per_post;
     let text = clean_post_text(text, settings.posts.max_text_chars, media_ids.len())?;
     let youtube_embeds = crate::youtube::metadata_for_text(&text).await;
     let allow_mentions = settings.posts.allow_mentions;
@@ -248,6 +250,9 @@ pub async fn create_post(
     pool.call(move |conn| {
         let tx = conn.transaction()?;
         let root_post_id = if let Some(parent_id) = parent_post_id {
+            if let Some(actor_id) = user_id {
+                ensure_post_interaction_accessible_tx(&tx, actor_id, parent_id)?;
+            }
             let root = tx
                 .query_row(
                     "SELECT COALESCE(root_post_id, id) FROM posts WHERE id = ? AND is_deleted = 0",
@@ -262,6 +267,13 @@ pub async fn create_post(
         } else {
             None
         };
+        let (image_count, video_count) = media_kind_counts_tx(&tx, user_id, &media_ids)?;
+        if image_count > max_images_per_post {
+            anyhow::bail!("too many image attachments");
+        }
+        if video_count > max_videos_per_post {
+            anyhow::bail!("too many video attachments");
+        }
         let anonymous_label = user_id.is_none().then_some("Anonymous");
         tx.execute(
             "INSERT INTO posts (user_id, anonymous_label, text, parent_post_id, root_post_id) VALUES (?, ?, ?, ?, ?)",
@@ -294,6 +306,31 @@ pub async fn create_post(
         Ok(post_id)
     })
     .await
+}
+
+fn media_kind_counts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    owner_user_id: Option<i64>,
+    media_ids: &[i64],
+) -> anyhow::Result<(usize, usize)> {
+    let mut image_count = 0usize;
+    let mut video_count = 0usize;
+    for media_id in media_ids {
+        let media_kind = tx
+            .query_row(
+                "SELECT media_kind FROM media WHERE id = ? AND owner_user_id IS ?",
+                params![media_id, owner_user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match media_kind.as_deref() {
+            Some("image") => image_count += 1,
+            Some("video") => video_count += 1,
+            Some(_) => anyhow::bail!("media attachment has unsupported kind"),
+            None => anyhow::bail!("media attachment not found"),
+        }
+    }
+    Ok((image_count, video_count))
 }
 
 pub async fn edit_post(
@@ -417,14 +454,31 @@ pub async fn timeline(
     if mode != "bookmarks" {
         posts.extend(repost_events(pool, viewer_id, mode, None).await?);
     }
+    sort_events_newest_first(&mut posts);
+    posts.truncate(40);
+    Ok(posts)
+}
+
+/// Orders merged post/repost events newest first.
+///
+/// Timestamps have second granularity, so the tie-break uses the numeric row
+/// id rather than the `p:`/`r:` prefixed event id string (which would order
+/// `p:9` before `p:10`).
+fn sort_events_newest_first(posts: &mut [PostView]) {
     posts.sort_by(|left, right| {
         right
             .event_created_at
             .cmp(&left.event_created_at)
-            .then_with(|| right.event_id.cmp(&left.event_id))
+            .then_with(|| event_sort_key(right).cmp(&event_sort_key(left)))
     });
-    posts.truncate(40);
-    Ok(posts)
+}
+
+fn event_sort_key(post: &PostView) -> i64 {
+    post.event_id
+        .rsplit(':')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 pub async fn profile_timeline(
@@ -453,12 +507,7 @@ pub async fn profile_tab_timeline(
     if matches!(tab, ProfileTimelineTab::Posts | ProfileTimelineTab::Media) {
         posts.extend(repost_events(pool, viewer_id, tab.repost_mode(), Some(user_id)).await?);
     }
-    posts.sort_by(|left, right| {
-        right
-            .event_created_at
-            .cmp(&left.event_created_at)
-            .then_with(|| right.event_id.cmp(&left.event_id))
-    });
+    sort_events_newest_first(&mut posts);
     posts.truncate(40);
     Ok(posts)
 }
@@ -499,7 +548,7 @@ pub async fn profile_pinned_post(
     sql.push_str(
         " AND p.id = (SELECT pinned_post_id FROM users WHERE id = ? AND is_deleted = 0) AND p.user_id = ?",
     );
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(" LIMIT 1");
     let mut bindings = vec![user_id, user_id];
     push_viewer_filter_bindings(&mut bindings, viewer_id);
@@ -531,16 +580,29 @@ pub async fn post_thread(
     };
     let root_id = root;
     let mut sql = base_post_query();
-    sql.push_str(" AND (p.id = ? OR p.root_post_id = ?) ORDER BY p.id ASC LIMIT 200");
+    sql.push_str(" AND (p.id = ? OR p.root_post_id = ?)");
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
+    sql.push_str(" ORDER BY p.id ASC LIMIT 200");
+    let mut bindings = vec![root_id, root_id];
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
     let rows = pool
-        .call(move |conn| query_post_rows(conn, &sql, params![root_id, root_id]))
+        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
         .await?;
-    rows_to_posts(pool, rows, viewer_id).await
+    let posts = rows_to_posts(pool, rows, viewer_id).await?;
+    // The requested post can be hidden by a block, mute, suspension, or
+    // deletion while visible replies remain. Treat that as "not found" rather
+    // than rendering an orphaned reply branch.
+    if posts.iter().any(|post| post.id == post_id) {
+        Ok(posts)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 pub async fn repost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<bool> {
     pool.call(move |conn| {
         let tx = conn.transaction()?;
+        ensure_post_interaction_accessible_tx(&tx, user_id, post_id)?;
         let owner: Option<i64> = tx
             .query_row(
                 "SELECT user_id FROM posts WHERE id = ? AND is_deleted = 0",
@@ -661,10 +723,14 @@ pub async fn quote_target_preview(
     viewer_id: Option<i64>,
     post_id: i64,
 ) -> anyhow::Result<QuotePreview> {
-    let preview = quote_preview_for_post(pool, Some(post_id), viewer_id)
-        .await?
-        .filter(|preview| !preview.unavailable);
-    preview.ok_or_else(|| anyhow::anyhow!("post not found"))
+    let previews = pool
+        .call(move |conn| quote_previews(conn, viewer_id, &[post_id]))
+        .await?;
+    previews
+        .get(&post_id)
+        .filter(|preview| !preview.unavailable)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("post not found"))
 }
 
 pub async fn unrepost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<bool> {
@@ -678,23 +744,94 @@ pub async fn unrepost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::
     .await
 }
 
-pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> anyhow::Result<bool> {
+/// Result of asking to follow an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowOutcome {
+    /// A follow row was created immediately.
+    Followed,
+    /// The target requires approval and a pending request was recorded.
+    Requested,
+    /// The viewer already follows the target.
+    AlreadyFollowing,
+    /// A pending request already exists for this pair.
+    AlreadyRequested,
+}
+
+/// Follows an account, or records a request when the target requires approval.
+///
+/// Targets with `users.follow_approval_required = 1` receive a
+/// `follow_request` notification and must approve the request before the
+/// follow counts or grants follower privileges. Existing followers are never
+/// removed when an account enables protection. Repeated and concurrent
+/// requests are idempotent, and blocks in either direction reject the action.
+/// Deleted or suspended accounts can neither follow nor be followed.
+pub async fn follow(
+    pool: &SqlitePool,
+    follower_id: i64,
+    followed_id: i64,
+) -> anyhow::Result<FollowOutcome> {
     if follower_id == followed_id {
         anyhow::bail!("cannot follow yourself");
     }
     pool.call(move |conn| {
         let tx = conn.transaction()?;
-        let target_available = tx
+        let actor_available = tx
             .query_row(
                 "SELECT is_deleted = 0 AND is_suspended = 0 FROM users WHERE id = ?",
-                [followed_id],
+                [follower_id],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?
             .unwrap_or(0)
             != 0;
-        if !target_available {
+        if !actor_available {
+            anyhow::bail!("account cannot follow");
+        }
+        let target = tx
+            .query_row(
+                "SELECT is_deleted = 0 AND is_suspended = 0, follow_approval_required FROM users WHERE id = ?",
+                [followed_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((available, approval_required)) = target else {
             anyhow::bail!("account cannot be followed");
+        };
+        if available == 0 || blocks_exist_tx(&tx, follower_id, followed_id)? {
+            anyhow::bail!("account cannot be followed");
+        }
+        if follow_exists_tx(&tx, follower_id, followed_id)? {
+            tx.commit()?;
+            return Ok(FollowOutcome::AlreadyFollowing);
+        }
+        // Pending requests stay pending even after the target disables
+        // protection: the owner can still approve or reject them, and asking
+        // again does not create a second request.
+        if follow_request_exists_tx(&tx, follower_id, followed_id)? {
+            tx.commit()?;
+            return Ok(FollowOutcome::AlreadyRequested);
+        }
+        if approval_required != 0 {
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO follow_requests (requester_id, target_id) VALUES (?, ?)",
+                params![follower_id, followed_id],
+            )?;
+            if changed > 0 {
+                create_notification_tx(
+                    &tx,
+                    followed_id,
+                    Some(follower_id),
+                    None,
+                    "follow_request",
+                    "requested to follow you",
+                )?;
+            }
+            tx.commit()?;
+            return Ok(if changed > 0 {
+                FollowOutcome::Requested
+            } else {
+                FollowOutcome::AlreadyRequested
+            });
         }
         let changed = tx.execute(
             "INSERT OR IGNORE INTO follows (follower_id, followed_id) VALUES (?, ?)",
@@ -711,7 +848,255 @@ pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> an
             )?;
         }
         tx.commit()?;
+        Ok(if changed > 0 {
+            FollowOutcome::Followed
+        } else {
+            FollowOutcome::AlreadyFollowing
+        })
+    })
+    .await
+}
+
+fn follow_exists_tx(
+    tx: &rusqlite::Transaction<'_>,
+    follower_id: i64,
+    followed_id: i64,
+) -> anyhow::Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?",
+            params![follower_id, followed_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn follow_request_exists_tx(
+    tx: &rusqlite::Transaction<'_>,
+    requester_id: i64,
+    target_id: i64,
+) -> anyhow::Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+            params![requester_id, target_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// An account involved in a pending follow request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowRequestView {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub bio: String,
+    pub profile_picture_path: Option<String>,
+    pub created_at: String,
+}
+
+/// Approves a pending request, creating the follow and notifying the requester.
+///
+/// The request row is deleted first and only a successful delete allows the
+/// follow to be created. Requests from deleted, suspended, or blocked
+/// accounts are discarded without creating a follow or notification.
+/// Returns `true` when a pending request was consumed; when the follow already
+/// exists the request is still consumed, but the follow row and the approval
+/// notification are never duplicated.
+pub async fn approve_follow_request(
+    pool: &SqlitePool,
+    target_id: i64,
+    requester_id: i64,
+) -> anyhow::Result<bool> {
+    pool.call(move |conn| {
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "DELETE FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+            params![requester_id, target_id],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let requester_available = tx
+            .query_row(
+                "SELECT is_deleted = 0 AND is_suspended = 0 FROM users WHERE id = ?",
+                [requester_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            != 0;
+        if !requester_available || blocks_exist_tx(&tx, requester_id, target_id)? {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO follows (follower_id, followed_id) VALUES (?, ?)",
+            params![requester_id, target_id],
+        )?;
+        if inserted > 0 {
+            create_notification_tx(
+                &tx,
+                requester_id,
+                Some(target_id),
+                None,
+                "follow_request_approved",
+                "approved your follow request",
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    })
+    .await
+}
+
+/// Rejects a pending request. Returns `true` when a request existed.
+pub async fn reject_follow_request(
+    pool: &SqlitePool,
+    target_id: i64,
+    requester_id: i64,
+) -> anyhow::Result<bool> {
+    pool.call(move |conn| {
+        let changed = conn.execute(
+            "DELETE FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+            params![requester_id, target_id],
+        )?;
         Ok(changed > 0)
+    })
+    .await
+}
+
+/// Cancels the viewer's own pending request to another account.
+pub async fn cancel_follow_request(
+    pool: &SqlitePool,
+    requester_id: i64,
+    target_id: i64,
+) -> anyhow::Result<bool> {
+    pool.call(move |conn| {
+        let changed = conn.execute(
+            "DELETE FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+            params![requester_id, target_id],
+        )?;
+        Ok(changed > 0)
+    })
+    .await
+}
+
+/// Pending incoming requests awaiting `user_id`'s approval, oldest first.
+///
+/// Blocked pairs are hidden in both directions. Suspended requesters are not
+/// filtered here because approval re-validates the requester and discards
+/// requests that can no longer be approved.
+pub async fn incoming_follow_requests(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> anyhow::Result<Vec<FollowRequestView>> {
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name, u.bio,
+              COALESCE(pic.thumbnail_public_path, pic.public_path),
+              r.created_at
+            FROM follow_requests r
+            JOIN users u ON u.id = r.requester_id
+            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+            WHERE r.target_id = ? AND u.is_deleted = 0
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = u.id)
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = u.id AND blocked_id = ?)
+            ORDER BY r.created_at ASC, r.requester_id ASC
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![user_id, user_id, user_id], map_follow_request_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+/// Pending outgoing requests created by `user_id`, oldest first.
+///
+/// The returned accounts are the request targets, so the UI can link to them.
+pub async fn outgoing_follow_requests(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> anyhow::Result<Vec<FollowRequestView>> {
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name, u.bio,
+              COALESCE(pic.thumbnail_public_path, pic.public_path),
+              r.created_at
+            FROM follow_requests r
+            JOIN users u ON u.id = r.target_id
+            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+            WHERE r.requester_id = ? AND u.is_deleted = 0 AND u.is_suspended = 0
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = u.id)
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = u.id AND blocked_id = ?)
+            ORDER BY r.created_at ASC, r.target_id ASC
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![user_id, user_id, user_id], map_follow_request_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+fn map_follow_request_row(row: &Row<'_>) -> rusqlite::Result<FollowRequestView> {
+    Ok(FollowRequestView {
+        user_id: row.get(0)?,
+        username: row.get(1)?,
+        display_name: row.get(2)?,
+        bio: row.get(3)?,
+        profile_picture_path: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+/// Number of pending incoming requests for `user_id`.
+pub async fn pending_follow_request_count(pool: &SqlitePool, user_id: i64) -> anyhow::Result<i64> {
+    pool.call(move |conn| {
+        Ok(conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM follow_requests r
+            JOIN users u ON u.id = r.requester_id
+            WHERE r.target_id = ? AND u.is_deleted = 0
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = u.id)
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = u.id AND blocked_id = ?)
+            "#,
+            params![user_id, user_id, user_id],
+            |row| row.get(0),
+        )?)
+    })
+    .await
+}
+
+/// Enables or disables follow approval for an account.
+///
+/// Enabling protection never removes existing follows. Disabling protection
+/// leaves existing pending requests pending: the owner can still approve or
+/// reject them, and new follows are accepted directly.
+pub async fn set_follow_approval_required(
+    pool: &SqlitePool,
+    user_id: i64,
+    required: bool,
+) -> anyhow::Result<()> {
+    pool.call(move |conn| {
+        let changed = conn.execute(
+            "UPDATE users SET follow_approval_required = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
+            params![i64::from(required), user_id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("account not found");
+        }
+        Ok(())
     })
     .await
 }
@@ -746,17 +1131,85 @@ pub async fn active_follow_targets(pool: &SqlitePool, ids: &[i64]) -> anyhow::Re
         .collect())
 }
 
+/// Removes a follow, or cancels the viewer's pending request in that direction.
+///
+/// Returns `true` only when a follow row was deleted; cancelling a pending
+/// request is a side effect so the button works in the requested state too.
 pub async fn unfollow(
     pool: &SqlitePool,
     follower_id: i64,
     followed_id: i64,
 ) -> anyhow::Result<bool> {
     pool.call(move |conn| {
-        let changed = conn.execute(
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "DELETE FROM follows WHERE follower_id = ? AND followed_id = ?",
             params![follower_id, followed_id],
         )?;
+        tx.execute(
+            "DELETE FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+            params![follower_id, followed_id],
+        )?;
+        tx.commit()?;
         Ok(changed > 0)
+    })
+    .await
+}
+
+/// The viewer's relationship to a profile, used to render accurate controls
+/// and profile states instead of always showing unused actions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProfileRelationship {
+    pub following: bool,
+    /// The viewer has a pending follow request to this profile.
+    pub requested: bool,
+    pub blocked: bool,
+    pub muted: bool,
+    pub blocks_viewer: bool,
+}
+
+impl ProfileRelationship {
+    #[must_use]
+    pub const fn has_block(self) -> bool {
+        self.blocked || self.blocks_viewer
+    }
+}
+
+pub async fn profile_relationship(
+    pool: &SqlitePool,
+    viewer_id: Option<i64>,
+    profile_id: i64,
+) -> anyhow::Result<ProfileRelationship> {
+    let Some(viewer_id) = viewer_id else {
+        return Ok(ProfileRelationship::default());
+    };
+    if viewer_id == profile_id {
+        return Ok(ProfileRelationship::default());
+    }
+    pool.call(move |conn| {
+        Ok(conn.query_row(
+            r#"
+            SELECT
+              EXISTS(SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?),
+              EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?),
+              EXISTS(SELECT 1 FROM mutes WHERE muter_id = ? AND muted_id = ?),
+              EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?),
+              EXISTS(SELECT 1 FROM follow_requests WHERE requester_id = ? AND target_id = ?)
+            "#,
+            params![
+                viewer_id, profile_id, viewer_id, profile_id, viewer_id, profile_id, profile_id,
+                viewer_id, viewer_id, profile_id
+            ],
+            |row| {
+                Ok(ProfileRelationship {
+                    following: row.get::<_, i64>(0)? != 0,
+                    blocked: row.get::<_, i64>(1)? != 0,
+                    muted: row.get::<_, i64>(2)? != 0,
+                    blocks_viewer: row.get::<_, i64>(3)? != 0,
+                    requested: row.get::<_, i64>(4)? != 0,
+                })
+            },
+        )?)
     })
     .await
 }
@@ -811,36 +1264,104 @@ pub async fn instance_counts(pool: &SqlitePool) -> anyhow::Result<(i64, i64)> {
     .await
 }
 
-pub async fn following_accounts(
+/// Maximum accounts rendered per follower/following page.
+pub const ACCOUNT_LIST_PAGE_SIZE: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowEdge {
+    Followers,
+    Following,
+}
+
+/// Shared follower/following list query with keyset pagination and viewer
+/// visibility filtering. Returns the page and whether more accounts follow.
+async fn follow_account_list(
     pool: &SqlitePool,
-    viewer_id: i64,
-) -> anyhow::Result<Vec<AccountView>> {
-    pool.call(move |conn| {
-        let mut stmt = conn.prepare(
+    account_id: i64,
+    viewer_id: Option<i64>,
+    edge: FollowEdge,
+    after: Option<String>,
+) -> anyhow::Result<(Vec<AccountView>, bool)> {
+    let (edge_column, anchor_column) = match edge {
+        FollowEdge::Followers => ("follower_id", "followed_id"),
+        FollowEdge::Following => ("followed_id", "follower_id"),
+    };
+    let mut sql = format!(
+        r#"
+        SELECT u.id, u.username, u.display_name, u.bio,
+          COALESCE(pic.thumbnail_public_path, pic.public_path),
+          EXISTS(
+            SELECT 1 FROM follows vf
+            WHERE vf.follower_id = ? AND vf.followed_id = u.id
+          )
+        FROM follows f
+        JOIN users u ON u.id = f.{edge_column}
+        LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+        WHERE f.{anchor_column} = ? AND u.is_deleted = 0 AND u.is_suspended = 0
+        "#
+    );
+    let mut bindings = vec![
+        rusqlite::types::Value::Integer(viewer_id.unwrap_or(0)),
+        rusqlite::types::Value::Integer(account_id),
+    ];
+    if let Some(cursor) = &after {
+        sql.push_str(" AND u.normalized_username > ?");
+        bindings.push(rusqlite::types::Value::Text(cursor.to_ascii_lowercase()));
+    }
+    if viewer_id.is_some() {
+        sql.push_str(
             r#"
-            SELECT u.id, u.username, u.display_name, u.bio,
-              COALESCE(pic.thumbnail_public_path, pic.public_path)
-            FROM follows f
-            JOIN users u ON u.id = f.followed_id
-            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
-            WHERE f.follower_id = ? AND u.is_deleted = 0
-            ORDER BY lower(u.username)
+            AND u.id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+            AND u.id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)
+            AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = u.id AND blocked_id = ?)
             "#,
-        )?;
+        );
+        if let Some(viewer_id) = viewer_id {
+            bindings.extend(std::iter::repeat_n(
+                rusqlite::types::Value::Integer(viewer_id),
+                3,
+            ));
+        }
+    }
+    sql.push_str(" ORDER BY u.normalized_username ASC LIMIT ?");
+    let limit = i64::try_from(ACCOUNT_LIST_PAGE_SIZE + 1)?;
+    bindings.push(rusqlite::types::Value::Integer(limit));
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([viewer_id], |row| {
+            .query_map(params_from_iter(bindings), |row| {
                 Ok(AccountView {
                     id: row.get(0)?,
                     username: row.get(1)?,
                     display_name: row.get(2)?,
                     bio: row.get(3)?,
                     profile_picture_path: row.get(4)?,
-                    viewer_following: true,
+                    viewer_following: row.get::<_, i64>(5)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })
+    .await
+    .map(|mut accounts| {
+        let has_more = accounts.len() > ACCOUNT_LIST_PAGE_SIZE;
+        accounts.truncate(ACCOUNT_LIST_PAGE_SIZE);
+        (accounts, has_more)
+    })
+}
+
+pub async fn following_accounts(
+    pool: &SqlitePool,
+    viewer_id: i64,
+    after: Option<String>,
+) -> anyhow::Result<(Vec<AccountView>, bool)> {
+    follow_account_list(
+        pool,
+        viewer_id,
+        Some(viewer_id),
+        FollowEdge::Following,
+        after,
+    )
     .await
 }
 
@@ -864,21 +1385,27 @@ pub async fn onboarding_suggestions(
             WHERE u.id != ?
               AND u.is_deleted = 0
               AND u.is_suspended = 0
+              AND u.id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+              AND u.id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = u.id AND blocked_id = ?)
             ORDER BY lower(u.username), u.id
             LIMIT ?
             "#,
         )?;
         let rows = stmt
-            .query_map(params![viewer_id, viewer_id, limit], |row| {
-                Ok(AccountView {
-                    id: row.get(0)?,
-                    username: row.get(1)?,
-                    display_name: row.get(2)?,
-                    bio: row.get(3)?,
-                    profile_picture_path: row.get(4)?,
-                    viewer_following: row.get::<_, i64>(5)? != 0,
-                })
-            })?
+            .query_map(
+                params![viewer_id, viewer_id, viewer_id, viewer_id, viewer_id, limit],
+                |row| {
+                    Ok(AccountView {
+                        id: row.get(0)?,
+                        username: row.get(1)?,
+                        display_name: row.get(2)?,
+                        bio: row.get(3)?,
+                        profile_picture_path: row.get(4)?,
+                        viewer_following: row.get::<_, i64>(5)? != 0,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })
@@ -889,78 +1416,18 @@ pub async fn followers_accounts(
     pool: &SqlitePool,
     account_id: i64,
     viewer_id: Option<i64>,
-) -> anyhow::Result<Vec<AccountView>> {
-    let viewer_id = viewer_id.unwrap_or(0);
-    pool.call(move |conn| {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT u.id, u.username, u.display_name, u.bio,
-              COALESCE(pic.thumbnail_public_path, pic.public_path),
-              EXISTS(
-                SELECT 1 FROM follows vf
-                WHERE vf.follower_id = ? AND vf.followed_id = u.id
-              )
-            FROM follows f
-            JOIN users u ON u.id = f.follower_id
-            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
-            WHERE f.followed_id = ? AND u.is_deleted = 0
-            ORDER BY lower(u.username)
-            "#,
-        )?;
-        let rows = stmt
-            .query_map(params![viewer_id, account_id], |row| {
-                Ok(AccountView {
-                    id: row.get(0)?,
-                    username: row.get(1)?,
-                    display_name: row.get(2)?,
-                    bio: row.get(3)?,
-                    profile_picture_path: row.get(4)?,
-                    viewer_following: row.get::<_, i64>(5)? != 0,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })
-    .await
+    after: Option<String>,
+) -> anyhow::Result<(Vec<AccountView>, bool)> {
+    follow_account_list(pool, account_id, viewer_id, FollowEdge::Followers, after).await
 }
 
 pub async fn following_accounts_for_profile(
     pool: &SqlitePool,
     account_id: i64,
     viewer_id: Option<i64>,
-) -> anyhow::Result<Vec<AccountView>> {
-    let viewer_id = viewer_id.unwrap_or(0);
-    pool.call(move |conn| {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT u.id, u.username, u.display_name, u.bio,
-              COALESCE(pic.thumbnail_public_path, pic.public_path),
-              EXISTS(
-                SELECT 1 FROM follows vf
-                WHERE vf.follower_id = ? AND vf.followed_id = u.id
-              )
-            FROM follows f
-            JOIN users u ON u.id = f.followed_id
-            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
-            WHERE f.follower_id = ? AND u.is_deleted = 0
-            ORDER BY lower(u.username)
-            "#,
-        )?;
-        let rows = stmt
-            .query_map(params![viewer_id, account_id], |row| {
-                Ok(AccountView {
-                    id: row.get(0)?,
-                    username: row.get(1)?,
-                    display_name: row.get(2)?,
-                    bio: row.get(3)?,
-                    profile_picture_path: row.get(4)?,
-                    viewer_following: row.get::<_, i64>(5)? != 0,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })
-    .await
+    after: Option<String>,
+) -> anyhow::Result<(Vec<AccountView>, bool)> {
+    follow_account_list(pool, account_id, viewer_id, FollowEdge::Following, after).await
 }
 
 pub async fn block(pool: &SqlitePool, blocker_id: i64, blocked_id: i64) -> anyhow::Result<()> {
@@ -969,12 +1436,17 @@ pub async fn block(pool: &SqlitePool, blocker_id: i64, blocked_id: i64) -> anyho
     }
     pool.call(move |conn| {
         let tx = conn.transaction()?;
+        ensure_account_actionable_tx(&tx, blocked_id)?;
         tx.execute(
             "INSERT OR IGNORE INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
             params![blocker_id, blocked_id],
         )?;
         tx.execute(
             "DELETE FROM follows WHERE (follower_id = ? AND followed_id = ?) OR (follower_id = ? AND followed_id = ?)",
+            params![blocker_id, blocked_id, blocked_id, blocker_id],
+        )?;
+        tx.execute(
+            "DELETE FROM follow_requests WHERE (requester_id = ? AND target_id = ?) OR (requester_id = ? AND target_id = ?)",
             params![blocker_id, blocked_id, blocked_id, blocker_id],
         )?;
         tx.commit()?;
@@ -1023,13 +1495,37 @@ pub async fn mute(pool: &SqlitePool, muter_id: i64, muted_id: i64) -> anyhow::Re
         anyhow::bail!("cannot mute yourself");
     }
     pool.call(move |conn| {
-        conn.execute(
+        let tx = conn.transaction()?;
+        ensure_account_actionable_tx(&tx, muted_id)?;
+        tx.execute(
             "INSERT OR IGNORE INTO mutes (muter_id, muted_id) VALUES (?, ?)",
             params![muter_id, muted_id],
         )?;
+        tx.commit()?;
         Ok(())
     })
     .await
+}
+
+/// Rejects block/mute targets that do not exist or were deleted, mirroring the
+/// follow target check so deleted accounts cannot accumulate invisible rows.
+fn ensure_account_actionable_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: i64,
+) -> anyhow::Result<()> {
+    let available = tx
+        .query_row(
+            "SELECT is_deleted = 0 FROM users WHERE id = ?",
+            [account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0)
+        != 0;
+    if !available {
+        anyhow::bail!("account not found");
+    }
+    Ok(())
 }
 
 pub async fn unmute(pool: &SqlitePool, muter_id: i64, muted_id: i64) -> anyhow::Result<()> {
@@ -1069,7 +1565,7 @@ pub async fn muted_users(
 
 pub async fn add_muted_word(pool: &SqlitePool, user_id: i64, term: &str) -> anyhow::Result<()> {
     let term = clean_muted_word(term)?;
-    let normalized = term.to_ascii_lowercase();
+    let normalized = term.to_lowercase();
     pool.call(move |conn| {
         conn.execute(
             "INSERT OR IGNORE INTO muted_words (user_id, term, normalized_term) VALUES (?, ?, ?)",
@@ -1132,6 +1628,7 @@ fn clean_muted_word(term: &str) -> anyhow::Result<String> {
 pub async fn like(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<()> {
     pool.call(move |conn| {
         let tx = conn.transaction()?;
+        ensure_post_interaction_accessible_tx(&tx, user_id, post_id)?;
         let owner_exists = tx
             .query_row(
                 "SELECT 1 FROM posts WHERE id = ? AND is_deleted = 0",
@@ -1169,13 +1666,66 @@ pub async fn unlike(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Re
 
 pub async fn bookmark(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<()> {
     pool.call(move |conn| {
-        conn.execute(
+        let tx = conn.transaction()?;
+        ensure_post_interaction_accessible_tx(&tx, user_id, post_id)?;
+        tx.execute(
             "INSERT OR IGNORE INTO bookmarks (user_id, post_id) VALUES (?, ?)",
             params![user_id, post_id],
         )?;
+        tx.commit()?;
         Ok(())
     })
     .await
+}
+
+fn ensure_post_interaction_accessible_tx(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: i64,
+    post_id: i64,
+) -> anyhow::Result<()> {
+    let owner = tx
+        .query_row(
+            r#"
+            SELECT p.user_id
+            FROM posts p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.id = ? AND p.is_deleted = 0
+              AND (p.user_id IS NULL OR (u.is_deleted = 0 AND u.is_suspended = 0))
+            "#,
+            [post_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?;
+    let Some(owner) = owner else {
+        anyhow::bail!("post not found");
+    };
+    if let Some(owner) = owner
+        && owner != user_id
+        && blocks_exist_tx(tx, user_id, owner)?
+    {
+        anyhow::bail!("post not found");
+    }
+    Ok(())
+}
+
+fn blocks_exist_tx(
+    tx: &rusqlite::Transaction<'_>,
+    left_id: i64,
+    right_id: i64,
+) -> anyhow::Result<bool> {
+    Ok(tx
+        .query_row(
+            r#"
+            SELECT 1 FROM blocks
+            WHERE (blocker_id = ? AND blocked_id = ?)
+               OR (blocker_id = ? AND blocked_id = ?)
+            LIMIT 1
+            "#,
+            params![left_id, right_id, right_id, left_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 pub async fn unbookmark(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<()> {
@@ -1265,14 +1815,16 @@ pub async fn delete_post(
         anyhow::bail!("cannot delete this post");
     }
     pool.call(move |conn| {
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE posts SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
             [post_id],
         )?;
-        conn.execute(
+        tx.execute(
             "UPDATE users SET pinned_post_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE pinned_post_id = ?",
             [post_id],
         )?;
+        tx.commit()?;
         Ok(())
     })
     .await
@@ -1325,22 +1877,44 @@ pub async fn search(
                 FROM users u
                 LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
                 WHERE u.is_deleted = 0
+                  AND u.is_suspended = 0
+                  AND (
+                    ? < 0 OR (
+                      u.id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+                      AND u.id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM blocks
+                        WHERE blocker_id = u.id AND blocked_id = ?
+                      )
+                    )
+                  )
                   AND (u.normalized_username LIKE ? OR u.display_name LIKE ?)
                 ORDER BY lower(u.username)
                 LIMIT 20
                 "#,
             )?;
             let rows = stmt
-                .query_map(params![viewer_id, username_query, display_query], |row| {
-                    Ok(AccountView {
-                        id: row.get(0)?,
-                        username: row.get(1)?,
-                        display_name: row.get(2)?,
-                        bio: row.get(3)?,
-                        profile_picture_path: row.get(4)?,
-                        viewer_following: row.get::<_, i64>(5)? != 0,
-                    })
-                })?
+                .query_map(
+                    params![
+                        viewer_id,
+                        viewer_id,
+                        viewer_id,
+                        viewer_id,
+                        viewer_id,
+                        username_query,
+                        display_query
+                    ],
+                    |row| {
+                        Ok(AccountView {
+                            id: row.get(0)?,
+                            username: row.get(1)?,
+                            display_name: row.get(2)?,
+                            bio: row.get(3)?,
+                            profile_picture_path: row.get(4)?,
+                            viewer_following: row.get::<_, i64>(5)? != 0,
+                        })
+                    },
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -1348,14 +1922,16 @@ pub async fn search(
     let rows = if let Some(fts_query) = fts_query_from_user_input(query) {
         let mut post_sql = base_post_query();
         post_sql.push_str(" AND p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?)");
-        append_viewer_filters(&mut post_sql, "p.user_id", viewer_id);
+        append_viewer_filters(&mut post_sql, "p.user_id", "p.text", viewer_id);
         post_sql.push_str(" LIMIT 40");
         pool.call(move |conn| {
             if let Some(viewer_id) = viewer_id {
                 query_post_rows(
                     conn,
                     &post_sql,
-                    params![fts_query, viewer_id, viewer_id, viewer_id],
+                    params![
+                        fts_query, viewer_id, viewer_id, viewer_id, viewer_id, viewer_id
+                    ],
                 )
             } else {
                 query_post_rows(conn, &post_sql, params![fts_query])
@@ -1499,12 +2075,37 @@ fn fts_query_from_user_input(query: &str) -> Option<String> {
     }
 }
 
+/// SQL fragment that hides notifications whose actor is blocked in either
+/// direction, muted, or whose post text matches one of the recipient's muted
+/// words. Binds `VIEWER_FILTER_BINDINGS` copies of the recipient's user id.
+const NOTIFICATION_VISIBLE_SQL: &str = r#"
+  AND (
+    n.actor_user_id IS NULL
+    OR (
+      n.actor_user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+      AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = n.actor_user_id AND blocked_id = ?)
+      AND n.actor_user_id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)
+    )
+  )
+  AND (
+    p.user_id = ?
+    OR NOT EXISTS (
+      SELECT 1 FROM muted_words mw
+      WHERE mw.user_id = ? AND rustpost_muted_word_match(COALESCE(p.text, ''), mw.normalized_term)
+    )
+  )
+"#;
+
+fn push_notification_filter_bindings(bindings: &mut Vec<i64>, user_id: i64) {
+    bindings.extend(std::iter::repeat_n(user_id, VIEWER_FILTER_BINDINGS));
+}
+
 pub async fn notifications(
     pool: &SqlitePool,
     user_id: i64,
 ) -> anyhow::Result<Vec<NotificationView>> {
     pool.call(move |conn| {
-        let mut stmt = conn.prepare(
+        let sql = format!(
             r#"
             SELECT n.id, n.kind, n.actor_user_id, u.username, u.display_name,
               n.post_id, p.text, p.is_deleted, p.parent_post_id, p.quote_post_id,
@@ -1518,12 +2119,16 @@ pub async fn notifications(
                 OR n.actor_user_id IS NULL
                 OR COALESCE(u.liked_posts_public, 0) != 0
               )
+              {NOTIFICATION_VISIBLE_SQL}
             ORDER BY n.id DESC
             LIMIT 80
             "#,
-        )?;
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bindings = vec![user_id];
+        push_notification_filter_bindings(&mut bindings, user_id);
         let rows = stmt
-            .query_map([user_id], |row| {
+            .query_map(params_from_iter(bindings), |row| {
                 let kind = row.get::<_, String>(1)?;
                 let post_id = row.get::<_, Option<i64>>(5)?;
                 let post_is_deleted = row
@@ -1650,21 +2255,24 @@ fn push_notification_group_item(
 
 pub async fn unread_notification_count(pool: &SqlitePool, user_id: i64) -> anyhow::Result<i64> {
     pool.call(move |conn| {
-        Ok(conn.query_row(
+        let sql = format!(
             r#"
             SELECT COUNT(*)
             FROM notifications n
             LEFT JOIN users u ON u.id = n.actor_user_id AND u.is_deleted = 0
+            LEFT JOIN posts p ON p.id = n.post_id
             WHERE n.user_id = ? AND n.read_at IS NULL
               AND (
                 n.kind != 'like'
                 OR n.actor_user_id IS NULL
                 OR COALESCE(u.liked_posts_public, 0) != 0
               )
+              {NOTIFICATION_VISIBLE_SQL}
             "#,
-            [user_id],
-            |row| row.get(0),
-        )?)
+        );
+        let mut bindings = vec![user_id];
+        push_notification_filter_bindings(&mut bindings, user_id);
+        Ok(conn.query_row(&sql, params_from_iter(bindings), |row| row.get(0))?)
     })
     .await
 }
@@ -1729,15 +2337,21 @@ fn notification_group_counts_tx(
     target_post_id: Option<i64>,
 ) -> anyhow::Result<(i64, i64)> {
     if kind == "follow" {
-        return Ok(conn.query_row(
+        let sql = format!(
             r#"
-            SELECT COUNT(*), COALESCE(SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END), 0)
-            FROM notifications
-            WHERE user_id = ? AND kind = 'follow'
-            "#,
-            [user_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?);
+            SELECT COUNT(*), COALESCE(SUM(CASE WHEN n.read_at IS NULL THEN 1 ELSE 0 END), 0)
+            FROM notifications n
+            LEFT JOIN users actor ON actor.id = n.actor_user_id AND actor.is_deleted = 0
+            LEFT JOIN posts p ON p.id = n.post_id
+            WHERE n.user_id = ? AND n.kind = 'follow'
+              {NOTIFICATION_VISIBLE_SQL}
+            "#
+        );
+        let mut bindings = vec![user_id];
+        push_notification_filter_bindings(&mut bindings, user_id);
+        return Ok(conn.query_row(&sql, params_from_iter(bindings), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?);
     }
     let Some(target_expr) = notification_group_target_expr(kind) else {
         return Ok((0, 0));
@@ -1757,13 +2371,21 @@ fn notification_group_counts_tx(
             OR n.actor_user_id IS NULL
             OR COALESCE(actor.liked_posts_public, 0) != 0
           )
+          {NOTIFICATION_VISIBLE_SQL}
         "#
     );
-    Ok(
-        conn.query_row(&sql, params![user_id, kind, target_post_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?,
-    )
+    let mut bindings = vec![
+        rusqlite::types::Value::Integer(user_id),
+        rusqlite::types::Value::Text(kind.to_owned()),
+        rusqlite::types::Value::Integer(target_post_id),
+    ];
+    bindings.extend(std::iter::repeat_n(
+        rusqlite::types::Value::Integer(user_id),
+        VIEWER_FILTER_BINDINGS,
+    ));
+    Ok(conn.query_row(&sql, params_from_iter(bindings), |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?)
 }
 
 fn notification_group_target_expr(kind: &str) -> Option<&'static str> {
@@ -1843,6 +2465,7 @@ fn base_post_query() -> String {
     LEFT JOIN users u ON u.id = p.user_id
     LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
     WHERE p.is_deleted = 0
+      AND (p.user_id IS NULL OR (u.is_deleted = 0 AND u.is_suspended = 0))
     "#.to_owned()
 }
 
@@ -1867,7 +2490,8 @@ fn base_repost_query() -> String {
     LEFT JOIN posts p ON p.id = r.post_id
     LEFT JOIN users u ON u.id = p.user_id
     LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
-    WHERE ru.is_deleted = 0
+    WHERE ru.is_deleted = 0 AND ru.is_suspended = 0
+      AND (p.user_id IS NULL OR (u.is_deleted = 0 AND u.is_suspended = 0))
     "#.to_owned()
 }
 
@@ -1888,7 +2512,7 @@ async fn post_events(
     if matches!(mode, "home" | "bookmarks") {
         sql.push_str(" AND p.parent_post_id IS NULL");
     }
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     if let Some(cursor) = cursor {
         sql.push_str(" AND p.id < ");
         sql.push_str(&cursor.to_string());
@@ -1916,7 +2540,7 @@ async fn post_events_for_user(
 ) -> anyhow::Result<Vec<PostView>> {
     let mut sql = base_post_query();
     sql.push_str(" AND p.user_id = ? AND p.parent_post_id IS NULL");
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(" ORDER BY p.id DESC LIMIT 40");
     let mut bindings = vec![user_id];
     push_viewer_filter_bindings(&mut bindings, viewer_id);
@@ -1933,7 +2557,7 @@ async fn reply_events_for_user(
 ) -> anyhow::Result<Vec<PostView>> {
     let mut sql = base_post_query();
     sql.push_str(" AND p.user_id = ? AND p.parent_post_id IS NOT NULL");
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(" ORDER BY p.id DESC LIMIT 40");
     let mut bindings = vec![user_id];
     push_viewer_filter_bindings(&mut bindings, viewer_id);
@@ -1951,7 +2575,7 @@ async fn media_events_for_user(
     let mut sql = base_post_query();
     sql.push_str(" AND p.user_id = ? AND ");
     sql.push_str(&media_surface_condition("p.id", "p.text"));
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(" ORDER BY p.id DESC LIMIT 40");
     let mut bindings = vec![user_id];
     push_viewer_filter_bindings(&mut bindings, viewer_id);
@@ -1968,7 +2592,7 @@ async fn liked_events_for_user(
 ) -> anyhow::Result<Vec<PostView>> {
     let mut sql = base_post_query();
     sql.push_str(" AND p.id IN (SELECT post_id FROM likes WHERE user_id = ?)");
-    append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     sql.push_str(
         " ORDER BY (SELECT created_at FROM likes WHERE user_id = ? AND post_id = p.id) DESC, p.id DESC LIMIT 40",
     );
@@ -2002,7 +2626,7 @@ async fn repost_events(
     if viewer_id.is_some() {
         sql.push_str(" AND r.user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)");
         sql.push_str(" AND r.user_id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?)");
-        append_viewer_filters(&mut sql, "p.user_id", viewer_id);
+        append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
     }
     sql.push_str(" ORDER BY r.id DESC LIMIT 40");
     let mut bindings = Vec::new();
@@ -2030,7 +2654,19 @@ fn media_surface_condition(post_id_column: &str, text_column: &str) -> String {
     )
 }
 
-fn append_viewer_filters(sql: &mut String, user_column: &str, viewer_id: Option<i64>) {
+/// Number of bound parameters added by [`append_viewer_filters`].
+const VIEWER_FILTER_BINDINGS: usize = 5;
+
+/// Appends the standard viewer visibility predicates: accounts the viewer
+/// blocked, accounts that blocked the viewer, accounts the viewer muted, and
+/// the viewer's muted words. The viewer's own posts are never hidden by their
+/// own muted words.
+fn append_viewer_filters(
+    sql: &mut String,
+    user_column: &str,
+    text_column: &str,
+    viewer_id: Option<i64>,
+) {
     if viewer_id.is_some() {
         sql.push_str(&format!(
             " AND ({user_column} IS NULL OR {user_column} NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?))"
@@ -2038,17 +2674,18 @@ fn append_viewer_filters(sql: &mut String, user_column: &str, viewer_id: Option<
         sql.push_str(&format!(
             " AND ({user_column} IS NULL OR {user_column} NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?))"
         ));
-        sql.push_str(
-            " AND NOT EXISTS (SELECT 1 FROM muted_words mw WHERE mw.user_id = ? AND instr(lower(p.text), mw.normalized_term) > 0)",
-        );
+        sql.push_str(&format!(
+            " AND ({user_column} IS NULL OR NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = {user_column} AND blocked_id = ?))"
+        ));
+        sql.push_str(&format!(
+            " AND ({user_column} IS NULL OR {user_column} = ? OR NOT EXISTS (SELECT 1 FROM muted_words mw WHERE mw.user_id = ? AND rustpost_muted_word_match({text_column}, mw.normalized_term)))"
+        ));
     }
 }
 
 fn push_viewer_filter_bindings(bindings: &mut Vec<i64>, viewer_id: Option<i64>) {
     if let Some(id) = viewer_id {
-        bindings.push(id);
-        bindings.push(id);
-        bindings.push(id);
+        bindings.extend(std::iter::repeat_n(id, VIEWER_FILTER_BINDINGS));
     }
 }
 
@@ -2090,48 +2727,59 @@ fn map_post_row(row: &Row<'_>) -> rusqlite::Result<PostRow> {
     })
 }
 
+/// Enriches pre-fetched post rows with media, embeds, viewer state, counts,
+/// and quote previews using a fixed number of batched queries.
+///
+/// This replaced a per-row enrichment loop that issued up to seven queries per
+/// post, which meant hundreds of round trips for a single 40-post timeline.
 async fn rows_to_posts(
     pool: &SqlitePool,
     rows: Vec<PostRow>,
     viewer_id: Option<i64>,
 ) -> anyhow::Result<Vec<PostView>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    pool.call(move |conn| enrich_posts(conn, rows, viewer_id))
+        .await
+}
+
+fn enrich_posts(
+    conn: &Connection,
+    rows: Vec<PostRow>,
+    viewer_id: Option<i64>,
+) -> anyhow::Result<Vec<PostView>> {
+    let visible_ids = rows
+        .iter()
+        .filter(|row| !row.original_unavailable)
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+    let media = media_for_posts(conn, &visible_ids)?;
+    let embeds = youtube_embeds_for_posts(conn, &visible_ids)?;
+    let viewer_likes = viewer_relation_ids(conn, viewer_id, ViewerRelation::Likes, &visible_ids)?;
+    let viewer_bookmarks =
+        viewer_relation_ids(conn, viewer_id, ViewerRelation::Bookmarks, &visible_ids)?;
+    let viewer_reposts =
+        viewer_relation_ids(conn, viewer_id, ViewerRelation::Reposts, &visible_ids)?;
+    let like_counts = visible_like_counts(conn, viewer_id, &visible_ids)?;
+    let quote_ids = rows
+        .iter()
+        .filter_map(|row| row.quote_post_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let quotes = quote_previews(conn, viewer_id, &quote_ids)?;
+
     let mut posts = Vec::with_capacity(rows.len());
     for row in rows {
+        let unavailable = row.original_unavailable;
         let id = row.id;
-        let original_unavailable = row.original_unavailable;
-        let media = if original_unavailable {
-            Vec::new()
-        } else {
-            media_for_post(pool, id).await?
-        };
-        let youtube_embeds = if original_unavailable {
-            Vec::new()
-        } else {
-            youtube_embeds_for_post(pool, id).await?
-        };
-        let viewer_liked = if let Some(user_id) = viewer_id {
-            !original_unavailable && relation_exists(pool, "likes", user_id, id).await?
-        } else {
-            false
-        };
-        let viewer_bookmarked = if let Some(user_id) = viewer_id {
-            !original_unavailable && relation_exists(pool, "bookmarks", user_id, id).await?
-        } else {
-            false
-        };
-        let viewer_reposted = if let Some(user_id) = viewer_id {
-            !original_unavailable && relation_exists(pool, "reposts", user_id, id).await?
-        } else {
-            false
-        };
-        let like_count = if original_unavailable {
-            0
-        } else {
-            visible_like_count(pool, viewer_id, id).await?
-        };
-        let viewer_can_repost =
-            viewer_id.is_some_and(|user_id| !original_unavailable && row.user_id != Some(user_id));
-        let quote = quote_preview_for_post(pool, row.quote_post_id, viewer_id).await?;
+        let quote = row.quote_post_id.map(|quote_id| {
+            quotes
+                .get(&quote_id)
+                .cloned()
+                .unwrap_or_else(|| unavailable_quote_preview(quote_id))
+        });
         posts.push(PostView {
             event_id: row.event_id,
             event_kind: if row.event_kind == "repost" {
@@ -2150,100 +2798,219 @@ async fn rows_to_posts(
             created_at: row.created_at,
             edited_at: row.edited_at,
             event_created_at: row.event_created_at,
-            like_count,
+            like_count: if unavailable {
+                0
+            } else {
+                like_counts.get(&id).copied().unwrap_or(0)
+            },
             repost_count: row.repost_count,
             reply_count: row.reply_count,
-            viewer_liked,
-            viewer_bookmarked,
-            viewer_reposted,
-            viewer_can_repost,
+            viewer_liked: viewer_likes.contains(&id),
+            viewer_bookmarked: viewer_bookmarks.contains(&id),
+            viewer_reposted: viewer_reposts.contains(&id),
+            viewer_can_repost: viewer_id
+                .is_some_and(|user_id| !unavailable && row.user_id != Some(user_id)),
             pinned_by_author: row.pinned_by_author,
-            original_unavailable,
+            original_unavailable: unavailable,
             reposted_by_user_id: row.repost_user_id,
             reposted_by_username: row.repost_username,
             reposted_by_display_name: row.repost_display_name,
             reposted_at: row.repost_created_at,
             quote,
-            media,
-            youtube_embeds,
+            media: media.get(&id).cloned().unwrap_or_default(),
+            youtube_embeds: embeds.get(&id).cloned().unwrap_or_default(),
         });
     }
     Ok(posts)
 }
 
-async fn visible_like_count(
-    pool: &SqlitePool,
-    viewer_id: Option<i64>,
-    post_id: i64,
-) -> anyhow::Result<i64> {
-    let viewer_id = viewer_id.unwrap_or(-1);
-    pool.call(move |conn| {
-        Ok(conn.query_row(
-            r#"
-            SELECT COUNT(*)
-            FROM likes l
-            JOIN users u ON u.id = l.user_id AND u.is_deleted = 0
-            WHERE l.post_id = ? AND (u.liked_posts_public != 0 OR l.user_id = ?)
-            "#,
-            params![post_id, viewer_id],
-            |row| row.get(0),
-        )?)
-    })
-    .await
+fn unavailable_quote_preview(quote_post_id: i64) -> QuotePreview {
+    QuotePreview {
+        id: quote_post_id,
+        username: None,
+        display_name: None,
+        anonymous_label: None,
+        text: String::new(),
+        created_at: String::new(),
+        unavailable: true,
+    }
 }
 
-async fn quote_preview_for_post(
-    pool: &SqlitePool,
-    quote_post_id: Option<i64>,
-    viewer_id: Option<i64>,
-) -> anyhow::Result<Option<QuotePreview>> {
-    let Some(quote_post_id) = quote_post_id else {
-        return Ok(None);
-    };
-    pool.call(move |conn| {
-        let mut sql = r#"
-            SELECT q.id, q.user_id, u.username, u.display_name, q.anonymous_label, q.text, q.created_at
-            FROM posts q
-            LEFT JOIN users u ON u.id = q.user_id
-            WHERE q.id = ? AND q.is_deleted = 0
-        "#
-        .to_owned();
-        if viewer_id.is_some() {
-            sql.push_str(
-                " AND (q.user_id IS NULL OR q.user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?))",
-            );
-            sql.push_str(
-                " AND (q.user_id IS NULL OR q.user_id NOT IN (SELECT muted_id FROM mutes WHERE muter_id = ?))",
-            );
-            sql.push_str(
-                " AND (q.user_id IS NULL OR NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = q.user_id AND blocked_id = ?))",
-            );
-            sql.push_str(
-                " AND NOT EXISTS (SELECT 1 FROM muted_words mw WHERE mw.user_id = ? AND instr(lower(q.text), mw.normalized_term) > 0)",
-            );
+fn sql_placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn media_for_posts(
+    conn: &Connection,
+    post_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, Vec<MediaView>>> {
+    if post_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = format!(
+        r#"
+        SELECT pm.post_id, m.public_path, m.mime_type, m.media_kind, m.alt_text, m.is_nsfw
+        FROM post_media pm
+        JOIN media m ON m.id = pm.media_id
+        WHERE pm.post_id IN ({})
+        ORDER BY pm.post_id ASC, pm.position ASC
+        "#,
+        sql_placeholders(post_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(post_ids.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            MediaView {
+                public_path: row.get(1)?,
+                mime_type: row.get(2)?,
+                media_kind: row.get(3)?,
+                alt_text: row.get(4)?,
+                is_nsfw: row.get::<_, i64>(5)? != 0,
+            },
+        ))
+    })?;
+    let mut media: HashMap<i64, Vec<MediaView>> = HashMap::new();
+    for row in rows {
+        let (post_id, view) = row?;
+        media.entry(post_id).or_default().push(view);
+    }
+    Ok(media)
+}
+
+fn youtube_embeds_for_posts(
+    conn: &Connection,
+    post_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, Vec<YoutubeEmbed>>> {
+    if post_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = format!(
+        r#"
+        SELECT post_id, video_id, title
+        FROM post_embeds
+        WHERE provider = 'youtube' AND post_id IN ({})
+        ORDER BY post_id ASC, position ASC, id ASC
+        "#,
+        sql_placeholders(post_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(post_ids.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut embeds: HashMap<i64, Vec<YoutubeEmbed>> = HashMap::new();
+    for row in rows {
+        let (post_id, video_id, title) = row?;
+        if let Some(embed) = crate::youtube::embed_from_stored(&video_id, title) {
+            embeds.entry(post_id).or_default().push(embed);
         }
-        let preview = if let Some(viewer_id) = viewer_id {
-            conn.query_row(
-                &sql,
-                params![quote_post_id, viewer_id, viewer_id, viewer_id, viewer_id],
-                map_quote_preview_row,
-            )
-            .optional()?
-        } else {
-            conn.query_row(&sql, params![quote_post_id], map_quote_preview_row)
-                .optional()?
-        };
-        Ok(Some(preview.unwrap_or_else(|| QuotePreview {
-            id: quote_post_id,
-            username: None,
-            display_name: None,
-            anonymous_label: None,
-            text: String::new(),
-            created_at: String::new(),
-            unavailable: true,
-        })))
-    })
-    .await
+    }
+    Ok(embeds)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ViewerRelation {
+    Likes,
+    Bookmarks,
+    Reposts,
+}
+
+impl ViewerRelation {
+    const fn table(self) -> &'static str {
+        match self {
+            Self::Likes => "likes",
+            Self::Bookmarks => "bookmarks",
+            Self::Reposts => "reposts",
+        }
+    }
+}
+
+fn viewer_relation_ids(
+    conn: &Connection,
+    viewer_id: Option<i64>,
+    relation: ViewerRelation,
+    post_ids: &[i64],
+) -> anyhow::Result<BTreeSet<i64>> {
+    let Some(viewer_id) = viewer_id else {
+        return Ok(BTreeSet::new());
+    };
+    if post_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let sql = format!(
+        "SELECT post_id FROM {} WHERE user_id = ? AND post_id IN ({})",
+        relation.table(),
+        sql_placeholders(post_ids.len())
+    );
+    let mut bindings = Vec::with_capacity(post_ids.len() + 1);
+    bindings.push(viewer_id);
+    bindings.extend_from_slice(post_ids);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(bindings), |row| row.get::<_, i64>(0))?;
+    Ok(rows.collect::<Result<BTreeSet<_>, _>>()?)
+}
+
+fn visible_like_counts(
+    conn: &Connection,
+    viewer_id: Option<i64>,
+    post_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, i64>> {
+    if post_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = format!(
+        r#"
+        SELECT l.post_id, COUNT(*)
+        FROM likes l
+        JOIN users u ON u.id = l.user_id AND u.is_deleted = 0
+        WHERE l.post_id IN ({}) AND (u.liked_posts_public != 0 OR l.user_id = ?)
+        GROUP BY l.post_id
+        "#,
+        sql_placeholders(post_ids.len())
+    );
+    let mut bindings = Vec::with_capacity(post_ids.len() + 1);
+    bindings.extend_from_slice(post_ids);
+    bindings.push(viewer_id.unwrap_or(-1));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(bindings), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+}
+
+fn quote_previews(
+    conn: &Connection,
+    viewer_id: Option<i64>,
+    quote_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, QuotePreview>> {
+    if quote_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut sql = format!(
+        r#"
+        SELECT q.id, q.user_id, u.username, u.display_name, q.anonymous_label, q.text, q.created_at
+        FROM posts q
+        LEFT JOIN users u ON u.id = q.user_id
+        WHERE q.id IN ({}) AND q.is_deleted = 0
+          AND (q.user_id IS NULL OR (u.is_deleted = 0 AND u.is_suspended = 0))
+        "#,
+        sql_placeholders(quote_ids.len())
+    );
+    append_viewer_filters(&mut sql, "q.user_id", "q.text", viewer_id);
+    let mut bindings = quote_ids.to_vec();
+    push_viewer_filter_bindings(&mut bindings, viewer_id);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(bindings), |row| {
+        let preview = map_quote_preview_row(row)?;
+        Ok((preview.id, preview))
+    })?;
+    Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
 }
 
 fn map_quote_preview_row(row: &Row<'_>) -> rusqlite::Result<QuotePreview> {
@@ -2265,7 +3032,13 @@ fn ensure_quote_target_accessible_tx(
 ) -> anyhow::Result<()> {
     let owner: Option<i64> = tx
         .query_row(
-            "SELECT user_id FROM posts WHERE id = ? AND is_deleted = 0",
+            r#"
+            SELECT p.user_id
+            FROM posts p
+            JOIN users u ON u.id = p.user_id
+            WHERE p.id = ? AND p.is_deleted = 0
+              AND u.is_deleted = 0 AND u.is_suspended = 0
+            "#,
             [post_id],
             |row| row.get(0),
         )
@@ -2301,55 +3074,6 @@ fn user_relation_exists_tx(
         .query_row(&sql, params![left_id, right_id], |_| Ok(()))
         .optional()?
         .is_some())
-}
-
-async fn relation_exists(
-    pool: &SqlitePool,
-    table: &str,
-    user_id: i64,
-    post_id: i64,
-) -> anyhow::Result<bool> {
-    let sql = format!("SELECT 1 FROM {table} WHERE user_id = ? AND post_id = ?");
-    pool.call(move |conn| {
-        Ok(conn
-            .query_row(&sql, params![user_id, post_id], |_| Ok(()))
-            .optional()?
-            .is_some())
-    })
-    .await
-}
-
-async fn media_for_post(pool: &SqlitePool, post_id: i64) -> anyhow::Result<Vec<MediaView>> {
-    pool.call(move |conn| {
-        let mut stmt = conn.prepare(
-            r#"
-        SELECT m.public_path, m.mime_type, m.media_kind, m.alt_text, m.is_nsfw
-        FROM post_media pm JOIN media m ON m.id = pm.media_id
-        WHERE pm.post_id = ? ORDER BY pm.position ASC
-        "#,
-        )?;
-        let rows = stmt
-            .query_map([post_id], |row| {
-                Ok(MediaView {
-                    public_path: row.get(0)?,
-                    mime_type: row.get(1)?,
-                    media_kind: row.get(2)?,
-                    alt_text: row.get(3)?,
-                    is_nsfw: row.get::<_, i64>(4)? != 0,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })
-    .await
-}
-
-async fn youtube_embeds_for_post(
-    pool: &SqlitePool,
-    post_id: i64,
-) -> anyhow::Result<Vec<YoutubeEmbed>> {
-    pool.call(move |conn| youtube_embeds_for_post_conn(conn, post_id).map_err(Into::into))
-        .await
 }
 
 fn youtube_embeds_for_post_conn(
@@ -2790,6 +3514,72 @@ mod tests {
         assert!(!repost(&pool, bob, post).await.expect("duplicate repost"));
         block(&pool, alice, bob).await.expect("block");
         mute(&pool, alice, bob).await.expect("mute");
+    }
+
+    #[tokio::test]
+    async fn create_post_enforces_image_and_video_attachment_limits() {
+        let (pool, mut settings, alice, _bob) = fixture().await;
+        settings.posts.max_media_per_post = 4;
+        settings.posts.max_images_per_post = 1;
+        settings.posts.max_videos_per_post = 1;
+        let first_image = insert_test_media_kind(&pool, alice, "image").await;
+        let second_image = insert_test_media_kind(&pool, alice, "image").await;
+        let first_video = insert_test_media_kind(&pool, alice, "video").await;
+        let second_video = insert_test_media_kind(&pool, alice, "video").await;
+
+        let too_many_images = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "image limit",
+            None,
+            &[first_image, second_image],
+        )
+        .await
+        .expect_err("image limit");
+        assert_eq!(too_many_images.to_string(), "too many image attachments");
+
+        let too_many_videos = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "video limit",
+            None,
+            &[first_video, second_video],
+        )
+        .await
+        .expect_err("video limit");
+        assert_eq!(too_many_videos.to_string(), "too many video attachments");
+
+        create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "mixed media within limits",
+            None,
+            &[first_image, first_video],
+        )
+        .await
+        .expect("mixed media post");
+    }
+
+    #[tokio::test]
+    async fn create_post_rejects_media_owned_by_another_user() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let bob_media = insert_test_media_kind(&pool, bob, "image").await;
+
+        let error = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "stolen media",
+            None,
+            &[bob_media],
+        )
+        .await
+        .expect_err("other user's media must be rejected");
+
+        assert_eq!(error.to_string(), "media attachment not found");
     }
 
     #[tokio::test]
@@ -3268,6 +4058,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_users_cannot_interact_with_blocker_content_or_account() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(&pool, &settings, Some(alice), "original", None, &[])
+            .await
+            .expect("original");
+        block(&pool, alice, bob).await.expect("block");
+
+        assert!(follow(&pool, bob, alice).await.is_err());
+        assert!(like(&pool, bob, original).await.is_err());
+        assert!(bookmark(&pool, bob, original).await.is_err());
+        assert!(repost(&pool, bob, original).await.is_err());
+        assert!(
+            create_post(
+                &pool,
+                &settings,
+                Some(bob),
+                "blocked reply",
+                Some(original),
+                &[],
+            )
+            .await
+            .is_err()
+        );
+
+        let (follows, likes, bookmarks, reposts, replies): (i64, i64, i64, i64, i64) = pool
+            .call(move |conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM follows", [], |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM likes", [], |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM bookmarks", [], |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM reposts", [], |row| row.get(0))?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM posts WHERE parent_post_id = ?",
+                        [original],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .expect("interaction counts");
+        assert_eq!(
+            (follows, likes, bookmarks, reposts, replies),
+            (0, 0, 0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_users_cannot_recover_blocker_posts_from_feeds_threads_or_search() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "blocked visibility target",
+            None,
+            &[],
+        )
+        .await
+        .expect("original");
+        block(&pool, alice, bob).await.expect("block");
+
+        let timeline = timeline(&pool, Some(bob), "local", None)
+            .await
+            .expect("timeline");
+        let thread = post_thread(&pool, Some(bob), original)
+            .await
+            .expect("thread");
+        let (users, posts) = search(&pool, Some(bob), "alice blocked visibility")
+            .await
+            .expect("search");
+
+        assert!(timeline.iter().all(|post| post.user_id != Some(alice)));
+        assert!(thread.is_empty());
+        assert!(users.iter().all(|user| user.id != alice));
+        assert!(posts.iter().all(|post| post.user_id != Some(alice)));
+    }
+
+    #[tokio::test]
+    async fn suspended_user_posts_are_hidden_and_cannot_receive_interactions() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let original = create_post(
+            &pool,
+            &settings,
+            Some(alice),
+            "suspended visibility target",
+            None,
+            &[],
+        )
+        .await
+        .expect("original");
+        pool.call(move |conn| {
+            conn.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", [alice])?;
+            Ok(())
+        })
+        .await
+        .expect("suspend user");
+
+        let timeline = timeline(&pool, Some(bob), "local", None)
+            .await
+            .expect("timeline");
+        let thread = post_thread(&pool, Some(bob), original)
+            .await
+            .expect("thread");
+        let (users, posts) = search(&pool, Some(bob), "suspended visibility")
+            .await
+            .expect("search");
+
+        assert!(timeline.iter().all(|post| post.user_id != Some(alice)));
+        assert!(thread.is_empty());
+        assert!(users.iter().all(|user| user.id != alice));
+        assert!(posts.iter().all(|post| post.user_id != Some(alice)));
+        assert!(like(&pool, bob, original).await.is_err());
+        assert!(repost(&pool, bob, original).await.is_err());
+        assert!(
+            create_post(
+                &pool,
+                &settings,
+                Some(bob),
+                "reply to suspended post",
+                Some(original),
+                &[],
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn compact_post_avatar_prefers_profile_thumbnail() {
         let (pool, settings, alice, _) = fixture().await;
         set_profile_picture(
@@ -3322,7 +4240,9 @@ mod tests {
         let (pool, _settings, alice, bob) = fixture().await;
         follow(&pool, bob, alice).await.expect("follow");
 
-        let accounts = following_accounts(&pool, bob).await.expect("accounts");
+        let (accounts, _) = following_accounts(&pool, bob, None)
+            .await
+            .expect("accounts");
 
         assert_eq!(accounts.len(), 1);
         assert!(accounts[0].profile_picture_path.is_none());
@@ -3623,6 +4543,36 @@ mod tests {
         .expect("attach media");
     }
 
+    async fn insert_test_media_kind(
+        pool: &SqlitePool,
+        owner_user_id: i64,
+        media_kind: &str,
+    ) -> i64 {
+        let media_kind = media_kind.to_owned();
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let extension = if media_kind == "video" {
+            "webm"
+        } else {
+            "webp"
+        };
+        let mime_type = if media_kind == "video" {
+            "video/webm"
+        } else {
+            "image/webp"
+        };
+        let stored_path = format!("/tmp/rustpost-test-{id}.{extension}");
+        let public_path = format!("/uploads/{media_kind}s/rustpost-test-{id}.{extension}");
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len) VALUES (?, 'media', ?, ?, ?, ?, 1)",
+                params![owner_user_id, stored_path, public_path, mime_type, media_kind],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .expect("test media")
+    }
+
     async fn notification_count(
         pool: &SqlitePool,
         user_id: i64,
@@ -3637,6 +4587,66 @@ mod tests {
             )?)
         })
         .await
+    }
+
+    async fn notification_message(
+        pool: &SqlitePool,
+        user_id: i64,
+        kind: &str,
+    ) -> anyhow::Result<Option<(String, Option<i64>)>> {
+        let kind = kind.to_owned();
+        pool.call(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT message, actor_user_id FROM notifications WHERE user_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+                    params![user_id, kind],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    async fn follow_request_count(pool: &SqlitePool, requester_id: i64, target_id: i64) -> i64 {
+        pool.call(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+                params![requester_id, target_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .expect("follow request count")
+    }
+
+    async fn follow_row_count(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> i64 {
+        pool.call(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM follows WHERE follower_id = ? AND followed_id = ?",
+                params![follower_id, followed_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .expect("follow row count")
+    }
+
+    async fn register_account(pool: &SqlitePool, settings: &Settings, username: &str) -> i64 {
+        auth::register_user(pool, settings, username, "very secure password", false)
+            .await
+            .expect("register account")
+    }
+
+    async fn set_account_flags(pool: &SqlitePool, user_id: i64, deleted: bool, suspended: bool) {
+        pool.call(move |conn| {
+            conn.execute(
+                "UPDATE users SET is_deleted = ?, is_suspended = ? WHERE id = ?",
+                params![i64::from(deleted), i64::from(suspended), user_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("account flags");
     }
 
     #[tokio::test]
@@ -4182,8 +5192,14 @@ mod tests {
     async fn follow_unfollow_is_idempotent_and_counts_once() {
         let (pool, _settings, alice, bob) = fixture().await;
 
-        assert!(follow(&pool, bob, alice).await.expect("first follow"));
-        assert!(!follow(&pool, bob, alice).await.expect("duplicate follow"));
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("first follow"),
+            FollowOutcome::Followed
+        );
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("duplicate follow"),
+            FollowOutcome::AlreadyFollowing
+        );
         assert!(is_following(&pool, bob, alice).await.expect("is following"));
         assert_eq!(
             follow_counts(&pool, alice).await.expect("alice counts"),
@@ -4213,6 +5229,500 @@ mod tests {
             !is_following(&pool, bob, alice)
                 .await
                 .expect("not following")
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_account_records_follow_request() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_profile_picture(
+            &pool,
+            alice,
+            "/uploads/images/alice.webp",
+            Some("/uploads/thumbs/alice-profile.webp"),
+        )
+        .await;
+        set_profile_picture(&pool, bob, "/uploads/images/bob.webp", None).await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request follow"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+        assert!(
+            !is_following(&pool, bob, alice)
+                .await
+                .expect("not following")
+        );
+        assert_eq!(
+            follow_counts(&pool, alice).await.expect("alice counts"),
+            (0, 0)
+        );
+        assert!(
+            followers_accounts(&pool, alice, Some(bob), None)
+                .await
+                .expect("followers list")
+                .0
+                .is_empty()
+        );
+        assert!(
+            following_accounts(&pool, bob, None)
+                .await
+                .expect("bob following list")
+                .0
+                .is_empty()
+        );
+
+        let relationship = profile_relationship(&pool, Some(bob), alice)
+            .await
+            .expect("relationship");
+        assert!(!relationship.following);
+        assert!(relationship.requested);
+
+        let incoming = incoming_follow_requests(&pool, alice)
+            .await
+            .expect("incoming requests");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].user_id, bob);
+        assert_eq!(incoming[0].username, "bob");
+        assert_eq!(
+            incoming[0].profile_picture_path.as_deref(),
+            Some("/uploads/images/bob.webp")
+        );
+        let outgoing = outgoing_follow_requests(&pool, bob)
+            .await
+            .expect("outgoing requests");
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].user_id, alice);
+        assert_eq!(outgoing[0].username, "alice");
+        assert_eq!(
+            outgoing[0].profile_picture_path.as_deref(),
+            Some("/uploads/thumbs/alice-profile.webp")
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("alice pending count"),
+            1
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, bob)
+                .await
+                .expect("bob pending count"),
+            0
+        );
+
+        let (message, actor) = notification_message(&pool, alice, "follow_request")
+            .await
+            .expect("lookup")
+            .expect("follow_request notification");
+        assert_eq!(message, "requested to follow you");
+        assert_eq!(actor, Some(bob));
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("duplicate request"),
+            FollowOutcome::AlreadyRequested
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+    }
+
+    #[tokio::test]
+    async fn approving_request_creates_follow_and_notifies_requester() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request follow"),
+            FollowOutcome::Requested
+        );
+
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert!(
+            !approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("re-approve")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert!(is_following(&pool, bob, alice).await.expect("following"));
+        assert_eq!(
+            follow_counts(&pool, alice).await.expect("alice counts"),
+            (1, 0)
+        );
+        let relationship = profile_relationship(&pool, Some(bob), alice)
+            .await
+            .expect("relationship after approval");
+        assert!(relationship.following);
+        assert!(!relationship.requested);
+
+        let (message, actor) = notification_message(&pool, bob, "follow_request_approved")
+            .await
+            .expect("lookup")
+            .expect("approval notification");
+        assert_eq!(message, "approved your follow request");
+        assert_eq!(actor, Some(alice));
+    }
+
+    #[tokio::test]
+    async fn follow_request_reject_and_cancel_are_direction_sensitive() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        // Only the requester may cancel and only the target may approve/reject.
+        assert!(
+            !approve_follow_request(&pool, bob, alice)
+                .await
+                .expect("wrong-direction approve")
+        );
+        assert!(
+            !reject_follow_request(&pool, bob, alice)
+                .await
+                .expect("wrong-direction reject")
+        );
+        assert!(
+            !cancel_follow_request(&pool, alice, bob)
+                .await
+                .expect("wrong-direction cancel")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+
+        assert!(
+            reject_follow_request(&pool, alice, bob)
+                .await
+                .expect("reject")
+        );
+        assert!(
+            !reject_follow_request(&pool, alice, bob)
+                .await
+                .expect("re-reject")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert!(!is_following(&pool, bob, alice).await.expect("no follow"));
+        assert_eq!(
+            follow_counts(&pool, alice).await.expect("alice counts"),
+            (0, 0)
+        );
+        assert!(
+            notification_message(&pool, bob, "follow_request_approved")
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request again"),
+            FollowOutcome::Requested
+        );
+        assert!(
+            cancel_follow_request(&pool, bob, alice)
+                .await
+                .expect("cancel")
+        );
+        assert!(
+            !cancel_follow_request(&pool, bob, alice)
+                .await
+                .expect("re-cancel")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert!(
+            !is_following(&pool, bob, alice)
+                .await
+                .expect("still no follow")
+        );
+    }
+
+    #[tokio::test]
+    async fn block_removes_pending_follow_requests_in_both_directions() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+
+        // Blocking removes the blocker's own outgoing request.
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        block(&pool, bob, alice).await.expect("bob blocks alice");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+
+        // Blocking also removes requests targeting the blocker.
+        set_follow_approval_required(&pool, carol, true)
+            .await
+            .expect("protect carol");
+        assert_eq!(
+            follow(&pool, alice, carol).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        block(&pool, carol, alice)
+            .await
+            .expect("carol blocks alice");
+        assert_eq!(follow_request_count(&pool, alice, carol).await, 0);
+
+        // A block in either direction rejects new follows.
+        assert!(follow(&pool, alice, bob).await.is_err());
+        assert!(follow(&pool, alice, carol).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unfollow_cancels_a_pending_follow_request() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        assert!(
+            !unfollow(&pool, bob, alice)
+                .await
+                .expect("unfollow cancels request")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert!(
+            outgoing_follow_requests(&pool, bob)
+                .await
+                .expect("outgoing")
+                .is_empty()
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_toggle_keeps_followers_and_pending_requests() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        let dave = auth::register_user(&pool, &settings, "dave", "very secure password", false)
+            .await
+            .expect("dave");
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("bob follows"),
+            FollowOutcome::Followed
+        );
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("enable protection");
+        assert!(
+            is_following(&pool, bob, alice)
+                .await
+                .expect("existing follow kept")
+        );
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("bob again"),
+            FollowOutcome::AlreadyFollowing
+        );
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("carol requests"),
+            FollowOutcome::Requested
+        );
+
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("disable protection");
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 1);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(
+            follow(&pool, dave, alice).await.expect("dave follows"),
+            FollowOutcome::Followed
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (2, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+
+        // The owner can still approve the request made while protection was on.
+        assert!(
+            approve_follow_request(&pool, alice, carol)
+                .await
+                .expect("approve")
+        );
+        assert!(
+            is_following(&pool, carol, alice)
+                .await
+                .expect("carol follow")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (3, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("disable again");
+        assert_eq!(
+            set_follow_approval_required(&pool, dave + 10_000, true)
+                .await
+                .expect_err("missing account")
+                .to_string(),
+            "account not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_request_lists_apply_visibility_filters() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        let dave = auth::register_user(&pool, &settings, "dave", "very secure password", false)
+            .await
+            .expect("dave");
+
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        for requester in [bob, carol, dave] {
+            assert_eq!(
+                follow(&pool, requester, alice).await.expect("request"),
+                FollowOutcome::Requested
+            );
+        }
+        // These states cannot be produced by block()/account deletion without
+        // deleting the request, so insert them directly to exercise the
+        // list/count visibility filters.
+        pool.call(move |conn| {
+            conn.execute("UPDATE users SET is_deleted = 1 WHERE id = ?", [dave])?;
+            conn.execute(
+                "INSERT INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
+                params![bob, alice],
+            )?;
+            conn.execute(
+                "INSERT INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
+                params![alice, carol],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("mark states");
+
+        assert!(
+            incoming_follow_requests(&pool, alice)
+                .await
+                .expect("incoming")
+                .is_empty()
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending count"),
+            0
+        );
+        assert!(
+            outgoing_follow_requests(&pool, bob)
+                .await
+                .expect("bob outgoing")
+                .is_empty()
+        );
+        assert!(
+            outgoing_follow_requests(&pool, carol)
+                .await
+                .expect("carol outgoing")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_request_notifications_are_grouped_and_markable() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread"),
+            1
+        );
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+        let request_group = groups
+            .iter()
+            .find(|group| group.kind == "follow_request")
+            .expect("follow_request group");
+        assert_eq!(request_group.total_count, 1);
+        assert_eq!(request_group.unread_count, 1);
+        assert_eq!(request_group.actors.len(), 1);
+        assert_eq!(request_group.actors[0].username.as_deref(), Some("bob"));
+
+        // Non-post notifications are marked read through the ids-based path.
+        mark_notification_ids_read(&pool, alice, &request_group.notification_ids)
+            .await
+            .expect("mark request read");
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread"),
+            0
+        );
+
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(
+            unread_notification_count(&pool, bob)
+                .await
+                .expect("bob unread"),
+            1
+        );
+        let groups = notification_groups(&pool, bob).await.expect("bob groups");
+        let approved_group = groups
+            .iter()
+            .find(|group| group.kind == "follow_request_approved")
+            .expect("approval group");
+        assert_eq!(approved_group.total_count, 1);
+        assert_eq!(approved_group.actors.len(), 1);
+        assert_eq!(approved_group.actors[0].username.as_deref(), Some("alice"));
+        mark_notification_ids_read(&pool, bob, &approved_group.notification_ids)
+            .await
+            .expect("mark approval read");
+        assert_eq!(
+            unread_notification_count(&pool, bob)
+                .await
+                .expect("bob unread"),
+            0
         );
     }
 
@@ -4259,12 +5769,1370 @@ mod tests {
             .await
             .expect("carol follows alice");
 
-        let accounts = following_accounts(&pool, alice)
+        let (accounts, _) = following_accounts(&pool, alice, None)
             .await
             .expect("following accounts");
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id, bob);
         assert_eq!(accounts[0].username, "bob");
         assert!(accounts[0].viewer_following);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_posts_all_commit_with_unique_ids() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let mut handles = Vec::new();
+        for index in 0..24 {
+            let pool = pool.clone();
+            let settings = settings.clone();
+            let author = if index % 2 == 0 { alice } else { bob };
+            handles.push(tokio::spawn(async move {
+                create_post(
+                    &pool,
+                    &settings,
+                    Some(author),
+                    &format!("concurrent post {index}"),
+                    None,
+                    &[],
+                )
+                .await
+            }));
+        }
+        let mut ids = BTreeSet::new();
+        for handle in handles {
+            let id = handle.await.expect("task").expect("concurrent post");
+            ids.insert(id);
+        }
+        assert_eq!(ids.len(), 24);
+        let count: i64 = pool
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM posts WHERE is_deleted = 0",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("post count");
+        assert_eq!(count, 24);
+
+        // All 24 posts share one-second timestamps; the merged timeline must
+        // still be ordered by numeric id, not by the "p:<id>" event string.
+        let timeline = timeline(&pool, None, "local", None)
+            .await
+            .expect("timeline");
+        let ids = timeline.iter().map(|post| post.id).collect::<Vec<_>>();
+        let mut newest_first = ids.clone();
+        newest_first.sort_unstable_by(|left, right| right.cmp(left));
+        assert_eq!(ids, newest_first);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rate_limit_checks_record_at_most_the_limit() {
+        let (pool, _settings, alice, _bob) = fixture().await;
+        let actor = format!("user:{alice}");
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let pool = pool.clone();
+            let actor = actor.clone();
+            handles.push(tokio::spawn(async move {
+                crate::rate_limit::check_and_record(
+                    &pool,
+                    crate::rate_limit::Scope::Post,
+                    &actor,
+                    3,
+                    60,
+                )
+                .await
+            }));
+        }
+        let mut accepted = 0;
+        for handle in handles {
+            if handle.await.expect("task").is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_follows_create_one_relationship() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move { follow(&pool, alice, bob).await }));
+        }
+        for handle in handles {
+            let outcome = handle.await.expect("task").expect("follow");
+            assert!(matches!(
+                outcome,
+                FollowOutcome::Followed | FollowOutcome::AlreadyFollowing
+            ));
+        }
+        let rows: i64 = pool
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM follows WHERE follower_id = ? AND followed_id = ?",
+                    params![alice, bob],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("follow count");
+        assert_eq!(rows, 1);
+        assert_eq!(
+            notification_count(&pool, bob, "follow")
+                .await
+                .expect("follow notifications"),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_follow_requests_create_one_row_and_notification() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move { follow(&pool, bob, alice).await }));
+        }
+        for handle in handles {
+            let outcome = handle.await.expect("task").expect("follow");
+            assert!(matches!(
+                outcome,
+                FollowOutcome::Requested | FollowOutcome::AlreadyRequested
+            ));
+        }
+        let (requests, follows): (i64, i64) = pool
+            .call(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+                        params![bob, alice],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM follows WHERE follower_id = ? AND followed_id = ?",
+                        params![bob, alice],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .expect("request state");
+        assert_eq!(requests, 1);
+        assert_eq!(follows, 0);
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("request notifications"),
+            1
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("approval notifications"),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_block_and_unblock_leave_consistent_state() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        follow(&pool, alice, bob).await.expect("follow");
+        let mut handles = Vec::new();
+        for index in 0..20 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                if index % 2 == 0 {
+                    block(&pool, alice, bob).await
+                } else {
+                    unblock(&pool, alice, bob).await
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task").expect("block toggle");
+        }
+        let (blocks, follows): (i64, i64) = pool
+            .call(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM blocks WHERE blocker_id = ? AND blocked_id = ?",
+                        params![alice, bob],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM follows WHERE (follower_id = ? AND followed_id = ?) OR (follower_id = ? AND followed_id = ?)",
+                        params![alice, bob, bob, alice],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .expect("state");
+        // A block must never coexist with a follow relationship.
+        assert!(
+            blocks == 0 || follows == 0,
+            "blocks={blocks} follows={follows}"
+        );
+    }
+
+    #[tokio::test]
+    async fn muted_words_are_case_insensitive_unicode_and_exempt_own_posts() {
+        let (pool, settings, alice, bob) = fixture().await;
+        add_muted_word(&pool, alice, "CAFÉ").await.expect("mute");
+        add_muted_word(&pool, alice, "breaking news")
+            .await
+            .expect("mute phrase");
+        add_muted_word(&pool, alice, "cat").await.expect("mute");
+        // Duplicates (case-insensitive) collapse to one row.
+        add_muted_word(&pool, alice, "café")
+            .await
+            .expect("dup mute");
+        let stored = muted_words(&pool, alice).await.expect("list");
+        assert_eq!(stored.len(), 3);
+        for invalid in ["", "   ", "\n"] {
+            assert!(add_muted_word(&pool, alice, invalid).await.is_err());
+        }
+        assert!(
+            add_muted_word(&pool, alice, &"x".repeat(101))
+                .await
+                .is_err()
+        );
+
+        let hidden = [
+            "CAFÉ is open",
+            "a café visit",
+            "Breaking NEWS today",
+            "concatenate the strings",
+            "the cat sat down",
+        ];
+        for text in hidden {
+            create_post(&pool, &settings, Some(bob), text, None, &[])
+                .await
+                .expect("hidden post");
+        }
+        create_post(&pool, &settings, Some(bob), "a dog appears", None, &[])
+            .await
+            .expect("visible post");
+        create_post(&pool, &settings, Some(alice), "my own CAFÉ cat", None, &[])
+            .await
+            .expect("own post");
+
+        let timeline = timeline(&pool, Some(alice), "local", None)
+            .await
+            .expect("timeline");
+        let texts = timeline
+            .iter()
+            .map(|post| post.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(texts.contains(&"a dog appears"));
+        assert!(texts.contains(&"my own CAFÉ cat"));
+        assert_eq!(timeline.len(), 2, "unexpected timeline: {texts:?}");
+
+        let (_, search_posts) = search(&pool, Some(alice), "concatenate")
+            .await
+            .expect("search");
+        assert!(search_posts.is_empty());
+
+        remove_muted_word(&pool, alice, stored[0].id)
+            .await
+            .expect("remove");
+        assert_eq!(muted_words(&pool, alice).await.expect("list").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn notifications_hide_blocked_muted_and_muted_word_content() {
+        let (pool, settings, alice, bob) = fixture().await;
+        create_post(
+            &pool,
+            &settings,
+            Some(bob),
+            "spoilers ahead @alice",
+            None,
+            &[],
+        )
+        .await
+        .expect("mention post");
+        assert_eq!(
+            notifications(&pool, alice)
+                .await
+                .expect("notifications")
+                .len(),
+            1
+        );
+
+        add_muted_word(&pool, alice, "spoilers")
+            .await
+            .expect("mute word");
+        assert!(
+            notifications(&pool, alice)
+                .await
+                .expect("notifications")
+                .is_empty()
+        );
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread"),
+            0
+        );
+
+        remove_muted_word(
+            &pool,
+            alice,
+            muted_words(&pool, alice).await.expect("list")[0].id,
+        )
+        .await
+        .expect("unmute word");
+        follow(&pool, bob, alice).await.expect("follow");
+        assert_eq!(
+            notifications(&pool, alice)
+                .await
+                .expect("notifications")
+                .len(),
+            2
+        );
+
+        block(&pool, alice, bob).await.expect("block");
+        assert!(
+            notifications(&pool, alice)
+                .await
+                .expect("notifications")
+                .is_empty()
+        );
+        unblock(&pool, alice, bob).await.expect("unblock");
+        assert_eq!(
+            notifications(&pool, alice)
+                .await
+                .expect("notifications")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_protection_keeps_followers_and_only_requests_new_follows() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("bob follows"),
+            FollowOutcome::Followed
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert!(
+            followers_accounts(&pool, alice, None, None)
+                .await
+                .expect("followers")
+                .0
+                .iter()
+                .any(|account| account.id == bob)
+        );
+        assert!(
+            following_accounts(&pool, bob, None)
+                .await
+                .expect("bob following")
+                .0
+                .iter()
+                .any(|account| account.id == alice)
+        );
+
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        // Existing followers survive the toggle untouched.
+        assert!(is_following(&pool, bob, alice).await.expect("kept follow"));
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert!(
+            followers_accounts(&pool, alice, None, None)
+                .await
+                .expect("followers")
+                .0
+                .iter()
+                .any(|account| account.id == bob)
+        );
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("bob repeats"),
+            FollowOutcome::AlreadyFollowing
+        );
+
+        // New follows become pending requests only.
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("carol requests"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(follow_row_count(&pool, carol, alice).await, 0);
+        assert!(
+            !is_following(&pool, carol, alice)
+                .await
+                .expect("not following")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert!(
+            followers_accounts(&pool, alice, None, None)
+                .await
+                .expect("followers")
+                .0
+                .iter()
+                .all(|account| account.id != carol)
+        );
+        assert!(
+            following_accounts(&pool, carol, None)
+                .await
+                .expect("carol following")
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 1);
+        let relationship = profile_relationship(&pool, Some(carol), alice)
+            .await
+            .expect("relationship");
+        assert!(!relationship.following);
+        assert!(relationship.requested);
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            1
+        );
+        let (message, actor) = notification_message(&pool, alice, "follow_request")
+            .await
+            .expect("lookup")
+            .expect("notification");
+        assert_eq!(message, "requested to follow you");
+        assert_eq!(actor, Some(carol));
+    }
+
+    #[tokio::test]
+    async fn disabling_protection_keeps_pending_requests_until_approved() {
+        let (pool, settings, alice, _bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("unprotect alice");
+
+        // Disabling protection neither approves nor deletes the pending request.
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 1);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(follow_row_count(&pool, carol, alice).await, 0);
+        assert!(
+            !is_following(&pool, carol, alice)
+                .await
+                .expect("no auto follow")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+
+        // New follows are immediate while the old request stays pending.
+        assert_eq!(
+            follow(&pool, dave, alice).await.expect("dave"),
+            FollowOutcome::Followed
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 1);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+
+        // The owner can still approve the request created while protected.
+        assert!(
+            approve_follow_request(&pool, alice, carol)
+                .await
+                .expect("approve")
+        );
+        assert!(is_following(&pool, carol, alice).await.expect("approved"));
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 0);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (2, 0));
+        assert_eq!(follow_row_count(&pool, carol, alice).await, 1);
+        assert_eq!(
+            notification_count(&pool, carol, "follow_request_approved")
+                .await
+                .expect("notification"),
+            1
+        );
+        let (message, actor) = notification_message(&pool, carol, "follow_request_approved")
+            .await
+            .expect("lookup")
+            .expect("notification");
+        assert_eq!(message, "approved your follow request");
+        assert_eq!(actor, Some(alice));
+
+        // Re-approving consumes nothing and duplicates nothing.
+        assert!(
+            !approve_follow_request(&pool, alice, carol)
+                .await
+                .expect("re-approve")
+        );
+        assert_eq!(follow_row_count(&pool, carol, alice).await, 1);
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (2, 0));
+        assert_eq!(
+            notification_count(&pool, carol, "follow_request_approved")
+                .await
+                .expect("notification"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario proves pending requests survive repeated enable/disable cycles without auto-approval or duplicates"
+    )]
+    async fn repeated_protection_toggles_never_approve_or_duplicate_pending_requests() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        for round in 0..3 {
+            set_follow_approval_required(&pool, alice, false)
+                .await
+                .expect("unprotect alice");
+            assert_eq!(
+                follow_request_count(&pool, bob, alice).await,
+                1,
+                "round {round}"
+            );
+            assert_eq!(
+                pending_follow_request_count(&pool, alice)
+                    .await
+                    .expect("pending"),
+                1,
+                "round {round}"
+            );
+            assert_eq!(
+                follow_row_count(&pool, bob, alice).await,
+                0,
+                "round {round}"
+            );
+            assert_eq!(
+                follow(&pool, bob, alice).await.expect("repeat"),
+                FollowOutcome::AlreadyRequested,
+                "round {round}"
+            );
+
+            set_follow_approval_required(&pool, alice, true)
+                .await
+                .expect("protect alice");
+            assert_eq!(
+                follow_request_count(&pool, bob, alice).await,
+                1,
+                "round {round}"
+            );
+            assert_eq!(
+                pending_follow_request_count(&pool, alice)
+                    .await
+                    .expect("pending"),
+                1,
+                "round {round}"
+            );
+            assert_eq!(
+                follow_row_count(&pool, bob, alice).await,
+                0,
+                "round {round}"
+            );
+            assert_eq!(
+                follow(&pool, bob, alice).await.expect("repeat"),
+                FollowOutcome::AlreadyRequested,
+                "round {round}"
+            );
+        }
+
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            1
+        );
+        assert_eq!(
+            notification_count(&pool, alice, "follow")
+                .await
+                .expect("notification"),
+            0
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("unprotect alice");
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 1);
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_requests_are_visible_only_to_requester_and_target() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        let incoming = incoming_follow_requests(&pool, alice)
+            .await
+            .expect("incoming");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].user_id, bob);
+        assert!(
+            incoming_follow_requests(&pool, bob)
+                .await
+                .expect("bob")
+                .is_empty()
+        );
+        assert!(
+            incoming_follow_requests(&pool, carol)
+                .await
+                .expect("carol")
+                .is_empty()
+        );
+        assert!(
+            incoming_follow_requests(&pool, dave)
+                .await
+                .expect("dave")
+                .is_empty()
+        );
+
+        let outgoing = outgoing_follow_requests(&pool, bob)
+            .await
+            .expect("outgoing");
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].user_id, alice);
+        assert!(
+            outgoing_follow_requests(&pool, alice)
+                .await
+                .expect("alice")
+                .is_empty()
+        );
+        assert!(
+            outgoing_follow_requests(&pool, carol)
+                .await
+                .expect("carol")
+                .is_empty()
+        );
+        assert!(
+            outgoing_follow_requests(&pool, dave)
+                .await
+                .expect("dave")
+                .is_empty()
+        );
+
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        for unrelated in [bob, carol, dave] {
+            assert_eq!(
+                pending_follow_request_count(&pool, unrelated)
+                    .await
+                    .expect("pending"),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_request_resolution_picks_exactly_one_winner() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        let (approved, cancelled) = tokio::join!(
+            approve_follow_request(&pool, alice, bob),
+            cancel_follow_request(&pool, bob, alice)
+        );
+        let approved = approved.expect("approve");
+        let cancelled = cancelled.expect("cancel");
+        assert_ne!(approved, cancelled, "exactly one must resolve the request");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        let expected_rows = i64::from(approved);
+        let expected_notifications = i64::from(approved);
+        assert_eq!(follow_row_count(&pool, bob, alice).await, expected_rows);
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            expected_notifications
+        );
+
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        let (approved, rejected) = tokio::join!(
+            approve_follow_request(&pool, alice, carol),
+            reject_follow_request(&pool, alice, carol)
+        );
+        let approved = approved.expect("approve");
+        let rejected = rejected.expect("reject");
+        assert_ne!(approved, rejected, "exactly one must resolve the request");
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 0);
+        assert_eq!(
+            follow_row_count(&pool, carol, alice).await,
+            i64::from(approved)
+        );
+        assert_eq!(
+            notification_count(&pool, carol, "follow_request_approved")
+                .await
+                .expect("notification"),
+            i64::from(approved)
+        );
+
+        // Cancelling and approving in the same tick resolves the request once.
+        assert_eq!(
+            follow(&pool, dave, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        let (cancelled, approved) = tokio::join!(
+            cancel_follow_request(&pool, dave, alice),
+            approve_follow_request(&pool, alice, dave)
+        );
+        let cancelled = cancelled.expect("cancel");
+        let approved = approved.expect("approve");
+        assert_ne!(cancelled, approved, "exactly one must resolve the request");
+        assert_eq!(follow_request_count(&pool, dave, alice).await, 0);
+        assert_eq!(
+            follow_row_count(&pool, dave, alice).await,
+            i64::from(approved)
+        );
+        assert_eq!(
+            notification_count(&pool, dave, "follow_request_approved")
+                .await
+                .expect("notification"),
+            i64::from(approved)
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_clear_pending_requests_and_unblock_does_not_restore_them() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        // The requester blocking the target clears the pending request.
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        block(&pool, bob, alice).await.expect("bob blocks alice");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert!(follow(&pool, bob, alice).await.is_err());
+        assert!(
+            !approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert!(
+            !reject_follow_request(&pool, alice, bob)
+                .await
+                .expect("reject")
+        );
+        assert!(
+            !cancel_follow_request(&pool, bob, alice)
+                .await
+                .expect("cancel")
+        );
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 0);
+
+        // Unblocking leaves the cleared request gone; a new one is a fresh row.
+        unblock(&pool, bob, alice).await.expect("unblock");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("re-request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+
+        // The target blocking the requester clears it from the other direction.
+        block(&pool, alice, bob).await.expect("alice blocks bob");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert!(follow(&pool, bob, alice).await.is_err());
+        unblock(&pool, alice, bob).await.expect("unblock");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+
+        // A third account's block also prevents new pending requests.
+        set_follow_approval_required(&pool, carol, true)
+            .await
+            .expect("protect carol");
+        block(&pool, carol, bob).await.expect("carol blocks bob");
+        assert!(follow(&pool, bob, carol).await.is_err());
+        assert_eq!(follow_request_count(&pool, bob, carol).await, 0);
+        assert_eq!(follow_row_count(&pool, bob, carol).await, 0);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario covers deleted and suspended targets, requesters, and pending requests in sequence"
+    )]
+    async fn follow_transitions_skip_deleted_and_suspended_accounts() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+        let grace = register_account(&pool, &settings, "grace").await;
+        set_account_flags(&pool, carol, true, false).await;
+        set_account_flags(&pool, dave, false, true).await;
+
+        // Unavailable targets cannot be followed...
+        assert_eq!(
+            follow(&pool, alice, carol)
+                .await
+                .expect_err("deleted target")
+                .to_string(),
+            "account cannot be followed"
+        );
+        assert_eq!(
+            follow(&pool, alice, dave)
+                .await
+                .expect_err("suspended target")
+                .to_string(),
+            "account cannot be followed"
+        );
+        // ...and unavailable accounts cannot follow or request either.
+        assert_eq!(
+            follow(&pool, carol, alice)
+                .await
+                .expect_err("deleted requester")
+                .to_string(),
+            "account cannot follow"
+        );
+        assert_eq!(
+            follow(&pool, dave, alice)
+                .await
+                .expect_err("suspended requester")
+                .to_string(),
+            "account cannot follow"
+        );
+        assert_eq!(follow_row_count(&pool, carol, alice).await, 0);
+        assert_eq!(follow_row_count(&pool, dave, alice).await, 0);
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 0);
+        assert_eq!(follow_request_count(&pool, dave, alice).await, 0);
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        // A suspended requester's pending request is discarded on approval.
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        set_account_flags(&pool, bob, false, true).await;
+        assert!(
+            !approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 0);
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        // A deleted requester's request is hidden and discarded the same way.
+        assert_eq!(
+            follow(&pool, grace, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        set_account_flags(&pool, grace, true, false).await;
+        assert!(
+            !incoming_follow_requests(&pool, alice)
+                .await
+                .expect("incoming")
+                .iter()
+                .any(|request| request.user_id == grace)
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert!(
+            !approve_follow_request(&pool, alice, grace)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_request_count(&pool, grace, alice).await, 0);
+        assert_eq!(follow_row_count(&pool, grace, alice).await, 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_follow_requests_create_exactly_one_row_and_notification() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                follow(&pool, bob, alice).await.expect("duplicate"),
+                FollowOutcome::AlreadyRequested
+            );
+        }
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            1
+        );
+        assert_eq!(
+            incoming_follow_requests(&pool, alice)
+                .await
+                .expect("incoming")
+                .len(),
+            1
+        );
+        assert_eq!(
+            outgoing_follow_requests(&pool, bob)
+                .await
+                .expect("outgoing")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_counts_and_pending_counts_stay_consistent_across_states() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            2
+        );
+        assert_eq!(
+            incoming_follow_requests(&pool, alice)
+                .await
+                .expect("incoming")
+                .len(),
+            2
+        );
+        assert!(
+            followers_accounts(&pool, alice, None, None)
+                .await
+                .expect("followers")
+                .0
+                .is_empty()
+        );
+
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(
+            incoming_follow_requests(&pool, alice)
+                .await
+                .expect("incoming")
+                .len(),
+            1
+        );
+        assert_eq!(
+            following_accounts(&pool, bob, None)
+                .await
+                .expect("bob following")
+                .0
+                .len(),
+            1
+        );
+
+        assert!(
+            reject_follow_request(&pool, alice, carol)
+                .await
+                .expect("reject")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("unprotect alice");
+        assert_eq!(
+            follow(&pool, dave, alice).await.expect("follow"),
+            FollowOutcome::Followed
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (2, 0));
+        assert_eq!(
+            follow_counts(&pool, dave).await.expect("dave counts"),
+            (0, 1)
+        );
+
+        assert!(unfollow(&pool, dave, alice).await.expect("unfollow"));
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(
+            follow_counts(&pool, dave).await.expect("dave counts"),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_a_request_whose_follow_already_exists_is_a_no_op() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        // Simulate a racing approval that already created the follow row.
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO follows (follower_id, followed_id) VALUES (?, ?)",
+                params![bob, alice],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed follow");
+
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 1);
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        // Approving, rejecting, or cancelling a resolved request is a no-op.
+        assert!(
+            !approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("re-approve")
+        );
+        assert!(
+            !reject_follow_request(&pool, alice, bob)
+                .await
+                .expect("reject")
+        );
+        assert!(
+            !cancel_follow_request(&pool, bob, alice)
+                .await
+                .expect("cancel")
+        );
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 1);
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_request_lifecycle_creates_expected_notifications_only() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            1
+        );
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            1
+        );
+
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert!(
+            reject_follow_request(&pool, alice, carol)
+                .await
+                .expect("reject")
+        );
+        assert_eq!(
+            notification_count(&pool, carol, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        assert_eq!(
+            follow(&pool, dave, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert!(
+            cancel_follow_request(&pool, dave, alice)
+                .await
+                .expect("cancel")
+        );
+        assert_eq!(
+            notification_count(&pool, dave, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            3
+        );
+        assert_eq!(
+            notification_count(&pool, alice, "follow")
+                .await
+                .expect("notification"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_protection_never_promotes_pending_requests() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        for _ in 0..3 {
+            set_follow_approval_required(&pool, alice, false)
+                .await
+                .expect("unprotect alice");
+            assert_eq!(follow_row_count(&pool, bob, alice).await, 0);
+            set_follow_approval_required(&pool, alice, true)
+                .await
+                .expect("protect alice");
+            assert_eq!(follow_row_count(&pool, bob, alice).await, 0);
+        }
+        assert!(
+            !is_following(&pool, bob, alice)
+                .await
+                .expect("not following")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+        let relationship = profile_relationship(&pool, Some(bob), alice)
+            .await
+            .expect("relationship");
+        assert!(!relationship.following);
+        assert!(relationship.requested);
+
+        // Only explicit approval promotes the request to a real follow.
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("unprotect alice");
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 1);
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
     }
 }

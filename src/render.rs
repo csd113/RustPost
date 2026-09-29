@@ -1,7 +1,9 @@
+use std::fmt::Write as _;
+
 use crate::auth::{CurrentUser, Theme};
 use crate::social::{
-    AccountView, MediaView, NotificationGroupView, PostView, ProfileTimelineTab, QuotePreview,
-    TimelineEventKind,
+    AccountView, FollowRequestView, MediaView, NotificationGroupView, PostView, ProfileTimelineTab,
+    QuotePreview, TimelineEventKind,
 };
 use crate::youtube::{self, YoutubeEmbed};
 use axum::http::StatusCode;
@@ -15,6 +17,14 @@ pub struct LayoutContext {
     pub following_count: Option<i64>,
     pub notification_unread_count: Option<i64>,
     pub favicon_content_type: &'static str,
+    /// Enabled instance announcement, rendered beside the site name.
+    pub announcement: Option<String>,
+    /// Maintenance notice, rendered under the header while maintenance is on.
+    pub maintenance_notice: Option<String>,
+    /// Notice for accounts with a pending deletion deadline.
+    pub account_notice: Option<String>,
+    /// Pending incoming follow requests, shown as a nav badge.
+    pub pending_follow_requests: Option<i64>,
 }
 
 impl Default for LayoutContext {
@@ -26,6 +36,10 @@ impl Default for LayoutContext {
             following_count: None,
             notification_unread_count: None,
             favicon_content_type: "image/x-icon",
+            announcement: None,
+            maintenance_notice: None,
+            account_notice: None,
+            pending_follow_requests: None,
         }
     }
 }
@@ -145,6 +159,7 @@ pub fn layout_with_context(
             String::new()
         };
         let notifications = notification_nav_link(context.notification_unread_count.unwrap_or(0));
+        let requests = follow_requests_nav_link(context.pending_follow_requests.unwrap_or(0));
         let logout = csrf.map_or_else(String::new, |token| {
             format!(
                 r#"<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button>{}<span>Log out</span></button></form>"#,
@@ -154,7 +169,7 @@ pub fn layout_with_context(
         });
         let profile = nav_link(&format!("/users/{}", user.username), "Profile", "profile");
         format!(
-            "{}{}{}{notifications}{}{}{admin}{logout}",
+            "{}{}{}{notifications}{requests}{}{}{admin}{logout}",
             nav_link("/home", "Home Feed", "home"),
             nav_link("/following", "Following", "users"),
             nav_link("/search", "Search", "search"),
@@ -175,6 +190,9 @@ pub fn layout_with_context(
     let side_panel = dashboard_panel(user, context);
     let theme = user.map_or(Theme::Light, |user| user.theme).as_str();
     let header_tor = tor_header_indicator(context.tor_onion_address.as_deref());
+    let announcement = announcement_banner(context.announcement.as_deref());
+    let maintenance = maintenance_banner(context.maintenance_notice.as_deref());
+    let account_notice = account_notice_banner(context.account_notice.as_deref());
     format!(
         r#"<!doctype html>
 <html lang="en" data-theme="{}">
@@ -191,7 +209,8 @@ pub fn layout_with_context(
 <script src="/assets/rustpost.js" defer></script>
 </head>
 <body>
-<header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}</div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
+<header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}{}</div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
+{maintenance}{account_notice}
 <noscript><section class="noscript-banner" role="status"><strong>JavaScript is disabled.</strong> RustPost will use standard links and forms.</section></noscript>
 <main><div class="app-shell" data-testid="app-shell">{}<section class="primary-column" data-testid="primary-column">{} </section>{}</div></main>
 <footer class="site-footer">{}</footer>
@@ -204,6 +223,7 @@ pub fn layout_with_context(
         CSS,
         html_escape::encode_text(&brand_mark.to_string()),
         html_escape::encode_text(site_name),
+        announcement,
         header_tor,
         auth_nav,
         left_rail,
@@ -211,6 +231,33 @@ pub fn layout_with_context(
         side_panel,
         html_escape::encode_text(site_name),
     )
+}
+
+fn announcement_banner(announcement: Option<&str>) -> String {
+    announcement.map_or_else(String::new, |announcement| {
+        format!(
+            r#"<span class="announcement" role="status" data-testid="announcement">{}</span>"#,
+            html_escape::encode_text(announcement)
+        )
+    })
+}
+
+fn maintenance_banner(notice: Option<&str>) -> String {
+    notice.map_or_else(String::new, |notice| {
+        format!(
+            r#"<section class="notice maintenance-notice" role="status" data-testid="maintenance-notice"><p>{}</p></section>"#,
+            html_escape::encode_text(notice)
+        )
+    })
+}
+
+fn account_notice_banner(notice: Option<&str>) -> String {
+    notice.map_or_else(String::new, |notice| {
+        format!(
+            r#"<section class="notice error account-notice" role="alert" data-testid="account-notice"><p>{}</p><p><a href="/settings/delete">Review account deletion</a></p></section>"#,
+            html_escape::encode_text(notice)
+        )
+    })
 }
 
 fn tor_header_indicator(onion: Option<&str>) -> String {
@@ -278,6 +325,22 @@ fn notification_nav_link(unread_count: i64) -> String {
     }
 }
 
+fn follow_requests_nav_link(pending_count: i64) -> String {
+    if pending_count > 0 {
+        format!(
+            r#"<a href="/follow-requests">{}<span>Requests</span> <span class="nav-badge" aria-label="{pending_count} pending follow requests">{pending_count}</span></a>"#,
+            icon_svg("user-check")
+        )
+    } else {
+        nav_link("/follow-requests", "Requests", "user-check")
+    }
+}
+
+/// Picks the singular or plural label for a count.
+fn plural<'a>(count: i64, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
+}
+
 fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> String {
     let posting = if context.anonymous_mode_enabled {
         "Signed-in and anonymous posting"
@@ -302,8 +365,9 @@ fn dashboard_panel(user: Option<&CurrentUser>, context: &LayoutContext) -> Strin
             user.map_or_else(String::new, |user| {
                 let username = html_escape::encode_double_quoted_attribute(&user.username);
                 let display_name = html_escape::encode_double_quoted_attribute(&user.display_name);
+                let follower_label = plural(followers, "follower", "followers");
                 format!(
-                    r#"<dt>Social</dt><dd><a data-testid="dashboard-followers-link" href="/users/{username}/followers" aria-label="View followers for {display_name}">{followers} followers</a><br><a data-testid="dashboard-following-link" href="/users/{username}/following" aria-label="View users {display_name} follows">{following} following</a></dd>"#
+                    r#"<dt>Social</dt><dd><a data-testid="dashboard-followers-link" href="/users/{username}/followers" aria-label="View followers for {display_name}">{followers} {follower_label}</a><br><a data-testid="dashboard-following-link" href="/users/{username}/following" aria-label="View users {display_name} follows">{following} following</a></dd>"#
                 )
             })
         }
@@ -1051,6 +1115,36 @@ function setButtonState(button, active, label) {
   }
 }
 
+function clearFormError(form) {
+  const existing = form.querySelector("[data-form-error]");
+  if (existing) {
+    existing.remove();
+  }
+}
+
+function showFormError(form, message) {
+  clearFormError(form);
+  const notice = document.createElement("p");
+  notice.className = "notice error";
+  notice.setAttribute("role", "alert");
+  notice.setAttribute("data-form-error", "");
+  notice.textContent = message;
+  form.prepend(notice);
+}
+
+function enhancedErrorMessage(status) {
+  if (status === 429) {
+    return "Too many requests. Please wait a moment and try again.";
+  }
+  if (status === 400 || status === 422) {
+    return "That submission was rejected. Check the text and any attached media, then try again.";
+  }
+  if (status === 401 || status === 403) {
+    return "Your session may have expired. Reload the page and sign in again.";
+  }
+  return "Something went wrong. Please try again.";
+}
+
 document.addEventListener("submit", async (event) => {
   const form = event.target.closest("form[data-enhance]");
   if (!form || !window.fetch) {
@@ -1061,6 +1155,7 @@ document.addEventListener("submit", async (event) => {
     return;
   }
   form.dataset.submitting = "true";
+  form.setAttribute("aria-busy", "true");
   const submitter = event.submitter || form.querySelector("button[type=submit]");
   if (submitter) {
     submitter.disabled = true;
@@ -1075,9 +1170,10 @@ document.addEventListener("submit", async (event) => {
       credentials: "same-origin"
     });
     if (!response.ok) {
-      HTMLFormElement.prototype.submit.call(form);
+      showFormError(form, enhancedErrorMessage(response.status));
       return;
     }
+    clearFormError(form);
     const data = await response.json();
     if (data.kind === "follow") {
       const followForm = document.querySelector(`[data-follow-user="${data.user_id}"]`);
@@ -1085,15 +1181,17 @@ document.addEventListener("submit", async (event) => {
         followForm.action = data.action;
         const button = followForm.querySelector("button");
         if (button) {
+          const label = data.following ? "Following" : (data.requested ? "Requested" : "Follow");
+          const aria = data.following ? "Unfollow this account" : (data.requested ? "Cancel follow request" : "Follow this account");
           button.classList.toggle("active", data.following);
-          button.textContent = data.following ? "Following" : "Follow";
+          button.textContent = label;
           button.setAttribute("aria-pressed", data.following ? "true" : "false");
-          button.setAttribute("aria-label", data.following ? "Unfollow this account" : "Follow this account");
-          button.setAttribute("title", data.following ? "Unfollow this account" : "Follow this account");
+          button.setAttribute("aria-label", aria);
+          button.setAttribute("title", aria);
         }
       }
       document.querySelectorAll(`[data-profile-followers="${data.user_id}"]`).forEach((node) => {
-        node.textContent = `${data.followers} followers`;
+        node.textContent = `${data.followers} ${data.followers === 1 ? "follower" : "followers"}`;
       });
       document.querySelectorAll(`[data-profile-following="${data.user_id}"]`).forEach((node) => {
         node.textContent = `${data.following_count} following`;
@@ -1103,10 +1201,10 @@ document.addEventListener("submit", async (event) => {
         const likes = post.querySelector('[data-count="likes"]');
         const reposts = post.querySelector('[data-count="reposts"]');
         if (likes) {
-          likes.textContent = `${data.likes} likes`;
+          likes.textContent = `${data.likes} ${data.likes === 1 ? "like" : "likes"}`;
         }
         if (reposts) {
-          reposts.textContent = `${data.reposts} reposts`;
+          reposts.textContent = `${data.reposts} ${data.reposts === 1 ? "repost" : "reposts"}`;
         }
         const liked = post.querySelector('[data-action-kind="like"]');
         const bookmarked = post.querySelector('[data-action-kind="bookmark"]');
@@ -1137,7 +1235,7 @@ document.addEventListener("submit", async (event) => {
         document.querySelectorAll(`[data-post-id="${data.parent_post_id}"] [data-count="replies"]`).forEach((node) => {
           const current = Number.parseInt(node.textContent || "0", 10);
           const next = Number.isFinite(current) ? current + 1 : 1;
-          node.textContent = `${next} replies`;
+          node.textContent = `${next} ${next === 1 ? "reply" : "replies"}`;
         });
       }
       const created = document.getElementById(`post-${data.post_id}`);
@@ -1153,9 +1251,15 @@ document.addEventListener("submit", async (event) => {
       form.querySelectorAll("input[type=file][data-composer-media]").forEach(updateComposerMedia);
     }
   } catch (_err) {
-    form.submit();
+    // Do not silently re-POST: the first request may have been committed even
+    // though the response was lost.
+    showFormError(
+      form,
+      "Network problem. Reload the page to check whether your submission was saved before trying again."
+    );
   } finally {
     delete form.dataset.submitting;
+    form.removeAttribute("aria-busy");
     if (submitter) {
       submitter.disabled = false;
     }
@@ -1335,11 +1439,15 @@ pub fn accounts(accounts: &[AccountView], csrf: &str) -> String {
                     )
                 },
             );
-            let action = if account.viewer_following {
-                follow_form(account.id, csrf, true)
-            } else {
-                follow_form(account.id, csrf, false)
-            };
+            let action = follow_form(
+                account.id,
+                csrf,
+                if account.viewer_following {
+                    FollowButtonState::Following
+                } else {
+                    FollowButtonState::Follow
+                },
+            );
             format!(
                 r#"<article class="account-row">{}<div><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span><p>{}</p></div><div>{}</div></article>"#,
                 avatar,
@@ -1601,27 +1709,58 @@ fn search_user_results(users: &[AccountView]) -> String {
     )
 }
 
-pub fn follow_form(user_id: i64, csrf: &str, following: bool) -> String {
-    let (action, label, aria_label) = if following {
-        (
+/// Follow button state on profiles, account lists, and search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowButtonState {
+    /// No relationship; submitting sends a follow or a follow request.
+    Follow,
+    /// An accepted follow exists; submitting unfollows.
+    Following,
+    /// A pending request exists; submitting cancels the request.
+    Requested,
+}
+
+impl FollowButtonState {
+    #[must_use]
+    pub const fn from_flags(following: bool, requested: bool) -> Self {
+        if following {
+            Self::Following
+        } else if requested {
+            Self::Requested
+        } else {
+            Self::Follow
+        }
+    }
+}
+
+pub fn follow_form(user_id: i64, csrf: &str, state: FollowButtonState) -> String {
+    let (action, label, aria_label, active) = match state {
+        FollowButtonState::Following => (
             format!("/users/{user_id}/unfollow"),
             "Following",
             "Unfollow this account",
-        )
-    } else {
-        (
+            true,
+        ),
+        FollowButtonState::Requested => (
+            format!("/users/{user_id}/follow/cancel"),
+            "Requested",
+            "Cancel follow request",
+            false,
+        ),
+        FollowButtonState::Follow => (
             format!("/users/{user_id}/follow"),
             "Follow",
             "Follow this account",
-        )
+            false,
+        ),
     };
     format!(
         r#"<form method="post" action="{}" data-enhance="follow" data-follow-user="{}"><input type="hidden" name="csrf" value="{}"><button class="follow-button{}" type="submit" aria-pressed="{}" aria-label="{}" title="{}">{}</button></form>"#,
         html_escape::encode_double_quoted_attribute(&action),
         user_id,
         html_escape::encode_double_quoted_attribute(csrf),
-        if following { " active" } else { "" },
-        if following { "true" } else { "false" },
+        if active { " active" } else { "" },
+        if active { "true" } else { "false" },
         html_escape::encode_double_quoted_attribute(aria_label),
         html_escape::encode_double_quoted_attribute(aria_label),
         html_escape::encode_text(label)
@@ -2111,7 +2250,7 @@ fn post_card_with_options(
         .as_ref()
         .map_or_else(String::new, quote_preview_card);
     format!(
-        r#"<article class="{}" data-testid="post-card" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}{}{}<div class="counts"><span data-count="likes">{} likes</span><span data-count="reposts">{} reposts</span><span data-count="replies">{} replies</span>{}{}</div>{}</article>"#,
+        r#"<article class="{}" data-testid="post-card" id="post-{}" data-post-id="{}" data-event-id="{}"{}>{}{}<header class="post-header"><div class="author-block">{}<div>{}</div></div>{}</header><div class="text">{}</div>{}{}{}<div class="counts"><span data-count="likes">{} {}</span><span data-count="reposts">{} {}</span><span data-count="replies">{} {}</span>{}{}</div>{}</article>"#,
         post_class,
         post.id,
         post.id,
@@ -2127,8 +2266,11 @@ fn post_card_with_options(
         media,
         quote,
         post.like_count,
+        plural(post.like_count, "like", "likes"),
         post.repost_count,
+        plural(post.repost_count, "repost", "reposts"),
         post.reply_count,
+        plural(post.reply_count, "reply", "replies"),
         edited,
         permalink,
         controls
@@ -2381,28 +2523,87 @@ fn render_youtube_preview_card(preview: &YoutubeEmbed) -> String {
     )
 }
 
+/// Escapes post text and turns `#tags`, `@mentions`, and plain URLs into links.
+///
+/// Whitespace, including newlines, is preserved so multi-line posts render the
+/// way they were composed.
 pub fn linkify(text: &str) -> String {
-    html_escape::encode_text(text)
-        .split_whitespace()
-        .map(|word| {
-            if let Some(tag) = word.strip_prefix('#').filter(|value| !value.is_empty()) {
-                format!(
-                    r##"<a href="/tags/{}">#{}</a>"##,
-                    html_escape::encode_double_quoted_attribute(tag),
-                    html_escape::encode_text(tag)
-                )
-            } else if let Some(name) = word.strip_prefix('@').filter(|value| !value.is_empty()) {
-                format!(
-                    r#"<a href="/users/{}">@{}</a>"#,
-                    html_escape::encode_double_quoted_attribute(name),
-                    html_escape::encode_text(name)
-                )
-            } else {
-                word.to_owned()
-            }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let whitespace_run = rest.chars().next().is_some_and(char::is_whitespace);
+        let end = rest
+            .find(|ch: char| ch.is_whitespace() != whitespace_run)
+            .unwrap_or(rest.len());
+        let (chunk, tail) = rest.split_at(end);
+        if whitespace_run {
+            out.push_str(&html_escape::encode_text(chunk));
+        } else {
+            out.push_str(&linkify_token(chunk));
+        }
+        rest = tail;
+    }
+    out
+}
+
+fn linkify_token(token: &str) -> String {
+    let leading_len = token
+        .find(|ch: char| !matches!(ch, '(' | '[' | '{' | '"' | '\'' | '<' | '“' | '‘'))
+        .unwrap_or(token.len());
+    let (leading, remainder) = token.split_at(leading_len);
+    let core_len = remainder
+        .trim_end_matches(|ch: char| {
+            matches!(
+                ch,
+                '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"' | '\'' | '”' | '’'
+            )
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .len();
+    let (core, trailing) = remainder.split_at(core_len);
+    let mut out = html_escape::encode_text(leading).into_owned();
+    if let Some(tag) = core
+        .strip_prefix('#')
+        .filter(|value| !value.is_empty() && value.chars().any(char::is_alphanumeric))
+    {
+        let _ = write!(
+            out,
+            r##"<a href="/tags/{}">#{}</a>"##,
+            html_escape::encode_double_quoted_attribute(tag),
+            html_escape::encode_text(tag)
+        );
+    } else if let Some(name) = core
+        .strip_prefix('@')
+        .filter(|value| !value.is_empty() && value.chars().any(char::is_alphanumeric))
+    {
+        let _ = write!(
+            out,
+            r#"<a href="/users/{}">@{}</a>"#,
+            html_escape::encode_double_quoted_attribute(name),
+            html_escape::encode_text(name)
+        );
+    } else if is_linkable_url(core) {
+        let _ = write!(
+            out,
+            r#"<a href="{}" rel="noopener noreferrer nofollow">{}</a>"#,
+            html_escape::encode_double_quoted_attribute(core),
+            html_escape::encode_text(core)
+        );
+    } else {
+        out.push_str(&html_escape::encode_text(core));
+    }
+    out.push_str(&html_escape::encode_text(trailing));
+    out
+}
+
+fn is_linkable_url(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    host.contains('.') && !host.starts_with('.') && !host.ends_with('.')
 }
 
 pub fn empty_state(title: &str, message: &str) -> String {
@@ -2644,18 +2845,28 @@ fn notification_open_control(
         .map_or_else(String::new, |id| {
             format!(r#"<input type="hidden" name="group_target_post_id" value="{id}">"#)
         });
+    // Group kinds without a post target (for example follow requests) are
+    // marked read through their explicit notification ids.
+    let group_kind = if notification.kind == "follow" || notification.group_target_post_id.is_some()
+    {
+        format!(
+            r#"<input type="hidden" name="group_kind" value="{}">"#,
+            html_escape::encode_double_quoted_attribute(&notification.kind)
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<form id="{}" class="notification-open-form" method="post" action="/notifications/open"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="notification_ids" value="{}"><input type="hidden" name="group_kind" value="{}">{group_target}<input type="hidden" name="return_to" value="{}"><button class="button-link notification-open" type="submit">Open</button></form>"#,
+        r#"<form id="{}" class="notification-open-form" method="post" action="/notifications/open"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="notification_ids" value="{}">{group_kind}{group_target}<input type="hidden" name="return_to" value="{}"><button class="button-link notification-open" type="submit">Open</button></form>"#,
         html_escape::encode_double_quoted_attribute(form_id),
         html_escape::encode_double_quoted_attribute(csrf),
         html_escape::encode_double_quoted_attribute(&notification_ids),
-        html_escape::encode_double_quoted_attribute(&notification.kind),
         html_escape::encode_double_quoted_attribute(target)
     )
 }
 
 fn notification_preview(notification: &NotificationGroupView, target: Option<&str>) -> String {
-    if notification.kind == "follow" {
+    if is_account_notification(&notification.kind) {
         return String::new();
     }
     let text = if notification.post_available {
@@ -2682,8 +2893,19 @@ fn notification_preview(notification: &NotificationGroupView, target: Option<&st
     }
 }
 
+/// Notification kinds that point at an account rather than a post.
+fn is_account_notification(kind: &str) -> bool {
+    matches!(
+        kind,
+        "follow" | "follow_request" | "follow_request_approved"
+    )
+}
+
 fn notification_target(notification: &NotificationGroupView) -> Option<String> {
-    if notification.kind == "follow" {
+    if notification.kind == "follow_request" {
+        return Some("/follow-requests".to_owned());
+    }
+    if is_account_notification(&notification.kind) {
         return notification
             .actors
             .first()
@@ -2747,6 +2969,8 @@ fn notification_action_text(kind: &str) -> &'static str {
         "quote" => "quoted your post",
         "follow" => "followed you",
         "mention" => "mentioned you in a post",
+        "follow_request" => "requested to follow you",
+        "follow_request_approved" => "approved your follow request",
         _ => "sent you a notification",
     }
 }
@@ -2759,6 +2983,8 @@ fn notification_group_action_text(kind: &str) -> &'static str {
         "quote" => "quoted your post",
         "follow" => "followed you",
         "mention" => "mentioned you in a post",
+        "follow_request" => "requested to follow you",
+        "follow_request_approved" => "approved your follow request",
         _ => "sent you notifications",
     }
 }
@@ -2769,7 +2995,7 @@ fn notification_kind_label(kind: &str) -> &'static str {
         "like" => "L",
         "repost" => "Re",
         "quote" => "Q",
-        "follow" => "F",
+        "follow" | "follow_request" | "follow_request_approved" => "F",
         "mention" => "@",
         _ => "N",
     }
@@ -2822,9 +3048,195 @@ pub fn thread_back_control() -> String {
         .to_owned()
 }
 
-pub fn notice(kind: &str, message: &str) -> String {
+/// "Previously known as" note for profiles that changed handles.
+pub fn username_history_note(history: &[crate::identity::UsernameHistoryEntry]) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let handles = history
+        .iter()
+        .map(|entry| format!("@{}", entry.username))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        r#"<section class="notice {}"><p>{}</p></section>"#,
+        r#"<p class="username-history" data-testid="username-history">Previously known as {}</p>"#,
+        html_escape::encode_text(&handles)
+    )
+}
+
+/// Renders the page for a handle that no current account owns but that has
+/// history on this instance, so old profile links cannot silently resolve to a
+/// different person.
+pub fn historical_username_page(
+    requested: &str,
+    holders: &[crate::identity::HistoricalUsernameHolder],
+) -> String {
+    let rows = holders
+        .iter()
+        .map(|holder| {
+            format!(
+                r#"<li><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span> <span class="muted">held until {}</span></li>"#,
+                html_escape::encode_double_quoted_attribute(&holder.username),
+                html_escape::encode_text(&holder.display_name),
+                html_escape::encode_text(&holder.username),
+                html_escape::encode_text(&holder.changed_at),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<section class="panel" data-testid="historical-username"><h1>No account uses @{requested}</h1><p>This handle is not in use right now, but it was used before. RustPost does not redirect old profile links so they cannot silently point at a different person.</p><h2>Accounts that previously used this handle</h2><ul class="username-history-list">{rows}</ul></section>"#,
+        requested = html_escape::encode_text(requested),
+    )
+}
+
+/// Notice rendered on a profile whose handle was previously held by a
+/// permanently deleted account, so an old link cannot silently appear to
+/// represent the deleted account.
+pub fn released_username_profile_note() -> String {
+    r#"<p class="username-history" data-testid="released-username-note">This handle was previously used by an account that has since been permanently deleted. The current profile is a different account.</p>"#
+        .to_owned()
+}
+
+/// Page rendered for a handle released by a permanently deleted account.
+///
+/// Used when no current account owns the handle. Old profile URLs remain
+/// distinguishable from the deleted account without blocking the handle from
+/// being claimed again.
+pub fn released_username_page(requested: &str) -> String {
+    format!(
+        r#"<section class="panel" data-testid="released-username"><h1>No account uses @{requested}</h1><p>This handle was used by an account that has since been permanently deleted. The name is available again, and this page does not represent the deleted account.</p><p><a class="button-link" href="/register">Register this handle</a></p></section>"#,
+        requested = html_escape::encode_text(requested),
+    )
+}
+
+/// Renders the maintenance page shown for state-changing requests that are
+/// disabled while maintenance mode is on.
+pub fn maintenance_page(site_name: &str, notice: &str) -> String {
+    let body = format!(
+        r#"<section class="panel error-panel"><p class="eyebrow">503 unavailable</p><h1>Maintenance in progress</h1><p>{}</p><p><a class="button-link" href="/home">Back to Home Feed</a></p></section>"#,
+        html_escape::encode_text(notice)
+    );
+    layout(None, "Maintenance in progress", &body, site_name)
+}
+
+/// Pending follow requests, split into incoming requests awaiting the viewer's
+/// decision and outgoing requests the viewer can cancel.
+pub fn follow_requests_page(
+    incoming: &[FollowRequestView],
+    outgoing: &[FollowRequestView],
+    csrf: &str,
+) -> String {
+    format!(
+        r#"{}{}"#,
+        follow_request_section(
+            "Follow requests",
+            "Accounts that need your approval before they can follow you.",
+            incoming,
+            csrf,
+            FollowRequestDirection::Incoming,
+        ),
+        follow_request_section(
+            "Sent requests",
+            "Requests you sent to protected accounts. You can cancel them here.",
+            outgoing,
+            csrf,
+            FollowRequestDirection::Outgoing,
+        ),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowRequestDirection {
+    Incoming,
+    Outgoing,
+}
+
+fn follow_request_section(
+    title: &str,
+    help: &str,
+    requests: &[FollowRequestView],
+    csrf: &str,
+    direction: FollowRequestDirection,
+) -> String {
+    let content = if requests.is_empty() {
+        match direction {
+            FollowRequestDirection::Incoming => compact_empty_state(
+                "No follow requests.",
+                "Requests appear here when someone asks to follow a protected account.",
+            ),
+            FollowRequestDirection::Outgoing => compact_empty_state(
+                "No sent requests.",
+                "Requests you send to protected accounts appear here.",
+            ),
+        }
+    } else {
+        let rows = requests
+            .iter()
+            .map(|request| follow_request_row(request, csrf, direction))
+            .collect::<Vec<_>>()
+            .join("");
+        format!(r#"<div class="follow-request-list">{rows}</div>"#)
+    };
+    format!(
+        r#"<section class="panel" data-testid="follow-requests-panel"><h2>{}</h2><p class="muted">{}</p>{content}</section>"#,
+        html_escape::encode_text(title),
+        html_escape::encode_text(help),
+    )
+}
+
+fn follow_request_row(
+    request: &FollowRequestView,
+    csrf: &str,
+    direction: FollowRequestDirection,
+) -> String {
+    let csrf = html_escape::encode_double_quoted_attribute(csrf);
+    let username = html_escape::encode_double_quoted_attribute(&request.username);
+    let actions = match direction {
+        FollowRequestDirection::Incoming => {
+            let approve = format!(
+                r#"<form method="post" action="/users/{}/follow/approve"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">Approve</button></form>"#,
+                request.user_id
+            );
+            let reject = format!(
+                r#"<form method="post" action="/users/{}/follow/reject"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">Reject</button></form>"#,
+                request.user_id
+            );
+            format!("{approve}{reject}")
+        }
+        FollowRequestDirection::Outgoing => format!(
+            r#"<form method="post" action="/users/{}/follow/cancel"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">Cancel request</button></form>"#,
+            request.user_id
+        ),
+    };
+    let avatar = request.profile_picture_path.as_ref().map_or_else(
+        || {
+            let initial = request.display_name.chars().next().unwrap_or('R');
+            format!(
+                r#"<span class="post-avatar placeholder" aria-hidden="true">{}</span>"#,
+                html_escape::encode_text(&initial.to_string())
+            )
+        },
+        |path| {
+            format!(
+                r#"<img class="post-avatar" src="{}" alt="" loading="lazy">"#,
+                html_escape::encode_double_quoted_attribute(path)
+            )
+        },
+    );
+    format!(
+        r#"<article class="follow-request-row" data-testid="follow-request-row">{avatar}<div><a class="author-name" href="/users/{username}">{}</a> <span class="username">@{}</span><p>{}</p><p class="muted">Requested {}</p></div><div class="actions">{actions}</div></article>"#,
+        html_escape::encode_text(&request.display_name),
+        html_escape::encode_text(&request.username),
+        html_escape::encode_text(&request.bio),
+        html_escape::encode_text(&request.created_at),
+    )
+}
+
+pub fn notice(kind: &str, message: &str) -> String {
+    let role = if kind == "error" { "alert" } else { "status" };
+    format!(
+        r#"<section class="notice {}" role="{role}"><p>{}</p></section>"#,
         html_escape::encode_double_quoted_attribute(kind),
         html_escape::encode_text(message)
     )
@@ -2853,7 +3265,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
 }
 
 const CSS: &str = r#"
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;line-height:1.5;--bg:#f5f6f1;--surface:#fff;--surface-subtle:#fbfcfa;--surface-muted:#f4f5f2;--header-bg:rgba(255,255,255,.96);--text:#202124;--text-strong:#172017;--muted:#667064;--muted-strong:#59625a;--border:#dfe4dc;--border-strong:#b9c2b8;--link:#1f5f8b;--link-strong:#24445f;--brand:#163b2f;--brand-hover:#235544;--brand-text:#fff;--hover:#eef3f0;--focus:#93c5fd;--shadow:rgba(20,35,30,.04);--reply-border:#c8d8d0;--avatar-bg:#eef3f0;--warning:#9a5a00;--danger:#8a3d2d;--danger-strong:#6f2f22;--danger-bg:#fff8f5;--danger-border:#e6b8a8;--success-bg:#f4fbf5;--success-border:#add7b4;--media-bg:#f6f7f4;--card-gap:.5rem;--section-gap:.75rem;--shell-side:240px;--shell-primary:680px;--shell-gap:1.25rem;--shell-max:1220px;--header-padding-y:.8rem;--header-brand-size:2rem;--hairline:1px;--rail-sticky-top:calc(var(--header-brand-size) + var(--header-padding-y) + var(--header-padding-y) + var(--shell-gap) + var(--hairline))}
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;line-height:1.5;--bg:#f5f6f1;--surface:#fff;--surface-subtle:#fbfcfa;--surface-muted:#f4f5f2;--header-bg:rgba(255,255,255,.96);--text:#202124;--text-strong:#172017;--muted:#667064;--muted-strong:#59625a;--border:#dfe4dc;--border-strong:#b9c2b8;--link:#1f5f8b;--link-strong:#24445f;--brand:#163b2f;--brand-hover:#235544;--brand-text:#fff;--hover:#eef3f0;--focus:#2563eb;--shadow:rgba(20,35,30,.04);--reply-border:#c8d8d0;--avatar-bg:#eef3f0;--warning:#9a5a00;--danger:#8a3d2d;--danger-strong:#6f2f22;--danger-bg:#fff8f5;--danger-border:#e6b8a8;--success-bg:#f4fbf5;--success-border:#add7b4;--media-bg:#f6f7f4;--card-gap:.5rem;--section-gap:.75rem;--shell-side:240px;--shell-primary:680px;--shell-gap:1.25rem;--shell-max:1220px;--header-padding-y:.8rem;--header-brand-size:2rem;--hairline:1px;--rail-sticky-top:calc(var(--header-brand-size) + var(--header-padding-y) + var(--header-padding-y) + var(--shell-gap) + var(--hairline))}
 :root[data-theme="dark"]{color-scheme:dark;--bg:#111827;--surface:#182231;--surface-subtle:#1d2939;--surface-muted:#233044;--header-bg:rgba(17,24,39,.96);--text:#eef4fb;--text-strong:#f8fafc;--muted:#c3cfdd;--muted-strong:#d4deea;--border:#344256;--border-strong:#596b83;--link:#8fc7ff;--link-strong:#badcff;--brand:#4f8fc7;--brand-hover:#6aa8df;--brand-text:#06111f;--hover:#243349;--focus:#fbbf24;--shadow:rgba(0,0,0,.26);--reply-border:#4f6680;--avatar-bg:#243349;--warning:#f6c36b;--danger:#ffb4a2;--danger-strong:#ffd2c7;--danger-bg:#3a2020;--danger-border:#8f4d43;--success-bg:#163321;--success-border:#4c8a61;--media-bg:#0f172a}
 *{box-sizing:border-box}body{margin:0;min-width:320px;color:var(--text);background:var(--bg)}a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
 .site-header{position:sticky;top:0;z-index:10;background:var(--header-bg);border-bottom:1px solid var(--border);backdrop-filter:blur(8px)}
@@ -2869,13 +3281,13 @@ main{padding:var(--shell-gap)}.app-shell{width:min(100%,var(--shell-max));margin
 .page-header h1,.section-heading h1,.panel h1{margin:0;font-size:1.45rem;line-height:1.2}.panel h1+table,.panel h1+form,.panel h1+p,.panel h1+dl{margin-top:.85rem}.page-header p,.muted,.empty-state p{color:var(--muted);margin:.35rem 0 0}.section-heading{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;margin-bottom:.8rem}
 .character-counter{display:inline-block;flex:0 0 auto;min-width:8.5rem;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.character-counter-normal{color:var(--muted)}.character-counter-warning{color:var(--warning)}.character-counter-danger{color:var(--danger)}
 .notifications-hero{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin:0 0 var(--section-gap);padding:1rem;box-shadow:0 1px 2px var(--shadow);display:flex;align-items:center;justify-content:space-between;gap:1rem}.notifications-hero h1{margin:0;font-size:1.55rem;line-height:1.15}.notifications-hero p:not(.eyebrow){margin:.35rem 0 0;color:var(--muted-strong)}.caught-up-pill{display:inline-flex;align-items:center;min-height:2rem;border:1px solid var(--success-border);border-radius:999px;background:var(--success-bg);color:var(--text-strong);padding:.32rem .75rem;font-weight:800}.caught-up{padding:.75rem .85rem}.caught-up p{margin:0}.notification-group{margin:var(--section-gap) .15rem 0;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.notification-group:first-child{margin-top:0}.notification-row{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:.75rem;align-items:start;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.8rem;box-shadow:0 1px 2px var(--shadow)}.notification-row.unread{border-color:var(--border-strong);background:var(--surface-subtle)}.js-enabled .notification-row[data-card-href],.js-enabled .notification-row[data-card-form]{cursor:pointer}.js-enabled .notification-row[data-card-href]:hover,.js-enabled .notification-row[data-card-form]:hover{border-color:var(--border-strong);background:var(--hover)}.notification-kind{display:grid;place-items:center;width:2rem;height:2rem;border-radius:7px;background:var(--surface-muted);color:var(--link-strong);font-weight:900;font-size:.8rem}.notification-row.unread .notification-kind{background:var(--brand);color:var(--brand-text)}.notification-body{min-width:0}.notification-line{margin:0;overflow-wrap:anywhere}.notification-meta{margin:.35rem 0 0;color:var(--muted);font-size:.88rem}.notification-counts{color:var(--muted-strong);font-weight:800}.notification-preview{display:block;margin:.5rem 0 0;border:1px solid var(--border);border-radius:7px;padding:.55rem .65rem;background:var(--surface-subtle);color:var(--muted-strong);overflow-wrap:anywhere}.notification-preview:hover{background:var(--surface);text-decoration:none}.notification-preview.unavailable{border-style:dashed}.notification-actors{margin:.45rem 0 0}.notification-actors summary{display:inline-flex;align-items:center;min-height:1.7rem;color:var(--link-strong);font-weight:800;cursor:pointer}.notification-actors ul{list-style:none;margin:.25rem 0 0;padding:0;display:flex;flex-wrap:wrap;gap:.35rem}.notification-actors li{border:1px solid var(--border);border-radius:999px;background:var(--surface-subtle);padding:.16rem .5rem;font-size:.88rem}.notification-open-form{display:flex;align-items:flex-start}.notification-open{min-height:2rem;padding:.3rem .55rem;background:var(--surface);border-color:var(--border)}.unread-dot{width:.65rem;height:.65rem;border-radius:999px;background:var(--brand);margin-top:.7rem}
-label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button,select{font:inherit}input[type=text],input[type=search],input[type=password],input[type=url],input:not([type]),textarea,select{width:100%;padding:.72rem .8rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text)}textarea{resize:vertical;min-height:7rem}::placeholder{color:var(--muted)}
+label{display:block;font-weight:700;margin:.85rem 0 .35rem}input,textarea,button,select{font:inherit}input[type=text],input[type=search],input[type=password],input[type=url],input:not([type]),textarea,select{width:100%;padding:.72rem .8rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text)}textarea{resize:none;min-height:7rem}::placeholder{color:var(--muted)}
 input[type=checkbox]{accent-color:var(--brand)}.check-row,.theme-toggle{display:flex;align-items:center;gap:.55rem;font-weight:700;color:var(--text)}.theme-toggle{padding:.65rem .75rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle)}.theme-toggle input{width:auto}
 input[type=text].password-visible{padding-right:.8rem}.password-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:center}.password-control input{min-width:0}.password-toggle{display:none;background:var(--surface);color:var(--link-strong);border-color:var(--border);min-width:4.5rem}.js-enabled .password-toggle{display:inline-block}.auth-submit{margin-top:1.15rem}.auth-form{margin-top:.35rem}.auth-form .field-help{margin:.15rem 0 .4rem;color:var(--muted-strong)}
 .search-panel h1{margin-bottom:.75rem}.search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;align-items:center}.search-form input{min-width:0}.search-results{display:grid;gap:var(--section-gap)}.section-title{margin:.2rem 0 var(--section-gap);font-size:1.05rem;color:var(--text)}.search-results>.section-title{margin:0}.search-users{margin:0}.search-users .section-title{margin-top:0}.search-account{grid-template-columns:auto minmax(0,1fr)}
 input:focus,textarea:focus,select:focus,button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}button,.primary{border:1px solid var(--brand);background:var(--brand);color:var(--brand-text);border-radius:7px;padding:.5rem .8rem;cursor:pointer;font-weight:700}button:hover,.primary:hover{background:var(--brand-hover);text-decoration:none}button:disabled,.primary:disabled,button:disabled:hover,.primary:disabled:hover{border-color:var(--border);background:var(--surface-muted);color:var(--muted);cursor:not-allowed;opacity:1}
 nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.42rem .65rem}.rail-nav button{border-color:transparent;background:transparent;color:var(--link-strong);padding:.5rem .65rem}.rail-nav button:hover,.mobile-nav button:hover{background:var(--hover);color:var(--link-strong)}
-.composer-surface{position:relative;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);overflow:visible}.composer-surface textarea{border:0;border-radius:0;background:transparent;min-height:7rem;resize:vertical}.composer-surface textarea:focus{outline:0;box-shadow:inset 0 0 0 3px var(--focus)}.mention-menu[hidden]{display:none}.mention-menu{position:absolute;z-index:9;left:.55rem;right:.55rem;top:3.1rem;max-height:12rem;overflow:auto;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 8px 24px var(--shadow);padding:.25rem}.mention-option{display:grid;width:100%;grid-template-columns:minmax(0,1fr) auto;gap:.65rem;align-items:center;border:0;border-radius:6px;background:transparent;color:var(--text);padding:.42rem .5rem;text-align:left}.mention-option:hover,.mention-option[aria-selected="true"]{background:var(--hover);color:var(--text-strong)}.mention-name{font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mention-handle{color:var(--muted);font-size:.9rem}.composer-footer{display:flex;align-items:center;justify-content:space-between;gap:.55rem;border-top:1px solid var(--border);padding:.42rem .5rem;background:var(--surface-subtle)}.composer-file-control{position:relative;display:inline-flex;align-items:center;gap:.45rem;max-width:100%;margin:0;color:var(--link-strong);font-weight:800}.composer-file-input{max-width:100%;color:var(--muted-strong)}.composer-file-input::file-selector-button{border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.34rem .58rem;font-weight:800;cursor:pointer}.composer-file-input::file-selector-button:hover{background:var(--hover);color:var(--text-strong)}.composer-file-button{display:none}.js-enabled .composer-file-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.js-enabled .composer-file-button{display:inline-flex;align-items:center;gap:.38rem;min-height:2rem;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.3rem .55rem;cursor:pointer}.composer-file-button svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.js-enabled .composer-file-control:hover .composer-file-button{background:var(--hover);color:var(--text-strong)}.js-enabled .composer-file-input:focus-visible+.composer-file-button{outline:3px solid var(--focus);outline-offset:2px}.composer-media-selection[hidden]{display:none}.composer-media-selection{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;border-top:1px solid var(--border);padding:.5rem;background:var(--surface)}.composer-media-summary{font-weight:800;color:var(--muted-strong);overflow-wrap:anywhere}.composer-nsfw{margin:0}.composer-clear-media{background:var(--surface);color:var(--link-strong);border-color:var(--border);padding:.32rem .55rem}.composer-clear-media:hover{background:var(--hover);color:var(--text-strong)}.composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}
+.composer-surface{position:relative;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);overflow:visible}.composer-surface textarea{border:0;border-radius:0;background:transparent;min-height:7rem;resize:none}.composer-surface textarea:focus{outline:0;box-shadow:inset 0 0 0 3px var(--focus)}.mention-menu[hidden]{display:none}.mention-menu{position:absolute;z-index:9;left:.55rem;right:.55rem;top:3.1rem;max-height:12rem;overflow:auto;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 8px 24px var(--shadow);padding:.25rem}.mention-option{display:grid;width:100%;grid-template-columns:minmax(0,1fr) auto;gap:.65rem;align-items:center;border:0;border-radius:6px;background:transparent;color:var(--text);padding:.42rem .5rem;text-align:left}.mention-option:hover,.mention-option[aria-selected="true"]{background:var(--hover);color:var(--text-strong)}.mention-name{font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mention-handle{color:var(--muted);font-size:.9rem}.composer-footer{display:flex;align-items:center;justify-content:space-between;gap:.55rem;border-top:1px solid var(--border);padding:.42rem .5rem;background:var(--surface-subtle)}.composer-file-control{position:relative;display:inline-flex;align-items:center;gap:.45rem;max-width:100%;margin:0;color:var(--link-strong);font-weight:800}.composer-file-input{max-width:100%;color:var(--muted-strong)}.composer-file-input::file-selector-button{border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.34rem .58rem;font-weight:800;cursor:pointer}.composer-file-input::file-selector-button:hover{background:var(--hover);color:var(--text-strong)}.composer-file-button{display:none}.js-enabled .composer-file-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.js-enabled .composer-file-button{display:inline-flex;align-items:center;gap:.38rem;min-height:2rem;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.3rem .55rem;cursor:pointer}.composer-file-button svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.js-enabled .composer-file-control:hover .composer-file-button{background:var(--hover);color:var(--text-strong)}.js-enabled .composer-file-input:focus-visible+.composer-file-button{outline:3px solid var(--focus);outline-offset:2px}.composer-media-selection[hidden]{display:none}.composer-media-selection{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;border-top:1px solid var(--border);padding:.5rem;background:var(--surface)}.composer-media-summary{font-weight:800;color:var(--muted-strong);overflow-wrap:anywhere}.composer-nsfw{margin:0}.composer-clear-media{background:var(--surface);color:var(--link-strong);border-color:var(--border);padding:.32rem .55rem}.composer-clear-media:hover{background:var(--hover);color:var(--text-strong)}.composer-tools{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.85rem}
 .thread-nav{display:flex;margin:0 0 var(--section-gap) .85rem}.thread-back{width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:var(--link-strong)}.thread-back svg{width:1.2rem;height:1.2rem;fill:currentColor}.thread-back:hover{background:var(--hover);text-decoration:none}
 .timeline,.notifications-list,.account-list{display:grid;gap:var(--card-gap)}.timeline+.composer{margin-top:var(--section-gap)}.pinned-timeline{gap:var(--section-gap);margin-bottom:var(--section-gap)}.pinned-timeline>.section-title{margin:0}.post{margin:0;overflow:hidden;position:relative}.js-enabled .post[data-card-href]{cursor:pointer}.js-enabled .post[data-card-href]:hover{border-color:var(--border-strong)}.reply-post{margin-left:1.1rem;border-left:4px solid var(--reply-border);background:var(--surface-subtle)}.reply-post::before{content:"";position:absolute;left:-1.1rem;top:1.25rem;width:1.1rem;border-top:2px solid var(--reply-border)}.anchor-target{position:absolute;top:-5rem}.post-header{display:flex;justify-content:space-between;gap:.65rem;align-items:flex-start}.author-block{display:flex;gap:.55rem;align-items:center;min-width:0}.post-avatar{width:2rem;height:2rem;object-fit:cover;border-radius:999px;border:1px solid var(--border);background:var(--avatar-bg);flex:0 0 auto;margin:0}.post-avatar.placeholder{display:inline-grid;place-items:center;color:var(--muted-strong);font-weight:800}.author-name{font-weight:800;color:var(--text-strong)}.username,.post-time,.counts{color:var(--muted);font-size:.92rem}.text{white-space:pre-wrap;margin:.55rem 0;line-height:1.5;overflow-wrap:anywhere}.post img,.post video{display:block;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-top:.5rem;background:var(--media-bg)}.post img.post-avatar{display:block;margin:0;border-radius:999px}.youtube-previews{display:grid;gap:.5rem;margin:.35rem 0 .55rem}.youtube-preview-card{display:grid;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);color:var(--text);overflow:hidden}.youtube-preview-card:hover{border-color:var(--border-strong);background:var(--hover)}.youtube-preview-main{display:grid;grid-template-columns:minmax(5.5rem,7.5rem) minmax(0,1fr);gap:.65rem;align-items:center;min-height:4.5rem;color:inherit}.youtube-preview-main:hover{text-decoration:none}.youtube-thumbnail-frame{position:relative;display:block;width:100%;aspect-ratio:16/9;overflow:hidden;background:var(--media-bg)}.post img.youtube-thumbnail{width:100%;height:100%;object-fit:cover;margin:0;border:0;border-radius:0}.youtube-play{position:absolute;left:50%;top:50%;width:2rem;height:2rem;border-radius:999px;background:rgba(0,0,0,.68);box-shadow:0 1px 4px rgba(0,0,0,.35);transform:translate(-50%,-50%)}.youtube-play::before{content:"";position:absolute;left:.78rem;top:.55rem;border-top:.45rem solid transparent;border-bottom:.45rem solid transparent;border-left:.65rem solid #fff}.youtube-preview-body{display:grid;gap:.08rem;min-width:0;padding:.45rem .55rem .45rem 0}.youtube-preview-source{color:var(--muted);font-size:.78rem;font-weight:900;text-transform:uppercase}.youtube-preview-title{color:var(--text-strong);font-weight:850;overflow-wrap:anywhere}.youtube-preview-url{color:var(--muted-strong);font-size:.86rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.youtube-preview-actions{display:flex;justify-content:flex-end;border-top:1px solid var(--border);padding:.32rem .55rem}.youtube-open-link{color:var(--muted-strong);font-size:.84rem;font-weight:800}.youtube-player-frame{width:100%;aspect-ratio:16/9;background:#000}.youtube-preview-playing .youtube-preview-main{display:none}.youtube-iframe{display:block;width:100%;height:100%;border:0;background:#000}.nsfw-media{position:relative;margin-top:.5rem}.nsfw-media .post img,.nsfw-media .post video{margin-top:0}.nsfw-media-frame{position:relative;display:block;overflow:hidden;border-radius:8px}.nsfw-media-frame img,.nsfw-media-frame video{margin-top:0;filter:blur(24px);transform:scale(1.02)}.nsfw-toggle:checked+.nsfw-media-frame img,.nsfw-toggle:checked+.nsfw-media-frame video{filter:none;transform:none}.nsfw-badge{position:absolute;left:.55rem;bottom:.55rem;border-radius:999px;padding:.18rem .5rem;background:rgba(0,0,0,.72);color:#fff;font-size:.78rem;font-weight:900;letter-spacing:.03em}.nsfw-show{position:absolute;right:.55rem;bottom:.55rem;margin:0;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);color:var(--text-strong);padding:.32rem .65rem;font-weight:900;box-shadow:0 1px 2px var(--shadow);cursor:pointer}.nsfw-show:hover{background:var(--hover)}.nsfw-toggle:focus-visible~.nsfw-show{outline:3px solid var(--focus);outline-offset:2px}.nsfw-toggle:checked~.nsfw-show,.nsfw-toggle:checked+.nsfw-media-frame .nsfw-badge{display:none}
 .counts{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;min-height:1.4rem}.edited-marker{font-weight:800;color:var(--muted-strong)}.post-permalink{font-weight:700;color:var(--link-strong)}.js-enabled .post-permalink{display:none}.actions{display:inline-flex;gap:.25rem;flex-wrap:wrap;align-items:center;margin-top:.5rem;max-width:100%}.icon-button{width:2.2rem;height:2.2rem;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:0}.icon-button svg{width:1.05rem;height:1.05rem;fill:currentColor}.icon-button:hover,.icon-button.active{background:var(--hover);color:var(--text-strong);text-decoration:none}.icon-button.disabled,.icon-button:disabled{color:var(--muted);background:var(--surface-muted);border-color:var(--border);cursor:not-allowed;opacity:.75}.icon-button.disabled:hover,.icon-button:disabled:hover{background:var(--surface-muted);color:var(--muted)}.admin-nsfw-button{min-height:2.2rem;padding:.3rem .55rem;background:var(--surface);color:var(--link-strong);border-color:var(--border);font-size:.86rem}.admin-nsfw-button:hover{background:var(--hover);color:var(--text-strong)}.repost-control{position:relative;display:inline-flex;align-items:center;gap:.25rem}.repost-menu{position:absolute;z-index:8;left:0;top:calc(100% + .25rem);min-width:8.5rem;padding:.3rem;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface);box-shadow:0 6px 18px var(--shadow)}.repost-menu a{display:inline-flex;align-items:center;gap:.35rem;width:100%;min-height:2rem;border-radius:6px;padding:.32rem .55rem;color:var(--link-strong);font-weight:700}.repost-menu a svg{width:1rem;height:1rem;fill:currentColor;flex:0 0 auto}.repost-menu a:hover,.quote-fallback:hover{background:var(--hover);text-decoration:none}.quote-preview{display:block;margin:.6rem 0 .25rem;border:1px solid var(--border);border-radius:7px;background:var(--surface-subtle);overflow:hidden}.quote-preview p{margin:.65rem;color:var(--muted-strong)}.quote-link{display:grid;gap:.2rem;padding:.6rem;color:var(--text)}.quote-link:hover{background:var(--hover);text-decoration:none}.quote-author{font-weight:800}.quote-text{white-space:pre-wrap;overflow-wrap:anywhere}.quote-time{color:var(--muted);font-size:.86rem}.follow-button{min-width:6.6rem}.follow-button.active{background:var(--hover);color:var(--text-strong);border-color:var(--border-strong)}.profile-actions{margin-top:0}.profile-secondary button{background:var(--surface);color:var(--danger);border-color:var(--danger-border);padding:.32rem .5rem;min-height:1.85rem;font-size:.86rem}.profile-secondary button:hover{background:var(--danger-bg);color:var(--danger-strong)}.profile-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.profile-tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.35rem;margin:0 0 var(--section-gap);border-bottom:1px solid var(--border)}.profile-tabs a{display:flex;align-items:center;justify-content:center;min-height:2.6rem;border-radius:7px 7px 0 0;color:var(--muted-strong);font-weight:850}.profile-tabs a:hover{background:var(--hover);color:var(--text-strong);text-decoration:none}.profile-tabs a.active{color:var(--text-strong);background:var(--surface);box-shadow:inset 0 -3px 0 var(--brand)}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.repost-banner{color:var(--muted-strong);font-size:.9rem;font-weight:800;margin-bottom:.35rem}.unavailable{color:var(--muted)}.empty-state{text-align:center;padding:2rem 1rem}.empty-state h2{margin:0;font-size:1.2rem}.notice.error,.error-panel{border-color:var(--danger-border);background:var(--danger-bg)}.notice.success{border-color:var(--success-border);background:var(--success-bg)}.eyebrow{text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted);font-size:.78rem}.noscript-banner{max-width:1100px;margin:.7rem auto 0;padding:.65rem .85rem;border:1px solid var(--border);border-radius:8px;background:var(--surface-subtle);color:var(--muted-strong)}
@@ -2883,9 +3295,20 @@ nav button{border-color:transparent;background:transparent;color:var(--link-stro
 .settings-media-frame{position:relative;min-width:0}.settings-picture-row{display:flex;align-items:flex-end;gap:0}.settings-picture-wrap{display:inline-block;max-width:100%;line-height:0}.settings-picture-preview{display:block}.settings-media-actions{position:absolute;z-index:2;display:flex;gap:.35rem;align-items:center}.settings-banner-actions{top:.55rem;right:.55rem}.settings-picture-actions{left:50%;bottom:.45rem;transform:translateX(-50%)}.settings-media-control{position:relative;display:inline-flex}.settings-media-input,.settings-media-delete-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.settings-media-icon-button{display:inline-flex;align-items:center;justify-content:center;width:2rem;height:2rem;margin:0;border:1px solid rgba(255,255,255,.62);border-radius:999px;background:rgba(23,32,23,.56);color:#fff;padding:0;box-shadow:0 1px 4px rgba(0,0,0,.22);cursor:pointer;opacity:.72;transition:opacity .15s ease,background-color .15s ease,border-color .15s ease,transform .15s ease}.settings-media-icon-button svg{width:1rem;height:1rem;fill:currentColor}.settings-media-frame:hover .settings-media-icon-button,.settings-media-frame:focus-within .settings-media-icon-button,.settings-media-icon-button:hover{opacity:1}.settings-media-icon-button:hover{background:rgba(23,32,23,.82);text-decoration:none}.settings-media-input:focus-visible+.settings-media-icon-button,.settings-media-delete-input:focus-visible+.settings-media-icon-button{outline:3px solid var(--focus);outline-offset:2px;opacity:1}.settings-media-delete-input:checked+.settings-media-icon-button,.settings-media-removing .settings-media-remove{background:var(--danger);border-color:var(--danger-border);color:var(--brand-text);opacity:1}.settings-media-has-file .settings-media-change{background:var(--brand);border-color:rgba(255,255,255,.72);color:var(--brand-text);opacity:1}.settings-media-disabled{position:absolute;right:.55rem;bottom:.55rem;max-width:calc(100% - 1.1rem);margin:0;border:1px solid rgba(255,255,255,.5);border-radius:999px;background:rgba(23,32,23,.62);color:#fff;padding:.22rem .55rem;font-size:.82rem;font-weight:800;line-height:1.2;overflow-wrap:anywhere}
 .notification-row:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.notification-open{min-height:2.25rem;padding:.35rem .6rem}.notification-actors summary{min-height:2.1rem}.post-permalink{font-weight:700;color:var(--link-strong)}.js-enabled .post-permalink{display:inline-flex}.js-enabled .post-permalink:not(:focus-visible){position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.js-enabled .post-permalink:focus-visible{display:inline-flex;align-items:center;position:absolute;right:.85rem;bottom:.85rem;z-index:2;min-height:2.25rem;border:1px solid var(--border-strong);border-radius:999px;background:var(--surface);padding:.3rem .65rem;box-shadow:0 6px 18px var(--shadow);text-decoration:none}.icon-button{width:2.45rem;height:2.45rem}.admin-nsfw-button{min-height:2.45rem;padding:.35rem .6rem}.thread-back{width:2.4rem;height:2.4rem}button,.primary{min-height:2.5rem;padding:.52rem .82rem}input[type=checkbox]{width:1.05rem;height:1.05rem;accent-color:var(--brand)}input[type=file]{max-width:100%;color:var(--muted-strong)}input[type=file]::file-selector-button{min-height:2.15rem;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--link-strong);padding:.34rem .58rem;font-weight:800;cursor:pointer}input[type=file]::file-selector-button:hover{background:var(--hover);color:var(--text-strong)}label:has(>input[type=checkbox]){display:flex;align-items:flex-start;gap:.55rem;min-height:2.4rem;margin:.75rem 0 .35rem}label:has(>input[type=checkbox]) input[type=checkbox]{flex:0 0 auto;margin-top:.22rem}.empty-state{padding:2.2rem 1rem}.danger-zone{border-color:var(--danger-border);background:var(--danger-bg)}.danger-zone h2,.danger-zone h3{color:var(--danger-strong)}.admin-nav-grid{grid-template-columns:repeat(auto-fit,minmax(13rem,1fr))}.admin-nav-card{position:relative;display:grid;align-content:center;min-height:4.2rem;padding-right:2.3rem;color:var(--link-strong);font-weight:850}.admin-nav-card::after{content:"";position:absolute;right:1rem;top:50%;width:.48rem;height:.48rem;border-top:2px solid currentColor;border-right:2px solid currentColor;transform:translateY(-50%) rotate(45deg);opacity:.62}.admin-nav-card:hover{border-color:var(--border-strong);background:var(--hover);text-decoration:none}.admin-nav-card:focus-visible::after,.admin-nav-card:hover::after{opacity:1}
 .profile-secondary button{min-height:2.4rem}.settings-media-icon-button{width:2.25rem;height:2.25rem}.settings-media-icon-button svg{width:1.08rem;height:1.08rem}
+.counts a{color:var(--muted);font-weight:700;text-decoration:none}.counts a:hover{color:var(--link-strong);text-decoration:underline}
+.profile-title-row>div{min-width:0}.profile-title-row h1{margin:0;overflow-wrap:anywhere}.profile-bio{margin:.55rem 0 0;overflow-wrap:anywhere}.profile-state-note{color:var(--muted-strong);font-weight:700}
+.notice.info{border-color:var(--border-strong);background:var(--surface-subtle)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms !important;animation-duration:.01ms !important}}
+.announcement{min-width:0;max-width:min(34rem,100%);color:var(--muted-strong);font-size:.86rem;font-weight:600;line-height:1.25;overflow-wrap:anywhere;white-space:normal;flex:0 1 auto}
+.maintenance-notice{margin:0 0 var(--section-gap);border-color:var(--border-strong);background:var(--surface-subtle)}
+.account-notice{margin:0 0 var(--section-gap)}
+.follow-request-row{display:grid;gap:.55rem;border:1px solid var(--border);border-radius:8px;padding:.75rem;background:var(--surface)}
+.follow-request-row .actions{display:flex;gap:.45rem;flex-wrap:wrap;align-items:center}
+.username-history{margin:.35rem 0 0;color:var(--muted);font-size:.9rem}
+.username-history-list{list-style:none;margin:.35rem 0 0;padding:0;display:grid;gap:.2rem}
 @media (max-width:1100px){.app-shell{--shell-side:220px;--shell-max:880px;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary))}.right-rail{display:none}}
 @media (max-width:820px){.app-shell{grid-template-columns:minmax(0,680px)}.left-rail,.right-rail{display:none}.mobile-nav{display:flex}}
-@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.header-brand-row{align-items:center;width:100%;gap:.55rem}.tor-indicator{max-width:calc(100% - 7rem);margin-left:auto}.tor-details{left:auto;right:0;max-width:calc(100vw - 1.5rem)}.site-header{position:static}nav{justify-content:flex-start}.mobile-nav{width:100%}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group,.admin-user-search,.admin-user-row,.onboarding-media-row{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar,.notifications-hero{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.composer-footer,.composer-media-selection{align-items:flex-start;flex-direction:column}.composer-file-input{max-width:100%}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-switch-row{grid-template-columns:1fr;gap:.55rem}.settings-switch-toggle,.settings-switch-control{justify-self:start}.settings-form-actions{justify-content:stretch}.settings-form-actions button,.settings-danger-action .button-link{width:100%;justify-content:center}.settings-item-list li{align-items:stretch;flex-direction:column}.admin-user-search-actions,.admin-user-actions{align-items:stretch;flex-direction:column}.admin-user-search-actions button,.admin-user-search-actions .button-link,.admin-user-actions button{width:100%;justify-content:center}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1,.notifications-hero h1{font-size:1.25rem}.notification-row{grid-template-columns:auto minmax(0,1fr);gap:.6rem}.unread-dot{position:absolute;right:.75rem;top:.75rem;margin:0}.notification-preview{padding:.5rem}}
+@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.header-brand-row{align-items:center;flex-wrap:wrap;width:100%;gap:.55rem}.announcement{flex-basis:100%;max-width:100%}.tor-indicator{max-width:calc(100% - 7rem);margin-left:auto}.tor-details{left:auto;right:0;max-width:calc(100vw - 1.5rem)}.site-header{position:static}nav{justify-content:flex-start}.mobile-nav{width:100%}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group,.admin-user-search,.admin-user-row,.onboarding-media-row{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar,.notifications-hero{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.composer-footer,.composer-media-selection{align-items:flex-start;flex-direction:column}.composer-file-input{max-width:100%}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-switch-row{grid-template-columns:1fr;gap:.55rem}.settings-switch-toggle,.settings-switch-control{justify-self:start}.settings-form-actions{justify-content:stretch}.settings-form-actions button,.settings-danger-action .button-link{width:100%;justify-content:center}.settings-item-list li{align-items:stretch;flex-direction:column}.admin-user-search-actions,.admin-user-actions{align-items:stretch;flex-direction:column}.admin-user-search-actions button,.admin-user-search-actions .button-link,.admin-user-actions button{width:100%;justify-content:center}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1,.notifications-hero h1{font-size:1.25rem}.notification-row{grid-template-columns:auto minmax(0,1fr);gap:.6rem}.unread-dot{position:absolute;right:.75rem;top:.75rem;margin:0}.notification-preview{padding:.5rem}}
 "#;
 
 #[cfg(test)]
@@ -2920,6 +3343,8 @@ mod tests {
             is_suspended: false,
             theme: Theme::Dark,
             nsfw_blur_enabled: true,
+            must_change_password: false,
+            deletion_scheduled_at: None,
         };
         let body = layout(Some(&user), "Home Feed", "<p>body</p>", "My Microblog");
 
@@ -3020,6 +3445,8 @@ mod tests {
             is_suspended: false,
             theme: Theme::Light,
             nsfw_blur_enabled: true,
+            must_change_password: false,
+            deletion_scheduled_at: None,
         };
         let body = layout_with_csrf(
             Some(&user),
@@ -3056,6 +3483,8 @@ mod tests {
             is_suspended: false,
             theme: Theme::Light,
             nsfw_blur_enabled: true,
+            must_change_password: false,
+            deletion_scheduled_at: None,
         };
         let body = layout_with_context(
             Some(&user),
@@ -3353,6 +3782,8 @@ mod tests {
             is_suspended: false,
             theme: Theme::Light,
             nsfw_blur_enabled: true,
+            must_change_password: false,
+            deletion_scheduled_at: None,
         };
         let mut post = test_post();
         post.user_id = Some(2);
@@ -3387,6 +3818,8 @@ mod tests {
             is_suspended: false,
             theme: Theme::Light,
             nsfw_blur_enabled: true,
+            must_change_password: false,
+            deletion_scheduled_at: None,
         };
         let mut post = test_post();
         post.user_id = Some(2);
@@ -3531,8 +3964,25 @@ mod tests {
 
         assert!(!body.contains("youtube-preview-card"));
         assert!(body.contains(
-            r#"<div class="text">hello https://example.com/watch?v=dQw4w9WgXcQ <a href="/tags/rust">#rust</a></div>"#
+            r#"<div class="text">hello <a href="https://example.com/watch?v=dQw4w9WgXcQ" rel="noopener noreferrer nofollow">https://example.com/watch?v=dQw4w9WgXcQ</a> <a href="/tags/rust">#rust</a></div>"#
         ));
+    }
+
+    #[test]
+    fn linkify_preserves_newlines_and_trims_trailing_punctuation() {
+        assert_eq!(
+            linkify("first line\nsecond #rust, line"),
+            "first line\nsecond <a href=\"/tags/rust\">#rust</a>, line"
+        );
+        assert_eq!(linkify("  spaced  \n\ntext  "), "  spaced  \n\ntext  ");
+        assert_eq!(
+            linkify("see (https://example.test/a)."),
+            "see (<a href=\"https://example.test/a\" rel=\"noopener noreferrer nofollow\">https://example.test/a</a>)."
+        );
+        assert_eq!(linkify("#"), "#");
+        assert_eq!(linkify("@"), "@");
+        assert_eq!(linkify("no links here"), "no links here");
+        assert_eq!(linkify("hello@example.test"), "hello@example.test");
     }
 
     #[test]

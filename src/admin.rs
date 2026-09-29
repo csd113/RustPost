@@ -1188,7 +1188,7 @@ pub async fn reset_admin_password(
     password: &str,
 ) -> anyhow::Result<()> {
     crate::validation::validate_password(password, settings)?;
-    let hash = auth::hash_password(password)?;
+    let hash = auth::hash_password_async(password.to_owned()).await?;
     let username = username.trim().to_ascii_lowercase();
     let changed = pool
         .call(move |conn| {

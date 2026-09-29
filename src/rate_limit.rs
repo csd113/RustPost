@@ -26,6 +26,11 @@ impl Scope {
     }
 }
 
+/// Atomically checks the limit and records the event.
+///
+/// The check and the insert happen inside one database transaction so that
+/// concurrent requests from the same actor cannot all observe an under-limit
+/// state and slip past the limit together.
 pub async fn check_and_record(
     pool: &SqlitePool,
     scope: Scope,
@@ -33,8 +38,29 @@ pub async fn check_and_record(
     max_events: i64,
     window_secs: i64,
 ) -> anyhow::Result<()> {
-    ensure_under_limit(pool, scope, actor, max_events, window_secs).await?;
-    record(pool, scope, actor).await
+    if max_events <= 0 {
+        anyhow::bail!("rate limit exceeded; try again later");
+    }
+    let cutoff = format!("-{window_secs} seconds");
+    let actor = actor.to_owned();
+    pool.call(move |conn| {
+        let tx = conn.transaction()?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM rate_limit_events WHERE scope = ? AND actor = ? AND created_at >= datetime('now', ?)",
+            params![scope.as_str(), actor, cutoff],
+            |row| row.get(0),
+        )?;
+        if count >= max_events {
+            anyhow::bail!("rate limit exceeded; try again later");
+        }
+        tx.execute(
+            "INSERT INTO rate_limit_events (scope, actor) VALUES (?, ?)",
+            params![scope.as_str(), actor],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
 }
 
 pub async fn ensure_under_limit(

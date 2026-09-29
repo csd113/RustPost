@@ -42,6 +42,7 @@ struct StoredMedia {
     media_kind: String,
     original_sha256: String,
     normalized_sha256: Option<String>,
+    is_nsfw: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -69,18 +70,60 @@ struct UploadContext<'a> {
 struct StagedUpload {
     owner_user_id: Option<i64>,
     original_filename: String,
-    staging: PathBuf,
+    staging: StagedUploadGuard,
     bytes: u64,
 }
 
 struct PreparedUpload {
     owner_user_id: Option<i64>,
     original_filename: String,
-    staging: PathBuf,
+    staging: StagedUploadGuard,
     bytes: u64,
     mime: String,
     media_kind: MediaKind,
     original_sha256: String,
+}
+
+struct StagedUploadGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StagedUploadGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn remove(&mut self) {
+        if remove_staged_upload(&self.path).await {
+            self.disarm();
+        }
+    }
+}
+
+impl Drop for StagedUploadGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                path = %self.path.display(),
+                error = %error,
+                "failed to remove staged upload during guard drop"
+            );
+        }
+    }
 }
 
 struct NewMediaRecord {
@@ -140,8 +183,8 @@ async fn save_upload_inner(
     let original_filename = field.file_name().unwrap_or("upload").to_owned();
     reject_path_tricks(&original_filename)?;
     let id = Uuid::new_v4().simple().to_string();
-    let staging = paths.staged_upload_path(&id);
-    let bytes = write_upload_to_staging(settings, &staging, &mut field).await?;
+    let staging = StagedUploadGuard::new(paths.staged_upload_path(&id));
+    let bytes = write_upload_to_staging(settings, staging.path(), &mut field).await?;
     let context = UploadContext {
         pool,
         settings,
@@ -166,11 +209,18 @@ async fn save_staged_upload(
     upload: StagedUpload,
     required_image_label: Option<&'static str>,
 ) -> anyhow::Result<i64> {
-    let prepared = prepare_staged_upload(context.settings, upload).await?;
+    save_staged_upload_inner(context, upload, required_image_label).await
+}
+
+async fn save_staged_upload_inner(
+    context: &UploadContext<'_>,
+    upload: StagedUpload,
+    required_image_label: Option<&'static str>,
+) -> anyhow::Result<i64> {
+    let mut prepared = prepare_staged_upload(context.settings, upload).await?;
     if let Some(label) = required_image_label
         && prepared.media_kind != MediaKind::Image
     {
-        remove_staged_upload(&prepared.staging).await;
         anyhow::bail!("{label} must be an image");
     }
     if let Some(media_id) = try_insert_duplicate(
@@ -181,7 +231,7 @@ async fn save_staged_upload(
     )
     .await?
     {
-        remove_staged_upload(&prepared.staging).await;
+        prepared.staging.remove().await;
         return Ok(media_id);
     }
     store_new_upload(context, prepared).await
@@ -191,19 +241,20 @@ async fn prepare_staged_upload(
     settings: &Settings,
     upload: StagedUpload,
 ) -> anyhow::Result<PreparedUpload> {
-    let data = tokio::fs::read(&upload.staging).await?;
-    let Some(kind) = infer::get(&data) else {
-        remove_staged_upload(&upload.staging).await;
+    let (kind, original_sha256, prefix) = sniff_and_hash(upload.staging.path()).await?;
+    let Some(kind) = kind else {
         anyhow::bail!("unsupported media type");
     };
     let mime = kind.mime_type().to_owned();
-    let media_kind = match classify(settings, &mime, upload.bytes) {
-        Ok(media_kind) => media_kind,
-        Err(error) => {
-            remove_staged_upload(&upload.staging).await;
-            return Err(error);
+    let media_kind = classify(settings, &mime, upload.bytes)?;
+    if media_kind == MediaKind::Image
+        && let Some((width, height)) = image_dimensions(&prefix)
+    {
+        let pixels = u64::from(width).saturating_mul(u64::from(height));
+        if pixels > MAX_IMAGE_PIXELS {
+            anyhow::bail!("image dimensions exceed the maximum supported size");
         }
-    };
+    }
     Ok(PreparedUpload {
         owner_user_id: upload.owner_user_id,
         original_filename: upload.original_filename,
@@ -211,8 +262,135 @@ async fn prepare_staged_upload(
         bytes: upload.bytes,
         mime,
         media_kind,
-        original_sha256: sha256_hex(&data),
+        original_sha256,
     })
+}
+
+/// Upper bound used to reject decompression-bomb style images before ffmpeg
+/// decodes them. 100 megapixels is far above any realistic profile or post
+/// image while keeping a full RGBA decode under ~400 MB.
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+
+/// Reads width/height from the headers of the image formats `RustPost` accepts.
+/// Returns `None` for unknown or truncated headers.
+fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if data.starts_with(PNG_SIGNATURE) {
+        let width = read_be_u32(data, 16)?;
+        let height = read_be_u32(data, 20)?;
+        return Some((width, height));
+    }
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        let width = read_le_u16(data, 6)?;
+        let height = read_le_u16(data, 8)?;
+        return Some((u32::from(width), u32::from(height)));
+    }
+    if data.starts_with(&[0xFF, 0xD8]) {
+        return jpeg_dimensions(data);
+    }
+    if data.len() >= 30 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        return match &data[12..16] {
+            b"VP8X" => {
+                let width = read_le_u24(data, 24)? + 1;
+                let height = read_le_u24(data, 27)? + 1;
+                Some((width, height))
+            }
+            b"VP8 " => {
+                let width = u32::from(read_le_u16(data, 26)? & 0x3FFF);
+                let height = u32::from(read_le_u16(data, 28)? & 0x3FFF);
+                Some((width, height))
+            }
+            b"VP8L" => {
+                let bits = read_le_u32(data, 21)?;
+                let width = (bits & 0x3FFF) + 1;
+                let height = ((bits >> 14) & 0x3FFF) + 1;
+                Some((width, height))
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+fn read_be_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+fn read_le_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_le_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let bytes = data.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_le_u24(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 3)?;
+    Some(u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16))
+}
+
+fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    let mut index = 2usize;
+    while index + 9 < data.len() {
+        if data[index] != 0xFF {
+            index += 1;
+            continue;
+        }
+        let marker = data[index + 1];
+        if matches!(marker, 0xD8 | 0xD9 | 0x01) || (0xD0..=0xD7).contains(&marker) {
+            index += 2;
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes([data[index + 2], data[index + 3]]));
+        if length < 2 {
+            return None;
+        }
+        // Start-of-frame markers (excluding DHT/JPG/DAC at C4/C8/CC).
+        let is_sof = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
+        if is_sof {
+            let height = u32::from(u16::from_be_bytes([data[index + 5], data[index + 6]]));
+            let width = u32::from(u16::from_be_bytes([data[index + 7], data[index + 8]]));
+            return Some((width, height));
+        }
+        index += 2 + length;
+    }
+    None
+}
+
+/// Number of leading bytes inspected for content-based media type detection.
+///
+/// The `infer` signatures are all at the start of a file, so a bounded prefix
+/// is enough and avoids loading an entire upload (potentially hundreds of
+/// megabytes of video) into memory.
+const MEDIA_SNIFF_PREFIX_BYTES: usize = 64 * 1024;
+
+/// Streams a staged upload once, sniffing its magic bytes and hashing it
+/// without buffering the whole file. The bounded prefix is also reused for
+/// image dimension checks.
+async fn sniff_and_hash(path: &Path) -> anyhow::Result<(Option<infer::Type>, String, Vec<u8>)> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buffer = vec![0_u8; MEDIA_SNIFF_PREFIX_BYTES];
+    let mut prefix = Vec::with_capacity(MEDIA_SNIFF_PREFIX_BYTES);
+    let mut hasher = Sha256::new();
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        if prefix.len() < MEDIA_SNIFF_PREFIX_BYTES {
+            let take = (MEDIA_SNIFF_PREFIX_BYTES - prefix.len()).min(read);
+            prefix.extend_from_slice(&buffer[..take]);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let kind = infer::get(&prefix);
+    let hash = hex_lower(hasher.finalize().as_ref());
+    Ok((kind, hash, prefix))
 }
 
 async fn try_insert_duplicate(
@@ -252,7 +430,7 @@ async fn try_insert_duplicate(
 
 async fn store_new_upload(
     context: &UploadContext<'_>,
-    upload: PreparedUpload,
+    mut upload: PreparedUpload,
 ) -> anyhow::Result<i64> {
     let ext = safe_extension(&upload.mime, upload.media_kind);
     let mut basename = stable_media_basename(&upload.original_filename, &upload.original_sha256);
@@ -261,7 +439,8 @@ async fn store_new_upload(
         stem.clone_into(&mut basename);
     }
     let original_public_path = public_upload_path(context.paths, &original_path)?;
-    tokio::fs::rename(&upload.staging, &original_path).await?;
+    tokio::fs::rename(upload.staging.path(), &original_path).await?;
+    upload.staging.disarm();
     let stored = convert_or_original(
         context.settings,
         context.paths,
@@ -272,7 +451,13 @@ async fn store_new_upload(
         &upload.mime,
     )
     .await;
-    let normalized_sha256 = hash_file(&stored.path).await?;
+    let normalized_sha256 = match hash_file(&stored.path).await {
+        Ok(hash) => hash,
+        Err(error) => {
+            cleanup_unreferenced_uploads(context.pool, [&original_path, &stored.path]).await;
+            return Err(error);
+        }
+    };
     if stored.state == "converted" && !context.settings.media.keep_original_uploads {
         let _ = tokio::fs::remove_file(&original_path).await;
     }
@@ -285,7 +470,7 @@ async fn store_new_upload(
     )
     .await?
     {
-        cleanup_unreferenced_uploads([&original_path, &stored.path]).await;
+        cleanup_unreferenced_uploads(context.pool, [&original_path, &stored.path]).await;
         return Ok(media_id);
     }
 
@@ -324,10 +509,12 @@ async fn store_new_upload(
                 try_insert_duplicate_after_canonical_conflict(context, &upload, &normalized_sha256)
                     .await?
             {
-                cleanup_unreferenced_uploads([&cleanup_paths[0], &cleanup_paths[1]]).await;
+                cleanup_unreferenced_uploads(context.pool, [&cleanup_paths[0], &cleanup_paths[1]])
+                    .await;
                 return Ok(media_id);
             }
-            cleanup_unreferenced_uploads([&cleanup_paths[0], &cleanup_paths[1]]).await;
+            cleanup_unreferenced_uploads(context.pool, [&cleanup_paths[0], &cleanup_paths[1]])
+                .await;
             return Err(error);
         }
     };
@@ -424,7 +611,7 @@ async fn insert_duplicate_media(
         .filter(|hash| !hash.is_empty());
     pool.call(move |conn| {
         conn.execute(
-            "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, conversion_state, original_sha256, normalized_sha256, canonical_media_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate', ?, ?, ?)",
+            "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, conversion_state, original_sha256, normalized_sha256, canonical_media_id, is_nsfw) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate', ?, ?, ?, ?)",
             params![
                 owner_user_id,
                 original_filename,
@@ -436,6 +623,7 @@ async fn insert_duplicate_media(
                 original_sha256,
                 normalized_sha256,
                 canonical.id,
+                i64::from(canonical.is_nsfw),
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -448,18 +636,49 @@ async fn write_upload_to_staging(
     staging: &Path,
     field: &mut Field<'_>,
 ) -> anyhow::Result<u64> {
+    let result = write_upload_to_staging_inner(settings, staging, field).await;
+    if result.is_err() {
+        remove_staged_upload(staging).await;
+    }
+    result
+}
+
+async fn write_upload_to_staging_inner(
+    settings: &Settings,
+    staging: &Path,
+    field: &mut Field<'_>,
+) -> anyhow::Result<u64> {
     let mut file = tokio::fs::File::create(staging).await?;
     let mut bytes = 0_u64;
     while let Some(chunk) = field.chunk().await? {
         bytes += u64::try_from(chunk.len())?;
         if bytes > settings.media.max_video_size {
-            remove_staged_upload(staging).await;
             anyhow::bail!("upload exceeds maximum size");
         }
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
     Ok(bytes)
+}
+
+pub async fn save_banner_upload(
+    pool: &SqlitePool,
+    settings: &Settings,
+    paths: &RuntimePaths,
+    ffmpeg: &FfmpegStatus,
+    owner_user_id: i64,
+    field: Field<'_>,
+) -> anyhow::Result<i64> {
+    save_upload_inner(
+        pool,
+        settings,
+        paths,
+        ffmpeg,
+        Some(owner_user_id),
+        field,
+        Some("profile banner"),
+    )
+    .await
 }
 
 pub async fn save_profile_picture_upload(
@@ -550,15 +769,41 @@ async fn generate_profile_picture_thumbnail(
     Ok(())
 }
 
-async fn remove_staged_upload(path: &Path) {
-    if let Err(error) = tokio::fs::remove_file(path).await {
-        tracing::debug!(error = %error, "failed to remove rejected staged upload");
+async fn remove_staged_upload(path: &Path) -> bool {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::debug!(error = %error, "failed to remove rejected staged upload");
+            false
+        }
     }
 }
 
-async fn cleanup_unreferenced_uploads<const N: usize>(paths: [&Path; N]) {
+/// Removes upload scratch files that are not referenced by any `media` row.
+///
+/// The reference check protects a concurrently committed canonical row from
+/// having its file removed by a duplicate-upload cleanup path.
+async fn cleanup_unreferenced_uploads<const N: usize>(pool: &SqlitePool, paths: [&Path; N]) {
     let unique_paths = paths.into_iter().collect::<BTreeSet<_>>();
     for path in unique_paths {
+        let path_string = path.to_string_lossy().to_string();
+        let referenced = pool
+            .call(move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT 1 FROM media WHERE original_path = ? OR stored_path = ? OR thumbnail_path = ? LIMIT 1",
+                        params![path_string, path_string, path_string],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some())
+            })
+            .await
+            .unwrap_or(true);
+        if referenced {
+            continue;
+        }
         if let Err(error) = tokio::fs::remove_file(path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -585,10 +830,10 @@ async fn find_duplicate_media(
         .call(move |conn| {
             let sql = match hash_kind {
                 MediaHashKind::Original => {
-                    "SELECT id, stored_path, public_path, mime_type, media_kind, original_sha256, normalized_sha256 FROM media WHERE canonical_media_id IS NULL AND media_kind = ? AND original_sha256 = ? ORDER BY id ASC LIMIT 8"
+                    "SELECT id, stored_path, public_path, mime_type, media_kind, original_sha256, normalized_sha256, is_nsfw FROM media WHERE canonical_media_id IS NULL AND media_kind = ? AND original_sha256 = ? ORDER BY id ASC LIMIT 8"
                 }
                 MediaHashKind::Normalized => {
-                    "SELECT id, stored_path, public_path, mime_type, media_kind, original_sha256, normalized_sha256 FROM media WHERE canonical_media_id IS NULL AND media_kind = ? AND normalized_sha256 = ? ORDER BY id ASC LIMIT 8"
+                    "SELECT id, stored_path, public_path, mime_type, media_kind, original_sha256, normalized_sha256, is_nsfw FROM media WHERE canonical_media_id IS NULL AND media_kind = ? AND normalized_sha256 = ? ORDER BY id ASC LIMIT 8"
                 }
             };
             let mut stmt = conn.prepare(sql)?;
@@ -602,6 +847,7 @@ async fn find_duplicate_media(
                         media_kind: row.get(4)?,
                         original_sha256: row.get(5)?,
                         normalized_sha256: row.get(6)?,
+                        is_nsfw: row.get::<_, i64>(7)? != 0,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -755,14 +1001,36 @@ fn mime_matches_kind(mime_type: &str, media_kind: MediaKind) -> bool {
 }
 
 async fn hash_file(path: &Path) -> anyhow::Result<String> {
-    let data = tokio::fs::read(path).await?;
-    Ok(sha256_hex(&data))
+    use tokio::io::AsyncReadExt as _;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buffer = vec![0_u8; MEDIA_SNIFF_PREFIX_BYTES];
+    let mut hasher = Sha256::new();
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_lower(hasher.finalize().as_ref()))
 }
 
+#[cfg(test)]
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hex_lower(hasher.finalize().as_ref())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn stable_media_basename(original_filename: &str, original_sha256: &str) -> String {
@@ -806,17 +1074,35 @@ fn stable_media_basename(original_filename: &str, original_sha256: &str) -> Stri
     format!("{}-{}", sanitized, &original_sha256[..prefix_len])
 }
 
+/// Picks an unused output path and claims it atomically.
+///
+/// Concurrent uploads of identical bytes derive the same basename, so a plain
+/// `exists()` check would let two conversions target the same file. Creating
+/// the file with `create_new` claims the name at the filesystem level; callers
+/// overwrite or rename over the claimed (empty) file.
 fn unique_media_path(dir: &Path, basename: &str, extension: &str) -> PathBuf {
-    let path = dir.join(format!("{basename}.{extension}"));
-    if !path.exists() {
-        return path;
-    }
-    dir.join(format!(
+    let fallback = dir.join(format!(
         "{}-{}.{}",
         basename,
         Uuid::new_v4().simple(),
         extension
-    ))
+    ));
+    let candidates = std::iter::once(dir.join(format!("{basename}.{extension}")))
+        .chain(std::iter::once(fallback.clone()));
+    for candidate in candidates {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_claim) => return candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // The directory may be missing or read-only; return the intended
+            // path so the caller surfaces the real I/O error.
+            Err(_error) => return candidate,
+        }
+    }
+    fallback
 }
 
 fn public_upload_path(paths: &RuntimePaths, path: &Path) -> anyhow::Result<String> {
@@ -846,6 +1132,7 @@ fn has_parent_component(path: &Path) -> bool {
 
 pub async fn set_profile_media(
     pool: &SqlitePool,
+    paths: &RuntimePaths,
     user_id: i64,
     slot: ProfileMediaSlot,
     media_id: i64,
@@ -862,13 +1149,16 @@ pub async fn set_profile_media(
         })
         .await?;
     if media_kind.as_deref() != Some("image") {
-        delete_media(pool, media_id).await?;
+        delete_media(pool, paths, media_id).await?;
         anyhow::bail!("profile media must be an image");
     }
     let select_sql = format!("SELECT {} FROM users WHERE id = ?", slot.column());
     let previous: Option<i64> = pool
         .call(move |conn| Ok(conn.query_row(&select_sql, [user_id], |row| row.get(0))?))
         .await?;
+    if let Some(previous) = previous.filter(|previous| *previous != media_id) {
+        validate_media_deletion_paths(pool, paths, previous).await?;
+    }
     let update_sql = format!(
         "UPDATE users SET {} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         slot.column()
@@ -879,13 +1169,14 @@ pub async fn set_profile_media(
     })
     .await?;
     if let Some(previous) = previous.filter(|previous| *previous != media_id) {
-        delete_media(pool, previous).await?;
+        delete_media(pool, paths, previous).await?;
     }
     Ok(())
 }
 
 pub async fn clear_profile_media(
     pool: &SqlitePool,
+    paths: &RuntimePaths,
     user_id: i64,
     slot: ProfileMediaSlot,
 ) -> anyhow::Result<()> {
@@ -893,6 +1184,9 @@ pub async fn clear_profile_media(
     let previous: Option<i64> = pool
         .call(move |conn| Ok(conn.query_row(&select_sql, [user_id], |row| row.get(0))?))
         .await?;
+    if let Some(previous) = previous {
+        validate_media_deletion_paths(pool, paths, previous).await?;
+    }
     let update_sql = format!(
         "UPDATE users SET {} = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         slot.column()
@@ -903,15 +1197,35 @@ pub async fn clear_profile_media(
     })
     .await?;
     if let Some(previous) = previous {
-        delete_media(pool, previous).await?;
+        delete_media(pool, paths, previous).await?;
     }
     Ok(())
 }
 
-pub async fn delete_media(pool: &SqlitePool, media_id: i64) -> anyhow::Result<()> {
+pub async fn delete_media(
+    pool: &SqlitePool,
+    paths: &RuntimePaths,
+    media_id: i64,
+) -> anyhow::Result<()> {
+    validate_media_deletion_paths(pool, paths, media_id).await?;
     let paths_to_remove = pool
         .call(move |conn| {
             let tx = conn.transaction()?;
+            let referenced: bool = tx.query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM post_media WHERE media_id = ?
+                    UNION ALL
+                    SELECT 1 FROM users
+                    WHERE profile_picture_media_id = ? OR banner_media_id = ?
+                )
+                "#,
+                params![media_id, media_id, media_id],
+                |row| row.get(0),
+            )?;
+            if referenced {
+                anyhow::bail!("media is still referenced by a post or profile");
+            }
             let media_paths: Option<(Option<String>, String, Option<String>)> = tx
                 .query_row(
                     "SELECT original_path, stored_path, thumbnail_path FROM media WHERE id = ?",
@@ -957,6 +1271,178 @@ pub async fn delete_media(pool: &SqlitePool, media_id: i64) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+async fn validate_media_deletion_paths(
+    pool: &SqlitePool,
+    paths: &RuntimePaths,
+    media_id: i64,
+) -> anyhow::Result<()> {
+    let media_paths: Option<(Option<String>, String, Option<String>)> = pool
+        .call(move |conn| {
+            conn.query_row(
+                "SELECT original_path, stored_path, thumbnail_path FROM media WHERE id = ?",
+                [media_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?;
+    let Some((original_path, stored_path, thumbnail_path)) = media_paths else {
+        return Ok(());
+    };
+    for path in [original_path, Some(stored_path), thumbnail_path]
+        .into_iter()
+        .flatten()
+        .filter(|path| !path.is_empty())
+    {
+        validate_media_deletion_path(paths, Path::new(&path)).await?;
+    }
+    Ok(())
+}
+
+async fn validate_media_deletion_path(paths: &RuntimePaths, path: &Path) -> anyhow::Result<()> {
+    if !path.is_absolute() || has_parent_component(path) {
+        anyhow::bail!("refusing to delete unsafe media path {}", path.display());
+    }
+    let allowed_roots = [
+        &paths.uploads_originals,
+        &paths.uploads_images,
+        &paths.uploads_videos,
+        &paths.uploads_thumbs,
+    ];
+    let Some(root) = allowed_roots
+        .into_iter()
+        .find(|root| path.starts_with(root))
+    else {
+        anyhow::bail!(
+            "refusing to delete media path outside upload directories: {}",
+            path.display()
+        );
+    };
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("refusing to delete non-file media path {}", path.display());
+    }
+    let canonical_root = tokio::fs::canonicalize(root).await?;
+    let canonical_path = tokio::fs::canonicalize(path).await?;
+    if !canonical_path.starts_with(canonical_root) {
+        anyhow::bail!(
+            "refusing to delete media path outside upload directories: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+pub async fn delete_post_media(
+    pool: &SqlitePool,
+    paths: &RuntimePaths,
+    post_id: i64,
+) -> anyhow::Result<()> {
+    let media_ids = post_media_ids(pool, post_id).await?;
+    for media_id in &media_ids {
+        validate_media_deletion_paths(pool, paths, *media_id).await?;
+    }
+    let paths_to_remove = pool
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM post_media WHERE post_id = ?", [post_id])?;
+            let mut paths = BTreeSet::new();
+            for media_id in media_ids {
+                let referenced: bool = tx.query_row(
+                    r#"
+                    SELECT EXISTS(
+                        SELECT 1 FROM post_media WHERE media_id = ?
+                        UNION ALL
+                        SELECT 1 FROM users
+                        WHERE profile_picture_media_id = ? OR banner_media_id = ?
+                    )
+                    "#,
+                    params![media_id, media_id, media_id],
+                    |row| row.get(0),
+                )?;
+                if referenced {
+                    continue;
+                }
+                let media_paths: Option<(Option<String>, String, Option<String>)> = tx
+                    .query_row(
+                        "SELECT original_path, stored_path, thumbnail_path FROM media WHERE id = ?",
+                        [media_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                let Some((original_path, stored_path, thumbnail_path)) = media_paths else {
+                    continue;
+                };
+                promote_canonical_references(&tx, media_id)?;
+                tx.execute("DELETE FROM media_jobs WHERE media_id = ?", [media_id])?;
+                tx.execute("DELETE FROM media WHERE id = ?", [media_id])?;
+                for path in [original_path, Some(stored_path), thumbnail_path]
+                    .into_iter()
+                    .flatten()
+                    .filter(|path| !path.is_empty())
+                {
+                    let remaining: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM media WHERE original_path = ? OR stored_path = ? OR thumbnail_path = ?",
+                        params![path, path, path],
+                        |row| row.get(0),
+                    )?;
+                    if remaining == 0 {
+                        paths.insert(PathBuf::from(path));
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(paths.into_iter().collect::<Vec<_>>())
+        })
+        .await?;
+    remove_media_files(paths_to_remove, post_id, "post media cleanup").await;
+    Ok(())
+}
+
+pub async fn validate_post_media_deletion(
+    pool: &SqlitePool,
+    paths: &RuntimePaths,
+    post_id: i64,
+) -> anyhow::Result<()> {
+    for media_id in post_media_ids(pool, post_id).await? {
+        validate_media_deletion_paths(pool, paths, media_id).await?;
+    }
+    Ok(())
+}
+
+async fn post_media_ids(pool: &SqlitePool, post_id: i64) -> anyhow::Result<Vec<i64>> {
+    pool.call(move |conn| {
+        let mut stmt =
+            conn.prepare("SELECT media_id FROM post_media WHERE post_id = ? ORDER BY position")?;
+        let ids = stmt
+            .query_map([post_id], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        Ok(ids)
+    })
+    .await
+}
+
+async fn remove_media_files(paths: Vec<PathBuf>, subject_id: i64, operation: &'static str) {
+    for path in paths {
+        if let Err(error) = tokio::fs::remove_file(&path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                subject_id,
+                path = %path.display(),
+                error = %error,
+                operation,
+                "failed to remove unreferenced media file"
+            );
+        }
+    }
 }
 
 fn promote_canonical_references(
@@ -1065,6 +1551,7 @@ async fn convert_or_original(
                         };
                     }
                     Err(err) => {
+                        remove_partial_conversion(&out).await;
                         return original_fallback(
                             original,
                             paths,
@@ -1090,6 +1577,7 @@ async fn convert_or_original(
                         };
                     }
                     Err(err) => {
+                        remove_partial_conversion(&out).await;
                         return original_fallback(
                             original,
                             paths,
@@ -1105,6 +1593,20 @@ async fn convert_or_original(
         }
     }
     original_fallback(original, paths, media_kind, original_mime, "original", "")
+}
+
+/// Removes a partially written conversion output after an ffmpeg failure or
+/// timeout. Missing files are fine.
+async fn remove_partial_conversion(path: &Path) {
+    if let Err(error) = tokio::fs::remove_file(path).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "failed to remove partial media conversion output"
+        );
+    }
 }
 
 fn original_fallback(
@@ -1184,12 +1686,133 @@ mod tests {
     }
 
     #[test]
+    fn image_dimension_probe_reads_headers() {
+        let png = tiny_png_bytes();
+        assert_eq!(image_dimensions(&png), Some((1, 1)));
+
+        let mut oversized = png;
+        oversized[16..20].copy_from_slice(&40_000_u32.to_be_bytes());
+        oversized[20..24].copy_from_slice(&40_000_u32.to_be_bytes());
+        let (width, height) = image_dimensions(&oversized).expect("png dimensions");
+        assert_eq!((width, height), (40_000, 40_000));
+        assert!(u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS);
+
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&640u16.to_le_bytes());
+        gif.extend_from_slice(&480u16.to_le_bytes());
+        gif.extend_from_slice(&[0; 8]);
+        assert_eq!(image_dimensions(&gif), Some((640, 480)));
+
+        assert_eq!(image_dimensions(b"not an image"), None);
+        assert_eq!(image_dimensions(&[0xFF, 0xD8]), None);
+    }
+
+    #[test]
     fn size_limits() {
         let settings = Settings::default();
         assert!(classify(&settings, "image/png", settings.media.max_image_size).is_ok());
         assert!(classify(&settings, "image/png", settings.media.max_image_size + 1).is_err());
         assert!(classify(&settings, "video/mp4", settings.media.max_video_size).is_ok());
         assert!(classify(&settings, "video/mp4", settings.media.max_video_size + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_malformed_upload_removes_staging_file() {
+        let (_temp, paths, pool, settings, ffmpeg, user_id) = media_fixture().await;
+        let bytes = b"not a supported media file";
+        let staging = paths.staged_upload_path(&Uuid::new_v4().simple().to_string());
+        tokio::fs::write(&staging, bytes).await.expect("staging");
+        let context = UploadContext {
+            pool: &pool,
+            settings: &settings,
+            paths: &paths,
+            ffmpeg: &ffmpeg,
+        };
+
+        let error = save_staged_upload(
+            &context,
+            StagedUpload {
+                owner_user_id: Some(user_id),
+                original_filename: "malformed.png".to_owned(),
+                staging: StagedUploadGuard::new(staging.clone()),
+                bytes: u64::try_from(bytes.len()).expect("byte len"),
+            },
+            None,
+        )
+        .await
+        .expect_err("malformed upload must be rejected");
+
+        assert!(error.to_string().contains("unsupported media type"));
+        assert!(!staging.exists());
+        assert_eq!(media_count(&pool).await, 0);
+        assert_tmp_uploads_empty(&paths).await;
+    }
+
+    #[tokio::test]
+    async fn rejected_oversize_image_removes_staging_file() {
+        let (_temp, paths, pool, mut settings, ffmpeg, user_id) = media_fixture().await;
+        let bytes = tiny_png_bytes();
+        settings.media.max_image_size =
+            u64::try_from(bytes.len().saturating_sub(1)).expect("image size");
+        let staging = paths.staged_upload_path(&Uuid::new_v4().simple().to_string());
+        tokio::fs::write(&staging, &bytes).await.expect("staging");
+        let context = UploadContext {
+            pool: &pool,
+            settings: &settings,
+            paths: &paths,
+            ffmpeg: &ffmpeg,
+        };
+
+        let error = save_staged_upload(
+            &context,
+            StagedUpload {
+                owner_user_id: Some(user_id),
+                original_filename: "large.png".to_owned(),
+                staging: StagedUploadGuard::new(staging.clone()),
+                bytes: u64::try_from(bytes.len()).expect("byte len"),
+            },
+            None,
+        )
+        .await
+        .expect_err("oversize image must be rejected");
+
+        assert!(error.to_string().contains("image exceeds maximum size"));
+        assert!(!staging.exists());
+        assert_eq!(media_count(&pool).await, 0);
+        assert_tmp_uploads_empty(&paths).await;
+    }
+
+    #[test]
+    fn staged_upload_guard_drop_removes_armed_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("upload.tmp");
+        std::fs::write(&staging, b"partial upload").expect("staging");
+
+        {
+            let _guard = StagedUploadGuard::new(staging.clone());
+        }
+
+        assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn successful_upload_disarms_guard_and_keeps_durable_media() {
+        let (_temp, paths, pool, settings, ffmpeg, user_id) = media_fixture().await;
+
+        let media_id = save_test_upload(
+            &pool,
+            &settings,
+            &paths,
+            &ffmpeg,
+            user_id,
+            "Photo.PNG",
+            &tiny_png_bytes(),
+        )
+        .await;
+
+        let row = media_row(&pool, media_id).await;
+        assert!(Path::new(&row.stored_path).exists());
+        assert_tmp_uploads_empty(&paths).await;
     }
 
     #[tokio::test]
@@ -1407,9 +2030,13 @@ mod tests {
         .await;
         let second = insert_duplicate_row(&pool, user_id, first, &shared).await;
 
-        delete_media(&pool, second).await.expect("delete duplicate");
+        delete_media(&pool, &paths, second)
+            .await
+            .expect("delete duplicate");
         assert!(shared.exists());
-        delete_media(&pool, first).await.expect("delete canonical");
+        delete_media(&pool, &paths, first)
+            .await
+            .expect("delete canonical");
         assert!(!shared.exists());
     }
 
@@ -1434,7 +2061,9 @@ mod tests {
         .await;
         let second = insert_duplicate_row(&pool, user_id, first, &shared).await;
 
-        delete_media(&pool, first).await.expect("delete canonical");
+        delete_media(&pool, &paths, first)
+            .await
+            .expect("delete canonical");
 
         assert!(shared.exists());
         let promoted = media_row(&pool, second).await;
@@ -1588,7 +2217,9 @@ mod tests {
     #[tokio::test]
     async fn profile_media_replacement_deletes_previous_file() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
+        let paths = RuntimePaths::from_data_dir(temp.path().join("data"));
+        paths.ensure().expect("paths");
+        let pool = crate::db::connect(&paths.database_path)
             .await
             .expect("connect");
         crate::db::migrate(&pool).await.expect("migrate");
@@ -1597,9 +2228,9 @@ mod tests {
             crate::auth::register_user(&pool, &settings, "alice", "very secure password", false)
                 .await
                 .expect("user");
-        let first = temp.path().join("first.webp");
-        let first_thumb = temp.path().join("first-thumb.webp");
-        let second = temp.path().join("second.webp");
+        let first = paths.uploads_images.join("first.webp");
+        let first_thumb = paths.uploads_thumbs.join("first-thumb.webp");
+        let second = paths.uploads_images.join("second.webp");
         tokio::fs::write(&first, b"first").await.expect("first");
         tokio::fs::write(&first_thumb, b"first-thumb")
             .await
@@ -1609,10 +2240,10 @@ mod tests {
         let second_id = insert_test_media(&pool, user_id, &second, "image").await;
         set_test_thumbnail(&pool, first_id, &first_thumb).await;
 
-        set_profile_media(&pool, user_id, ProfileMediaSlot::Picture, first_id)
+        set_profile_media(&pool, &paths, user_id, ProfileMediaSlot::Picture, first_id)
             .await
             .expect("set first");
-        set_profile_media(&pool, user_id, ProfileMediaSlot::Picture, second_id)
+        set_profile_media(&pool, &paths, user_id, ProfileMediaSlot::Picture, second_id)
             .await
             .expect("set second");
 
@@ -1624,7 +2255,9 @@ mod tests {
     #[tokio::test]
     async fn profile_media_rejects_non_image_and_removes_upload() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
+        let paths = RuntimePaths::from_data_dir(temp.path().join("data"));
+        paths.ensure().expect("paths");
+        let pool = crate::db::connect(&paths.database_path)
             .await
             .expect("connect");
         crate::db::migrate(&pool).await.expect("migrate");
@@ -1633,16 +2266,89 @@ mod tests {
             crate::auth::register_user(&pool, &settings, "alice", "very secure password", false)
                 .await
                 .expect("user");
-        let video = temp.path().join("video.webm");
+        let video = paths.uploads_videos.join("video.webm");
         tokio::fs::write(&video, b"video").await.expect("video");
         let media_id = insert_test_media(&pool, user_id, &video, "video").await;
 
         assert!(
-            set_profile_media(&pool, user_id, ProfileMediaSlot::Picture, media_id)
+            set_profile_media(&pool, &paths, user_id, ProfileMediaSlot::Picture, media_id)
                 .await
                 .is_err()
         );
         assert!(!video.exists());
+    }
+
+    #[tokio::test]
+    async fn media_deletion_rejects_restored_paths_outside_upload_directories() {
+        let (temp, paths, pool, _settings, _ffmpeg, user_id) = media_fixture().await;
+        let outside = temp.path().join("outside.webp");
+        tokio::fs::write(&outside, b"private")
+            .await
+            .expect("outside");
+        let media_id = insert_test_media(&pool, user_id, &outside, "image").await;
+
+        let error = delete_media(&pool, &paths, media_id)
+            .await
+            .expect_err("outside path must be rejected");
+
+        assert!(error.to_string().contains("outside upload directories"));
+        assert!(outside.exists());
+        let row_exists: bool = pool
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM media WHERE id = ?)",
+                    [media_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("media row");
+        assert!(row_exists);
+    }
+
+    #[tokio::test]
+    async fn deleted_post_media_is_removed_only_after_its_last_reference() {
+        let (_temp, paths, pool, _settings, _ffmpeg, user_id) = media_fixture().await;
+        let stored = paths.uploads_images.join("post.webp");
+        tokio::fs::write(&stored, b"post")
+            .await
+            .expect("post media");
+        let media_id = insert_test_media(&pool, user_id, &stored, "image").await;
+        let (first_post, second_post) = pool
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO posts (user_id, text) VALUES (?, 'first')",
+                    [user_id],
+                )?;
+                let first = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO posts (user_id, text) VALUES (?, 'second')",
+                    [user_id],
+                )?;
+                let second = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO post_media (post_id, media_id, position) VALUES (?, ?, 0)",
+                    params![first, media_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO post_media (post_id, media_id, position) VALUES (?, ?, 0)",
+                    params![second, media_id],
+                )?;
+                Ok((first, second))
+            })
+            .await
+            .expect("posts");
+
+        delete_post_media(&pool, &paths, first_post)
+            .await
+            .expect("first cleanup");
+        assert!(stored.exists());
+
+        delete_post_media(&pool, &paths, second_post)
+            .await
+            .expect("second cleanup");
+        assert!(!stored.exists());
     }
 
     #[cfg(unix)]
@@ -1803,7 +2509,7 @@ mod tests {
             StagedUpload {
                 owner_user_id: Some(user_id),
                 original_filename: filename.to_owned(),
-                staging,
+                staging: StagedUploadGuard::new(staging),
                 bytes: u64::try_from(bytes.len()).expect("byte len"),
             },
             None,
@@ -1835,6 +2541,23 @@ mod tests {
         })
         .await
         .expect("media row")
+    }
+
+    async fn media_count(pool: &SqlitePool) -> i64 {
+        pool.call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?))
+            .await
+            .expect("media count")
+    }
+
+    async fn assert_tmp_uploads_empty(paths: &RuntimePaths) {
+        let mut entries = tokio::fs::read_dir(&paths.tmp_uploads)
+            .await
+            .expect("tmp uploads dir");
+        let mut leftovers = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("tmp upload entry") {
+            leftovers.push(entry.path());
+        }
+        assert!(leftovers.is_empty(), "leftover tmp uploads: {leftovers:?}");
     }
 
     struct TestCanonicalMedia<'a> {

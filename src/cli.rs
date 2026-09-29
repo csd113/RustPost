@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Command as ProcessCommand;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -13,6 +14,8 @@ use crate::{admin, backup, config, db, demo_seed, logging, runtime, server, term
 
 #[derive(Debug, Parser)]
 #[command(
+    name = "rustpost-cli",
+    version,
     about = "Single-binary self-hosted microblog",
     after_help = "Common first run:\n  rustpost-cli init\n  rustpost-cli create-admin-interactive\n  rustpost-cli serve"
 )]
@@ -81,10 +84,6 @@ enum Command {
         include_tor_keys: bool,
     },
 
-    /// Print only the configured onion address when one is available.
-    #[command(about = "Print the onion address when one is available")]
-    PrintOnionAddress,
-
     /// Start the `RustPost` web server.
     #[command(about = "Start the RustPost web server")]
     Serve,
@@ -103,6 +102,9 @@ pub async fn run() -> anyhow::Result<()> {
     paths = paths
         .with_tor_data_dir(&settings.tor.data_dir)
         .with_backup_dir(&settings.backup.backup_dir);
+    // Keep backup and restore pointed at the settings file the operator
+    // actually loaded, including an explicit --config path.
+    paths.settings_path.clone_from(&settings_path);
     paths.ensure()?;
     info!(data_dir = %paths.data_dir.display(), settings = %settings_path.display(), "runtime paths ready");
 
@@ -170,14 +172,6 @@ async fn run_command(
             archive,
             include_tor_keys,
         } => restore_command(&paths, &archive, include_tor_keys),
-        Command::PrintOnionAddress => {
-            let status = tor::validate_startup(&settings.tor);
-            stdout_line(format_args!(
-                "{}",
-                status.onion_address().unwrap_or_default()
-            ))?;
-            Ok(())
-        }
         Command::Serve => serve(paths, settings_path, settings).await,
     }
 }
@@ -347,10 +341,17 @@ async fn serve(
         },
     )
     .await?;
-    let state = server::AppState::new(pool, settings.clone(), paths.clone(), ffmpeg, tor_status);
+    let state = server::AppState::new(
+        pool.clone(),
+        settings.clone(),
+        paths.clone(),
+        ffmpeg,
+        tor_status,
+    );
     let app = server::router(state);
     let shutdown_rx = shutdown_receiver();
     backup::spawn_automatic_scheduler(paths.clone(), settings_path, shutdown_rx.clone());
+    server::spawn_maintenance_scheduler(pool, paths.clone(), shutdown_rx.clone());
 
     if settings.tor.tor_only {
         return serve_tor_only(onion_listener, app, shutdown_rx).await;
@@ -522,6 +523,7 @@ fn spawn_onion_forwarding(
         if !started.running() {
             return;
         }
+        spawn_tor_status_sync(tor_status.clone(), started, shutdown_rx.clone());
         let addr = match listener.local_addr() {
             Ok(addr) => addr,
             Err(error) => {
@@ -538,6 +540,27 @@ fn spawn_onion_forwarding(
         .await
         {
             warn!(error = %error, "Tor onion forwarding listener failed");
+        }
+    });
+}
+
+fn spawn_tor_status_sync(
+    visible: tor::TorStatus,
+    running: tor::TorStatus,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    visible.replace_snapshot_with(&running);
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
         }
     });
 }

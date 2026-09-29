@@ -84,7 +84,7 @@ pub async fn convert_image_to_webp(
     output: &Path,
 ) -> anyhow::Result<String> {
     let args = image_webp_args(settings, input, output);
-    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_secs(120)).await?;
+    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_mins(2)).await?;
     if result.status.success() {
         Ok(stderr_summary(&result.stderr))
     } else {
@@ -99,7 +99,7 @@ pub async fn convert_image_to_webp_thumbnail(
     size: u16,
 ) -> anyhow::Result<String> {
     let args = image_webp_thumbnail_args(settings, input, output, size);
-    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_secs(120)).await?;
+    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_mins(2)).await?;
     if result.status.success() {
         Ok(stderr_summary(&result.stderr))
     } else {
@@ -113,7 +113,7 @@ pub async fn convert_video_to_webm(
     output: &Path,
 ) -> anyhow::Result<String> {
     let args = video_webm_args(settings, input, output);
-    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_secs(300)).await?;
+    let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_mins(5)).await?;
     if result.status.success() {
         Ok(stderr_summary(&result.stderr))
     } else {
@@ -290,12 +290,20 @@ mod tests {
 
     #[tokio::test]
     async fn ffmpeg_timeout_is_reported() {
-        let result = super::run_ffmpeg(
-            "sh",
-            &["-c".to_owned(), "sleep 2".to_owned()],
-            std::time::Duration::from_millis(50),
-        )
-        .await;
+        #[cfg(windows)]
+        let (program, args) = (
+            "powershell.exe",
+            vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                "Start-Sleep -Seconds 2".to_owned(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", vec!["-c".to_owned(), "sleep 2".to_owned()]);
+
+        let result = super::run_ffmpeg(program, &args, std::time::Duration::from_millis(50)).await;
         assert!(result.is_err());
         assert!(
             result

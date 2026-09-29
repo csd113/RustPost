@@ -10,6 +10,8 @@ pub enum AppError {
     #[error("forbidden")]
     Forbidden,
     #[error("{0}")]
+    PayloadTooLarge(String),
+    #[error("{0}")]
     RateLimited(String),
     #[error("not found")]
     NotFound,
@@ -32,6 +34,7 @@ impl IntoResponse for AppError {
                 "authentication required".to_owned(),
             ),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_owned()),
+            Self::PayloadTooLarge(message) => (StatusCode::PAYLOAD_TOO_LARGE, message),
             Self::RateLimited(message) => (StatusCode::TOO_MANY_REQUESTS, message),
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_owned()),
             Self::Io(_) | Self::Sqlite(_) | Self::Anyhow(_) => {

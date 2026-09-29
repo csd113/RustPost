@@ -27,7 +27,10 @@ use crate::errors::{AppError, AppResult};
 use crate::ffmpeg::FfmpegStatus;
 use crate::registration_captcha::RegistrationCaptchaStore;
 use crate::runtime::RuntimePaths;
-use crate::{account, admin, backup, csrf, favicon, media, rate_limit, render, social};
+use crate::{
+    account, admin, backup, csrf, favicon, identity, instance, media, portability, rate_limit,
+    render, social,
+};
 
 const CSRF_TOKEN_HISTORY_LIMIT: usize = 32;
 
@@ -39,6 +42,14 @@ pub struct AppState {
     pub ffmpeg: FfmpegStatus,
     pub tor: crate::tor::TorStatus,
     pub registration_captcha: RegistrationCaptchaStore,
+    /// Cached `media.nsfw_blur_enabled` so page rendering does not read and
+    /// parse `settings.toml` on every request. Updated when an admin saves
+    /// deep settings.
+    pub nsfw_blur_default: Arc<std::sync::atomic::AtomicBool>,
+    /// Set after an in-process restore swaps the runtime directories. The
+    /// running process still holds the previous `SQLite` connection, so writes
+    /// are refused until the operator restarts `RustPost`.
+    pub restart_required: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -50,6 +61,7 @@ impl AppState {
         ffmpeg: FfmpegStatus,
         tor: crate::tor::TorStatus,
     ) -> Arc<Self> {
+        let nsfw_blur_default = settings.media.nsfw_blur_enabled;
         Arc::new(Self {
             pool,
             settings,
@@ -57,12 +69,289 @@ impl AppState {
             ffmpeg,
             tor,
             registration_captcha: RegistrationCaptchaStore::default(),
+            nsfw_blur_default: Arc::new(std::sync::atomic::AtomicBool::new(nsfw_blur_default)),
+            restart_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 }
 
+/// Refuses state-changing requests after an in-process restore, because the
+/// running process would write them to the replaced (unlinked) database file.
+async fn restart_required_guard(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    use axum::http::Method;
+
+    if state
+        .restart_required
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        )
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(render::error_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "A backup was restored. Restart RustPost before making changes so your data is written to the restored database.",
+            )),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Paths that stay reachable while an account is restricted to a forced
+/// password change. Static assets, logout, the password form, account
+/// deletion, and data export must remain available.
+fn password_change_exempt(path: &str) -> bool {
+    if path.starts_with("/assets/") || path.starts_with("/uploads/") {
+        return true;
+    }
+    matches!(
+        path,
+        "/login"
+            | "/settings/password"
+            | "/logout"
+            | "/favicon.ico"
+            | "/local"
+            | "/settings/delete"
+            | "/settings/delete/confirm"
+            | "/settings/delete/cancel"
+            | "/settings/export"
+            | "/account-deleted"
+    )
+}
+
+/// State-changing paths still allowed while an account is pending deletion.
+/// Everything else is read-only until the deletion is cancelled.
+fn pending_deletion_exempt(path: &str) -> bool {
+    matches!(
+        path,
+        "/logout" | "/settings/password" | "/settings/delete/cancel" | "/settings/delete/confirm"
+    )
+}
+
+fn is_state_changing(method: &axum::http::Method) -> bool {
+    !matches!(
+        *method,
+        axum::http::Method::GET
+            | axum::http::Method::HEAD
+            | axum::http::Method::OPTIONS
+            | axum::http::Method::TRACE
+    )
+}
+
+/// Enforces forced-password-reset and pending-deletion restrictions for the
+/// authenticated viewer on every route, so a long-lived session cannot bypass
+/// either account state.
+async fn account_state_guard(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let guarded_path = request.uri().path();
+    if guarded_path.starts_with("/assets/")
+        || guarded_path.starts_with("/uploads/")
+        || guarded_path == "/favicon.ico"
+    {
+        return next.run(request).await;
+    }
+    if auth::session_cookie(request.headers()).is_none() {
+        return next.run(request).await;
+    }
+    let user = match auth::current_user(&state.pool, request.headers()).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return next.run(request).await,
+        Err(error) => {
+            // Fail closed: an authenticated request whose account state cannot
+            // be verified must not bypass forced password or deletion checks.
+            tracing::warn!(error = %error, "account state lookup failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Html(render::error_page(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Your account state could not be verified. Try again shortly.",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let path = request.uri().path();
+    if user.must_change_password && !password_change_exempt(path) {
+        return Redirect::to("/settings/password?required=1").into_response();
+    }
+    if user.deletion_scheduled_at.is_some()
+        && is_state_changing(request.method())
+        && !pending_deletion_exempt(path)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Html(render::error_page(
+                StatusCode::FORBIDDEN,
+                "This account is scheduled for deletion. Cancel the deletion in account settings to keep using it.",
+            )),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Central maintenance-mode policy for mutating routes.
+///
+/// Only routes that publish or rewrite public content are candidates. Reads,
+/// authentication, account/security operations, social graph actions, and the
+/// admin UI stay available while maintenance mode is on. Registration is
+/// blocked for everyone; publish routes are blocked for non-administrators so
+/// administrators can verify the instance and later disable maintenance.
+///
+/// Keep this table authoritative: any new route that publishes content
+/// (creates or rewrites posts/replies/quotes/reposts, or imports archives that
+/// publish posts) must be added here, with a matching table-driven test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintenancePolicy {
+    /// Always reachable.
+    Allowed,
+    /// Blocked for every request.
+    Blocked,
+    /// Blocked for anonymous users and non-administrators.
+    BlockedUnlessAdmin,
+}
+
+fn maintenance_policy(method: &axum::http::Method, path: &str) -> MaintenancePolicy {
+    if *method != axum::http::Method::POST {
+        return MaintenancePolicy::Allowed;
+    }
+    match path {
+        "/register" => MaintenancePolicy::Blocked,
+        "/posts" | "/settings/import" => MaintenancePolicy::BlockedUnlessAdmin,
+        _ if path.starts_with("/posts/")
+            && (path.ends_with("/quote")
+                || path.ends_with("/repost")
+                || path.ends_with("/edit")) =>
+        {
+            MaintenancePolicy::BlockedUnlessAdmin
+        }
+        _ => MaintenancePolicy::Allowed,
+    }
+}
+
+async fn maintenance_guard(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let policy = maintenance_policy(request.method(), request.uri().path());
+    if policy == MaintenancePolicy::Allowed {
+        return next.run(request).await;
+    }
+    let settings = match instance::load(&state.pool).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load instance settings; refusing state change");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Html(render::maintenance_page(
+                    &state.settings.site.name,
+                    instance::DEFAULT_MAINTENANCE_MESSAGE,
+                )),
+            )
+                .into_response();
+        }
+    };
+    if !settings.maintenance_mode {
+        return next.run(request).await;
+    }
+    if policy == MaintenancePolicy::BlockedUnlessAdmin
+        && let Ok(Some(user)) = auth::current_user(&state.pool, request.headers()).await
+        && user.is_admin
+    {
+        return next.run(request).await;
+    }
+    let notice = settings
+        .maintenance_notice()
+        .unwrap_or(instance::DEFAULT_MAINTENANCE_MESSAGE);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Html(render::maintenance_page(&state.settings.site.name, notice)),
+    )
+        .into_response()
+}
+
+/// Periodically prunes expired operational rows and abandoned temp files.
+///
+/// Startup performs an aggressive temp cleanup (nothing can be in flight yet);
+/// later cycles keep a grace period so active uploads are never removed.
+pub fn spawn_maintenance_scheduler(
+    pool: SqlitePool,
+    paths: RuntimePaths,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        // The longest configured rate-limit window is one hour; keep two hours.
+        const RATE_LIMIT_RETENTION_SECS: i64 = 2 * 60 * 60;
+        const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(30);
+        let mut first_cycle = true;
+        loop {
+            match crate::account::recover_pending_media_deletions(&paths).await {
+                Ok(0) => {}
+                Ok(recovered) => tracing::info!(
+                    recovered,
+                    "recovered interrupted account deletion media cleanup"
+                ),
+                Err(error) => {
+                    tracing::warn!(error = %error, "pending media deletion recovery failed");
+                }
+            }
+            let max_temp_age = if first_cycle {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_hours(1)
+            };
+            match paths.cleanup_stale_temp_files(max_temp_age) {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "removed stale upload staging files"),
+                Err(error) => tracing::warn!(error = %error, "temp file cleanup failed"),
+            }
+            if let Err(error) = crate::rate_limit::prune_old(&pool, RATE_LIMIT_RETENTION_SECS).await
+            {
+                tracing::warn!(error = %error, "rate limit event pruning failed");
+            }
+            match crate::auth::prune_stale_sessions(&pool, 7).await {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "removed stale sessions"),
+                Err(error) => tracing::warn!(error = %error, "session pruning failed"),
+            }
+            match crate::account::finalize_due_deletions(&pool, &paths).await {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "finalized scheduled account deletions"),
+                Err(error) => {
+                    tracing::warn!(error = %error, "scheduled account deletion finalization failed");
+                }
+            }
+            first_cycle = false;
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(MAINTENANCE_INTERVAL) => {}
+            }
+        }
+    });
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the route table is one flat registration list, matching the original layout"
+)]
 pub fn router(state: Arc<AppState>) -> Router {
     let upload_body_limit = upload_body_limit(&state.settings);
+    let import_body_limit = import_upload_body_limit(&state.settings);
     Router::new()
         .route("/", get(home))
         .route("/assets/rustpost-boot.js", get(client_boot_script))
@@ -88,7 +377,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/users/{username}/followers", get(profile_followers))
         .route("/users/{username}/following", get(profile_following))
         .route("/users/{id}/follow", post(follow))
+        .route("/users/{id}/follow/approve", post(approve_follow_request))
+        .route("/users/{id}/follow/reject", post(reject_follow_request))
+        .route("/users/{id}/follow/cancel", post(cancel_follow_request))
         .route("/users/{id}/unfollow", post(unfollow))
+        .route("/follow-requests", get(follow_requests))
         .route("/users/{id}/block", post(block))
         .route("/users/{id}/unblock", post(unblock))
         .route("/users/{id}/mute", post(mute))
@@ -96,7 +389,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/settings", get(settings_form).post(settings_update))
         .route("/settings/muted-words", post(add_muted_word))
         .route("/settings/muted-words/{id}/remove", post(remove_muted_word))
-        .route("/settings/password", post(change_password))
+        .route(
+            "/settings/password",
+            get(password_change_page).post(change_password),
+        )
+        .route("/settings/username", post(change_username))
+        .route("/settings/export", get(export_account))
+        .route(
+            "/settings/import",
+            get(import_account_form)
+                .post(import_account)
+                .layer(DefaultBodyLimit::max(import_body_limit)),
+        )
+        .route("/settings/delete/cancel", post(cancel_deletion))
         .route("/settings/delete", get(delete_account_warning))
         .route(
             "/settings/delete/confirm",
@@ -114,6 +419,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin", get(admin_dashboard))
         .route("/admin/users", get(admin_users))
         .route("/admin/users/{id}/suspend", post(admin_suspend))
+        .route(
+            "/admin/users/{id}/require-password-reset",
+            post(admin_require_password_reset),
+        )
+        .route(
+            "/admin/users/{id}/revoke-sessions",
+            post(admin_revoke_sessions),
+        )
+        .route("/admin/announcement", post(admin_update_announcement))
+        .route("/admin/maintenance", post(admin_update_maintenance))
         .route("/admin/posts/{id}/delete", post(admin_delete_post))
         .route("/admin/posts/{id}/nsfw", post(admin_toggle_post_nsfw))
         .route("/admin/health", get(admin_health))
@@ -152,6 +467,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             ServeDir::new(state.paths.uploads_thumbs.clone()),
         )
         .layer(DefaultBodyLimit::max(upload_body_limit))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            account_state_guard,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            maintenance_guard,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            restart_required_guard,
+        ))
         .layer(middleware::from_fn(
             crate::compression::response_compression,
         ))
@@ -160,11 +487,51 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 fn upload_body_limit(settings: &Settings) -> usize {
-    let limit = settings.media.max_video_size.saturating_add(1024 * 1024);
+    let limit = upload_payload_limit(settings).saturating_add(1024 * 1024);
     match usize::try_from(limit) {
         Ok(limit) => limit,
         Err(_overflow) => usize::MAX,
     }
+}
+
+/// Body limit for `POST /settings/import`. The configured compressed archive
+/// ceiling plus a small multipart/framing allowance so an oversized archive is
+/// rejected by the streaming handler with a clear 413 page instead of a
+/// transport-level body limit failure. The global media body limit stays
+/// independent of archive imports.
+fn import_upload_body_limit(settings: &Settings) -> usize {
+    const MULTIPART_SLACK_BYTES: u64 = 1024 * 1024;
+    let limit = settings
+        .accounts
+        .max_archive_upload_bytes
+        .saturating_add(MULTIPART_SLACK_BYTES);
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+fn upload_payload_limit(settings: &Settings) -> u64 {
+    let max_media = settings.posts.max_media_per_post;
+    if settings.media.max_video_size >= settings.media.max_image_size {
+        let videos = settings.posts.max_videos_per_post.min(max_media);
+        let images = settings
+            .posts
+            .max_images_per_post
+            .min(max_media.saturating_sub(videos));
+        return attachment_bytes(videos, settings.media.max_video_size)
+            .saturating_add(attachment_bytes(images, settings.media.max_image_size));
+    }
+    let images = settings.posts.max_images_per_post.min(max_media);
+    let videos = settings
+        .posts
+        .max_videos_per_post
+        .min(max_media.saturating_sub(images));
+    attachment_bytes(images, settings.media.max_image_size)
+        .saturating_add(attachment_bytes(videos, settings.media.max_video_size))
+}
+
+fn attachment_bytes(count: usize, max_size: u64) -> u64 {
+    u64::try_from(count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(max_size)
 }
 
 async fn client_script() -> Response {
@@ -255,6 +622,11 @@ struct ProfileQuery {
 }
 
 #[derive(Deserialize)]
+struct AccountListQuery {
+    after: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct MentionSuggestionsQuery {
     q: Option<String>,
 }
@@ -274,6 +646,7 @@ struct AdminUsersQuery {
 #[derive(Deserialize)]
 struct SettingsQuery {
     saved: Option<String>,
+    required: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -314,6 +687,7 @@ struct ParsedProfileUpdate {
     delete_banner: bool,
     nsfw_blur_enabled: bool,
     liked_posts_public: bool,
+    follow_approval_required: bool,
     profile_picture_media_id: Option<i64>,
     banner_media_id: Option<i64>,
 }
@@ -369,6 +743,8 @@ struct FollowActionResponse {
     kind: &'static str,
     user_id: i64,
     following: bool,
+    /// A pending follow request exists (button shows "Requested").
+    requested: bool,
     followers: i64,
     following_count: i64,
     action: String,
@@ -407,7 +783,9 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
     let user = current(&state, &headers).await?;
     let posts = social::timeline(&state.pool, user.as_ref().map(|u| u.id), "local", None).await?;
     let csrf = form_csrf(&state, &headers).await;
-    let composer = if user.is_some() || state.settings.accounts.anonymous_mode_enabled {
+    let composer = if (user.is_some() || state.settings.accounts.anonymous_mode_enabled)
+        && posting_enabled_for(&state, user.as_ref()).await?
+    {
         render::composer(csrf.as_deref(), None, state.settings.posts.max_text_chars)
     } else {
         String::new()
@@ -433,24 +811,34 @@ async fn layout_context(
     state: &AppState,
     user: Option<&CurrentUser>,
 ) -> AppResult<render::LayoutContext> {
-    let (counts, notification_unread_count) = if let Some(user) = user {
+    let (counts, notification_unread_count, pending_follow_requests) = if let Some(user) = user {
         (
             Some(social::follow_counts(&state.pool, user.id).await?),
             Some(social::unread_notification_count(&state.pool, user.id).await?),
+            Some(social::pending_follow_request_count(&state.pool, user.id).await?),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
+    let instance = instance::load(&state.pool).await.unwrap_or_else(|error| {
+        tracing::warn!(error = %error, "failed to load instance settings");
+        instance::InstanceSettings::default()
+    });
     Ok(render::LayoutContext {
         anonymous_mode_enabled: state.settings.accounts.anonymous_mode_enabled,
-        tor_onion_address: state.tor.onion_address().or_else(|| {
-            (!state.settings.tor.display_onion_address.is_empty())
-                .then(|| state.settings.tor.display_onion_address.clone())
-        }),
+        tor_onion_address: state.tor.onion_address(),
         follower_count: counts.map(|(followers, _following)| followers),
         following_count: counts.map(|(_followers, following)| following),
         notification_unread_count,
         favicon_content_type: favicon::current(&state.paths).content_type(),
+        announcement: instance.announcement_text().map(ToOwned::to_owned),
+        maintenance_notice: instance.maintenance_notice().map(ToOwned::to_owned),
+        account_notice: user.and_then(|user| {
+            user.deletion_scheduled_at
+                .as_ref()
+                .map(|deadline| format!("This account is scheduled for deletion on {deadline}."))
+        }),
+        pending_follow_requests,
     })
 }
 
@@ -472,11 +860,17 @@ async fn page_layout(
     ))
 }
 
+/// Whether the viewer may publish content right now. Maintenance mode blocks
+/// posting for everyone except administrators.
+async fn posting_enabled_for(state: &AppState, user: Option<&CurrentUser>) -> AppResult<bool> {
+    let instance = instance::load(&state.pool).await?;
+    Ok(!instance.maintenance_mode || user.is_some_and(|user| user.is_admin))
+}
+
 fn blur_nsfw_media(state: &AppState, user: Option<&CurrentUser>) -> bool {
-    let global_blur = Settings::load(&state.paths.settings_path)
-        .map_or(state.settings.media.nsfw_blur_enabled, |settings| {
-            settings.media.nsfw_blur_enabled
-        });
+    let global_blur = state
+        .nsfw_blur_default
+        .load(std::sync::atomic::Ordering::Relaxed);
     global_blur && user.is_none_or(|user| user.nsfw_blur_enabled)
 }
 
@@ -496,8 +890,10 @@ async fn login_form(State(state): State<Arc<AppState>>) -> Html<String> {
 async fn login(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Form(form): Form<AuthForm>,
 ) -> AppResult<Response> {
+    reject_cross_site_form_post(&headers)?;
     let actor = ip_actor(addr);
     rate_limit::ensure_under_limit(
         &state.pool,
@@ -508,10 +904,6 @@ async fn login(
     )
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
-    if let Err(err) = crate::validation::validate_password(&form.password, &state.settings) {
-        rate_limit::record(&state.pool, rate_limit::Scope::FailedLogin, &actor).await?;
-        return auth_form_response(&state, StatusCode::BAD_REQUEST, &err.to_string()).await;
-    }
     let session = match auth::login(&state.pool, &form.username, &form.password).await? {
         Ok(session) => session,
         Err(failure) => {
@@ -540,7 +932,20 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
     if !state.settings.accounts.registration_enabled {
         return Err(AppError::Forbidden);
     }
-    let body = register_form_body(&state, None).await?;
+    let instance = instance::load(&state.pool).await?;
+    let body = if instance.maintenance_mode {
+        format!(
+            r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Registration is currently closed.</h1>{}</section>"#,
+            render::notice(
+                "info",
+                instance
+                    .maintenance_notice()
+                    .unwrap_or(instance::DEFAULT_MAINTENANCE_MESSAGE)
+            )
+        )
+    } else {
+        register_form_body(&state, None).await?
+    };
     Ok(Html(
         page_layout(&state, None, None, "Register", &body).await?,
     ))
@@ -549,10 +954,22 @@ async fn register_form(State(state): State<Arc<AppState>>) -> AppResult<Html<Str
 async fn register(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Form(form): Form<RegisterForm>,
 ) -> AppResult<Response> {
+    reject_cross_site_form_post(&headers)?;
     if !state.settings.accounts.registration_enabled {
         return Err(AppError::Forbidden);
+    }
+    if instance::load(&state.pool).await?.maintenance_mode {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(render::maintenance_page(
+                &state.settings.site.name,
+                instance::DEFAULT_MAINTENANCE_MESSAGE,
+            )),
+        )
+            .into_response());
     }
     let Some(confirm_password) = form.confirm_password.as_deref() else {
         return Err(AppError::BadRequest(
@@ -717,6 +1134,7 @@ async fn onboarding_update(
     if let Some(media_id) = form.profile_picture_media_id {
         media::set_profile_media(
             &state.pool,
+            &state.paths,
             user.id,
             media::ProfileMediaSlot::Picture,
             media_id,
@@ -736,7 +1154,7 @@ async fn onboarding_update(
 
 async fn cleanup_onboarding_uploads(state: &AppState, form: &ParsedOnboardingUpdate) {
     if let Some(media_id) = form.profile_picture_media_id
-        && let Err(error) = media::delete_media(&state.pool, media_id).await
+        && let Err(error) = media::delete_media(&state.pool, &state.paths, media_id).await
     {
         tracing::warn!(
             media_id,
@@ -971,16 +1389,31 @@ async fn create_post(
         }
         Err(err) => return Err(err),
     };
+    let outcome = finish_post_create(&state, &headers, addr, user.as_ref(), &form).await;
+    if outcome.is_err() {
+        cleanup_post_uploads(&state, &form.media_ids).await;
+    }
+    outcome
+}
+
+async fn finish_post_create(
+    state: &AppState,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    user: Option<&CurrentUser>,
+    form: &ParsedPostCreate,
+) -> AppResult<Response> {
     if let Some(parent_id) = form.parent_post_id {
         ensure_parent_post_exists(&state.pool, parent_id).await?;
     }
     if user.is_some() {
-        validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
+        validate_csrf(&state.pool, headers, &form.csrf_token).await?;
     }
     if form.is_nsfw {
         media::set_media_nsfw(&state.pool, &form.media_ids, true).await?;
     }
-    let (scope, actor, max_events, window_secs) = if user.is_none() {
+    let viewer_id = user.map(|user| user.id);
+    let (scope, actor, max_events, window_secs) = if viewer_id.is_none() {
         (
             rate_limit::Scope::AnonymousPost,
             ip_actor(addr),
@@ -990,14 +1423,14 @@ async fn create_post(
     } else if form.parent_post_id.is_some() {
         (
             rate_limit::Scope::Reply,
-            user_actor(user.as_ref().map(|u| u.id).unwrap_or_default()),
+            user_actor(viewer_id.unwrap_or_default()),
             state.settings.moderation.replies_per_minute,
             60,
         )
     } else {
         (
             rate_limit::Scope::Post,
-            user_actor(user.as_ref().map(|u| u.id).unwrap_or_default()),
+            user_actor(viewer_id.unwrap_or_default()),
             state.settings.moderation.posts_per_minute,
             60,
         )
@@ -1008,7 +1441,7 @@ async fn create_post(
     let post_id = social::create_post(
         &state.pool,
         &state.settings,
-        user.as_ref().map(|u| u.id),
+        viewer_id,
         &form.text,
         form.parent_post_id,
         &form.media_ids,
@@ -1019,8 +1452,8 @@ async fn create_post(
         || format!("/home#post-{post_id}"),
         |_| format!("/posts/{post_id}#reply-{post_id}"),
     );
-    if enhanced_request(&headers) {
-        let posts = social::post_thread(&state.pool, user.as_ref().map(|u| u.id), post_id).await?;
+    if enhanced_request(headers) {
+        let posts = social::post_thread(&state.pool, viewer_id, post_id).await?;
         let post = posts
             .iter()
             .find(|post| post.id == post_id)
@@ -1033,17 +1466,17 @@ async fn create_post(
             html: if form.parent_post_id.is_some() {
                 render::thread_post_card_with_controls(
                     post,
-                    user.as_ref(),
-                    form_csrf(&state, &headers).await.as_deref(),
-                    blur_nsfw_media(&state, user.as_ref()),
+                    user,
+                    form_csrf(state, headers).await.as_deref(),
+                    blur_nsfw_media(state, user),
                     state.settings.posts.post_edit_window_seconds,
                 )
             } else {
                 render::post_card_with_controls(
                     post,
-                    user.as_ref(),
-                    form_csrf(&state, &headers).await.as_deref(),
-                    blur_nsfw_media(&state, user.as_ref()),
+                    user,
+                    form_csrf(state, headers).await.as_deref(),
+                    blur_nsfw_media(state, user),
                     state.settings.posts.post_edit_window_seconds,
                 )
             },
@@ -1053,10 +1486,24 @@ async fn create_post(
     Ok(Redirect::to(&redirect).into_response())
 }
 
+/// Deletes media rows and files that were uploaded for a post that was never
+/// created, so rejected or failed submissions do not leave orphaned uploads.
+async fn cleanup_post_uploads(state: &AppState, media_ids: &[i64]) {
+    for media_id in media_ids {
+        if let Err(error) = media::delete_media(&state.pool, &state.paths, *media_id).await {
+            tracing::warn!(
+                media_id,
+                error = %error,
+                "failed to clean up media uploaded for a rejected post"
+            );
+        }
+    }
+}
+
 async fn parse_post_create(
     state: &AppState,
     user_id: Option<i64>,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> AppResult<ParsedPostCreate> {
     let mut form = ParsedPostCreate {
         csrf_token: String::new(),
@@ -1065,6 +1512,19 @@ async fn parse_post_create(
         media_ids: Vec::new(),
         is_nsfw: false,
     };
+    let outcome = fill_post_create_form(state, user_id, multipart, &mut form).await;
+    if outcome.is_err() {
+        cleanup_post_uploads(state, &form.media_ids).await;
+    }
+    outcome.map(|()| form)
+}
+
+async fn fill_post_create_form(
+    state: &AppState,
+    user_id: Option<i64>,
+    mut multipart: Multipart,
+    form: &mut ParsedPostCreate,
+) -> AppResult<()> {
     while let Some(field) = multipart
         .next_field()
         .await
@@ -1115,6 +1575,11 @@ async fn parse_post_create(
                     .file_name()
                     .is_some_and(|name| !name.trim().is_empty()) =>
             {
+                if form.media_ids.len() >= state.settings.posts.max_media_per_post {
+                    return Err(AppError::BadRequest(
+                        "too many media attachments".to_owned(),
+                    ));
+                }
                 form.media_ids.push(
                     media::save_upload(
                         &state.pool,
@@ -1131,7 +1596,7 @@ async fn parse_post_create(
             _ => {}
         }
     }
-    Ok(form)
+    Ok(())
 }
 
 async fn bad_request_page(
@@ -1161,7 +1626,9 @@ async fn thread(
         return Err(AppError::NotFound);
     }
     let csrf = form_csrf(&state, &headers).await;
-    let composer = if user.is_some() || state.settings.accounts.anonymous_mode_enabled {
+    let composer = if (user.is_some() || state.settings.accounts.anonymous_mode_enabled)
+        && posting_enabled_for(&state, user.as_ref()).await?
+    {
         render::composer(
             csrf.as_deref(),
             Some(id),
@@ -1302,7 +1769,13 @@ async fn delete_post(
         }
         Err(err) => return Err(err),
     };
+    media::validate_post_media_deletion(&state.pool, &state.paths, id).await?;
     social::delete_post(&state.pool, user.id, id, user.is_admin).await?;
+    // The post is already deleted; a media cleanup failure should not turn a
+    // successful deletion into an error page.
+    if let Err(error) = media::delete_post_media(&state.pool, &state.paths, id).await {
+        tracing::warn!(post_id = id, error = %error, "post deleted but media cleanup failed");
+    }
     let fallback = if let Some(parent_id) = preview.parent_post_id {
         format!("/posts/{parent_id}#post-{parent_id}")
     } else {
@@ -1466,6 +1939,36 @@ async fn reply_redirect(Path(id): Path<i64>) -> Redirect {
     Redirect::to(&format!("/posts/{id}"))
 }
 
+/// Renders the page for a handle no account currently owns.
+///
+/// When the handle appears in `username_history`, the page lists the accounts
+/// that previously held it instead of silently resolving to a different
+/// person. Unknown handles keep the normal 404 response.
+async fn historical_username_page(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    headers: &HeaderMap,
+    requested: &str,
+) -> AppResult<Html<String>> {
+    let normalized = requested.trim().to_ascii_lowercase();
+    let holders = identity::historical_username_holders(&state.pool, &normalized).await?;
+    if holders.is_empty() {
+        if instance::username_was_released(&state.pool, &normalized).await? {
+            let csrf = form_csrf(state, headers).await;
+            let body = render::released_username_page(&normalized);
+            return Ok(Html(
+                page_layout(state, user, csrf.as_deref(), "Released username", &body).await?,
+            ));
+        }
+        return Err(AppError::NotFound);
+    }
+    let csrf = form_csrf(state, headers).await;
+    let body = render::historical_username_page(&normalized, &holders);
+    Ok(Html(
+        page_layout(state, user, csrf.as_deref(), "Username history", &body).await?,
+    ))
+}
+
 fn profile_tab_from_query(tab: Option<&str>) -> social::ProfileTimelineTab {
     match tab {
         Some("replies") => social::ProfileTimelineTab::Replies,
@@ -1505,6 +2008,7 @@ async fn profile(
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
     let active_tab = profile_tab_from_query(query.tab.as_deref());
+    let requested_username = username.clone();
     let profile = state
         .pool
         .call(move |conn| {
@@ -1553,12 +2057,14 @@ async fn profile(
         is_suspended,
     )) = profile
     else {
-        return Err(AppError::NotFound);
+        return historical_username_page(&state, user.as_ref(), &headers, &requested_username)
+            .await;
     };
     let csrf = form_csrf(&state, &headers).await;
     let viewer_id = user.as_ref().map(|u| u.id);
     let owner_or_admin =
         viewer_id == Some(profile_id) || user.as_ref().is_some_and(|viewer| viewer.is_admin);
+    let relationship = social::profile_relationship(&state.pool, viewer_id, profile_id).await?;
     let activity_visible = (!is_suspended || owner_or_admin)
         && social::profile_activity_visible(&state.pool, viewer_id, profile_id).await?;
     let likes_visible = activity_visible && (liked_posts_public || viewer_id == Some(profile_id));
@@ -1580,7 +2086,7 @@ async fn profile(
         });
     }
     let (followers, following) = social::follow_counts(&state.pool, profile_id).await?;
-    let controls = profile_controls(&state, user.as_ref(), csrf.as_deref(), profile_id).await?;
+    let controls = profile_controls(user.as_ref(), csrf.as_deref(), profile_id, relationship);
     let picture = picture_path.map_or_else(
         || r#"<div class="profile-picture" aria-hidden="true"></div>"#.to_owned(),
         |path| {
@@ -1599,15 +2105,7 @@ async fn profile(
             )
         },
     );
-    let website_link = if website.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            r#"<p><a href="{}">{}</a></p>"#,
-            html_escape::encode_double_quoted_attribute(website.as_str()),
-            html_escape::encode_text(website.as_str())
-        )
-    };
+    let website_link = render_profile_website_link(&website);
     let location_line = if location.trim().is_empty() {
         String::new()
     } else {
@@ -1616,6 +2114,30 @@ async fn profile(
             html_escape::encode_text(location.as_str())
         )
     };
+    let bio_line = if bio.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="profile-bio">{}</p>"#,
+            html_escape::encode_text(bio.as_str())
+        )
+    };
+    let profile_state_note =
+        profile_state_note(is_suspended, owner_or_admin, relationship, activity_visible);
+    let mut username_history =
+        render::username_history_note(&identity::username_history(&state.pool, profile_id).await?);
+    if instance::username_was_released(&state.pool, &profile_username.to_ascii_lowercase()).await? {
+        username_history.push_str(&render::released_username_profile_note());
+    }
+    let counts = format!(
+        r#"<p class="counts"><a href="/users/{}/followers" data-profile-followers="{}">{}</a><a href="/users/{}/following" data-profile-following="{}">{}</a></p>"#,
+        html_escape::encode_double_quoted_attribute(&profile_username),
+        profile_id,
+        count_label(followers, "follower", "followers"),
+        html_escape::encode_double_quoted_attribute(&profile_username),
+        profile_id,
+        count_label(following, "following", "following"),
+    );
     let pinned = pinned_post.as_ref().map_or_else(String::new, |post| {
         render::pinned_post_with_controls(
             post,
@@ -1627,14 +2149,17 @@ async fn profile(
     });
     let tabs = render::profile_tabs(&profile_username, active_tab);
     let timeline = if !activity_visible {
-        render::posts_with_controls_empty_state(
-            &posts,
-            user.as_ref(),
-            csrf.as_deref(),
-            blur_nsfw_media(&state, user.as_ref()),
-            state.settings.posts.post_edit_window_seconds,
-            profile_tab_empty_state(active_tab),
-        )
+        match profile_state_note {
+            Some((title, message)) => render::empty_state(title, message),
+            None => render::posts_with_controls_empty_state(
+                &posts,
+                user.as_ref(),
+                csrf.as_deref(),
+                blur_nsfw_media(&state, user.as_ref()),
+                state.settings.posts.post_edit_window_seconds,
+                profile_tab_empty_state(active_tab),
+            ),
+        }
     } else if active_tab == social::ProfileTimelineTab::Likes && !likes_visible {
         render::empty_state("This user’s likes are private", "")
     } else {
@@ -1648,18 +2173,16 @@ async fn profile(
         )
     };
     let body = format!(
-        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div><p class="counts"><span data-profile-followers="{}">{} followers</span><span data-profile-following="{}">{} following</span></p>{}<p>{}</p>{}</div></div></section>{}{}{}"#,
+        r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div>{}{}{}{}{}</div></div></section>{}{}{}"#,
         banner,
         picture,
         html_escape::encode_text(display_name.as_str()),
         html_escape::encode_text(profile_username.as_str()),
         controls,
-        profile_id,
-        followers,
-        profile_id,
-        following,
+        counts,
+        username_history,
+        bio_line,
         location_line,
-        html_escape::encode_text(bio.as_str()),
         website_link,
         pinned,
         tabs,
@@ -1675,6 +2198,52 @@ async fn profile(
         )
         .await?,
     ))
+}
+
+/// A human-readable explanation for why a profile's activity is hidden.
+fn profile_state_note(
+    is_suspended: bool,
+    owner_or_admin: bool,
+    relationship: social::ProfileRelationship,
+    activity_visible: bool,
+) -> Option<(&'static str, &'static str)> {
+    if activity_visible || owner_or_admin {
+        return None;
+    }
+    if relationship.blocked {
+        return Some((
+            "You blocked this account",
+            "Unblock this account to see their posts and interact again.",
+        ));
+    }
+    if relationship.blocks_viewer {
+        return Some((
+            "Activity unavailable",
+            "This account's posts and replies are not visible to you.",
+        ));
+    }
+    if relationship.muted {
+        return Some((
+            "You muted this account",
+            "Their posts stay hidden from your feeds until you unmute them.",
+        ));
+    }
+    if is_suspended {
+        return Some((
+            "Account suspended",
+            "This account's posts and replies are not visible.",
+        ));
+    }
+    None
+}
+
+/// Renders "1 follower" / "2 followers" without a separate plural forms crate.
+fn count_label(count: i64, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
 }
 
 async fn profile_identity(
@@ -1702,6 +2271,7 @@ async fn profile_followers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(username): Path<String>,
+    Query(query): Query<AccountListQuery>,
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await;
@@ -1710,11 +2280,15 @@ async fn profile_followers(
     else {
         return Err(AppError::NotFound);
     };
-    let accounts =
-        social::followers_accounts(&state.pool, profile_id, user.as_ref().map(|user| user.id))
-            .await?;
+    let (accounts, has_more) = social::followers_accounts(
+        &state.pool,
+        profile_id,
+        user.as_ref().map(|user| user.id),
+        query.after,
+    )
+    .await?;
     let body = format!(
-        "{}{}",
+        "{}{}{}",
         render::page_header(
             &format!("{display_name} followers"),
             &format!("Users who follow @{profile_username}.")
@@ -1722,6 +2296,11 @@ async fn profile_followers(
         render::account_links_with_empty_state(
             &accounts,
             render::EmptyState::new("No followers yet.", "Followers will appear here.",),
+        ),
+        account_list_next_link(
+            &format!("/users/{profile_username}/followers"),
+            &accounts,
+            has_more
         )
     );
     Ok(Html(
@@ -1740,6 +2319,7 @@ async fn profile_following(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(username): Path<String>,
+    Query(query): Query<AccountListQuery>,
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await;
@@ -1748,14 +2328,15 @@ async fn profile_following(
     else {
         return Err(AppError::NotFound);
     };
-    let accounts = social::following_accounts_for_profile(
+    let (accounts, has_more) = social::following_accounts_for_profile(
         &state.pool,
         profile_id,
         user.as_ref().map(|user| user.id),
+        query.after,
     )
     .await?;
     let body = format!(
-        "{}{}",
+        "{}{}{}",
         render::page_header(
             &format!("{display_name} following"),
             &format!("Users @{profile_username} follows.")
@@ -1766,6 +2347,11 @@ async fn profile_following(
                 "Not following anyone yet.",
                 "Followed accounts will appear here.",
             ),
+        ),
+        account_list_next_link(
+            &format!("/users/{profile_username}/following"),
+            &accounts,
+            has_more
         )
     );
     Ok(Html(
@@ -1780,27 +2366,71 @@ async fn profile_following(
     ))
 }
 
-async fn profile_controls(
-    state: &AppState,
+/// Renders the "Show more" link for keyset-paginated account lists.
+fn account_list_next_link(base: &str, accounts: &[social::AccountView], has_more: bool) -> String {
+    if !has_more {
+        return String::new();
+    }
+    let Some(last) = accounts.last() else {
+        return String::new();
+    };
+    let cursor = last.username.to_ascii_lowercase();
+    let cursor = html_escape::encode_double_quoted_attribute(&cursor);
+    let base = html_escape::encode_double_quoted_attribute(base);
+    format!(
+        r#"<p class="account-list-more"><a class="button-link" href="{base}?after={cursor}">Show more accounts</a></p>"#
+    )
+}
+
+fn profile_controls(
     user: Option<&CurrentUser>,
     csrf: Option<&str>,
     profile_id: i64,
-) -> AppResult<String> {
+    relationship: social::ProfileRelationship,
+) -> String {
     let (Some(viewer), Some(csrf)) = (user, csrf) else {
-        return Ok(String::new());
+        return String::new();
     };
     if viewer.id == profile_id {
-        return Ok(
-            r#"<div class="actions profile-actions"><a class="button-link" href="/settings">Settings</a></div>"#
-                .to_owned(),
+        return r#"<div class="actions profile-actions"><a class="button-link" href="/settings">Settings</a></div>"#
+            .to_owned();
+    }
+    if relationship.blocks_viewer {
+        return r#"<div class="actions profile-actions"><span class="profile-state-note">This account blocked you.</span></div>"#
+            .to_owned();
+    }
+    if relationship.blocked {
+        return format!(
+            r#"<div class="actions profile-actions"><span class="profile-state-note">You blocked this account.</span><span class="actions profile-secondary">{}</span></div>"#,
+            small_form(
+                &format!("/users/{profile_id}/unblock"),
+                csrf,
+                "Unblock",
+                "Unblock this account"
+            )
         );
     }
     let follow_action = render::follow_form(
         profile_id,
         csrf,
-        social::is_following(&state.pool, viewer.id, profile_id).await?,
+        render::FollowButtonState::from_flags(relationship.following, relationship.requested),
     );
-    Ok(format!(
+    let mute_action = if relationship.muted {
+        small_form(
+            &format!("/users/{profile_id}/unmute"),
+            csrf,
+            "Unmute",
+            "Unmute this account",
+        )
+    } else {
+        small_form(
+            &format!("/users/{profile_id}/mute"),
+            csrf,
+            "Mute",
+            "Mute this account",
+        )
+    };
+    format!(
         r#"<div class="actions profile-actions">{}<span class="actions profile-secondary">{}{}</span></div>"#,
         follow_action,
         small_form(
@@ -1809,13 +2439,8 @@ async fn profile_controls(
             "Block",
             "Block this account"
         ),
-        small_form(
-            &format!("/users/{profile_id}/mute"),
-            csrf,
-            "Mute",
-            "Mute this account"
-        )
-    ))
+        mute_action
+    )
 }
 
 async fn follow(
@@ -1833,6 +2458,65 @@ async fn follow(
         return Ok(Json(follow_action_response(&state.pool, user.id, id).await?).into_response());
     }
     Ok(Redirect::to(&account_action_return(&state.pool, &headers, id).await?).into_response())
+}
+
+async fn approve_follow_request(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    social::approve_follow_request(&state.pool, user.id, id)
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    Ok(Redirect::to("/follow-requests").into_response())
+}
+
+async fn reject_follow_request(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    social::reject_follow_request(&state.pool, user.id, id)
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    Ok(Redirect::to("/follow-requests").into_response())
+}
+
+async fn cancel_follow_request(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    social::cancel_follow_request(&state.pool, user.id, id)
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    if enhanced_request(&headers) {
+        return Ok(Json(follow_action_response(&state.pool, user.id, id).await?).into_response());
+    }
+    Ok(Redirect::to("/follow-requests").into_response())
+}
+
+async fn follow_requests(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> AppResult<Html<String>> {
+    let user = require_active_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let incoming = social::incoming_follow_requests(&state.pool, user.id).await?;
+    let outgoing = social::outgoing_follow_requests(&state.pool, user.id).await?;
+    let body = render::follow_requests_page(&incoming, &outgoing, &csrf);
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Follow requests", &body).await?,
+    ))
 }
 
 async fn unfollow(
@@ -1885,8 +2569,67 @@ fn settings_query_notice(saved: Option<&str>) -> Option<(&'static str, &'static 
         Some("muted-word") => Some(("success", "Muted word saved.")),
         Some("muted-word-removed") => Some(("success", "Muted word removed.")),
         Some("password") => Some(("success", "Password changed.")),
+        Some("username") => Some(("success", "Username changed.")),
+        Some("delete-requested") => Some((
+            "success",
+            "Account deletion requested. You can cancel it until the deadline.",
+        )),
+        Some("delete-cancelled") => Some(("success", "Account deletion cancelled.")),
         _ => None,
     }
+}
+
+/// Username change form plus the account's recorded previous handles.
+fn settings_username_panel(
+    username: &str,
+    history: &[identity::UsernameHistoryEntry],
+    csrf: &str,
+) -> String {
+    let history_html = if history.is_empty() {
+        r#"<p class="username-history">No previous usernames.</p>"#.to_owned()
+    } else {
+        let rows = history
+            .iter()
+            .map(|entry| {
+                format!(
+                    r#"<li>@{} <span class="muted">changed {}</span></li>"#,
+                    html_escape::encode_text(&entry.username),
+                    html_escape::encode_text(&entry.changed_at)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            r#"<h3>Previous usernames</h3><p class="username-history">Handles you used before stay reserved so nobody else can claim them. You can always switch back to one of them.</p><ul class="username-history-list">{rows}</ul>"#
+        )
+    };
+    format!(
+        r#"<section class="panel settings-card" data-testid="settings-card"><h2>Username</h2><p class="settings-section-help">Your public @handle is used in profile links and mentions.</p><form method="post" action="/settings/username" class="settings-password-form"><input type="hidden" name="csrf" value="{csrf}"><label for="new_username">New username</label><input id="new_username" name="new_username" value="{username}" autocomplete="username" required><label for="username_password">Current password</label><div class="password-control"><input id="username_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="username_password" aria-label="Show password">Show</button></div><div class="settings-form-actions"><button type="submit">Change username</button></div></form>{history_html}</section>"#,
+        csrf = html_escape::encode_double_quoted_attribute(csrf),
+        username = html_escape::encode_double_quoted_attribute(username),
+    )
+}
+
+/// Export and import entry points for portable account archives.
+fn settings_account_data_panel() -> String {
+    r#"<section class="panel settings-card" data-testid="settings-card"><h2>Account data</h2><p class="settings-section-help">Export your posts, profile, media, follows, and settings as a portable archive, or import an archive exported from another RustPost instance.</p><p class="actions"><a class="button-link" href="/settings/export">Export account archive</a> <a class="button-link" href="/settings/import">Import account archive</a></p><p class="muted">Archives never include your password, sessions, tokens, or administrator access.</p></section>"#
+        .to_owned()
+}
+
+/// Danger panel for requesting or cancelling account deletion.
+fn settings_delete_panel(deletion: Option<&account::DeletionRequest>, csrf: &str) -> String {
+    deletion.map_or_else(
+        || {
+            r#"<section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>Deleting your account starts a countdown before permanent removal.</p><p class="settings-danger-action"><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#.to_owned()
+        },
+        |deletion| {
+            format!(
+                r#"<section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p data-testid="deletion-deadline">This account is scheduled for permanent deletion on {}.</p><p>You can cancel the deletion until then. Until it completes, this account keeps your posts but cannot publish or change account data.</p><form method="post" action="/settings/delete/cancel"><input type="hidden" name="csrf" value="{}"><button type="submit">Cancel deletion</button></form></section>"#,
+                html_escape::encode_text(&deletion.scheduled_at),
+                html_escape::encode_double_quoted_attribute(csrf),
+            )
+        },
+    )
 }
 
 struct SettingsProfile {
@@ -1897,16 +2640,18 @@ struct SettingsProfile {
     theme: String,
     nsfw_blur_enabled: bool,
     liked_posts_public: bool,
+    follow_approval_required: bool,
     picture_path: Option<String>,
     banner_path: Option<String>,
 }
 
 async fn settings_profile(pool: &SqlitePool, user_id: i64) -> AppResult<SettingsProfile> {
     pool.call(move |conn| {
-        conn.query_row(
-            r#"
+        Ok(conn
+            .query_row(
+                r#"
         SELECT u.display_name, u.bio, u.location, u.website, u.theme, u.nsfw_blur_enabled,
-          u.liked_posts_public,
+          u.liked_posts_public, u.follow_approval_required,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path
         FROM users u
@@ -1914,25 +2659,26 @@ async fn settings_profile(pool: &SqlitePool, user_id: i64) -> AppResult<Settings
         LEFT JOIN media banner ON banner.id = u.banner_media_id
         WHERE u.id = ?
         "#,
-            [user_id],
-            |row| {
-                Ok(SettingsProfile {
-                    display_name: row.get(0)?,
-                    bio: row.get(1)?,
-                    location: row.get(2)?,
-                    website: row.get(3)?,
-                    theme: row.get(4)?,
-                    nsfw_blur_enabled: row.get::<_, i64>(5)? != 0,
-                    liked_posts_public: row.get::<_, i64>(6)? != 0,
-                    picture_path: row.get(7)?,
-                    banner_path: row.get(8)?,
-                })
-            },
-        )
-        .map_err(Into::into)
+                [user_id],
+                |row| {
+                    Ok(SettingsProfile {
+                        display_name: row.get(0)?,
+                        bio: row.get(1)?,
+                        location: row.get(2)?,
+                        website: row.get(3)?,
+                        theme: row.get(4)?,
+                        nsfw_blur_enabled: row.get::<_, i64>(5)? != 0,
+                        liked_posts_public: row.get::<_, i64>(6)? != 0,
+                        follow_approval_required: row.get::<_, i64>(7)? != 0,
+                        picture_path: row.get(8)?,
+                        banner_path: row.get(9)?,
+                    })
+                },
+            )
+            .optional()?)
     })
-    .await
-    .map_err(Into::into)
+    .await?
+    .ok_or(AppError::Unauthorized)
 }
 
 fn settings_profile_media(
@@ -2109,6 +2855,45 @@ fn validate_profile_location(location: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn validate_profile_website(website: &str) -> AppResult<()> {
+    let website = website.trim();
+    if website.is_empty() {
+        return Ok(());
+    }
+    if website.chars().count() > 2_048 {
+        return Err(AppError::BadRequest("website URL is too long".to_owned()));
+    }
+    if website.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "website URL contains unsupported control characters".to_owned(),
+        ));
+    }
+    if !is_safe_profile_website_url(website) {
+        return Err(AppError::BadRequest(
+            "website URL must start with http:// or https://".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_safe_profile_website_url(website: &str) -> bool {
+    website.parse::<Uri>().is_ok_and(|uri| {
+        matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some()
+    })
+}
+
+fn render_profile_website_link(website: &str) -> String {
+    let website = website.trim();
+    if website.is_empty() || !is_safe_profile_website_url(website) {
+        return String::new();
+    }
+    format!(
+        r#"<p class="profile-meta profile-website"><a href="{}" rel="noopener noreferrer nofollow">{}</a></p>"#,
+        html_escape::encode_double_quoted_attribute(website),
+        html_escape::encode_text(website)
+    )
+}
+
 async fn mute(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2149,6 +2934,10 @@ async fn settings_form(
     Ok(Html(settings_page(&state, &user, &csrf, notice).await?))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the settings page template is assembled in one place so panels keep a consistent layout"
+)]
 async fn settings_page(
     state: &AppState,
     user: &CurrentUser,
@@ -2159,6 +2948,10 @@ async fn settings_page(
     let blocked = social::blocked_users(&state.pool, user.id).await?;
     let muted = social::muted_users(&state.pool, user.id).await?;
     let muted_words = social::muted_words(&state.pool, user.id).await?;
+    let username_history = identity::username_history(&state.pool, user.id).await?;
+    let deletion = account::deletion_status(&state.pool, user.id).await?;
+    let username_panel = settings_username_panel(&user.username, &username_history, csrf);
+    let delete_panel = settings_delete_panel(deletion.as_ref(), csrf);
     let notice_html =
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
     let password_hint = if state.settings.accounts.min_password_length == 0 {
@@ -2209,10 +3002,16 @@ async fn settings_page(
             "Make liked posts public",
             "Allow other people to view your Likes tab on your profile.",
         ),
+        settings_switch(
+            "follow_approval_required",
+            profile.follow_approval_required,
+            "Require approval for new followers",
+            "New followers must be approved before they can follow you. Existing followers are kept, and pending requests are not affected.",
+        ),
     ]
     .join("");
     let body = format!(
-        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, media, and account controls.</p></div></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}"><div class="settings-section settings-section-media"><div class="settings-section-heading"><h2>Profile media</h2><p class="settings-section-help">Avatar and banner images for your profile header.</p></div>{}</div><div class="settings-section settings-section-profile"><div class="settings-section-heading"><h2>Profile</h2><p class="settings-section-help">Your name, bio, location, and link as shown on your profile.</p></div>{}</div><div class="settings-section settings-section-preferences"><div class="settings-section-heading"><h2>Preferences and privacy</h2><p class="settings-section-help">Control your display theme, NSFW media blur, and profile activity visibility.</p></div><div class="settings-switch-list">{}</div></div><div class="settings-form-actions"><button class="primary" type="submit">Save profile settings</button></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Blocked users</h2><p class="settings-section-help">Blocked accounts cannot follow or interact with you.</p>{}</section><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted users</h2><p class="settings-section-help">Muted accounts stay hidden from your views.</p>{}</section></div><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted words</h2><p class="settings-section-help">Hide posts containing specific words or phrases.</p><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel settings-security-panel" data-testid="settings-card"><h2>Change password</h2><p class="settings-section-help">Update the password used to sign in to this account.</p><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form></section><section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>This permanently removes your profile, posts, media, sessions, and account relationships.</p><p class="settings-danger-action"><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#,
+        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, media, and account controls.</p></div></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}"><div class="settings-section settings-section-media"><div class="settings-section-heading"><h2>Profile media</h2><p class="settings-section-help">Avatar and banner images for your profile header.</p></div>{}</div><div class="settings-section settings-section-profile"><div class="settings-section-heading"><h2>Profile</h2><p class="settings-section-help">Your name, bio, location, and link as shown on your profile.</p></div>{}</div><div class="settings-section settings-section-preferences"><div class="settings-section-heading"><h2>Preferences and privacy</h2><p class="settings-section-help">Control your display theme, NSFW media blur, and profile activity visibility.</p></div><div class="settings-switch-list">{}</div></div><div class="settings-form-actions"><button class="primary" type="submit">Save profile settings</button></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Blocked users</h2><p class="settings-section-help">Blocked accounts cannot follow or interact with you.</p>{}</section><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted users</h2><p class="settings-section-help">Muted accounts stay hidden from your views.</p>{}</section></div><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted words</h2><p class="settings-section-help">Hide posts containing specific words or phrases.</p><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel settings-security-panel" data-testid="settings-card"><h2>Change password</h2><p class="settings-section-help">Update the password used to sign in to this account.</p><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form></section>{username_panel}{account_data_panel}{delete_panel}"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         profile_media,
         profile_fields,
@@ -2240,6 +3039,9 @@ async fn settings_page(
         new_password_attrs,
         html_escape::encode_text(&password_hint),
         confirm_new_password_attrs,
+        username_panel = username_panel,
+        account_data_panel = settings_account_data_panel(),
+        delete_panel = delete_panel,
     );
     page_layout(state, Some(user), Some(csrf), "Settings", &body).await
 }
@@ -2263,9 +3065,23 @@ async fn settings_update(
 ) -> AppResult<Response> {
     let user = require_user(&state, &headers).await?;
     let form = parse_profile_update(&state, user.id, multipart).await?;
-    validate_csrf(&state.pool, &headers, &form.csrf_token).await?;
+    let outcome = apply_profile_update(&state, &headers, &user, &form).await;
+    if outcome.is_err() {
+        cleanup_profile_uploads(&state, &form).await;
+    }
+    outcome
+}
+
+async fn apply_profile_update(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &CurrentUser,
+    form: &ParsedProfileUpdate,
+) -> AppResult<Response> {
+    validate_csrf(&state.pool, headers, &form.csrf_token).await?;
     crate::validation::validate_profile_text(&form.display_name, &form.bio, &state.settings)?;
     validate_profile_location(&form.location)?;
+    validate_profile_website(&form.website)?;
     let display_name = form.display_name.trim().to_owned();
     let bio = form.bio.trim().to_owned();
     let location = form.location.trim().to_owned();
@@ -2273,11 +3089,13 @@ async fn settings_update(
     let theme = form.theme.as_str().to_owned();
     let nsfw_blur_enabled = i64::from(form.nsfw_blur_enabled);
     let liked_posts_public = i64::from(form.liked_posts_public);
+    let follow_approval_required = i64::from(form.follow_approval_required);
+    let user_id = user.id;
     state
         .pool
         .call(move |conn| {
             conn.execute(
-                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, nsfw_blur_enabled = ?, liked_posts_public = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, nsfw_blur_enabled = ?, liked_posts_public = ?, follow_approval_required = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 params![
                     display_name,
                     bio,
@@ -2286,21 +3104,35 @@ async fn settings_update(
                     theme,
                     nsfw_blur_enabled,
                     liked_posts_public,
-                    user.id
+                    follow_approval_required,
+                    user_id
                 ],
             )?;
             Ok(())
         })
         .await?;
     if form.delete_profile_picture {
-        media::clear_profile_media(&state.pool, user.id, media::ProfileMediaSlot::Picture).await?;
+        media::clear_profile_media(
+            &state.pool,
+            &state.paths,
+            user.id,
+            media::ProfileMediaSlot::Picture,
+        )
+        .await?;
     }
     if form.delete_banner {
-        media::clear_profile_media(&state.pool, user.id, media::ProfileMediaSlot::Banner).await?;
+        media::clear_profile_media(
+            &state.pool,
+            &state.paths,
+            user.id,
+            media::ProfileMediaSlot::Banner,
+        )
+        .await?;
     }
     if let Some(media_id) = form.profile_picture_media_id {
         media::set_profile_media(
             &state.pool,
+            &state.paths,
             user.id,
             media::ProfileMediaSlot::Picture,
             media_id,
@@ -2310,6 +3142,7 @@ async fn settings_update(
     if let Some(media_id) = form.banner_media_id {
         media::set_profile_media(
             &state.pool,
+            &state.paths,
             user.id,
             media::ProfileMediaSlot::Banner,
             media_id,
@@ -2361,6 +3194,7 @@ async fn change_password(
 ) -> AppResult<Response> {
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let current_session_token = auth::session_cookie(&headers);
     match auth::change_password(
         &state.pool,
         &state.settings,
@@ -2368,12 +3202,13 @@ async fn change_password(
         &form.current_password,
         &form.new_password,
         &form.confirm_new_password,
+        current_session_token.as_deref(),
     )
     .await
     {
         Ok(()) => Ok(Redirect::to("/settings?saved=password").into_response()),
         Err(err) => {
-            settings_response(
+            password_response(
                 &state,
                 &user,
                 &headers,
@@ -2384,6 +3219,32 @@ async fn change_password(
             .await
         }
     }
+}
+
+/// Renders password-change failures on the restricted page while a forced
+/// reset is active, and on the full settings page otherwise.
+async fn password_response(
+    state: &AppState,
+    user: &CurrentUser,
+    headers: &HeaderMap,
+    status: StatusCode,
+    kind: &'static str,
+    message: &str,
+) -> AppResult<Response> {
+    if user.must_change_password {
+        let csrf = form_csrf(state, headers).await.unwrap_or_default();
+        return Ok((
+            status,
+            Html(password_change_page_html(
+                state,
+                user,
+                &csrf,
+                Some((kind, message)),
+            )),
+        )
+            .into_response());
+    }
+    settings_response(state, user, headers, status, kind, message).await
 }
 
 async fn settings_response(
@@ -2408,7 +3269,11 @@ async fn delete_account_warning(
 ) -> AppResult<Html<String>> {
     let user = require_active_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let body = render_delete_account_warning();
+    let deletion = account::deletion_status(&state.pool, user.id).await?;
+    let body = deletion.map_or_else(
+        || render_delete_account_warning(state.settings.accounts.deletion_grace_period_days),
+        |deletion| render_delete_account_pending(&deletion, &csrf),
+    );
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Delete account", &body).await?,
     ))
@@ -2457,6 +3322,33 @@ async fn delete_account_final(
             "Delete confirmation expired. Start the delete account flow again.",
         )
         .await;
+    }
+    if state.settings.accounts.deletion_grace_period_days > 0 {
+        let password_ok = auth::verify_user_password(&state.pool, user.id, &form.password).await?;
+        if !password_ok {
+            return delete_account_final_response(
+                &state,
+                &user,
+                &headers,
+                StatusCode::UNAUTHORIZED,
+                "Password is incorrect.",
+            )
+            .await;
+        }
+        return match account::request_deletion(&state.pool, &state.settings, user.id).await {
+            Ok(_request) => Ok(Redirect::to("/settings?saved=delete-requested").into_response()),
+            Err(err) => {
+                tracing::warn!(user_id = user.id, error = %err, "account deletion request failed");
+                delete_account_final_response(
+                    &state,
+                    &user,
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    "Account deletion could not be scheduled. Try again later.",
+                )
+                .await
+            }
+        };
     }
     match account::delete_account(&state.pool, &state.paths, user.id, &form.password).await {
         Ok(_summary) => {
@@ -2596,9 +3488,28 @@ async fn account_deleted(State(state): State<Arc<AppState>>) -> AppResult<Html<S
     ))
 }
 
-fn render_delete_account_warning() -> String {
-    r#"<section class="panel danger-panel delete-account-panel"><h1>Delete account</h1><p>This is permanent. RustPost will remove your profile, posts, reposts, likes, follows, blocks, mutes, bookmarks, sessions, and uploaded media owned by your account.</p><div class="actions"><form method="get" action="/settings/delete/confirm"><button class="danger" type="submit">Confirm delete account</button></form><a class="button-link" href="/settings">Cancel</a></div></section>"#
-        .to_owned()
+fn render_delete_account_warning(grace_days: u64) -> String {
+    let grace = if grace_days == 0 {
+        "With the current configuration the account is removed immediately after password confirmation."
+            .to_owned()
+    } else {
+        format!(
+            "After you confirm with your password, RustPost starts a {grace_days}-day countdown. You can cancel any time before the deadline; permanent removal happens after it."
+        )
+    };
+    format!(
+        r#"<section class="panel danger-panel delete-account-panel"><h1>Delete account</h1><p>Permanent removal deletes your profile, posts, reposts, likes, follows, blocks, mutes, bookmarks, sessions, and uploaded media owned by your account.</p><p>{}</p><div class="actions"><form method="get" action="/settings/delete/confirm"><button class="danger" type="submit">Confirm delete account</button></form><a class="button-link" href="/settings">Cancel</a></div></section>"#,
+        html_escape::encode_text(&grace),
+    )
+}
+
+fn render_delete_account_pending(deletion: &account::DeletionRequest, csrf: &str) -> String {
+    format!(
+        r#"<section class="panel danger-panel delete-account-panel" data-testid="deletion-pending"><h1>Deletion scheduled</h1><p>This account is scheduled for permanent deletion on <strong>{}</strong>.</p><p>Until then your posts stay visible, but publishing and account changes are disabled. You can cancel the deletion below.</p><form method="post" action="/settings/delete/cancel"><input type="hidden" name="csrf" value="{}"><button type="submit">Cancel deletion</button></form><p class="muted">Requested {}</p></section>"#,
+        html_escape::encode_text(&deletion.scheduled_at),
+        html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_text(&deletion.requested_at),
+    )
 }
 
 fn render_delete_account_final_warning(
@@ -2608,22 +3519,483 @@ fn render_delete_account_final_warning(
 ) -> String {
     let notice = error.map_or_else(String::new, |message| render::notice("error", message));
     format!(
-        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="delete_intent" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
+        r#"{notice}<section class="panel danger-panel delete-account-panel"><h1>Final warning</h1><p>Deleting your account cannot be undone. Enter your password to permanently delete this account.</p><form method="post" action="/settings/delete/confirm" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="delete_intent" value="{}"><label for="delete_password">Password</label><div class="password-control"><input id="delete_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="delete_password" aria-label="Show password">Show</button></div><div class="actions"><button class="danger" type="submit">Delete account permanently</button><a class="button-link" href="/settings">Cancel</a></div></form></section>"#,
         html_escape::encode_double_quoted_attribute(csrf),
         html_escape::encode_double_quoted_attribute(delete_intent)
     )
 }
 
+/// Standalone password form used for the forced-password-reset flow and
+/// direct visits to `/settings/password`.
+async fn password_change_page(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SettingsQuery>,
+) -> AppResult<Html<String>> {
+    let user = require_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let notice = if query.required.as_deref() == Some("1") {
+        Some((
+            "error",
+            "You must change your password before using the rest of your account.",
+        ))
+    } else {
+        settings_query_notice(query.saved.as_deref())
+    };
+    Ok(Html(password_change_page_html(
+        &state, &user, &csrf, notice,
+    )))
+}
+
+fn password_change_page_html(
+    state: &AppState,
+    user: &CurrentUser,
+    csrf: &str,
+    notice: Option<(&str, &str)>,
+) -> String {
+    let notice_html =
+        notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
+    let hint = password_hint(state);
+    let new_password_attrs = render::password_length_attrs(
+        state.settings.accounts.min_password_length,
+        "new-password-requirement",
+    );
+    let confirm_new_password_attrs = render::password_length_attrs(
+        state.settings.accounts.min_password_length,
+        "confirm-new-password-requirement",
+    );
+    let logout = small_form("/logout", csrf, "Log out", "Log out of this session");
+    let restricted = if user.must_change_password {
+        r#"<p class="settings-section-help">An administrator requires this account to set a new password before it can be used again.</p>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"{notice_html}<section class="panel settings-card settings-security-panel" data-testid="settings-card"><h2>Change password</h2><p class="settings-section-help">Update the password used to sign in to this account.</p>{restricted}{}<div class="actions">{logout}</div></section>"#,
+        password_form_html(
+            csrf,
+            &hint,
+            &new_password_attrs,
+            &confirm_new_password_attrs
+        ),
+    )
+}
+
+fn password_hint(state: &AppState) -> String {
+    if state.settings.accounts.min_password_length == 0 {
+        "No minimum password length is currently required.".to_owned()
+    } else {
+        format!(
+            "Password must be at least {} characters.",
+            state.settings.accounts.min_password_length
+        )
+    }
+}
+
+fn password_form_html(
+    csrf: &str,
+    hint: &str,
+    new_password_attrs: &str,
+    confirm_new_password_attrs: &str,
+) -> String {
+    format!(
+        r#"<form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+        html_escape::encode_text(hint),
+        new_password_attrs,
+        html_escape::encode_text(hint),
+        confirm_new_password_attrs,
+    )
+}
+
+#[derive(Deserialize)]
+struct UsernameChangeForm {
+    csrf: String,
+    new_username: String,
+    password: String,
+}
+
+async fn change_username(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<UsernameChangeForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let password_ok = auth::verify_user_password(&state.pool, user.id, &form.password).await?;
+    if !password_ok {
+        return settings_response(
+            &state,
+            &user,
+            &headers,
+            StatusCode::UNAUTHORIZED,
+            "error",
+            "Password is incorrect.",
+        )
+        .await;
+    }
+    match identity::change_username(&state.pool, &state.settings, user.id, &form.new_username).await
+    {
+        Ok(_change) => Ok(Redirect::to("/settings?saved=username").into_response()),
+        Err(err) => {
+            settings_response(
+                &state,
+                &user,
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "error",
+                &err.to_string(),
+            )
+            .await
+        }
+    }
+}
+
+async fn cancel_deletion(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    account::cancel_deletion(&state.pool, user.id).await?;
+    Ok(Redirect::to("/settings?saved=delete-cancelled").into_response())
+}
+
+async fn export_account(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    // The guard keeps runtime temp cleanup from removing the staged export
+    // archive while it is being written.
+    let _operation = crate::runtime::begin_temp_operation();
+    let filename = format!(
+        "rustpost-account-{}-{}.tar.gz",
+        safe_filename_component(&user.username),
+        Uuid::new_v4().simple()
+    );
+    let destination =
+        state
+            .paths
+            .tmp_dir
+            .join(format!("{}{}", portability::EXPORT_TMP_PREFIX, filename));
+    let export = match portability::export_account(
+        &state.pool,
+        &state.paths,
+        user.id,
+        &destination,
+        portability::ArchiveLimits::from_settings(&state.settings),
+    )
+    .await
+    {
+        Ok(export) => export,
+        Err(err) => {
+            tracing::warn!(user_id = user.id, error = %err, "account export failed");
+            let _ = tokio::fs::remove_file(&destination).await;
+            return Err(AppError::BadRequest(err.to_string()));
+        }
+    };
+    stream_staged_file(&export.archive_path, &filename, "application/gzip").await
+}
+
+/// Validates a value for use inside an attachment filename.
+fn safe_filename_component(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(32)
+        .collect()
+}
+
+async fn stream_staged_file(
+    path: &std::path::Path,
+    download_name: &str,
+    content_type: &'static str,
+) -> AppResult<Response> {
+    let metadata = tokio::fs::metadata(path).await?;
+    let file = tokio::fs::File::open(path).await?;
+    let cleanup_path = path.to_owned();
+    let stream = futures_util::stream::unfold(
+        (file, cleanup_path),
+        |(mut file, cleanup_path)| async move {
+            let mut buffer = vec![0u8; 64 * 1024];
+            match file.read(&mut buffer).await {
+                Ok(0) => {
+                    let _ = tokio::fs::remove_file(&cleanup_path).await;
+                    None
+                }
+                Ok(read) => {
+                    buffer.truncate(read);
+                    Some((
+                        Ok::<Bytes, io::Error>(Bytes::from(buffer)),
+                        (file, cleanup_path),
+                    ))
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&cleanup_path).await;
+                    Some((Err(error), (file, cleanup_path)))
+                }
+            }
+        },
+    );
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        download_name.replace('"', "")
+    );
+    let mut response = Body::from_stream(stream).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&metadata.len().to_string())
+            .map_err(|err| AppError::BadRequest(err.to_string()))?,
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition).map_err(|err| AppError::BadRequest(err.to_string()))?,
+    );
+    Ok(response)
+}
+
+async fn import_account_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> AppResult<Html<String>> {
+    let user = require_active_user(&state, &headers).await?;
+    let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let instance = instance::load(&state.pool).await?;
+    let body = if instance.maintenance_mode {
+        format!(
+            r#"<section class="panel"><h1>Import account archive</h1>{}</section>"#,
+            render::notice(
+                "error",
+                instance
+                    .maintenance_notice()
+                    .unwrap_or(instance::DEFAULT_MAINTENANCE_MESSAGE)
+            )
+        )
+    } else {
+        render_import_account_form(
+            &csrf,
+            user.must_change_password,
+            state.settings.accounts.max_archive_upload_bytes,
+            state.settings.accounts.max_archive_expanded_bytes,
+        )
+    };
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Import account", &body).await?,
+    ))
+}
+
+fn render_import_account_form(
+    csrf: &str,
+    forced_password_change: bool,
+    max_upload_bytes: u64,
+    max_expanded_bytes: u64,
+) -> String {
+    let disabled = if forced_password_change {
+        r#"<p class="settings-section-help">Finish the required password change before importing an archive.</p>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<section class="panel" data-testid="import-account-panel"><h1>Import account archive</h1><p>Import a RustPost account archive that you exported from another instance. The archive adds posts, media, muted words, and outgoing follows to your account. Usernames, passwords, administrator flags, and sessions in an archive are ignored.</p>{}{disabled}<form method="post" action="/settings/import" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{}"><label for="account_archive">RustPost account archive (.tar.gz)</label><input id="account_archive" name="archive" type="file" accept=".tar.gz,application/gzip" required><p class="muted">Maximum compressed archive size: {}. Maximum expanded media size: {}. Limits are enforced while the archive is streamed.</p><div class="actions"><button type="submit">Import archive</button></div></form><p><a class="button-link" href="/settings">Back to settings</a></p></section>"#,
+        render::notice(
+            "info",
+            "Follows to protected accounts become pending requests and still require approval.",
+        ),
+        html_escape::encode_double_quoted_attribute(csrf),
+        format_bytes(max_upload_bytes),
+        format_bytes(max_expanded_bytes),
+    )
+}
+
+async fn import_account(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> AppResult<Response> {
+    let user = require_active_user(&state, &headers).await?;
+    // The guard keeps runtime temp cleanup from removing this operation's
+    // staged upload or export archive while it is in flight.
+    let _operation = crate::runtime::begin_temp_operation();
+    // Imports publish content, so they share the post rate-limit budget.
+    rate_limit::check_and_record(
+        &state.pool,
+        rate_limit::Scope::Post,
+        &user_actor(user.id),
+        state.settings.moderation.posts_per_minute,
+        60,
+    )
+    .await
+    .map_err(|err| AppError::RateLimited(err.to_string()))?;
+    let staged = stage_account_import(&state, &headers, multipart).await?;
+    let report =
+        portability::import_account(&state.pool, &state.paths, &state.settings, user.id, &staged)
+            .await;
+    let _ = tokio::fs::remove_file(&staged).await;
+    match report {
+        Ok(report) => {
+            let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+            let body = render_import_report(&report, &csrf);
+            Ok(
+                Html(
+                    page_layout(&state, Some(&user), Some(&csrf), "Import complete", &body).await?,
+                )
+                .into_response(),
+            )
+        }
+        Err(err) => {
+            tracing::warn!(user_id = user.id, error = %err, "account import failed");
+            let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+            let body = format!(
+                r#"{}{}"#,
+                render::notice("error", &err.to_string()),
+                render_import_account_form(
+                    &csrf,
+                    user.must_change_password,
+                    state.settings.accounts.max_archive_upload_bytes,
+                    state.settings.accounts.max_archive_expanded_bytes,
+                )
+            );
+            Ok((
+                StatusCode::BAD_REQUEST,
+                Html(page_layout(&state, Some(&user), Some(&csrf), "Import account", &body).await?),
+            )
+                .into_response())
+        }
+    }
+}
+
+async fn stage_account_import(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut multipart: Multipart,
+) -> AppResult<PathBuf> {
+    /// Smallest accepted `csrf` field; larger values are rejected so a
+    /// malicious request cannot make the server buffer an arbitrary string.
+    const MAX_CSRF_FIELD_BYTES: u64 = 4 * 1024;
+    /// Bound for unrelated multipart fields that are drained and ignored.
+    const MAX_IGNORED_FIELD_BYTES: u64 = 64 * 1024;
+
+    let mut csrf: Option<String> = None;
+    let mut staged: Option<PathBuf> = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?
+    {
+        let name = field.name().map(ToOwned::to_owned).unwrap_or_default();
+        if name == "csrf" {
+            csrf = Some(read_limited_text_field(&mut field, MAX_CSRF_FIELD_BYTES).await?);
+            continue;
+        }
+        if name != "archive" || field.file_name().is_none() {
+            drain_limited_field(&mut field, MAX_IGNORED_FIELD_BYTES).await?;
+            continue;
+        }
+        let csrf_token = csrf.clone().ok_or(AppError::Forbidden)?;
+        validate_csrf(&state.pool, headers, &csrf_token).await?;
+        if staged.is_some() {
+            return Err(AppError::BadRequest(
+                "only one archive can be imported at a time".to_owned(),
+            ));
+        }
+        let path = state.paths.tmp_dir.join(format!(
+            "{}{}.tar.gz",
+            portability::IMPORT_TMP_PREFIX,
+            Uuid::new_v4().simple()
+        ));
+        let written = write_multipart_field_to_file(
+            field,
+            &path,
+            Some(state.settings.accounts.max_archive_upload_bytes),
+        )
+        .await;
+        match written {
+            Ok(_bytes) => staged = Some(path),
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(err);
+            }
+        }
+    }
+    staged.ok_or_else(|| AppError::BadRequest("choose a RustPost account archive".to_owned()))
+}
+
+/// Reads a text multipart field with a byte cap so an oversized field cannot
+/// force unbounded buffering.
+async fn read_limited_text_field(
+    field: &mut axum::extract::multipart::Field<'_>,
+    max_bytes: u64,
+) -> AppResult<String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?
+    {
+        if u64::try_from(bytes.len() + chunk.len()).unwrap_or(u64::MAX) > max_bytes {
+            return Err(AppError::BadRequest(
+                "a multipart form field is too large".to_owned(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_utf8| AppError::BadRequest("invalid form value".to_owned()))
+}
+
+/// Drains an ignored multipart field while enforcing a small cap.
+async fn drain_limited_field(
+    field: &mut axum::extract::multipart::Field<'_>,
+    max_bytes: u64,
+) -> AppResult<()> {
+    let mut read = 0u64;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?
+    {
+        read = read.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if read > max_bytes {
+            return Err(AppError::BadRequest(
+                "a multipart form field is too large".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn render_import_report(report: &portability::ImportReport, csrf: &str) -> String {
+    format!(
+        r#"<section class="panel" data-testid="import-report"><h1>Import complete</h1><dl><dt>Archive account</dt><dd>@{}</dd><dt>Posts imported</dt><dd>{}</dd><dt>Media imported</dt><dd>{}</dd><dt>Follows added</dt><dd>{}</dd><dt>Follow requests pending approval</dt><dd>{}</dd><dt>Follows skipped</dt><dd>{}</dd><dt>Post references unresolved</dt><dd>{}</dd><dt>Muted words imported</dt><dd>{}</dd><dt>Profile fields applied</dt><dd>{}</dd><dt>Profile fields kept</dt><dd>{}</dd></dl><p><a class="button-link" href="/settings">Back to settings</a></p>{}</section>"#,
+        html_escape::encode_text(&report.archive_username),
+        report.posts_imported,
+        report.media_imported,
+        report.follows_imported,
+        report.follows_pending,
+        report.follows_skipped,
+        report.post_references_dropped,
+        report.muted_words_imported,
+        report.profile_fields_applied,
+        report.profile_fields_skipped,
+        small_form(
+            "/settings/import",
+            csrf,
+            "Import another archive",
+            "Import another account archive"
+        ),
+    )
+}
+
 // Multipart parsing is kept in one place so uploaded profile media and text
 // fields share one validation path before any database updates happen.
-#[expect(
-    clippy::too_many_lines,
-    reason = "multipart profile parsing keeps validation and file handling in one transaction-sized flow"
-)]
 async fn parse_profile_update(
     state: &AppState,
     user_id: i64,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> AppResult<ParsedProfileUpdate> {
     let mut form = ParsedProfileUpdate {
         csrf_token: String::new(),
@@ -2636,9 +4008,23 @@ async fn parse_profile_update(
         delete_banner: false,
         nsfw_blur_enabled: false,
         liked_posts_public: false,
+        follow_approval_required: false,
         profile_picture_media_id: None,
         banner_media_id: None,
     };
+    let outcome = fill_profile_update_form(state, user_id, multipart, &mut form).await;
+    if outcome.is_err() {
+        cleanup_profile_uploads(state, &form).await;
+    }
+    outcome.map(|()| form)
+}
+
+async fn fill_profile_update_form(
+    state: &AppState,
+    user_id: i64,
+    mut multipart: Multipart,
+    form: &mut ParsedProfileUpdate,
+) -> AppResult<()> {
     while let Some(field) = multipart
         .next_field()
         .await
@@ -2648,101 +4034,123 @@ async fn parse_profile_update(
             continue;
         };
         match name.as_str() {
-            "csrf" => {
-                form.csrf_token = field
-                    .text()
-                    .await
-                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+            "csrf" | "display_name" | "bio" | "location" | "website" => {
+                fill_profile_text_field(form, &name, field).await?;
             }
-            "display_name" => {
-                form.display_name = field
-                    .text()
-                    .await
-                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
-            }
-            "bio" => {
-                form.bio = field
-                    .text()
-                    .await
-                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
-            }
-            "location" => {
-                form.location = field
-                    .text()
-                    .await
-                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
-            }
-            "website" => {
-                form.website = field
-                    .text()
-                    .await
-                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
-            }
-            "dark_mode" => {
-                form.theme = Theme::Dark;
-            }
-            "nsfw_blur_enabled" => {
-                form.nsfw_blur_enabled = true;
-            }
-            "liked_posts_public" => {
-                form.liked_posts_public = true;
-            }
-            "delete_profile_picture" => {
-                form.delete_profile_picture = true;
-            }
-            "delete_banner" => {
-                form.delete_banner = true;
-            }
+            "dark_mode" => form.theme = Theme::Dark,
+            "nsfw_blur_enabled" => form.nsfw_blur_enabled = true,
+            "liked_posts_public" => form.liked_posts_public = true,
+            "follow_approval_required" => form.follow_approval_required = true,
+            "delete_profile_picture" => form.delete_profile_picture = true,
+            "delete_banner" => form.delete_banner = true,
             "profile_picture" if field.file_name().is_some() => {
-                if !state.settings.accounts.allow_profile_pictures {
-                    return Err(AppError::Forbidden);
-                }
-                if field.file_name().is_none_or(|name| name.trim().is_empty()) {
-                    continue;
-                }
-                form.profile_picture_media_id = Some(
-                    media::save_profile_picture_upload(
-                        &state.pool,
-                        &state.settings,
-                        &state.paths,
-                        &state.ffmpeg,
-                        user_id,
-                        field,
-                    )
-                    .await
-                    .map_err(|err| {
-                        tracing::warn!(error = %err, "profile picture upload rejected");
-                        AppError::BadRequest(err.to_string())
-                    })?,
-                );
+                fill_profile_picture_upload(state, user_id, form, field).await?;
             }
             "banner" if field.file_name().is_some() => {
-                if !state.settings.accounts.allow_profile_banners {
-                    return Err(AppError::Forbidden);
-                }
-                if field.file_name().is_none_or(|name| name.trim().is_empty()) {
-                    continue;
-                }
-                form.banner_media_id = Some(
-                    media::save_upload(
-                        &state.pool,
-                        &state.settings,
-                        &state.paths,
-                        &state.ffmpeg,
-                        Some(user_id),
-                        field,
-                    )
-                    .await
-                    .map_err(|err| {
-                        tracing::warn!(error = %err, "profile banner upload rejected");
-                        AppError::BadRequest(err.to_string())
-                    })?,
-                );
+                fill_banner_upload(state, user_id, form, field).await?;
             }
             _ => {}
         }
     }
-    Ok(form)
+    Ok(())
+}
+
+/// Reads one of the plain text profile fields into the parsed form.
+async fn fill_profile_text_field(
+    form: &mut ParsedProfileUpdate,
+    name: &str,
+    field: axum::extract::multipart::Field<'_>,
+) -> AppResult<()> {
+    let text = field
+        .text()
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    match name {
+        "csrf" => form.csrf_token = text,
+        "display_name" => form.display_name = text,
+        "bio" => form.bio = text,
+        "location" => form.location = text,
+        "website" => form.website = text,
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn fill_profile_picture_upload(
+    state: &AppState,
+    user_id: i64,
+    form: &mut ParsedProfileUpdate,
+    field: axum::extract::multipart::Field<'_>,
+) -> AppResult<()> {
+    if !state.settings.accounts.allow_profile_pictures {
+        return Err(AppError::Forbidden);
+    }
+    if field.file_name().is_none_or(|name| name.trim().is_empty()) {
+        return Ok(());
+    }
+    form.profile_picture_media_id = Some(
+        media::save_profile_picture_upload(
+            &state.pool,
+            &state.settings,
+            &state.paths,
+            &state.ffmpeg,
+            user_id,
+            field,
+        )
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "profile picture upload rejected");
+            AppError::BadRequest(err.to_string())
+        })?,
+    );
+    Ok(())
+}
+
+async fn fill_banner_upload(
+    state: &AppState,
+    user_id: i64,
+    form: &mut ParsedProfileUpdate,
+    field: axum::extract::multipart::Field<'_>,
+) -> AppResult<()> {
+    if !state.settings.accounts.allow_profile_banners {
+        return Err(AppError::Forbidden);
+    }
+    if field.file_name().is_none_or(|name| name.trim().is_empty()) {
+        return Ok(());
+    }
+    form.banner_media_id = Some(
+        media::save_banner_upload(
+            &state.pool,
+            &state.settings,
+            &state.paths,
+            &state.ffmpeg,
+            user_id,
+            field,
+        )
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "profile banner upload rejected");
+            AppError::BadRequest(err.to_string())
+        })?,
+    );
+    Ok(())
+}
+
+/// Deletes profile media that was uploaded for a settings save that did not
+/// complete, so rejected saves do not leave orphaned uploads behind.
+async fn cleanup_profile_uploads(state: &AppState, form: &ParsedProfileUpdate) {
+    for media_id in [form.profile_picture_media_id, form.banner_media_id]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(error) = media::delete_media(&state.pool, &state.paths, media_id).await {
+            tracing::warn!(
+                media_id,
+                error = %error,
+                "failed to clean up media uploaded for a rejected settings save"
+            );
+        }
+    }
 }
 
 async fn ensure_parent_post_exists(pool: &SqlitePool, parent_id: i64) -> AppResult<()> {
@@ -2902,19 +4310,23 @@ async fn follow_action_response(
     viewer_id: i64,
     profile_id: i64,
 ) -> AppResult<FollowActionResponse> {
-    let following = social::is_following(pool, viewer_id, profile_id).await?;
+    let relationship = social::profile_relationship(pool, Some(viewer_id), profile_id).await?;
     let (followers, following_count) = social::follow_counts(pool, profile_id).await?;
+    let action = if relationship.following {
+        format!("/users/{profile_id}/unfollow")
+    } else if relationship.requested {
+        format!("/users/{profile_id}/follow/cancel")
+    } else {
+        format!("/users/{profile_id}/follow")
+    };
     Ok(FollowActionResponse {
         kind: "follow",
         user_id: profile_id,
-        following,
+        following: relationship.following,
+        requested: relationship.requested,
         followers,
         following_count,
-        action: if following {
-            format!("/users/{profile_id}/unfollow")
-        } else {
-            format!("/users/{profile_id}/follow")
-        },
+        action,
     })
 }
 
@@ -2941,9 +4353,22 @@ async fn post_action_response(
                   EXISTS(SELECT 1 FROM bookmarks WHERE user_id = ? AND post_id = p.id),
                   EXISTS(SELECT 1 FROM reposts WHERE user_id = ? AND post_id = p.id)
                 FROM posts p
+                LEFT JOIN users author ON author.id = p.user_id
                 WHERE p.id = ? AND p.is_deleted = 0
+                  AND (p.user_id IS NULL OR (author.is_deleted = 0 AND author.is_suspended = 0))
+                  AND (
+                    p.user_id IS NULL
+                    OR p.user_id = ?
+                    OR (
+                      p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+                      AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = p.user_id AND blocked_id = ?)
+                    )
+                  )
                 "#,
-                params![viewer_id, viewer_id, viewer_id, viewer_id, post_id],
+                params![
+                    viewer_id, viewer_id, viewer_id, viewer_id, post_id, viewer_id, viewer_id,
+                    viewer_id
+                ],
                 |row| {
                     Ok(PostActionResponse {
                         kind: "post-action",
@@ -3155,6 +4580,36 @@ fn referer_target(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+fn reject_cross_site_form_post(headers: &HeaderMap) -> AppResult<()> {
+    if headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+    {
+        return Err(AppError::Forbidden);
+    }
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(());
+    };
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(AppError::Forbidden);
+    };
+    let origin_host = origin.parse::<Uri>().ok().and_then(|uri| {
+        uri.authority()
+            .map(|authority| authority.as_str().to_owned())
+    });
+    if origin_host.is_none_or(|origin_host| !origin_host.eq_ignore_ascii_case(host)) {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
 async fn bookmarks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -3182,14 +4637,17 @@ async fn bookmarks(
 async fn following(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<AccountListQuery>,
 ) -> AppResult<Html<String>> {
     let user = require_user(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
-    let accounts = social::following_accounts(&state.pool, user.id).await?;
+    let (accounts, has_more) =
+        social::following_accounts(&state.pool, user.id, query.after).await?;
     let body = format!(
-        "{}{}",
+        "{}{}{}",
         render::page_header("Following", "Accounts you follow."),
-        render::accounts(&accounts, &csrf)
+        render::accounts(&accounts, &csrf),
+        account_list_next_link("/following", &accounts, has_more)
     );
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Following", &body).await?,
@@ -3311,12 +4769,24 @@ async fn tag(
     .await
 }
 
+#[derive(Deserialize)]
+struct AdminDashboardQuery {
+    saved: Option<String>,
+}
+
 async fn admin_dashboard(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<AdminDashboardQuery>,
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let saved_notice = match query.saved.as_deref() {
+        Some("announcement") => Some(render::notice("success", "Announcement updated.")),
+        Some("maintenance") => Some(render::notice("success", "Maintenance setting updated.")),
+        _ => None,
+    }
+    .unwrap_or_default();
     let favicon_asset = favicon::current(&state.paths);
     let remove_form = if favicon_asset.is_custom() {
         small_form(
@@ -3334,18 +4804,181 @@ async fn admin_dashboard(
         html_escape::encode_double_quoted_attribute(&csrf),
         remove_form
     );
+    let instance = instance::load(&state.pool).await?;
+    let instance_panels = admin_instance_panels(&instance, &csrf);
     let body = format!(
-        "{}{}{}",
+        "{}{}{}{}{}",
         render::page_header(
             "Admin",
             "Manage site health, users, media jobs, settings, and backups."
         ),
+        saved_notice,
         r#"<section class="grid admin-nav-grid"><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/health">Site health</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/users">Users</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/media">Media jobs</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/deep-settings">Deep server settings</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/backups">Backups</a></section>"#,
+        instance_panels,
         favicon_panel
     );
     Ok(Html(
         page_layout(&state, Some(&user), Some(&csrf), "Admin", &body).await?,
     ))
+}
+
+/// Announcement and maintenance controls, persisted in `instance_settings`.
+fn admin_instance_panels(instance: &instance::InstanceSettings, csrf: &str) -> String {
+    let announcement_enabled = if instance.announcement_enabled {
+        " checked"
+    } else {
+        ""
+    };
+    let maintenance_enabled = if instance.maintenance_mode {
+        " checked"
+    } else {
+        ""
+    };
+    let announcement_status = if instance.announcement_text().is_some() {
+        "Currently visible in the top bar."
+    } else {
+        "Not currently shown."
+    };
+    let maintenance_status = if instance.maintenance_mode {
+        "Maintenance mode is ON. Posting and registration are disabled."
+    } else {
+        "Maintenance mode is off. The site is fully available."
+    };
+    format!(
+        r#"<section class="panel admin-card" data-testid="admin-announcement-panel"><h2>Announcement</h2><p class="muted">{announcement_status}</p><form method="post" action="/admin/announcement"><input type="hidden" name="csrf" value="{csrf}"><label for="announcement">Announcement text</label><textarea id="announcement" name="announcement" maxlength="280" rows="3">{announcement}</textarea><label class="check-row"><input type="checkbox" name="enabled" value="true"{announcement_enabled}> Show this announcement</label><div class="actions"><button type="submit" name="intent" value="save">Save announcement</button><button type="submit" name="intent" value="clear">Clear announcement</button></div></form></section><section class="panel admin-card" data-testid="admin-maintenance-panel"><h2>Maintenance mode</h2><p class="muted">{maintenance_status}</p><p class="muted">While maintenance mode is on, registration and post creation (posts, replies, quotes, and reposts) are blocked. Administrators can still post, and the site stays readable.</p><form method="post" action="/admin/maintenance"><input type="hidden" name="csrf" value="{csrf}"><label class="check-row"><input type="checkbox" name="enabled" value="true"{maintenance_enabled}> Enable maintenance mode</label><label for="maintenance_message">Message shown to visitors</label><textarea id="maintenance_message" name="message" maxlength="280" rows="3">{maintenance_message}</textarea><div class="actions"><button type="submit" name="intent" value="save">Save maintenance setting</button></div></form></section>"#,
+        csrf = html_escape::encode_double_quoted_attribute(csrf),
+        announcement = html_escape::encode_text(&instance.announcement),
+        maintenance_message = html_escape::encode_text(&instance.maintenance_message),
+        announcement_status = html_escape::encode_text(announcement_status),
+        maintenance_status = html_escape::encode_text(maintenance_status),
+    )
+}
+
+#[derive(Deserialize)]
+struct AnnouncementForm {
+    csrf: String,
+    announcement: Option<String>,
+    enabled: Option<String>,
+    intent: Option<String>,
+}
+
+async fn admin_update_announcement(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<AnnouncementForm>,
+) -> AppResult<Response> {
+    let user = require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    if form.intent.as_deref() == Some("clear") {
+        instance::save_announcement(&state.pool, "", false).await?;
+        admin::audit(
+            &state.pool,
+            user.id,
+            "update_announcement",
+            "instance_settings",
+        )
+        .await?;
+        return Ok(Redirect::to("/admin?saved=announcement").into_response());
+    }
+    let text = form.announcement.unwrap_or_default();
+    let enabled = form.enabled.as_deref() == Some("true");
+    match instance::save_announcement(&state.pool, &text, enabled).await {
+        Ok(()) => {
+            admin::audit(
+                &state.pool,
+                user.id,
+                "update_announcement",
+                "instance_settings",
+            )
+            .await?;
+            Ok(Redirect::to("/admin?saved=announcement").into_response())
+        }
+        Err(err) => admin_panel_error(&state, &user, &headers, &err.to_string()).await,
+    }
+}
+
+#[derive(Deserialize)]
+struct MaintenanceForm {
+    csrf: String,
+    message: Option<String>,
+    enabled: Option<String>,
+}
+
+async fn admin_update_maintenance(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<MaintenanceForm>,
+) -> AppResult<Response> {
+    let user = require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let enabled = form.enabled.as_deref() == Some("true");
+    let message = form.message.unwrap_or_default();
+    match instance::save_maintenance(&state.pool, enabled, &message).await {
+        Ok(()) => {
+            admin::audit(
+                &state.pool,
+                user.id,
+                if enabled {
+                    "enable_maintenance"
+                } else {
+                    "disable_maintenance"
+                },
+                "instance_settings",
+            )
+            .await?;
+            Ok(Redirect::to("/admin?saved=maintenance").into_response())
+        }
+        Err(err) => admin_panel_error(&state, &user, &headers, &err.to_string()).await,
+    }
+}
+
+async fn admin_panel_error(
+    state: &AppState,
+    user: &CurrentUser,
+    headers: &HeaderMap,
+    message: &str,
+) -> AppResult<Response> {
+    let csrf = form_csrf(state, headers).await.unwrap_or_default();
+    let instance = instance::load(&state.pool).await?;
+    let body = format!(
+        "{}{}{}",
+        render::notice("error", message),
+        admin_instance_panels(&instance, &csrf),
+        r#"<p><a class="button-link" href="/admin">Back to admin</a></p>"#
+    );
+    Ok((
+        StatusCode::BAD_REQUEST,
+        Html(page_layout(state, Some(user), Some(&csrf), "Admin", &body).await?),
+    )
+        .into_response())
+}
+
+async fn admin_require_password_reset(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    identity::require_password_reset(&state.pool, user.id, id)
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    Ok(Redirect::to("/admin/users").into_response())
+}
+
+async fn admin_revoke_sessions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> AppResult<Response> {
+    let user = require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    identity::revoke_user_sessions(&state.pool, user.id, id)
+        .await
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    Ok(Redirect::to("/admin/users").into_response())
 }
 
 async fn admin_favicon_upload(
@@ -3453,7 +5086,7 @@ async fn admin_health(
         .bootstrap_status()
         .unwrap_or_else(|| "unavailable".to_owned());
     let body = format!(
-        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>DB schema version</dt><dd>{}</dd><dt>DB diagnostics</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor running</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
+        r#"<section class="panel admin-card" data-testid="admin-card"><h1>Site health</h1><dl><dt>DB path</dt><dd>{}</dd><dt>DB schema version</dt><dd>{}</dd><dt>DB diagnostics</dt><dd>{}</dd><dt>Upload path</dt><dd>{}</dd><dt>Media path</dt><dd>{}</dd><dt>Logs path</dt><dd>{}</dd><dt>Backup path</dt><dd>{}</dd><dt>ffmpeg</dt><dd>{}</dd><dt>WebP support</dt><dd>{}</dd><dt>VP9 support</dt><dd>{}</dd><dt>Tor</dt><dd>{}</dd><dt>Tor enabled</dt><dd>{}</dd><dt>Tor service active</dt><dd>{}</dd><dt>Tor bootstrap</dt><dd>{}</dd><dt>Tor error</dt><dd>{}</dd><dt>Onion address</dt><dd>{}</dd><dt>Anonymous mode</dt><dd>{}</dd><dt>Registration</dt><dd>{}</dd></dl><h2>Recent media jobs</h2>{}</section>"#,
         html_escape::encode_text(&state.paths.database_path.display().to_string()),
         html_escape::encode_text(&schema_version),
         html_escape::encode_text(&schema_summary),
@@ -3582,6 +5215,19 @@ fn admin_user_row(row: &admin::AdminUserInvestigation, csrf: &str, searched: boo
             "Suspend this account"
         },
     );
+    let reset_password = small_form(
+        &format!("/admin/users/{}/require-password-reset", row.id),
+        csrf,
+        "Require password reset",
+        "Require this account to choose a new password before using the site again",
+    );
+    let revoke_sessions = small_form(
+        &format!("/admin/users/{}/revoke-sessions", row.id),
+        csrf,
+        "Log out sessions",
+        "Revoke every active session for this account",
+    );
+    let actions = format!("{action}{reset_password}{revoke_sessions}");
     format!(
         r#"<article class="admin-user-row"><div class="admin-user-main"><div class="admin-user-heading"><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span> <span class="muted">#{}</span></div><div class="admin-user-statuses">{}</div>{}<dl class="admin-user-meta"><dt>Created</dt><dd>{}</dd><dt>Updated</dt><dd>{}</dd><dt>Last session</dt><dd>{}</dd><dt>Last post</dt><dd>{}</dd><dt>Total posts</dt><dd>{}</dd><dt>Uploaded media</dt><dd>{}</dd><dt>Reports on posts</dt><dd>{}</dd><dt>Moderation actions</dt><dd>{}</dd><dt>Matching posts</dt><dd>{}</dd></dl>{}</div><div class="admin-user-actions">{}</div></article>"#,
         html_escape::encode_double_quoted_attribute(&row.username),
@@ -3600,7 +5246,7 @@ fn admin_user_row(row: &admin::AdminUserInvestigation, csrf: &str, searched: boo
         row.moderation_action_count,
         row.matching_post_count,
         preview,
-        action
+        actions
     )
 }
 
@@ -3672,7 +5318,11 @@ async fn admin_delete_post(
 ) -> AppResult<Response> {
     let user = require_admin(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    media::validate_post_media_deletion(&state.pool, &state.paths, id).await?;
     social::delete_post(&state.pool, user.id, id, true).await?;
+    if let Err(error) = media::delete_post_media(&state.pool, &state.paths, id).await {
+        tracing::warn!(post_id = id, error = %error, "post deleted but media cleanup failed");
+    }
     admin::audit(&state.pool, user.id, "delete_post", &format!("post:{id}")).await?;
     Ok(Redirect::to("/admin").into_response())
 }
@@ -3792,6 +5442,10 @@ async fn admin_deep_settings_update(
             );
             return deep_settings_html(&state, &user, &csrf, &body).await;
         }
+        state.nsfw_blur_default.store(
+            updated.media.nsfw_blur_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         admin::audit(
             &state.pool,
             user.id,
@@ -4201,6 +5855,9 @@ async fn admin_restore_backup(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    // Staged restore uploads live under the runtime temp directory; keep
+    // cleanup from removing them while the restore is in flight.
+    let _operation = crate::runtime::begin_temp_operation();
     let upload = match parse_restore_upload(&state, &headers, multipart).await {
         Ok(upload) => upload,
         Err(err) => {
@@ -4238,6 +5895,9 @@ async fn admin_restore_backup(
     let _remove_result = tokio::fs::remove_file(&upload.archive_path).await;
     match restored {
         Ok(report) => {
+            state
+                .restart_required
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let safety = report
                 .pre_restore_backup
                 .as_ref()
@@ -4321,7 +5981,7 @@ async fn parse_restore_upload(
                     .paths
                     .tmp_dir
                     .join(format!("restore-upload-{}.tar", Uuid::new_v4().simple()));
-                write_multipart_field_to_file(field, &path).await?;
+                write_multipart_field_to_file(field, &path, None).await?;
                 archive_path = Some(path);
             }
             _ => {}
@@ -4340,23 +6000,43 @@ async fn parse_restore_upload(
     })
 }
 
+/// Streams one multipart field to `path` and returns the bytes written.
+///
+/// When `max_bytes` is set the limit is enforced for every chunk as it
+/// arrives, so an oversized upload is rejected before the whole body is
+/// buffered or stored. Uploads must never be buffered in memory.
 async fn write_multipart_field_to_file(
     mut field: axum::extract::multipart::Field<'_>,
     path: &std::path::Path,
-) -> AppResult<()> {
+    max_bytes: Option<u64>,
+) -> AppResult<u64> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let mut output = tokio::fs::File::create(path).await?;
+    let mut written = 0u64;
     while let Some(chunk) = field
         .chunk()
         .await
         .map_err(|err| AppError::BadRequest(err.to_string()))?
     {
+        written = written.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if let Some(limit) = max_bytes
+            && written > limit
+        {
+            return Err(upload_limit_error(limit));
+        }
         output.write_all(&chunk).await?;
     }
     output.flush().await?;
-    Ok(())
+    Ok(written)
+}
+
+fn upload_limit_error(limit: u64) -> AppError {
+    AppError::PayloadTooLarge(format!(
+        "the uploaded archive is larger than the configured {} MiB limit",
+        limit / (1024 * 1024)
+    ))
 }
 
 async fn backups_page(
@@ -4538,7 +6218,7 @@ async fn require_active_user(state: &AppState, headers: &HeaderMap) -> AppResult
 }
 
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> AppResult<CurrentUser> {
-    let user = require_user(state, headers).await?;
+    let user = require_active_user(state, headers).await?;
     if !user.is_admin {
         return Err(AppError::Forbidden);
     }
@@ -4551,40 +6231,52 @@ async fn validate_csrf(pool: &SqlitePool, headers: &HeaderMap, token: &str) -> A
         .map_err(|_csrf_err| AppError::Forbidden)
 }
 
+/// Reads the session's current CSRF token and rotates it for the next form.
+///
+/// Two concurrent page loads for one session can both read the same stored
+/// hash; only one optimistic update wins. Retrying lets the loser read the new
+/// hash and rotate again instead of rendering a form with no token.
 async fn form_csrf(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    const ROTATION_ATTEMPTS: usize = 3;
     let token = auth::session_cookie(headers)?;
     let token_hash = auth::hash_token(&token);
-    let (stored_hash, previous_hashes): (String, Option<String>) = state
-        .pool
-        .call({
-            let token_hash = token_hash.clone();
-            move |conn| {
-                conn.query_row(
-                    "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
-                    [token_hash],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(Into::into)
-            }
-        })
-        .await
-        .ok()??;
-    let previous_hashes = csrf_history_with(&stored_hash, previous_hashes.as_deref());
-    let plain = auth::secure_token();
-    let new_hash = auth::hash_token(&plain);
-    let updated = state
-        .pool
-        .call(move |conn| {
-            let changed = conn.execute(
-                "UPDATE sessions SET csrf_token_hash = ?, previous_csrf_token_hash = ? WHERE token_hash = ? AND csrf_token_hash = ?",
-                params![new_hash, previous_hashes, token_hash, stored_hash],
-            )?;
-            Ok(changed == 1)
-        })
-        .await
-        .ok()?;
-    updated.then_some(plain)
+    for _attempt in 0..ROTATION_ATTEMPTS {
+        let (stored_hash, previous_hashes): (String, Option<String>) = state
+            .pool
+            .call({
+                let token_hash = token_hash.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND datetime(expires_at) > CURRENT_TIMESTAMP",
+                        [token_hash],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(Into::into)
+                }
+            })
+            .await
+            .ok()??;
+        let previous_hashes = csrf_history_with(&stored_hash, previous_hashes.as_deref());
+        let plain = auth::secure_token();
+        let new_hash = auth::hash_token(&plain);
+        let session_token_hash = token_hash.clone();
+        let updated = state
+            .pool
+            .call(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE sessions SET csrf_token_hash = ?, previous_csrf_token_hash = ? WHERE token_hash = ? AND csrf_token_hash = ?",
+                    params![new_hash, previous_hashes, session_token_hash, stored_hash],
+                )?;
+                Ok(changed == 1)
+            })
+            .await
+            .ok()?;
+        if updated {
+            return Some(plain);
+        }
+    }
+    None
 }
 
 fn csrf_history_with(current_hash: &str, previous_hashes: Option<&str>) -> String {
@@ -4662,6 +6354,21 @@ mod tests {
         assert_eq!(hashes[0], "current");
         assert_eq!(hashes[1], "token-1");
         assert_eq!(hashes[CSRF_TOKEN_HISTORY_LIMIT - 2], "token-30");
+    }
+
+    #[test]
+    fn upload_body_limit_covers_configured_media_mix() {
+        let settings = Settings::default();
+        let remaining_media =
+            u64::try_from(settings.posts.max_media_per_post.saturating_sub(1)).unwrap_or(u64::MAX);
+        let expected_payload = settings.media.max_video_size.saturating_add(
+            settings
+                .media
+                .max_image_size
+                .saturating_mul(remaining_media),
+        );
+
+        assert!(u64::try_from(upload_body_limit(&settings)).unwrap_or(0) > expected_payload);
     }
 
     #[test]
@@ -4747,6 +6454,72 @@ mod tests {
         let member_cookie = register_test_user(&server, "member").await;
 
         let response = get_with_cookie(&server, "/admin/users", &member_cookie).await;
+
+        assert_eq!(response.status, 403);
+    }
+
+    #[tokio::test]
+    async fn cross_site_login_and_registration_posts_are_rejected() {
+        let server = spawn_test_server_with_admin().await;
+
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("origin", "https://attacker.example"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+            b"username=siteowner&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        let registration = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("origin", "https://attacker.example"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+            b"username=forced&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+
+        assert_eq!(login.status, 403);
+        assert_eq!(registration.status, 403);
+        let forced_accounts: i64 = server
+            .pool
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM users WHERE normalized_username = 'forced'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("forced account count");
+        assert_eq!(forced_accounts, 0);
+    }
+
+    #[tokio::test]
+    async fn suspended_admin_session_cannot_access_admin_routes() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        server
+            .pool
+            .call(|conn| {
+                conn.execute(
+                    "UPDATE users SET is_suspended = 1 WHERE normalized_username = 'siteowner'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("suspend admin");
+
+        let response = get_with_cookie(&server, "/admin/users", &admin_cookie).await;
 
         assert_eq!(response.status, 403);
     }
@@ -5004,6 +6777,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_layout_does_not_render_configured_onion_fallback() {
+        let mut settings = Settings::default();
+        settings.tor.enabled = true;
+        settings.tor.display_onion_address =
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion".to_owned();
+        let server = spawn_test_server_with_settings(settings).await;
+
+        let response = request(&server.base_url, "GET", "/", &[], Vec::new()).await;
+
+        assert_eq!(response.status, 200);
+        assert!(!response.body.contains("tor-header-indicator"));
+        assert!(!response.body.contains(".onion"));
+    }
+
+    #[tokio::test]
     async fn auth_forms_show_password_minimum_and_short_passwords_return_forms() {
         let server = spawn_test_server().await;
 
@@ -5033,18 +6821,6 @@ mod tests {
                 .contains(r#"aria-describedby="confirm-password-requirement""#)
         );
 
-        let short_login = request(
-            &server.base_url,
-            "POST",
-            "/login",
-            &[("content-type", "application/x-www-form-urlencoded")],
-            b"username=alice&password=short".to_vec(),
-        )
-        .await;
-        assert_eq!(short_login.status, 400);
-        assert!(short_login.body.contains("<h1>Log in</h1>"));
-        assert!(short_login.body.contains("password is too short"));
-
         let short_register = request(
             &server.base_url,
             "POST",
@@ -5056,6 +6832,28 @@ mod tests {
         assert_eq!(short_register.status, 400);
         assert!(short_register.body.contains("<h1>Create account</h1>"));
         assert!(short_register.body.contains("password is too short"));
+    }
+
+    #[tokio::test]
+    async fn login_allows_existing_password_after_policy_increase() {
+        let server = spawn_test_server().await;
+        let mut permissive_settings = Settings::default();
+        permissive_settings.accounts.min_password_length = 0;
+        auth::register_user(&server.pool, &permissive_settings, "shorty", "short", false)
+            .await
+            .expect("register short password user");
+
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=shorty&password=short".to_vec(),
+        )
+        .await;
+
+        assert_eq!(login.status, 303);
+        assert!(header_value(&login, "set-cookie").is_some());
     }
 
     #[tokio::test]
@@ -6612,7 +8410,7 @@ mod tests {
         assert!(
             profile
                 .body
-                .contains(r#"data-profile-followers="1">1 followers"#)
+                .contains(r#"data-profile-followers="1">1 follower"#)
         );
         assert!(!profile.body.contains(">Unfollow</button>"));
     }
@@ -6937,6 +8735,66 @@ mod tests {
             (theme, nsfw_blur_enabled, liked_posts_public),
             ("dark".to_owned(), 1, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn profile_website_rejects_unsafe_schemes_and_hides_legacy_values() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+
+        let unsafe_saved = save_profile_settings(
+            &server,
+            &cookie,
+            &[
+                ("display_name", "Alice"),
+                ("bio", ""),
+                ("location", ""),
+                ("website", "javascript:alert(1)"),
+            ],
+        )
+        .await;
+        assert_eq!(unsafe_saved.status, 400);
+        assert!(
+            unsafe_saved
+                .body
+                .contains("website URL must start with http:// or https://")
+        );
+        let (_, _, _, _, _, _, website) = user_settings_state(&server, "alice").await;
+        assert_eq!(website, "");
+
+        server
+            .pool
+            .call(|conn| {
+                conn.execute(
+                    "UPDATE users SET website = 'javascript:alert(1)' WHERE normalized_username = 'alice'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("write legacy unsafe website");
+
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        assert_eq!(profile.status, 200);
+        assert!(!profile.body.contains("javascript:alert"));
+        assert!(!profile.body.contains(r#"href="javascript:"#));
+
+        let safe_saved = save_profile_settings(
+            &server,
+            &cookie,
+            &[
+                ("display_name", "Alice"),
+                ("bio", ""),
+                ("location", ""),
+                ("website", "https://example.test/profile"),
+            ],
+        )
+        .await;
+        assert_eq!(safe_saved.status, 303);
+        let profile = get_with_cookie(&server, "/users/alice", &cookie).await;
+        assert!(profile.body.contains(
+            r#"<a href="https://example.test/profile" rel="noopener noreferrer nofollow">https://example.test/profile</a>"#
+        ));
     }
 
     #[tokio::test]
@@ -7897,6 +9755,9 @@ mod tests {
         let logged_out = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
         assert!(logged_out.body.contains(r#"data-testid="nsfw-media""#));
 
+        // The running server uses the setting it loaded at startup. Editing
+        // settings.toml directly takes effect on restart (documented behavior),
+        // and page rendering no longer re-reads and re-parses the file.
         let mut settings = Settings::load(&server.data_dir.join("settings.toml")).expect("load");
         settings.media.nsfw_blur_enabled = false;
         std::fs::write(
@@ -7904,17 +9765,47 @@ mod tests {
             toml::to_string(&settings).expect("settings toml"),
         )
         .expect("write settings");
-        let unblurred = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
-        assert!(!unblurred.body.contains(r#"data-testid="nsfw-media""#));
+        let still_blurred = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(still_blurred.body.contains(r#"data-testid="nsfw-media""#));
+    }
 
-        settings.media.nsfw_blur_enabled = true;
-        std::fs::write(
-            server.data_dir.join("settings.toml"),
-            toml::to_string(&settings).expect("settings toml"),
+    #[tokio::test]
+    async fn global_nsfw_blur_default_applies_from_loaded_settings() {
+        let mut settings = Settings::default();
+        settings.media.nsfw_blur_enabled = false;
+        let server = spawn_test_server_with_settings(settings).await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+        let posted = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", &cookie),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "post-boundary",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("text", "unblurred by default"),
+                    ("nsfw", "true"),
+                ],
+                "media",
+                "photo.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
         )
-        .expect("write settings");
-        let safe_again = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
-        assert!(safe_again.body.contains(r#"data-testid="nsfw-media""#));
+        .await;
+        assert_eq!(posted.status, 303);
+
+        let logged_out = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(!logged_out.body.contains(r#"data-testid="nsfw-media""#));
     }
 
     #[tokio::test]
@@ -8600,7 +10491,8 @@ mod tests {
 
     #[tokio::test]
     async fn delete_account_intent_and_password_control_final_delete() {
-        let server = spawn_test_server().await;
+        // Immediate deletion keeps this test focused on intent and password control.
+        let server = spawn_test_server_without_deletion_grace().await;
         let registered = request(
             &server.base_url,
             "POST",
@@ -8697,7 +10589,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_account_route_succeeds_after_file_cleanup_failure() {
-        let server = spawn_test_server().await;
+        let server = spawn_test_server_without_deletion_grace().await;
         let registered = request(
             &server.base_url,
             "POST",
@@ -8759,6 +10651,372 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
             .expect("users count");
         assert_eq!(users, 0);
+    }
+
+    async fn user_id_for(server: &TestServer, username: &str) -> i64 {
+        let username = username.to_owned();
+        server
+            .pool
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT id FROM users WHERE normalized_username = ?",
+                    [username],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("user id")
+    }
+
+    /// End-to-end backup/restore: creates representative data through the HTTP
+    /// API, snapshots it, restores into a fresh data directory, and verifies
+    /// the restored database and media files.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end backup/restore scenario keeps setup, restore, and assertions in order"
+    )]
+    async fn backup_restore_round_trips_accounts_graph_muted_words_and_media() {
+        let server = spawn_test_server().await;
+        let alice = register_test_user(&server, "alice").await;
+        let bob = register_test_user(&server, "bob").await;
+        let _carol = register_test_user(&server, "carol").await;
+
+        create_text_post(&server, &alice, "alice first post").await;
+        create_text_post(&server, &bob, "bob first post").await;
+
+        // Media upload from bob.
+        let bob_csrf = csrf_token(&get_with_cookie(&server, "/home", &bob).await.body);
+        let upload = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", bob.as_str()),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=media-boundary",
+                ),
+            ],
+            multipart_body_with_file(
+                "media-boundary",
+                &[("csrf", bob_csrf.as_str()), ("text", "bob photo post")],
+                "media",
+                "holiday.png",
+                "image/png",
+                &tiny_png_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(upload.status, 303);
+
+        // Alice follows bob; bob blocks carol; alice mutes a word.
+        let bob_id = user_id_for(&server, "bob").await;
+        let carol_id = user_id_for(&server, "carol").await;
+        let alice_csrf = csrf_token(&get_with_cookie(&server, "/home", &alice).await.body);
+        let followed = post_form_with_cookie(
+            &server,
+            &format!("/users/{bob_id}/follow"),
+            &alice,
+            &format!("csrf={alice_csrf}"),
+        )
+        .await;
+        assert_eq!(followed.status, 303);
+        let bob_settings_csrf = csrf_token(&get_with_cookie(&server, "/settings", &bob).await.body);
+        let blocked = post_form_with_cookie(
+            &server,
+            &format!("/users/{carol_id}/block"),
+            &bob,
+            &format!("csrf={bob_settings_csrf}"),
+        )
+        .await;
+        assert_eq!(blocked.status, 303);
+        let alice_settings_csrf =
+            csrf_token(&get_with_cookie(&server, "/settings", &alice).await.body);
+        let muted = post_form_with_cookie(
+            &server,
+            "/settings/muted-words",
+            &alice,
+            &format!("csrf={alice_settings_csrf}&term=spoilers"),
+        )
+        .await;
+        assert_eq!(muted.status, 303);
+
+        let source_paths = RuntimePaths::from_data_dir(server.data_dir.clone());
+        let archive = backup::create_backup(&source_paths, false).expect("create backup");
+        assert!(archive.is_file());
+
+        let target_temp = tempfile::tempdir().expect("target temp dir");
+        let target_paths = RuntimePaths::from_data_dir(target_temp.path().to_path_buf());
+        target_paths.ensure().expect("target paths");
+        let report =
+            backup::restore_backup(&target_paths, &archive, false).expect("restore backup");
+        assert!(report.pre_restore_backup.is_some());
+
+        let restored =
+            rusqlite::Connection::open(&target_paths.database_path).expect("restored database");
+        let count = |table: &str| -> i64 {
+            restored
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count")
+        };
+        assert_eq!(count("users"), 3);
+        assert_eq!(count("posts"), 3);
+        assert_eq!(count("follows"), 1);
+        assert_eq!(count("blocks"), 1);
+        assert_eq!(count("muted_words"), 1);
+        assert_eq!(count("media"), 1);
+        let (stored_path, public_path): (String, String) = restored
+            .query_row(
+                "SELECT stored_path, public_path FROM media LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("media row");
+        // Restore rewrites absolute media paths for the destination data dir.
+        let target_prefix = target_paths.data_dir.to_string_lossy().to_string();
+        assert!(
+            stored_path.starts_with(&target_prefix),
+            "restored media path {stored_path} still points outside {target_prefix}"
+        );
+        let file_name = std::path::Path::new(&stored_path)
+            .file_name()
+            .expect("media file name");
+        assert!(
+            target_paths.uploads_originals.join(file_name).is_file(),
+            "restored media file is missing for {public_path}"
+        );
+        assert!(target_paths.settings_path.is_file());
+        crate::db::validate_schema(&restored).expect("restored schema validates");
+        let restored_post_id: i64 = restored
+            .query_row("SELECT post_id FROM post_media LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("post media");
+        drop(restored);
+
+        // Media cleanup must work against the restored paths.
+        let restored_pool = crate::db::connect(&target_paths.database_path)
+            .await
+            .expect("restored pool");
+        crate::media::delete_post_media(&restored_pool, &target_paths, restored_post_id)
+            .await
+            .expect("delete restored media");
+        assert!(!target_paths.uploads_originals.join(file_name).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_page_loads_each_render_a_csrf_token() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let base_url = server.base_url.clone();
+            let cookie = cookie.clone();
+            handles.push(tokio::spawn(async move {
+                request(
+                    &base_url,
+                    "GET",
+                    "/home",
+                    &[("cookie", &cookie)],
+                    Vec::new(),
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            let response = handle.await.expect("task");
+            assert_eq!(response.status, 200);
+            assert!(
+                response.body.contains(r#"name="csrf""#),
+                "concurrent page load rendered a form without a CSRF token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_image_headers_are_rejected_before_conversion() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+
+        let mut oversized = tiny_png_bytes();
+        oversized[16..20].copy_from_slice(&40_000_u32.to_be_bytes());
+        oversized[20..24].copy_from_slice(&40_000_u32.to_be_bytes());
+        let body = multipart_body_with_file(
+            "post-boundary",
+            &[("csrf", csrf.as_str()), ("text", "huge image")],
+            "media",
+            "huge.png",
+            "image/png",
+            &oversized,
+        );
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/posts",
+            &[
+                ("cookie", cookie.as_str()),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=post-boundary",
+                ),
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("dimensions"));
+        let media = media_row_count(&server).await;
+        assert_eq!(media, 0, "rejected image must not leave a media row");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_post_submissions_each_create_exactly_one_post() {
+        let mut settings = Settings::default();
+        settings.moderation.posts_per_minute = 50;
+        let server = spawn_test_server_with_settings(settings).await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+
+        let mut handles = Vec::new();
+        for index in 0..10 {
+            let base_url = server.base_url.clone();
+            let cookie = cookie.clone();
+            let csrf = csrf.clone();
+            handles.push(tokio::spawn(async move {
+                request(
+                    &base_url,
+                    "POST",
+                    "/posts",
+                    &[
+                        ("cookie", cookie.as_str()),
+                        (
+                            "content-type",
+                            "multipart/form-data; boundary=post-boundary",
+                        ),
+                    ],
+                    multipart_body(
+                        "post-boundary",
+                        &[
+                            ("csrf", csrf.as_str()),
+                            ("text", &format!("concurrent submission {index}")),
+                        ],
+                        false,
+                    ),
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await.expect("task").status, 303);
+        }
+
+        let (count, distinct): (i64, i64) = server
+            .pool
+            .call(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM posts WHERE is_deleted = 0",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(DISTINCT text) FROM posts WHERE is_deleted = 0",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .expect("post stats");
+        assert_eq!(count, 10);
+        assert_eq!(distinct, 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_identical_media_uploads_keep_files_intact() {
+        let mut settings = Settings::default();
+        settings.moderation.posts_per_minute = 50;
+        let server = spawn_test_server_with_settings(settings).await;
+        let cookie = register_test_user(&server, "alice").await;
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        let csrf = csrf_token(&home.body);
+
+        let mut handles = Vec::new();
+        for index in 0..6 {
+            let base_url = server.base_url.clone();
+            let cookie = cookie.clone();
+            let csrf = csrf.clone();
+            handles.push(tokio::spawn(async move {
+                let body = multipart_body_with_file(
+                    "media-boundary",
+                    &[
+                        ("csrf", csrf.as_str()),
+                        ("text", &format!("concurrent photo {index}")),
+                    ],
+                    "media",
+                    "same.png",
+                    "image/png",
+                    &tiny_png_bytes(),
+                );
+                request(
+                    &base_url,
+                    "POST",
+                    "/posts",
+                    &[
+                        ("cookie", cookie.as_str()),
+                        (
+                            "content-type",
+                            "multipart/form-data; boundary=media-boundary",
+                        ),
+                    ],
+                    body,
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            let response = handle.await.expect("task");
+            assert_eq!(response.status, 303);
+        }
+
+        let rows: Vec<(String, Option<i64>)> = server
+            .pool
+            .call(|conn| {
+                let mut stmt = conn.prepare("SELECT stored_path, canonical_media_id FROM media")?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .expect("media rows");
+        assert_eq!(rows.len(), 6);
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, canonical)| canonical.is_none())
+                .count(),
+            1,
+            "identical uploads must share one canonical row"
+        );
+        let mut distinct_paths = std::collections::BTreeSet::new();
+        for (stored_path, _canonical) in &rows {
+            let path = std::path::Path::new(stored_path);
+            assert!(path.is_file(), "missing media file {stored_path}");
+            assert_eq!(
+                std::fs::read(path).expect("read media"),
+                tiny_png_bytes(),
+                "media file content changed under concurrent uploads"
+            );
+            distinct_paths.insert(stored_path.clone());
+        }
+        assert_eq!(distinct_paths.len(), 1);
     }
 
     fn multipart_body(
@@ -9073,6 +11331,14 @@ mod tests {
         spawn_test_server_inner(false, settings).await
     }
 
+    /// A server configured for immediate account deletion after password
+    /// confirmation, matching the pre-grace-period behavior.
+    async fn spawn_test_server_without_deletion_grace() -> TestServer {
+        let mut settings = Settings::default();
+        settings.accounts.deletion_grace_period_days = 0;
+        spawn_test_server_with_settings(settings).await
+    }
+
     async fn spawn_test_server_inner(create_admin: bool, settings: Settings) -> TestServer {
         let temp = tempfile::tempdir().expect("temp dir");
         let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf())
@@ -9330,5 +11596,2202 @@ mod tests {
         let start = body.find(&marker).expect("hidden marker") + marker.len();
         let end = body[start..].find('"').expect("hidden end") + start;
         body[start..end].to_owned()
+    }
+
+    async fn protected_account_fixture() -> (TestServer, String, String, i64) {
+        let server = spawn_test_server().await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        let bob_cookie = register_test_user(&server, "bob").await;
+        let alice_id = user_id_for(&server, "alice").await;
+        let saved = save_profile_settings(
+            &server,
+            &alice_cookie,
+            &[("follow_approval_required", "true")],
+        )
+        .await;
+        assert_eq!(saved.status, 303);
+        (server, alice_cookie, bob_cookie, alice_id)
+    }
+
+    async fn post_multipart_with_cookie(
+        server: &TestServer,
+        path: &str,
+        cookie: &str,
+        boundary: &str,
+        fields: &[(&str, &str)],
+    ) -> TestResponse {
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        request(
+            &server.base_url,
+            "POST",
+            path,
+            &[("cookie", cookie), ("content-type", &content_type)],
+            multipart_body(boundary, fields, false),
+        )
+        .await
+    }
+
+    async fn count_rows(server: &TestServer, sql: &'static str) -> i64 {
+        server
+            .pool
+            .call(move |conn| Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0))?))
+            .await
+            .expect("row count")
+    }
+
+    #[tokio::test]
+    async fn protected_account_follow_requests_need_approval_before_following() {
+        let (server, alice_cookie, bob_cookie, alice_id) = protected_account_fixture().await;
+        let bob_id = user_id_for(&server, "bob").await;
+
+        let before = get_with_cookie(&server, "/users/alice", &bob_cookie).await;
+        let csrf = csrf_token(&before.body);
+        let requested = post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(requested.status, 303);
+
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 0);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            1
+        );
+        let profile = get_with_cookie(&server, "/users/alice", &bob_cookie).await;
+        assert!(profile.body.contains(">Requested</button>"));
+        assert!(profile.body.contains(&format!(
+            r#"data-profile-followers="{alice_id}">0 followers"#
+        )));
+
+        let requests = get_with_cookie(&server, "/follow-requests", &alice_cookie).await;
+        assert_eq!(requests.status, 200);
+        assert!(requests.body.contains("@bob"));
+        assert!(
+            requests
+                .body
+                .contains(&format!("/users/{bob_id}/follow/approve"))
+        );
+        assert!(
+            requests
+                .body
+                .contains(&format!("/users/{bob_id}/follow/reject"))
+        );
+        let notifications = get_with_cookie(&server, "/notifications", &alice_cookie).await;
+        assert!(notifications.body.contains("requested to follow you"));
+
+        let csrf = csrf_token(&requests.body);
+        let approved = post_form_with_cookie(
+            &server,
+            &format!("/users/{bob_id}/follow/approve"),
+            &alice_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(approved.status, 303);
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 1);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            0
+        );
+        let bob_notifications = get_with_cookie(&server, "/notifications", &bob_cookie).await;
+        assert!(
+            bob_notifications
+                .body
+                .contains("approved your follow request")
+        );
+        let profile = get_with_cookie(&server, "/users/alice", &bob_cookie).await;
+        assert!(profile.body.contains(">Following</button>"));
+    }
+
+    #[tokio::test]
+    async fn follow_requests_can_be_rejected_cancelled_and_blocks_clear_them() {
+        let (server, alice_cookie, bob_cookie, alice_id) = protected_account_fixture().await;
+        let bob_id = user_id_for(&server, "bob").await;
+
+        // Cancel a pending request from the requester's own view.
+        let before = get_with_cookie(&server, "/users/alice", &bob_cookie).await;
+        let csrf = csrf_token(&before.body);
+        post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        let sent = get_with_cookie(&server, "/follow-requests", &bob_cookie).await;
+        assert!(sent.body.contains("@alice"));
+        let csrf = csrf_token(&sent.body);
+        let cancelled = post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow/cancel"),
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(cancelled.status, 303);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            0
+        );
+
+        // Reject a fresh request.
+        let before = get_with_cookie(&server, "/users/alice", &bob_cookie).await;
+        let csrf = csrf_token(&before.body);
+        post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        let requests = get_with_cookie(&server, "/follow-requests", &alice_cookie).await;
+        let csrf = csrf_token(&requests.body);
+        let rejected = post_form_with_cookie(
+            &server,
+            &format!("/users/{bob_id}/follow/reject"),
+            &alice_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(rejected.status, 303);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            0
+        );
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 0);
+
+        // A pending request disappears when the target blocks the requester.
+        let before = get_with_cookie(&server, "/users/alice", &bob_cookie).await;
+        let csrf = csrf_token(&before.body);
+        post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        let profile = get_with_cookie(&server, "/users/bob", &alice_cookie).await;
+        let csrf = csrf_token(&profile.body);
+        let blocked = post_form_with_cookie(
+            &server,
+            &format!("/users/{bob_id}/block"),
+            &alice_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(blocked.status, 303);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            0
+        );
+        let blocked_request = get_with_cookie(&server, "/users/alice", &bob_cookie).await;
+        let csrf = csrf_token(&blocked_request.body);
+        let refused = post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(refused.status, 400);
+    }
+
+    #[tokio::test]
+    async fn disabling_follow_approval_keeps_pending_requests_pending() {
+        let (server, alice_cookie, bob_cookie, alice_id) = protected_account_fixture().await;
+        let before = get_with_cookie(&server, "/users/alice", &bob_cookie).await;
+        let csrf = csrf_token(&before.body);
+        post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+
+        let saved =
+            save_profile_settings(&server, &alice_cookie, &[("display_name", "Alice")]).await;
+        assert_eq!(saved.status, 303);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            1
+        );
+
+        let carol_cookie = register_test_user(&server, "carol").await;
+        let carol_view = get_with_cookie(&server, "/users/alice", &carol_cookie).await;
+        let csrf = csrf_token(&carol_view.body);
+        let followed = post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &carol_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(followed.status, 303);
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 1);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_announcement_renders_next_to_site_name_and_escapes_text() {
+        let server = spawn_test_server_with_admin().await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let dashboard = get_with_cookie(&server, "/admin", &admin_cookie).await;
+        let csrf = csrf_token(&dashboard.body);
+        let updated = post_form_with_cookie(
+            &server,
+            "/admin/announcement",
+            &admin_cookie,
+            &format!(
+                "csrf={}&announcement={}&enabled=true&intent=save",
+                form_encode(&csrf),
+                form_encode("<b>Window</b> at 20:00")
+            ),
+        )
+        .await;
+        assert_eq!(updated.status, 303);
+
+        let home = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert_eq!(home.status, 200);
+        assert!(home.body.contains(r#"data-testid="announcement""#));
+        assert!(home.body.contains("&lt;b&gt;Window&lt;/b&gt; at 20:00"));
+        assert!(!home.body.contains("<b>Window</b> at 20:00"));
+
+        let member_cookie = register_test_user(&server, "member").await;
+        let member_home = get_with_cookie(&server, "/home", &member_cookie).await;
+        let member_csrf = csrf_token(&member_home.body);
+        let forbidden = post_form_with_cookie(
+            &server,
+            "/admin/announcement",
+            &member_cookie,
+            &format!(
+                "csrf={}&announcement=hi&enabled=true&intent=save",
+                form_encode(&member_csrf)
+            ),
+        )
+        .await;
+        assert_eq!(forbidden.status, 403);
+
+        let dashboard = get_with_cookie(&server, "/admin", &admin_cookie).await;
+        let csrf = csrf_token(&dashboard.body);
+        let cleared = post_form_with_cookie(
+            &server,
+            "/admin/announcement",
+            &admin_cookie,
+            &format!("csrf={}&intent=clear", form_encode(&csrf)),
+        )
+        .await;
+        assert_eq!(cleared.status, 303);
+        let home = request(&server.base_url, "GET", "/home", &[], Vec::new()).await;
+        assert!(!home.body.contains(r#"data-testid="announcement""#));
+
+        let dashboard = get_with_cookie(&server, "/admin", &admin_cookie).await;
+        let csrf = csrf_token(&dashboard.body);
+        let too_long = post_form_with_cookie(
+            &server,
+            "/admin/announcement",
+            &admin_cookie,
+            &format!(
+                "csrf={}&announcement={}&enabled=true&intent=save",
+                form_encode(&csrf),
+                form_encode(&"x".repeat(281))
+            ),
+        )
+        .await;
+        assert_eq!(too_long.status, 400);
+        assert!(too_long.body.contains("announcement is too long"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_mode_blocks_registration_and_posting_but_stays_readable() {
+        let server = spawn_test_server_with_admin().await;
+        let member_cookie = register_test_user(&server, "member").await;
+        create_text_post(&server, &member_cookie, "before maintenance").await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let dashboard = get_with_cookie(&server, "/admin", &admin_cookie).await;
+        let csrf = csrf_token(&dashboard.body);
+        let enabled = post_form_with_cookie(
+            &server,
+            "/admin/maintenance",
+            &admin_cookie,
+            &format!(
+                "csrf={}&enabled=true&message={}",
+                form_encode(&csrf),
+                form_encode("Back at noon")
+            ),
+        )
+        .await;
+        assert_eq!(enabled.status, 303);
+
+        let home = get_with_cookie(&server, "/home", &member_cookie).await;
+        assert_eq!(home.status, 200);
+        assert!(home.body.contains(r#"data-testid="maintenance-notice""#));
+        assert!(home.body.contains("Back at noon"));
+        assert!(!home.body.contains(r#"id="post-text""#));
+
+        let csrf = csrf_token(&home.body);
+        let blocked = post_multipart_with_cookie(
+            &server,
+            "/posts",
+            &member_cookie,
+            "maintenance-post",
+            &[("csrf", csrf.as_str()), ("text", "should not publish")],
+        )
+        .await;
+        assert_eq!(blocked.status, 503);
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM posts WHERE text = 'should not publish'"
+            )
+            .await,
+            0
+        );
+
+        let register = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=late&password=very%20secure%20password&confirm_password=very%20secure%20password"
+                .to_vec(),
+        )
+        .await;
+        assert_eq!(register.status, 503);
+        let register_page = request(&server.base_url, "GET", "/register", &[], Vec::new()).await;
+        assert_eq!(register_page.status, 200);
+        assert!(
+            register_page
+                .body
+                .contains("Registration is currently closed.")
+        );
+
+        // Administrators keep posting so they can verify the instance.
+        let admin_home = get_with_cookie(&server, "/home", &admin_cookie).await;
+        assert!(admin_home.body.contains(r#"id="post-text""#));
+        let admin_csrf = csrf_token(&admin_home.body);
+        let admin_post = post_multipart_with_cookie(
+            &server,
+            "/posts",
+            &admin_cookie,
+            "maintenance-admin-post",
+            &[
+                ("csrf", admin_csrf.as_str()),
+                ("text", "admin verification post"),
+            ],
+        )
+        .await;
+        assert_eq!(admin_post.status, 303);
+
+        let dashboard = get_with_cookie(&server, "/admin", &admin_cookie).await;
+        let csrf = csrf_token(&dashboard.body);
+        let disabled = post_form_with_cookie(
+            &server,
+            "/admin/maintenance",
+            &admin_cookie,
+            &format!("csrf={}&intent=save", form_encode(&csrf)),
+        )
+        .await;
+        assert_eq!(disabled.status, 303);
+        create_text_post(&server, &member_cookie, "after maintenance").await;
+    }
+
+    #[tokio::test]
+    async fn admin_forced_password_reset_restricts_account_until_password_changes() {
+        let server = spawn_test_server_with_admin().await;
+        let member_cookie = register_test_user(&server, "member").await;
+        create_text_post(&server, &member_cookie, "before forced reset").await;
+        let member_id = user_id_for(&server, "member").await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let users_page = get_with_cookie(&server, "/admin/users", &admin_cookie).await;
+        let csrf = csrf_token(&users_page.body);
+        let reset = post_form_with_cookie(
+            &server,
+            &format!("/admin/users/{member_id}/require-password-reset"),
+            &admin_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(reset.status, 303);
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM admin_audit_log WHERE action = 'require_password_reset'"
+            )
+            .await,
+            1
+        );
+
+        let home = get_with_cookie(&server, "/home", &member_cookie).await;
+        assert_eq!(home.status, 303);
+        assert!(location(&home).starts_with("/settings/password"));
+
+        let page = get_with_cookie(&server, "/settings/password?required=1", &member_cookie).await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("You must change your password"));
+        assert!(!page.body.contains(r#"id="profile-settings-form""#));
+
+        let csrf = csrf_token(&page.body);
+        let blocked_post = post_multipart_with_cookie(
+            &server,
+            "/posts",
+            &member_cookie,
+            "reset-post",
+            &[("csrf", csrf.as_str()), ("text", "blocked by reset")],
+        )
+        .await;
+        assert_eq!(blocked_post.status, 303);
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM posts WHERE text = 'blocked by reset'"
+            )
+            .await,
+            0
+        );
+
+        let changed = post_form_with_cookie(
+            &server,
+            "/settings/password",
+            &member_cookie,
+            &format!(
+                "csrf={}&current_password=very%20secure%20password&new_password=brand%20new%20password&confirm_new_password=brand%20new%20password",
+                form_encode(&csrf)
+            ),
+        )
+        .await;
+        assert_eq!(changed.status, 303);
+        let home = get_with_cookie(&server, "/home", &member_cookie).await;
+        assert_eq!(home.status, 200);
+        create_text_post(&server, &member_cookie, "after password reset").await;
+
+        let old_login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=member&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(old_login.status, 401);
+        let new_login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=member&password=brand%20new%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(new_login.status, 303);
+    }
+
+    #[tokio::test]
+    async fn admin_forced_logout_revokes_only_that_accounts_sessions() {
+        let server = spawn_test_server_with_admin().await;
+        let member_cookie = register_test_user(&server, "member").await;
+        let second_login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=member&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(second_login.status, 303);
+        let second_cookie = session_cookie(&second_login);
+        let bystander_cookie = register_test_user(&server, "bystander").await;
+        let member_id = user_id_for(&server, "member").await;
+        let admin_cookie = admin_session_cookie(&server).await;
+
+        for _ in 0..2 {
+            let users_page = get_with_cookie(&server, "/admin/users", &admin_cookie).await;
+            let csrf = csrf_token(&users_page.body);
+            let revoked = post_form_with_cookie(
+                &server,
+                &format!("/admin/users/{member_id}/revoke-sessions"),
+                &admin_cookie,
+                &format!("csrf={csrf}"),
+            )
+            .await;
+            assert_eq!(revoked.status, 303);
+        }
+
+        for cookie in [&member_cookie, &second_cookie] {
+            let settings = get_with_cookie(&server, "/settings", cookie).await;
+            assert_eq!(settings.status, 401);
+        }
+        let bystander = get_with_cookie(&server, "/settings", &bystander_cookie).await;
+        assert_eq!(bystander.status, 200);
+        let login_again = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=member&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(login_again.status, 303);
+    }
+
+    #[tokio::test]
+    async fn forced_logout_does_not_clear_a_forced_password_reset() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = register_test_user(&server, "member").await;
+        let member_id = user_id_for(&server, "member").await;
+        let admin_cookie = admin_session_cookie(&server).await;
+
+        let users_page = get_with_cookie(&server, "/admin/users", &admin_cookie).await;
+        let csrf = csrf_token(&users_page.body);
+        let reset = post_form_with_cookie(
+            &server,
+            &format!("/admin/users/{member_id}/require-password-reset"),
+            &admin_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(reset.status, 303);
+
+        let users_page = get_with_cookie(&server, "/admin/users", &admin_cookie).await;
+        let csrf = csrf_token(&users_page.body);
+        let revoked = post_form_with_cookie(
+            &server,
+            &format!("/admin/users/{member_id}/revoke-sessions"),
+            &admin_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(revoked.status, 303);
+        let old_session = get_with_cookie(&server, "/settings", &cookie).await;
+        assert_eq!(old_session.status, 401);
+
+        let login = request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=member&password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(login.status, 303);
+        let fresh_cookie = session_cookie(&login);
+        let home = get_with_cookie(&server, "/home", &fresh_cookie).await;
+        assert_eq!(home.status, 303);
+        assert!(location(&home).starts_with("/settings/password"));
+    }
+
+    #[tokio::test]
+    async fn deletion_grace_period_blocks_writes_and_can_be_cancelled() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "deleter").await;
+        create_text_post(&server, &cookie, "post before deletion").await;
+
+        let confirm_page = get_with_cookie(&server, "/settings/delete/confirm", &cookie).await;
+        let csrf = csrf_token(&confirm_page.body);
+        let intent = hidden_value(&confirm_page.body, "delete_intent");
+        let requested = post_form_with_cookie(
+            &server,
+            "/settings/delete/confirm",
+            &cookie,
+            &format!("csrf={csrf}&delete_intent={intent}&password=very%20secure%20password"),
+        )
+        .await;
+        assert_eq!(requested.status, 303);
+        assert_eq!(location(&requested), "/settings?saved=delete-requested");
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM users WHERE deletion_scheduled_at IS NOT NULL"
+            )
+            .await,
+            1
+        );
+
+        let home = get_with_cookie(&server, "/home", &cookie).await;
+        assert_eq!(home.status, 200);
+        assert!(home.body.contains(r#"data-testid="account-notice""#));
+
+        let csrf = csrf_token(&home.body);
+        let blocked = post_multipart_with_cookie(
+            &server,
+            "/posts",
+            &cookie,
+            "deletion-post",
+            &[("csrf", csrf.as_str()), ("text", "should not publish")],
+        )
+        .await;
+        assert_eq!(blocked.status, 403);
+
+        let settings = get_with_cookie(&server, "/settings", &cookie).await;
+        assert!(settings.body.contains(r#"data-testid="deletion-deadline""#));
+        let csrf = csrf_token(&settings.body);
+        let cancelled = post_form_with_cookie(
+            &server,
+            "/settings/delete/cancel",
+            &cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(cancelled.status, 303);
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM users WHERE deletion_scheduled_at IS NULL"
+            )
+            .await,
+            1
+        );
+        create_text_post(&server, &cookie, "post after cancellation").await;
+    }
+
+    #[tokio::test]
+    async fn matched_deletion_deadlines_finalize_idempotently() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "expiring").await;
+        create_text_post(&server, &cookie, "expiring post").await;
+        let user_id = user_id_for(&server, "expiring").await;
+        let paths = RuntimePaths::from_data_dir(server.data_dir.clone());
+        server
+            .pool
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET deletion_requested_at = datetime('now','-31 days'), deletion_scheduled_at = datetime('now','-1 day') WHERE id = ?",
+                    [user_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("schedule deletion");
+
+        let removed = crate::account::finalize_due_deletions(&server.pool, &paths)
+            .await
+            .expect("finalize");
+        assert_eq!(removed, 1);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM users WHERE id = 1").await,
+            0
+        );
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM posts").await, 0);
+        let session = get_with_cookie(&server, "/home", &cookie).await;
+        assert_eq!(session.status, 200);
+        assert!(!session.body.contains(r#"data-testid="account-notice""#));
+        let removed_again = crate::account::finalize_due_deletions(&server.pool, &paths)
+            .await
+            .expect("finalize again");
+        assert_eq!(removed_again, 0);
+    }
+
+    #[tokio::test]
+    async fn zero_grace_period_deletes_immediately_after_confirmation() {
+        let mut settings = Settings::default();
+        settings.accounts.deletion_grace_period_days = 0;
+        let server = spawn_test_server_with_settings(settings).await;
+        let cookie = register_test_user(&server, "instant").await;
+        create_text_post(&server, &cookie, "instant post").await;
+
+        let confirm_page = get_with_cookie(&server, "/settings/delete/confirm", &cookie).await;
+        let csrf = csrf_token(&confirm_page.body);
+        let intent = hidden_value(&confirm_page.body, "delete_intent");
+        let deleted = post_form_with_cookie(
+            &server,
+            "/settings/delete/confirm",
+            &cookie,
+            &format!("csrf={csrf}&delete_intent={intent}&password=very%20secure%20password"),
+        )
+        .await;
+        assert_eq!(deleted.status, 303);
+        assert_eq!(location(&deleted), "/account-deleted");
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM users").await, 0);
+    }
+
+    #[tokio::test]
+    async fn username_changes_keep_identity_and_reserve_previous_handles() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "original").await;
+        create_text_post(&server, &cookie, "post from original").await;
+
+        let settings = get_with_cookie(&server, "/settings", &cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let wrong_password = post_form_with_cookie(
+            &server,
+            "/settings/username",
+            &cookie,
+            &format!("csrf={csrf}&new_username=renamed&password=not%20the%20password"),
+        )
+        .await;
+        assert_eq!(wrong_password.status, 401);
+
+        let changed = post_form_with_cookie(
+            &server,
+            "/settings/username",
+            &cookie,
+            &format!(
+                "csrf={csrf}&new_username={}&password=very%20secure%20password",
+                form_encode("ReNamed")
+            ),
+        )
+        .await;
+        assert_eq!(changed.status, 303);
+        assert_eq!(location(&changed), "/settings?saved=username");
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM username_history WHERE username = 'original'"
+            )
+            .await,
+            1
+        );
+
+        let profile = get_with_cookie(&server, "/users/renamed", &cookie).await;
+        assert_eq!(profile.status, 200);
+        assert!(profile.body.contains("Previously known as @original"));
+        assert!(profile.body.contains("post from original"));
+
+        let old_url = request(&server.base_url, "GET", "/users/original", &[], Vec::new()).await;
+        assert_eq!(old_url.status, 200);
+        assert!(old_url.body.contains("No account uses @original"));
+        assert!(old_url.body.contains(r#"href="/users/ReNamed""#));
+
+        let duplicate = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=original&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(duplicate.status, 400);
+        assert!(duplicate.body.contains("That username is already taken."));
+
+        let taken = post_form_with_cookie(
+            &server,
+            "/settings/username",
+            &cookie,
+            &format!("csrf={csrf}&new_username=settings&password=very%20secure%20password"),
+        )
+        .await;
+        assert_eq!(taken.status, 400);
+
+        let revert = post_form_with_cookie(
+            &server,
+            "/settings/username",
+            &cookie,
+            &format!("csrf={csrf}&new_username=original&password=very%20secure%20password"),
+        )
+        .await;
+        assert_eq!(revert.status, 303);
+        let profile = get_with_cookie(&server, "/users/original", &cookie).await;
+        assert!(profile.body.contains("Previously known as @ReNamed"));
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM username_history WHERE normalized_username = 'original'"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end scenario: export from one disposable instance and import into another"
+    )]
+    #[tokio::test]
+    async fn account_archives_round_trip_over_http_and_respect_protected_follows() {
+        let source = spawn_test_server().await;
+        let source_cookie = register_test_user(&source, "mover").await;
+        create_text_post(&source, &source_cookie, "portable post body").await;
+        let _protector_cookie = register_test_user(&source, "protector").await;
+        let protector_id = user_id_for(&source, "protector").await;
+        let protector_view = get_with_cookie(&source, "/users/protector", &source_cookie).await;
+        let csrf = csrf_token(&protector_view.body);
+        let followed = post_form_with_cookie(
+            &source,
+            &format!("/users/{protector_id}/follow"),
+            &source_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(followed.status, 303);
+
+        let export = get_with_cookie(&source, "/settings/export", &source_cookie).await;
+        assert_eq!(export.status, 200);
+        assert!(
+            header_value(&export, "content-disposition")
+                .expect("disposition")
+                .contains("attachment")
+        );
+        assert_eq!(&export.body_bytes[..2], &[0x1f, 0x8b]);
+
+        let destination = spawn_test_server().await;
+        let receiver_cookie = register_test_user(&destination, "receiver").await;
+        let protector_cookie = register_test_user(&destination, "protector").await;
+        let saved = save_profile_settings(
+            &destination,
+            &protector_cookie,
+            &[("follow_approval_required", "true")],
+        )
+        .await;
+        assert_eq!(saved.status, 303);
+
+        let import_page = get_with_cookie(&destination, "/settings/import", &receiver_cookie).await;
+        assert!(import_page.body.contains(r#"name="archive""#));
+        let csrf = csrf_token(&import_page.body);
+        let body = multipart_body_with_file(
+            "archive-boundary",
+            &[("csrf", csrf.as_str())],
+            "archive",
+            "account.tar.gz",
+            "application/gzip",
+            &export.body_bytes,
+        );
+        let imported = request(
+            &destination.base_url,
+            "POST",
+            "/settings/import",
+            &[
+                ("cookie", receiver_cookie.as_str()),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=archive-boundary",
+                ),
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(imported.status, 200);
+        assert!(imported.body.contains("Import complete"));
+        assert_eq!(
+            count_rows(
+                &destination,
+                "SELECT COUNT(*) FROM posts WHERE text = 'portable post body'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count_rows(&destination, "SELECT COUNT(*) FROM follow_requests").await,
+            1,
+            "protected accounts must receive a pending request instead of a follow"
+        );
+        assert_eq!(
+            count_rows(&destination, "SELECT COUNT(*) FROM follows").await,
+            0
+        );
+
+        let import_page = get_with_cookie(&destination, "/settings/import", &receiver_cookie).await;
+        let csrf = csrf_token(&import_page.body);
+        let body = multipart_body_with_file(
+            "archive-boundary",
+            &[("csrf", csrf.as_str())],
+            "archive",
+            "account.tar.gz",
+            "application/gzip",
+            &export.body_bytes,
+        );
+        let repeated = request(
+            &destination.base_url,
+            "POST",
+            "/settings/import",
+            &[
+                ("cookie", receiver_cookie.as_str()),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=archive-boundary",
+                ),
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(repeated.status, 400);
+        assert!(repeated.body.contains("already been imported"));
+    }
+
+    #[tokio::test]
+    async fn renames_and_deletions_keep_follow_requests_consistent() {
+        let (server, alice_cookie, bob_cookie, alice_id) = protected_account_fixture().await;
+        let bob_id = user_id_for(&server, "bob").await;
+
+        let before = get_with_cookie(&server, "/users/alice", &bob_cookie).await;
+        let csrf = csrf_token(&before.body);
+        post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+
+        // Renaming the requester keeps the request addressed to the same account.
+        let settings = get_with_cookie(&server, "/settings", &bob_cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let renamed = post_form_with_cookie(
+            &server,
+            "/settings/username",
+            &bob_cookie,
+            &format!("csrf={csrf}&new_username=robert&password=very%20secure%20password"),
+        )
+        .await;
+        assert_eq!(renamed.status, 303);
+        let requests = get_with_cookie(&server, "/follow-requests", &alice_cookie).await;
+        assert!(requests.body.contains("@robert"));
+        assert!(!requests.body.contains("@bob"));
+        let csrf = csrf_token(&requests.body);
+        let approved = post_form_with_cookie(
+            &server,
+            &format!("/users/{bob_id}/follow/approve"),
+            &alice_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(approved.status, 303);
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 1);
+
+        // Deleting the requester removes their pending requests and history.
+        server
+            .pool
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET deletion_requested_at = datetime('now','-31 days'), deletion_scheduled_at = datetime('now','-1 day') WHERE id = ?",
+                    [bob_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO follow_requests (requester_id, target_id) VALUES (?, ?)",
+                    params![bob_id, alice_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("schedule requester deletion");
+        let paths = RuntimePaths::from_data_dir(server.data_dir.clone());
+        let removed = crate::account::finalize_due_deletions(&server.pool, &paths)
+            .await
+            .expect("finalize");
+        assert_eq!(removed, 1);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            0
+        );
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM username_history WHERE normalized_username IN ('bob', 'robert')"
+            )
+            .await,
+            0
+        );
+        let reused = request(
+            &server.base_url,
+            "POST",
+            "/register",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"username=robert&password=very%20secure%20password&confirm_password=very%20secure%20password".to_vec(),
+        )
+        .await;
+        assert_eq!(reused.status, 303);
+    }
+
+    #[tokio::test]
+    async fn maintenance_mode_blocks_account_imports() {
+        let server = spawn_test_server_with_admin().await;
+        let member_cookie = register_test_user(&server, "member").await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        let dashboard = get_with_cookie(&server, "/admin", &admin_cookie).await;
+        let csrf = csrf_token(&dashboard.body);
+        post_form_with_cookie(
+            &server,
+            "/admin/maintenance",
+            &admin_cookie,
+            &format!("csrf={}&enabled=true", form_encode(&csrf)),
+        )
+        .await;
+
+        let page = get_with_cookie(&server, "/settings/import", &member_cookie).await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("maintenance mode"));
+
+        let csrf = csrf_token(&page.body);
+        let body = multipart_body_with_file(
+            "import-blocked",
+            &[("csrf", csrf.as_str())],
+            "archive",
+            "account.tar.gz",
+            "application/gzip",
+            &[0x1f, 0x8b, 0x08, 0x00],
+        );
+        let blocked = request(
+            &server.base_url,
+            "POST",
+            "/settings/import",
+            &[
+                ("cookie", member_cookie.as_str()),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=import-blocked",
+                ),
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(blocked.status, 503);
+    }
+
+    async fn enable_maintenance(server: &TestServer, admin_cookie: &str, message: &str) {
+        let dashboard = get_with_cookie(server, "/admin", admin_cookie).await;
+        assert_eq!(dashboard.status, 200);
+        let csrf = csrf_token(&dashboard.body);
+        let body = format!(
+            "csrf={}&enabled=true&message={}",
+            form_encode(&csrf),
+            form_encode(message)
+        );
+        let enabled =
+            post_form_with_cookie(server, "/admin/maintenance", admin_cookie, &body).await;
+        assert_eq!(enabled.status, 303);
+    }
+
+    async fn disable_maintenance(server: &TestServer, admin_cookie: &str) {
+        let dashboard = get_with_cookie(server, "/admin", admin_cookie).await;
+        let csrf = csrf_token(&dashboard.body);
+        let body = format!("csrf={}&intent=save", form_encode(&csrf));
+        let disabled =
+            post_form_with_cookie(server, "/admin/maintenance", admin_cookie, &body).await;
+        assert_eq!(disabled.status, 303);
+    }
+
+    async fn login_test_user(server: &TestServer, username: &str, password: &str) -> TestResponse {
+        request(
+            &server.base_url,
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            format!(
+                "username={}&password={}",
+                form_encode(username),
+                form_encode(password)
+            )
+            .into_bytes(),
+        )
+        .await
+    }
+
+    async fn flag_password_reset(server: &TestServer, admin_cookie: &str, user_id: i64) {
+        let users = get_with_cookie(server, "/admin/users", admin_cookie).await;
+        let csrf = csrf_token(&users.body);
+        let reset = post_form_with_cookie(
+            server,
+            &format!("/admin/users/{user_id}/require-password-reset"),
+            admin_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(reset.status, 303);
+    }
+
+    #[test]
+    fn maintenance_policy_covers_every_publish_route() {
+        use axum::http::Method;
+
+        let cases = [
+            (Method::GET, "/home", MaintenancePolicy::Allowed),
+            (Method::GET, "/posts/1", MaintenancePolicy::Allowed),
+            (Method::GET, "/settings/import", MaintenancePolicy::Allowed),
+            (Method::POST, "/register", MaintenancePolicy::Blocked),
+            (
+                Method::POST,
+                "/posts",
+                MaintenancePolicy::BlockedUnlessAdmin,
+            ),
+            (
+                Method::POST,
+                "/settings/import",
+                MaintenancePolicy::BlockedUnlessAdmin,
+            ),
+            (
+                Method::POST,
+                "/posts/1/quote",
+                MaintenancePolicy::BlockedUnlessAdmin,
+            ),
+            (
+                Method::POST,
+                "/posts/1/repost",
+                MaintenancePolicy::BlockedUnlessAdmin,
+            ),
+            (
+                Method::POST,
+                "/posts/1/edit",
+                MaintenancePolicy::BlockedUnlessAdmin,
+            ),
+            (Method::POST, "/posts/1/delete", MaintenancePolicy::Allowed),
+            (Method::POST, "/posts/1/like", MaintenancePolicy::Allowed),
+            (
+                Method::POST,
+                "/posts/1/bookmark",
+                MaintenancePolicy::Allowed,
+            ),
+            (Method::POST, "/posts/1/pin", MaintenancePolicy::Allowed),
+            (Method::POST, "/posts/1/reply", MaintenancePolicy::Allowed),
+            (Method::POST, "/users/1/follow", MaintenancePolicy::Allowed),
+            (Method::POST, "/users/1/block", MaintenancePolicy::Allowed),
+            (Method::POST, "/users/1/mute", MaintenancePolicy::Allowed),
+            (Method::POST, "/settings", MaintenancePolicy::Allowed),
+            (
+                Method::POST,
+                "/settings/password",
+                MaintenancePolicy::Allowed,
+            ),
+            (
+                Method::POST,
+                "/settings/username",
+                MaintenancePolicy::Allowed,
+            ),
+            (
+                Method::POST,
+                "/settings/delete/confirm",
+                MaintenancePolicy::Allowed,
+            ),
+            (
+                Method::POST,
+                "/settings/delete/cancel",
+                MaintenancePolicy::Allowed,
+            ),
+            (Method::POST, "/logout", MaintenancePolicy::Allowed),
+            (
+                Method::POST,
+                "/notifications/read",
+                MaintenancePolicy::Allowed,
+            ),
+            (
+                Method::POST,
+                "/notifications/open",
+                MaintenancePolicy::Allowed,
+            ),
+            (
+                Method::POST,
+                "/admin/maintenance",
+                MaintenancePolicy::Allowed,
+            ),
+            (
+                Method::POST,
+                "/admin/users/1/revoke-sessions",
+                MaintenancePolicy::Allowed,
+            ),
+            (Method::POST, "/onboarding", MaintenancePolicy::Allowed),
+        ];
+        for (method, path, expected) in cases {
+            assert_eq!(
+                maintenance_policy(&method, path),
+                expected,
+                "unexpected policy for {method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_mode_matrix_blocks_publishing_and_keeps_account_operations() {
+        let server = spawn_test_server_with_admin().await;
+        let member_cookie = register_test_user(&server, "member").await;
+        create_text_post(&server, &member_cookie, "member original post").await;
+        let admin_cookie = admin_session_cookie(&server).await;
+        create_text_post(&server, &admin_cookie, "admin original post").await;
+
+        enable_maintenance(&server, &admin_cookie, "Matrix maintenance").await;
+
+        // Publish mutations are refused for members and never touch the data.
+        let home = get_with_cookie(&server, "/home", &member_cookie).await;
+        let csrf = csrf_token(&home.body);
+        for path in ["/posts/1/edit", "/posts/1/quote", "/posts/1/repost"] {
+            let blocked = post_multipart_with_cookie(
+                &server,
+                path,
+                &member_cookie,
+                "maintenance-matrix",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("text", "blocked during maintenance"),
+                ],
+            )
+            .await;
+            assert_eq!(blocked.status, 503, "{path} should be blocked");
+            assert!(blocked.body.contains("Matrix maintenance"));
+        }
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM posts WHERE text = 'blocked during maintenance'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM posts WHERE id = 1 AND text = 'member original post'"
+            )
+            .await,
+            1,
+            "the edit must not have changed the stored post"
+        );
+
+        // Account and security operations keep working for members.
+        let saved =
+            save_profile_settings(&server, &member_cookie, &[("display_name", "Member")]).await;
+        assert_eq!(saved.status, 303);
+        let settings = get_with_cookie(&server, "/settings", &member_cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let renamed = post_form_with_cookie(
+            &server,
+            "/settings/username",
+            &member_cookie,
+            &format!("csrf={csrf}&new_username=member_renamed&password=very%20secure%20password"),
+        )
+        .await;
+        assert_eq!(renamed.status, 303);
+        let export = get_with_cookie(&server, "/settings/export", &member_cookie).await;
+        assert_eq!(export.status, 200);
+        let settings = get_with_cookie(&server, "/settings", &member_cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let cancelled = post_form_with_cookie(
+            &server,
+            "/settings/delete/cancel",
+            &member_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(cancelled.status, 303);
+        for path in ["/posts/1/like", "/posts/1/bookmark"] {
+            let response =
+                post_form_with_cookie(&server, path, &member_cookie, &format!("csrf={csrf}")).await;
+            assert_eq!(response.status, 303, "{path} should stay available");
+        }
+        let reply_redirect = post_form_with_cookie(
+            &server,
+            "/posts/1/reply",
+            &member_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(reply_redirect.status, 303);
+
+        // Administrators keep publishing so they can verify the instance.
+        let admin_csrf = csrf_token(&get_with_cookie(&server, "/home", &admin_cookie).await.body);
+        let admin_edit = post_form_with_cookie(
+            &server,
+            "/posts/2/edit",
+            &admin_cookie,
+            &format!(
+                "csrf={admin_csrf}&text={}",
+                form_encode("admin edit during maintenance")
+            ),
+        )
+        .await;
+        assert_eq!(admin_edit.status, 303);
+        let admin_repost = post_form_with_cookie(
+            &server,
+            "/posts/1/repost",
+            &admin_cookie,
+            &format!("csrf={admin_csrf}"),
+        )
+        .await;
+        assert_eq!(admin_repost.status, 303);
+
+        disable_maintenance(&server, &admin_cookie).await;
+        create_text_post(&server, &member_cookie, "member post after maintenance").await;
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table-driven forced-reset route matrix keeps every protected and exempt route visible"
+    )]
+    async fn forced_password_reset_blocks_protected_routes_and_keeps_exempt_flows() {
+        let server = spawn_test_server_with_admin().await;
+        let member_cookie = register_test_user(&server, "member").await;
+        create_text_post(&server, &member_cookie, "before forced reset").await;
+        let member_id = user_id_for(&server, "member").await;
+        let second_cookie =
+            session_cookie(&login_test_user(&server, "member", "very secure password").await);
+        let stale_cookie =
+            session_cookie(&login_test_user(&server, "member", "very secure password").await);
+        let admin_cookie = admin_session_cookie(&server).await;
+        flag_password_reset(&server, &admin_cookie, member_id).await;
+
+        // Every protected GET route redirects to the password page.
+        for path in [
+            "/home",
+            "/settings",
+            "/notifications",
+            "/following",
+            "/bookmarks",
+            "/mentions",
+            "/search?q=reset",
+            "/tags/reset",
+            "/posts/1",
+            "/users/member",
+            "/follow-requests",
+            "/settings/import",
+            "/onboarding",
+            "/admin",
+            "/admin/users",
+        ] {
+            for cookie in [&member_cookie, &second_cookie] {
+                let response = get_with_cookie(&server, path, cookie).await;
+                assert_eq!(response.status, 303, "GET {path} should redirect");
+                assert!(
+                    location(&response).starts_with("/settings/password?required=1"),
+                    "GET {path} redirected to {}",
+                    location(&response)
+                );
+            }
+        }
+
+        // Protected state-changing routes are intercepted before their handlers.
+        for path in [
+            "/settings",
+            "/settings/username",
+            "/settings/muted-words",
+            "/posts/1/edit",
+            "/posts/1/delete",
+            "/posts/1/like",
+            "/posts/1/bookmark",
+            "/posts/1/pin",
+            "/posts/1/repost",
+            "/posts/1/quote",
+            "/users/1/follow",
+            "/users/1/block",
+            "/users/1/mute",
+            "/notifications/read",
+            "/notifications/open",
+            "/settings/import",
+        ] {
+            let response = post_form_with_cookie(&server, path, &member_cookie, "csrf=bogus").await;
+            assert_eq!(response.status, 303, "POST {path} should redirect");
+            assert!(location(&response).starts_with("/settings/password?required=1"));
+        }
+
+        // Exempt account flows stay reachable.
+        let password_page = get_with_cookie(&server, "/settings/password", &member_cookie).await;
+        assert_eq!(password_page.status, 200);
+        assert!(password_page.body.contains(r#"id="current_password""#));
+        assert_eq!(
+            get_with_cookie(&server, "/settings/delete", &member_cookie)
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            get_with_cookie(&server, "/settings/delete/confirm", &member_cookie)
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            get_with_cookie(&server, "/account-deleted", &member_cookie)
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            get_with_cookie(&server, "/settings/export", &second_cookie)
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            request(
+                &server.base_url,
+                "GET",
+                "/assets/rustpost.js",
+                &[],
+                Vec::new()
+            )
+            .await
+            .status,
+            200
+        );
+        assert_eq!(
+            request(&server.base_url, "GET", "/favicon.ico", &[], Vec::new())
+                .await
+                .status,
+            200
+        );
+
+        // A stale cookie is treated as anonymous, not as a bypass.
+        let stale = get_with_cookie(&server, "/home", "rustpost_session=bogus").await;
+        assert_eq!(stale.status, 200);
+
+        // Logout stays reachable; it revokes only the session it is sent with.
+        let member_password_page =
+            get_with_cookie(&server, "/settings/password", &member_cookie).await;
+        let member_csrf = csrf_token(&member_password_page.body);
+        let logout = post_form_with_cookie(
+            &server,
+            "/logout",
+            &member_cookie,
+            &format!("csrf={member_csrf}"),
+        )
+        .await;
+        assert_eq!(logout.status, 303);
+
+        // Changing the password clears the flag atomically and revokes the
+        // other sessions; the session that changed the password survives.
+        let page = get_with_cookie(&server, "/settings/password", &second_cookie).await;
+        let csrf = csrf_token(&page.body);
+        let changed = post_form_with_cookie(
+            &server,
+            "/settings/password",
+            &second_cookie,
+            &format!(
+                "csrf={csrf}&current_password=very%20secure%20password&new_password=brand%20new%20password&confirm_new_password=brand%20new%20password"
+            ),
+        )
+        .await;
+        assert_eq!(changed.status, 303);
+        assert_eq!(location(&changed), "/settings?saved=password");
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM users WHERE must_change_password = 1"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            get_with_cookie(&server, "/home", &second_cookie)
+                .await
+                .status,
+            200
+        );
+        let third_cookie =
+            session_cookie(&login_test_user(&server, "member", "brand new password").await);
+        assert_eq!(
+            get_with_cookie(&server, "/settings", &third_cookie)
+                .await
+                .status,
+            200
+        );
+        // Sessions created before the password change are gone.
+        let revoked = get_with_cookie(&server, "/settings", &stale_cookie).await;
+        assert_eq!(revoked.status, 401);
+    }
+
+    #[tokio::test]
+    async fn forced_logout_revokes_all_sessions_and_allows_relogin() {
+        let server = spawn_test_server_with_admin().await;
+        let first_cookie = register_test_user(&server, "victim").await;
+        let second_cookie =
+            session_cookie(&login_test_user(&server, "victim", "very secure password").await);
+        let victim_id = user_id_for(&server, "victim").await;
+        let other_cookie = register_test_user(&server, "bystander").await;
+
+        assert_eq!(
+            get_with_cookie(&server, "/settings", &second_cookie)
+                .await
+                .status,
+            200
+        );
+
+        let admin_cookie = admin_session_cookie(&server).await;
+        let users = get_with_cookie(&server, "/admin/users", &admin_cookie).await;
+        let csrf = csrf_token(&users.body);
+        let revoked = post_form_with_cookie(
+            &server,
+            &format!("/admin/users/{victim_id}/revoke-sessions"),
+            &admin_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(revoked.status, 303);
+
+        for cookie in [&first_cookie, &second_cookie] {
+            let response = get_with_cookie(&server, "/settings", cookie).await;
+            assert_eq!(
+                response.status, 401,
+                "revoked session must not authenticate"
+            );
+        }
+        assert_eq!(
+            get_with_cookie(&server, "/settings", &other_cookie)
+                .await
+                .status,
+            200,
+            "other accounts keep their sessions"
+        );
+        let victim_sessions = {
+            server
+                .pool
+                .call(move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT COUNT(*) FROM sessions WHERE user_id = ? AND revoked_at IS NULL",
+                        [victim_id],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                })
+                .await
+                .expect("victim sessions")
+        };
+        assert_eq!(victim_sessions, 0);
+
+        // The account can log in again and a repeated forced logout is safe.
+        let third_cookie =
+            session_cookie(&login_test_user(&server, "victim", "very secure password").await);
+        assert_eq!(
+            get_with_cookie(&server, "/settings", &third_cookie)
+                .await
+                .status,
+            200
+        );
+        let users = get_with_cookie(&server, "/admin/users", &admin_cookie).await;
+        let csrf = csrf_token(&users.body);
+        let repeated = post_form_with_cookie(
+            &server,
+            &format!("/admin/users/{victim_id}/revoke-sessions"),
+            &admin_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(repeated.status, 303);
+        assert_eq!(
+            get_with_cookie(&server, "/settings", &third_cookie)
+                .await
+                .status,
+            401
+        );
+
+        // Missing accounts are rejected without touching sessions.
+        let missing = post_form_with_cookie(
+            &server,
+            "/admin/users/9999/revoke-sessions",
+            &admin_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(missing.status, 400);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one transition scenario walks public/protected toggles, pending requests, and follower counts"
+    )]
+    async fn protected_account_toggles_never_auto_approve_pending_requests() {
+        let mut settings = Settings::default();
+        settings.moderation.account_creations_per_ip_per_day = 20;
+        let server = spawn_test_server_with_settings(settings).await;
+        let alice_cookie = register_test_user(&server, "alice").await;
+        let alice_id = user_id_for(&server, "alice").await;
+        let saved = save_profile_settings(
+            &server,
+            &alice_cookie,
+            &[("follow_approval_required", "true")],
+        )
+        .await;
+        assert_eq!(saved.status, 303);
+        let bob_cookie = register_test_user(&server, "bob").await;
+        let bob_id = user_id_for(&server, "bob").await;
+        let carol_cookie = register_test_user(&server, "carol").await;
+
+        // Bob requests; the pending request is not a follower and shows a badge.
+        let profile = get_with_cookie(&server, "/users/alice", &bob_cookie).await;
+        let csrf = csrf_token(&profile.body);
+        let requested = post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &bob_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(requested.status, 303);
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 0);
+        let alice_home = get_with_cookie(&server, "/home", &alice_cookie).await;
+        assert!(
+            alice_home
+                .body
+                .contains(r#"aria-label="1 pending follow requests""#),
+            "the pending request must show in the navigation badge"
+        );
+        let alice_profile = get_with_cookie(&server, "/users/alice", &carol_cookie).await;
+        assert!(alice_profile.body.contains("0 followers"));
+
+        // Disabling protection keeps the pending request pending and lets new
+        // follows through immediately. Nothing is auto-approved.
+        let saved = save_profile_settings(
+            &server,
+            &alice_cookie,
+            &[("display_name", "Alice Unprotected")],
+        )
+        .await;
+        assert_eq!(saved.status, 303);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            1
+        );
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 0);
+        let carol_view = get_with_cookie(&server, "/users/alice", &carol_cookie).await;
+        let csrf = csrf_token(&carol_view.body);
+        let carol_follow = post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &carol_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(carol_follow.status, 303);
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 1);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            1,
+            "the pending request must survive the privacy change"
+        );
+
+        // Re-enabling protection keeps the existing follower and the pending
+        // request; a new account still needs approval.
+        let saved = save_profile_settings(
+            &server,
+            &alice_cookie,
+            &[
+                ("display_name", "Alice Protected"),
+                ("follow_approval_required", "true"),
+            ],
+        )
+        .await;
+        assert_eq!(saved.status, 303);
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 1);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            1
+        );
+        let dave_cookie = register_test_user(&server, "dave").await;
+        let dave_view = get_with_cookie(&server, "/users/alice", &dave_cookie).await;
+        let csrf = csrf_token(&dave_view.body);
+        let dave_follow = post_form_with_cookie(
+            &server,
+            &format!("/users/{alice_id}/follow"),
+            &dave_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(dave_follow.status, 303);
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 1);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            2
+        );
+
+        // Approving Bob after all toggles creates exactly one follow.
+        let requests = get_with_cookie(&server, "/follow-requests", &alice_cookie).await;
+        let csrf = csrf_token(&requests.body);
+        let approved = post_form_with_cookie(
+            &server,
+            &format!("/users/{bob_id}/follow/approve"),
+            &alice_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(approved.status, 303);
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM follows").await, 2);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM follow_requests").await,
+            1
+        );
+        let alice_profile = get_with_cookie(&server, "/users/alice", &carol_cookie).await;
+        assert!(alice_profile.body.contains("2 followers"));
+    }
+
+    #[tokio::test]
+    async fn released_username_tombstones_cover_old_urls_before_and_after_reuse() {
+        let server = spawn_test_server_without_deletion_grace().await;
+        let alice_cookie = register_test_user(&server, "tombstone_alice").await;
+        create_text_post(&server, &alice_cookie, "alice tombstone post").await;
+
+        let settings = get_with_cookie(&server, "/settings", &alice_cookie).await;
+        let csrf = csrf_token(&settings.body);
+        let renamed = post_form_with_cookie(
+            &server,
+            "/settings/username",
+            &alice_cookie,
+            &format!(
+                "csrf={csrf}&new_username=tombstone_alice_new&password=very%20secure%20password"
+            ),
+        )
+        .await;
+        assert_eq!(renamed.status, 303);
+
+        // While the account is alive the old URL is a history page.
+        let old_url = request(
+            &server.base_url,
+            "GET",
+            "/users/tombstone_alice",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(old_url.status, 200);
+        assert!(old_url.body.contains("No account uses @tombstone_alice"));
+        assert!(
+            old_url
+                .body
+                .contains(r#"href="/users/tombstone_alice_new""#)
+        );
+
+        // Immediate deletion releases the handles and records tombstones.
+        let confirm = get_with_cookie(&server, "/settings/delete/confirm", &alice_cookie).await;
+        let csrf = csrf_token(&confirm.body);
+        let intent = hidden_value(&confirm.body, "delete_intent");
+        let deleted = post_form_with_cookie(
+            &server,
+            "/settings/delete/confirm",
+            &alice_cookie,
+            &format!("csrf={csrf}&delete_intent={intent}&password=very%20secure%20password"),
+        )
+        .await;
+        assert_eq!(deleted.status, 303);
+        assert_eq!(location(&deleted), "/account-deleted");
+
+        for handle in ["tombstone_alice", "tombstone_alice_new"] {
+            let page = request(
+                &server.base_url,
+                "GET",
+                &format!("/users/{handle}"),
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(page.status, 200, "{handle} should render a tombstone");
+            assert!(
+                page.body.contains(r#"data-testid="released-username""#),
+                "{handle} should not silently disappear"
+            );
+            assert!(!page.body.contains("alice tombstone post"));
+        }
+
+        // A new account can claim the released handle, and the old URL then
+        // clearly marks it as a different account.
+        let bob_cookie = register_test_user(&server, "tombstone_alice_new").await;
+        let profile = get_with_cookie(&server, "/users/tombstone_alice_new", &bob_cookie).await;
+        assert_eq!(profile.status, 200);
+        assert!(
+            profile
+                .body
+                .contains(r#"data-testid="released-username-note""#),
+            "a reclaimed handle must disclose the earlier deleted account"
+        );
+        assert!(!profile.body.contains("alice tombstone post"));
+        let other_handle = request(
+            &server.base_url,
+            "GET",
+            "/users/tombstone_alice",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            other_handle
+                .body
+                .contains(r#"data-testid="released-username""#),
+            "the unclaimed old handle stays a tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_archive_uploads_are_rejected_cleanly_and_valid_ones_still_import() {
+        let mut settings = Settings::default();
+        settings.accounts.max_archive_upload_bytes = 64 * 1024;
+        let server = spawn_test_server_with_settings(settings).await;
+        let uploader_cookie = register_test_user(&server, "uploader").await;
+        create_text_post(&server, &uploader_cookie, "uploader archive post").await;
+        let paths = RuntimePaths::from_data_dir(server.data_dir.clone());
+
+        let import_page = get_with_cookie(&server, "/settings/import", &uploader_cookie).await;
+        let csrf = csrf_token(&import_page.body);
+        let mut oversized = vec![0u8; 64 * 1024 + 1];
+        oversized[..4].copy_from_slice(&[0x1f, 0x8b, 0x08, 0x00]);
+        let body = multipart_body_with_file(
+            "oversized-archive",
+            &[("csrf", csrf.as_str())],
+            "archive",
+            "oversized.tar.gz",
+            "application/gzip",
+            &oversized,
+        );
+        let rejected = request(
+            &server.base_url,
+            "POST",
+            "/settings/import",
+            &[
+                ("cookie", uploader_cookie.as_str()),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=oversized-archive",
+                ),
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(rejected.status, 413);
+        assert!(
+            rejected.body.contains("larger than the configured"),
+            "oversized uploads need a clear error: {}",
+            rejected.body
+        );
+        assert_eq!(count_rows(&server, "SELECT COUNT(*) FROM posts").await, 1);
+        assert_eq!(
+            count_rows(&server, "SELECT COUNT(*) FROM account_imports").await,
+            0
+        );
+        let leftovers = std::fs::read_dir(&paths.tmp_dir)
+            .expect("tmp dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(crate::portability::IMPORT_TMP_PREFIX)
+            })
+            .count();
+        assert_eq!(
+            leftovers, 0,
+            "rejected uploads must not leave staging files"
+        );
+
+        // A small, valid archive still imports under the same limit.
+        let export = get_with_cookie(&server, "/settings/export", &uploader_cookie).await;
+        assert_eq!(export.status, 200);
+        assert!(export.body_bytes.len() < 64 * 1024);
+        let receiver_cookie = register_test_user(&server, "receiver").await;
+        let import_page = get_with_cookie(&server, "/settings/import", &receiver_cookie).await;
+        let csrf = csrf_token(&import_page.body);
+        let body = multipart_body_with_file(
+            "valid-archive",
+            &[("csrf", csrf.as_str())],
+            "archive",
+            "account.tar.gz",
+            "application/gzip",
+            &export.body_bytes,
+        );
+        let imported = request(
+            &server.base_url,
+            "POST",
+            "/settings/import",
+            &[
+                ("cookie", receiver_cookie.as_str()),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=valid-archive",
+                ),
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(imported.status, 200);
+        assert!(imported.body.contains("Import complete"));
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM posts WHERE text = 'uploader archive post'"
+            )
+            .await,
+            2,
+            "the original post plus the imported copy"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario proves exclusions, tamper resistance, and non-mutation together"
+    )]
+    async fn account_archives_exclude_nonportable_state_and_reject_privilege_fields() {
+        let server = spawn_test_server().await;
+        let mover_cookie = register_test_user(&server, "archive_mover").await;
+        create_text_post(&server, &mover_cookie, "portable content only").await;
+        let onlooker_cookie = register_test_user(&server, "archive_onlooker").await;
+        create_text_post(&server, &onlooker_cookie, "other account content").await;
+        let mover_id = user_id_for(&server, "archive_mover").await;
+
+        let onlooker_home = get_with_cookie(&server, "/home", &onlooker_cookie).await;
+        let csrf = csrf_token(&onlooker_home.body);
+        for path in ["/posts/1/like", "/posts/1/bookmark", "/posts/1/repost"] {
+            let response =
+                post_form_with_cookie(&server, path, &onlooker_cookie, &format!("csrf={csrf}"))
+                    .await;
+            assert_eq!(response.status, 303, "{path}");
+        }
+        let follow = post_form_with_cookie(
+            &server,
+            &format!("/users/{mover_id}/follow"),
+            &onlooker_cookie,
+            &format!("csrf={csrf}"),
+        )
+        .await;
+        assert_eq!(follow.status, 303);
+
+        let export = get_with_cookie(&server, "/settings/export", &mover_cookie).await;
+        assert_eq!(export.status, 200);
+        let entries = read_tar_gz_entries(&export.body_bytes);
+        let names = entries
+            .iter()
+            .map(|(name, _bytes)| name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "manifest.json",
+                "profile.json",
+                "posts.json",
+                "media.json",
+                "follows.json",
+                "settings.json"
+            ]
+            .map(str::to_owned)
+        );
+        let posts_json = String::from_utf8(
+            entries
+                .iter()
+                .find(|(name, _)| name == "posts.json")
+                .expect("posts document")
+                .1
+                .clone(),
+        )
+        .expect("posts utf8");
+        assert!(posts_json.contains("portable content only"));
+        assert!(!posts_json.contains("other account content"));
+
+        let all_text = entries
+            .iter()
+            .map(|(_name, bytes)| String::from_utf8_lossy(bytes).into_owned())
+            .collect::<String>();
+        for secret in [
+            "password_hash",
+            "token_hash",
+            "csrf",
+            "is_admin",
+            "is_suspended",
+            "must_change_password",
+            "deletion_scheduled_at",
+            "notification",
+            "bookmark",
+            "repost",
+        ] {
+            assert!(
+                !all_text.contains(secret),
+                "archives must not carry {secret}"
+            );
+        }
+
+        // Tampering with the profile document cannot synthesize privileged or
+        // restricted account state on the destination.
+        let tampered = entries
+            .iter()
+            .map(|(name, bytes)| {
+                if name != "profile.json" {
+                    return (name.clone(), bytes.clone());
+                }
+                let mut profile: serde_json::Value =
+                    serde_json::from_slice(bytes).expect("profile json");
+                let object = profile.as_object_mut().expect("profile object");
+                for (key, value) in [
+                    ("is_admin", serde_json::Value::Bool(true)),
+                    ("is_suspended", serde_json::Value::Bool(true)),
+                    ("must_change_password", serde_json::Value::Bool(true)),
+                    (
+                        "deletion_scheduled_at",
+                        serde_json::Value::String("2000-01-01 00:00:00".to_owned()),
+                    ),
+                    (
+                        "password_hash",
+                        serde_json::Value::String("$argon2id$forged".to_owned()),
+                    ),
+                ] {
+                    object.insert(key.to_owned(), value);
+                }
+                (
+                    name.clone(),
+                    serde_json::to_vec(&profile).expect("tampered profile"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let tampered_bytes = write_tar_gz_entries(&tampered);
+
+        let receiver_cookie = register_test_user(&server, "archive_receiver").await;
+        let import_page = get_with_cookie(&server, "/settings/import", &receiver_cookie).await;
+        let csrf = csrf_token(&import_page.body);
+        let body = multipart_body_with_file(
+            "tampered-archive",
+            &[("csrf", csrf.as_str())],
+            "archive",
+            "tampered.tar.gz",
+            "application/gzip",
+            &tampered_bytes,
+        );
+        let imported = request(
+            &server.base_url,
+            "POST",
+            "/settings/import",
+            &[
+                ("cookie", receiver_cookie.as_str()),
+                (
+                    "content-type",
+                    "multipart/form-data; boundary=tampered-archive",
+                ),
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(imported.status, 200, "{}", imported.body);
+        assert!(imported.body.contains("Import complete"));
+        assert_eq!(
+            count_rows(
+                &server,
+                "SELECT COUNT(*) FROM posts WHERE text = 'portable content only'"
+            )
+            .await,
+            2,
+            "the original post plus the imported copy"
+        );
+        let receiver_id = user_id_for(&server, "archive_receiver").await;
+        let state = {
+            server
+                .pool
+                .call(move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT is_admin, is_suspended, must_change_password, deletion_scheduled_at FROM users WHERE id = ?",
+                        [receiver_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    )?)
+                })
+                .await
+                .expect("receiver state")
+        };
+        assert_eq!(state, (0, 0, 0, None));
+        let relogin = login_test_user(&server, "archive_receiver", "very secure password").await;
+        assert_eq!(relogin.status, 303, "the destination password is untouched");
+    }
+
+    #[tokio::test]
+    async fn deletion_finalization_invalidates_sessions_and_releases_with_tombstones() {
+        let server = spawn_test_server().await;
+        let cookie = register_test_user(&server, "scheduler_victim").await;
+        create_text_post(&server, &cookie, "scheduled deletion post").await;
+        let user_id = user_id_for(&server, "scheduler_victim").await;
+        let second_cookie = session_cookie(
+            &login_test_user(&server, "scheduler_victim", "very secure password").await,
+        );
+        server
+            .pool
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET deletion_requested_at = datetime('now','-31 days'), deletion_scheduled_at = datetime('now','-1 day') WHERE id = ?",
+                    [user_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("schedule deletion");
+
+        // The scheduler can race a request from the account it is finalizing.
+        let paths = RuntimePaths::from_data_dir(server.data_dir.clone());
+        let (removed, racing_request) = tokio::join!(
+            crate::account::finalize_due_deletions(&server.pool, &paths),
+            get_with_cookie(&server, "/settings", &second_cookie)
+        );
+        assert_eq!(removed.expect("finalize"), 1);
+        assert!(
+            matches!(racing_request.status, 200 | 401),
+            "a racing request must see either the account or a cleanly signed-out state, got {}",
+            racing_request.status
+        );
+        assert_eq!(
+            get_with_cookie(&server, "/settings", &second_cookie)
+                .await
+                .status,
+            401,
+            "sessions must be invalidated by finalization"
+        );
+        let live_sessions = {
+            server
+                .pool
+                .call(move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT COUNT(*) FROM sessions WHERE user_id = ?",
+                        [user_id],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                })
+                .await
+                .expect("sessions")
+        };
+        assert_eq!(live_sessions, 0);
+
+        // The handle is released and tombstoned rather than silently 404ing.
+        let page = request(
+            &server.base_url,
+            "GET",
+            "/users/scheduler_victim",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains(r#"data-testid="released-username""#));
+        let reused_cookie = register_test_user(&server, "scheduler_victim").await;
+        let reused = get_with_cookie(&server, "/users/scheduler_victim", &reused_cookie).await;
+        assert!(
+            reused
+                .body
+                .contains(r#"data-testid="released-username-note""#)
+        );
+        assert!(!reused.body.contains("scheduled deletion post"));
+    }
+
+    fn read_tar_gz_entries(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+        use flate2::read::GzDecoder;
+        use std::io::Read as _;
+
+        let decoder = GzDecoder::new(bytes);
+        let mut archive = tar::Archive::new(decoder);
+        let mut entries = Vec::new();
+        for entry in archive.entries().expect("tar entries") {
+            let mut entry = entry.expect("tar entry");
+            let name = entry
+                .path()
+                .expect("entry path")
+                .to_string_lossy()
+                .to_string();
+            let mut buffer = Vec::new();
+            entry.read_to_end(&mut buffer).expect("entry bytes");
+            entries.push((name, buffer));
+        }
+        entries
+    }
+
+    fn write_tar_gz_entries(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+
+        let encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_ustar();
+            header.set_path(name).expect("entry path");
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(u64::try_from(bytes.len()).expect("entry size"));
+            header.set_mode(0o600);
+            header.set_cksum();
+            builder.append(&header, bytes.as_slice()).expect("append");
+        }
+        let encoder = builder.into_inner().expect("tar finish");
+        encoder.finish().expect("gzip finish")
     }
 }

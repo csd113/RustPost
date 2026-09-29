@@ -1,15 +1,59 @@
 # Changelog
 
-## Unreleased - First-Release Database Baseline
+## v1.0.0 - First Release
+
+### Instance and social controls
+- Protected accounts: users can require approval before someone follows them. Requests are pending until approved, never count as followers, can be rejected or cancelled, and are cleared by blocks.
+- Instance announcements: administrators can publish, disable, or clear an announcement rendered next to the site name in the top bar.
+- Maintenance mode: administrators can disable registration and post creation (including replies, edits, quotes, reposts, and account imports) while the site stays readable; administrators keep posting access to verify the instance, and the block policy is a single table-driven rule set.
+
+### Account lifecycle
+- Account export/import: versioned `.tar.gz` archives with posts, profile data, media bytes, media list, outgoing follows, and settings; imports are validated, staged, remapped, and protected by repeat-import tracking.
+- Archive hardening: compressed upload/export and decompressed-content limits are independent and configurable, structural limits are enforced incrementally while streaming, media bytes must match their declared size/hash/type, and failed imports leave no partial state.
+- Admin forced password reset: a flagged account is restricted to the password-change and logout flows until the password changes, including on existing sessions.
+- Admin forced logout: every active session for one account can be revoked without affecting other accounts.
+- Account deletion grace period: deletion requests store a deadline (default 30 days, configurable), can be cancelled, block publishing while pending, and are finalized idempotently from persisted state with a durable media-cleanup journal.
+- Username changes and history: handles are validated and changed atomically, previous handles stay reserved, same-owner reclamation is allowed, and old profile URLs render a history or released-handle page instead of silently resolving to a different person.
+
+### Database
+- Schema version `4` adds account lifecycle columns, `follow_requests`, `username_history`, `instance_settings`, and `account_imports` with a forward migration from versions `1`–`3` and alpha adoption.
+
+### Runtime and Dependency Baseline
+- Raised the minimum supported Rust version to `1.91` and updated local, CI, and release-build documentation accordingly.
+- Upgraded the embedded Arti and Tor crate family to `0.46.0`, including the onion-stream API migration from the earlier pre-release baseline.
+- Updated direct dependencies to their latest compatible releases, including `base64 0.23`, `tower-http 0.7`, `infer 0.22`, and `ureq 3.4`.
+- Kept `rusqlite` at `0.36` so Cargo resolves a single compatible `libsqlite3-sys` version with Arti `0.46.0`.
+
+### Release Blockers Fixed
+- Standardized the release artifact, install docs, CI, and operator commands on the single `rustpost-cli` binary.
+- Bumped the crate version to `1.0.0` and refreshed `Cargo.lock`.
+- Updated first-run command hints to use the canonical `rustpost-cli` binary.
+- Removed the nonfunctional standalone `print-onion-address` command; active onion addresses are reported by the running service.
+- Fixed login so existing stored passwords continue to work after an operator raises the configured minimum password length.
+- Rejected unsafe profile website URL schemes server-side and stopped rendering unsafe legacy profile website values as links.
+- Enforced configured per-post image and video attachment limits and raised the multipart body limit to cover valid configured media mixes.
+- Hardened invalid upload cleanup with a cancellation-safe staged-file guard so rejected malformed, oversized, or staging-error uploads do not leave orphaned files under `tmp/uploads`.
+- Fixed restored media path remapping for Windows paths so backups remain usable after restoring into a different data directory.
+- Return a signed-out response when account finalization races settings page loading, instead of surfacing a server error.
+- Corrected generated settings copy for username, display name, and bio limits from bytes to characters.
+
+### Release Validation
+- Added regression coverage for malformed and oversized rejected upload cleanup, guard-drop cleanup, and successful durable-media handoff.
+- Completed a focused invalid-upload cleanup probe and three live disposable stress reruns across public browsing, auth, social, media, admin/diagnostics, and no-JS/Tor-like browser behavior with no pending staged uploads.
+- Updated the ignored local Playwright release harness so it no longer configures the rejected `tor.display_onion_address`; synthetic local Tor-header assertions were removed while opt-in real-onion coverage remains.
+- Documented the accepted v1.0.0 `cargo audit` exception for transitive Arti `rsa 0.9.10` / `RUSTSEC-2023-0071`, for which no fixed upgrade is currently available.
+- Recorded unmaintained transitive Arti dependencies as upstream maintenance caveats rather than RustPost application vulnerabilities.
+- Kept Playwright files and generated artifacts ignored and out of the repository.
+- Audited the release build, clean temporary-runtime first-run flow, restart persistence, backup/restore behavior, runtime permissions, and operator documentation before tagging.
 
 ### Database Lineage
-- Squashed the pre-release internal migration chain into a clean first-release SQLite schema baseline at database schema version `1`.
+- Squashed the pre-release internal migration chain into a clean first-release SQLite schema baseline at database schema version `4`.
 - Fresh databases are now initialized directly from the baseline instead of replaying alpha development migrations.
-- Existing current alpha databases that structurally match the baseline are marked as baseline version `1` without destructive changes or data loss.
+- Existing compatible alpha and release-candidate databases are migrated to schema version `4` without destructive changes or data loss.
 - Incomplete, unknown, or structurally unsafe pre-release databases now fail closed with administrator guidance to back up/export/recreate/restore instead of attempting blind migration.
 - Added stricter schema diagnostics for required tables, columns, indexes, and triggers so startup, backups, restores, and admin health can report incompatible or corrupt database structure clearly.
 - `check` now reports database schema status without creating or migrating the database during diagnostics.
-- Future post-release database changes should use normal forward migrations after baseline version `1`; released migration history must not be squashed or rewritten after the first public release.
+- Future post-release database changes should use normal forward migrations after baseline version `4`; released migration history must not be squashed or rewritten after the first public release.
 
 ## v0.1.6 - Pinned Profiles
 

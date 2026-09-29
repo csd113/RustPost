@@ -253,7 +253,9 @@ async fn create_social_graph(pool: &SqlitePool, ids: &DemoIds) -> anyhow::Result
         (ids.omar, ids.ada),
         (ids.omar, ids.tess),
     ] {
-        social::follow(pool, follower, followed).await?;
+        // The seeding script only cares that the relationship is recorded,
+        // whether the follow is immediate or pending approval.
+        let _outcome = social::follow(pool, follower, followed).await?;
     }
     Ok(())
 }
