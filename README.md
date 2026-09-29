@@ -16,7 +16,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/csd113/RustPost/ci.yml?branch=main&style=flat-square&label=CI&logo=github)](https://github.com/csd113/RustPost/actions)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![SQLite](https://img.shields.io/badge/database-SQLite-blue?style=flat-square&logo=sqlite)](https://www.sqlite.org/)
-[![Embedded Arti](https://img.shields.io/badge/embedded%20Arti-0.45.0-7D4698?style=flat-square&logo=torproject)](https://www.torproject.org/)
+[![Embedded Arti](https://img.shields.io/badge/embedded%20Arti-0.46.0-7D4698?style=flat-square&logo=torproject)](https://www.torproject.org/)
 [![License](https://img.shields.io/badge/license-see%20LICENSE-green?style=flat-square)](./LICENSE)
 
 [**Getting Started**](#-getting-started) · [**Configuration**](#-configuration) · [**CLI Reference**](#-cli-reference) · [**Security**](#-security-model) · [**Tor / Arti**](#-tor--arti)
@@ -389,11 +389,11 @@ The active onion address is shown by the running server in its startup/status ou
 **Current pinned Arti/Tor crates in `Cargo.toml`:**
 
 ```
-arti-client      = 0.45.0   # bootstraps the embedded Tor client and onion service
-tor-hsservice    = 0.45.0   # onion-service config, handle, and rendezvous streams
-tor-proto        = 0.45.0   # inspect and accept incoming onion stream requests
-tor-cell         = 0.45.0   # cell-level protocol handling
-tor-rtcompat     = 0.45.0   # Tokio-compatible Arti runtime
+arti-client      = 0.46.0   # bootstraps the embedded Tor client and onion service
+tor-hsservice    = 0.46.0   # onion-service config, handle, and rendezvous streams
+tor-proto        = 0.46.0   # inspect and accept incoming onion stream requests
+tor-cell         = 0.46.0   # cell-level protocol handling
+tor-rtcompat     = 0.46.0   # Tokio-compatible Arti runtime
 rustls           = 0.23     # ring crypto provider required by Arti's rustls stack
 ```
 
