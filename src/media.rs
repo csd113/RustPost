@@ -271,7 +271,7 @@ async fn prepare_staged_upload(
 /// image while keeping a full RGBA decode under ~400 MB.
 const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 
-/// Reads width/height from the headers of the image formats RustPost accepts.
+/// Reads width/height from the headers of the image formats `RustPost` accepts.
 /// Returns `None` for unknown or truncated headers.
 fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -1096,7 +1096,7 @@ fn unique_media_path(dir: &Path, basename: &str, extension: &str) -> PathBuf {
             .open(&candidate)
         {
             Ok(_claim) => return candidate,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             // The directory may be missing or read-only; return the intended
             // path so the caller surfaces the real I/O error.
             Err(_error) => return candidate,
@@ -1690,7 +1690,7 @@ mod tests {
         let png = tiny_png_bytes();
         assert_eq!(image_dimensions(&png), Some((1, 1)));
 
-        let mut oversized = png.clone();
+        let mut oversized = png;
         oversized[16..20].copy_from_slice(&40_000_u32.to_be_bytes());
         oversized[20..24].copy_from_slice(&40_000_u32.to_be_bytes());
         let (width, height) = image_dimensions(&oversized).expect("png dimensions");

@@ -6,12 +6,14 @@ use std::time::Duration;
 use anyhow::Context as _;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
-/// Pre-1.0 release schema version 1 (without the YouTube embed tables).
+/// Pre-1.0 schema version 1 (without the `YouTube` embed tables).
 const RELEASE_V1_SCHEMA_VERSION: i64 = 1;
-/// Release 1.0.0 shipped schema version 2 (the YouTube embed tables).
+/// Pre-1.0 schema version 2 (with the `YouTube` embed tables).
 const RELEASE_V2_SCHEMA_VERSION: i64 = 2;
+/// Pre-1.0 schema version 3 (with the release indexes).
+const RELEASE_V3_SCHEMA_VERSION: i64 = 3;
 const OLD_ALPHA_SCHEMA_VERSION: i64 = 13;
 const INCOMPATIBLE_DATABASE_HINT: &str = "back up or export the instance, recreate a fresh RustPost data directory, and restore from a known-good backup instead of attempting a blind migration";
 
@@ -205,6 +207,7 @@ impl SchemaReport {
 enum MigrationState {
     Empty,
     Baseline,
+    ReleaseVersion3,
     ReleaseVersion2,
     ReleaseVersion1,
     AlphaLatest,
@@ -247,6 +250,7 @@ fn ensure_release_baseline(conn: &Connection) -> anyhow::Result<()> {
     match migration_state(conn)? {
         MigrationState::Empty => initialize_release_baseline(conn)?,
         MigrationState::Baseline => {}
+        MigrationState::ReleaseVersion3 => migrate_release_v3_to_current(conn)?,
         MigrationState::ReleaseVersion2 => migrate_release_v2_to_current(conn)?,
         MigrationState::ReleaseVersion1 => migrate_release_v1_to_current(conn)?,
         MigrationState::AlphaLatest => adopt_latest_alpha_schema(conn)?,
@@ -264,6 +268,15 @@ fn validate_or_normalize_restorable_schema(
 ) -> anyhow::Result<()> {
     match migration_state(conn)? {
         MigrationState::Baseline => validate_schema(conn),
+        MigrationState::ReleaseVersion3 => {
+            if !normalize {
+                anyhow::bail!(
+                    "database schema version {RELEASE_V3_SCHEMA_VERSION} requires migration before use"
+                );
+            }
+            migrate_release_v3_to_current(conn)?;
+            validate_schema(conn)
+        }
         MigrationState::ReleaseVersion2 => {
             if !normalize {
                 anyhow::bail!(
@@ -342,6 +355,9 @@ fn migration_state(conn: &Connection) -> anyhow::Result<MigrationState> {
     if versions == [CURRENT_SCHEMA_VERSION] {
         return Ok(MigrationState::Baseline);
     }
+    if versions == [RELEASE_V3_SCHEMA_VERSION] {
+        return Ok(MigrationState::ReleaseVersion3);
+    }
     if versions == [RELEASE_V2_SCHEMA_VERSION] {
         return Ok(MigrationState::ReleaseVersion2);
     }
@@ -416,7 +432,43 @@ fn migrate_release_v1_to_current(conn: &Connection) -> anyhow::Result<()> {
 /// session revocation, media reference checks, and rate-limit pruning.
 fn migrate_release_v2_to_current(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(RELEASE_V3_INDEXES)?;
+    reset_schema_migrations_to(conn, RELEASE_V3_SCHEMA_VERSION)?;
+    migrate_release_v3_to_current(conn)
+}
+
+/// Adds the account lifecycle columns and tables used by protected accounts,
+/// forced password resets, deletion grace periods, username history, instance
+/// settings, and account imports.
+fn migrate_release_v3_to_current(conn: &Connection) -> anyhow::Result<()> {
+    for (column, definition) in USER_COLUMNS_ADDED_IN_V4 {
+        add_column_if_missing(conn, "users", column, definition)?;
+    }
+    conn.execute_batch(RELEASE_V4_SCHEMA)?;
     reset_schema_migrations(conn)
+}
+
+/// `ALTER TABLE ... ADD COLUMN` is not idempotent, so the migration checks the
+/// current table shape first. `PRAGMA table_info` output is safe to inspect
+/// because the table names here are compile-time constants.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> anyhow::Result<()> {
+    let exists = table_columns(conn, table)?
+        .iter()
+        .any(|existing| existing.name == column);
+    if exists {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "ALTER TABLE {} ADD COLUMN {} {};",
+        quoted_identifier(table),
+        quoted_identifier(column),
+        definition
+    ))?;
+    Ok(())
 }
 
 fn inspect_schema(conn: &Connection) -> anyhow::Result<SchemaReport> {
@@ -473,7 +525,9 @@ fn inspect_schema_objects(conn: &Connection) -> anyhow::Result<Vec<String>> {
 
 fn inspect_alpha_schema_objects(conn: &Connection) -> anyhow::Result<Vec<String>> {
     // Objects introduced after the alpha schema are reported as missing here
-    // but are created by the migration chain during adoption.
+    // but are created by the migration chain during adoption. The `users`
+    // column list may also differ because adoption appends the version 4
+    // account lifecycle columns.
     Ok(inspect_schema_objects(conn)?
         .into_iter()
         .filter(|issue| {
@@ -487,7 +541,17 @@ fn inspect_alpha_schema_objects(conn: &Connection) -> anyhow::Result<Vec<String>
                     | "missing index idx_sessions_user"
                     | "missing index idx_post_media_media"
                     | "missing index idx_rate_limit_created"
-            )
+                    | "missing table follow_requests"
+                    | "missing index idx_follow_requests_target"
+                    | "missing table username_history"
+                    | "missing index idx_username_history_normalized"
+                    | "missing table instance_settings"
+                    | "missing table account_imports"
+                    | "missing index idx_account_imports_user"
+            ) && !issue.starts_with("table users columns differ")
+                && !USER_COLUMNS_ADDED_IN_V4
+                    .iter()
+                    .any(|(column, _definition)| issue == &format!("missing column users.{column}"))
         })
         .collect())
 }
@@ -723,13 +787,68 @@ CREATE INDEX IF NOT EXISTS idx_post_embeds_post ON post_embeds(post_id, position
 CREATE INDEX IF NOT EXISTS idx_post_embeds_video ON post_embeds(provider, video_id);
 "#;
 
+/// Columns appended to `users` by schema version 4. The order is part of the
+/// schema contract: fresh baselines and migrated databases must match it.
+const USER_COLUMNS_ADDED_IN_V4: &[(&str, &str)] = &[
+    ("follow_approval_required", "INTEGER NOT NULL DEFAULT 0"),
+    ("must_change_password", "INTEGER NOT NULL DEFAULT 0"),
+    ("deletion_requested_at", "TEXT"),
+    ("deletion_scheduled_at", "TEXT"),
+];
+
+/// Tables and indexes introduced with schema version 4. Applied on top of a
+/// version 3 database; every statement is idempotent.
+const RELEASE_V4_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS follow_requests (
+    requester_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (requester_id, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_follow_requests_target ON follow_requests(target_id, requester_id);
+
+CREATE TABLE IF NOT EXISTS username_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    username TEXT NOT NULL,
+    normalized_username TEXT NOT NULL,
+    changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (user_id, normalized_username)
+);
+
+CREATE INDEX IF NOT EXISTS idx_username_history_normalized ON username_history(normalized_username);
+
+CREATE TABLE IF NOT EXISTS instance_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS account_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    archive_id TEXT NOT NULL,
+    format_version INTEGER NOT NULL,
+    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    posts_imported INTEGER NOT NULL DEFAULT 0,
+    media_imported INTEGER NOT NULL DEFAULT 0,
+    follows_imported INTEGER NOT NULL DEFAULT 0,
+    follows_pending INTEGER NOT NULL DEFAULT 0,
+    follows_skipped INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (user_id, archive_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_imports_user ON account_imports(user_id, imported_at DESC);
+"#;
+
 const BASELINE_SCHEMA: &str = r#"
 CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO schema_migrations (version) VALUES (3);
+INSERT INTO schema_migrations (version) VALUES (4);
 
 CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -751,7 +870,11 @@ CREATE TABLE users (
     location TEXT NOT NULL DEFAULT '',
     nsfw_blur_enabled INTEGER NOT NULL DEFAULT 1,
     onboarding_completed_at TEXT,
-    liked_posts_public INTEGER NOT NULL DEFAULT 1 CHECK (liked_posts_public IN (0, 1))
+    liked_posts_public INTEGER NOT NULL DEFAULT 1 CHECK (liked_posts_public IN (0, 1)),
+    follow_approval_required INTEGER NOT NULL DEFAULT 0,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    deletion_requested_at TEXT,
+    deletion_scheduled_at TEXT
 );
 
 CREATE TABLE sessions (
@@ -1021,6 +1144,48 @@ BEGIN
         THEN RAISE(ABORT, 'media canonical reference must point to same-kind canonical media')
     END;
 END;
+
+CREATE TABLE follow_requests (
+    requester_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (requester_id, target_id)
+);
+
+CREATE INDEX idx_follow_requests_target ON follow_requests(target_id, requester_id);
+
+CREATE TABLE username_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    username TEXT NOT NULL,
+    normalized_username TEXT NOT NULL,
+    changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (user_id, normalized_username)
+);
+
+CREATE INDEX idx_username_history_normalized ON username_history(normalized_username);
+
+CREATE TABLE instance_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE account_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    archive_id TEXT NOT NULL,
+    format_version INTEGER NOT NULL,
+    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    posts_imported INTEGER NOT NULL DEFAULT 0,
+    media_imported INTEGER NOT NULL DEFAULT 0,
+    follows_imported INTEGER NOT NULL DEFAULT 0,
+    follows_pending INTEGER NOT NULL DEFAULT 0,
+    follows_skipped INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (user_id, archive_id)
+);
+
+CREATE INDEX idx_account_imports_user ON account_imports(user_id, imported_at DESC);
 "#;
 
 const REQUIRED_TABLES: &[&str] = &[
@@ -1044,6 +1209,10 @@ const REQUIRED_TABLES: &[&str] = &[
     "reports",
     "posts_fts",
     "muted_words",
+    "follow_requests",
+    "username_history",
+    "instance_settings",
+    "account_imports",
 ];
 
 const FTS_SHADOW_TABLES: &[&str] = &[
@@ -1199,6 +1368,21 @@ const REQUIRED_INDEXES: &[RequiredIndex] = &[
         table: "media",
         name: "idx_media_unique_canonical_normalized_sha256",
         unique: true,
+    },
+    RequiredIndex {
+        table: "follow_requests",
+        name: "idx_follow_requests_target",
+        unique: false,
+    },
+    RequiredIndex {
+        table: "username_history",
+        name: "idx_username_history_normalized",
+        unique: false,
+    },
+    RequiredIndex {
+        table: "account_imports",
+        name: "idx_account_imports_user",
+        unique: false,
     },
 ];
 
@@ -1400,6 +1584,38 @@ const REQUIRED_COLUMNS: &[RequiredColumn] = &[
         type_name: "INTEGER",
         not_null: true,
         default_value: Some("1"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "users",
+        name: "follow_approval_required",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: Some("0"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "users",
+        name: "must_change_password",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: Some("0"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "users",
+        name: "deletion_requested_at",
+        type_name: "TEXT",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "users",
+        name: "deletion_scheduled_at",
+        type_name: "TEXT",
+        not_null: false,
+        default_value: None,
         primary_key_position: 0,
     },
     RequiredColumn {
@@ -2282,6 +2498,174 @@ const REQUIRED_COLUMNS: &[RequiredColumn] = &[
         default_value: Some("CURRENT_TIMESTAMP"),
         primary_key_position: 0,
     },
+    RequiredColumn {
+        table: "follow_requests",
+        name: "requester_id",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 1,
+    },
+    RequiredColumn {
+        table: "follow_requests",
+        name: "target_id",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 2,
+    },
+    RequiredColumn {
+        table: "follow_requests",
+        name: "created_at",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: Some("CURRENT_TIMESTAMP"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "username_history",
+        name: "id",
+        type_name: "INTEGER",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 1,
+    },
+    RequiredColumn {
+        table: "username_history",
+        name: "user_id",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "username_history",
+        name: "username",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "username_history",
+        name: "normalized_username",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "username_history",
+        name: "changed_at",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: Some("CURRENT_TIMESTAMP"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "instance_settings",
+        name: "key",
+        type_name: "TEXT",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 1,
+    },
+    RequiredColumn {
+        table: "instance_settings",
+        name: "value",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "instance_settings",
+        name: "updated_at",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: Some("CURRENT_TIMESTAMP"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "account_imports",
+        name: "id",
+        type_name: "INTEGER",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 1,
+    },
+    RequiredColumn {
+        table: "account_imports",
+        name: "user_id",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "account_imports",
+        name: "archive_id",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "account_imports",
+        name: "format_version",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "account_imports",
+        name: "imported_at",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: Some("CURRENT_TIMESTAMP"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "account_imports",
+        name: "posts_imported",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: Some("0"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "account_imports",
+        name: "media_imported",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: Some("0"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "account_imports",
+        name: "follows_imported",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: Some("0"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "account_imports",
+        name: "follows_pending",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: Some("0"),
+        primary_key_position: 0,
+    },
+    RequiredColumn {
+        table: "account_imports",
+        name: "follows_skipped",
+        type_name: "INTEGER",
+        not_null: true,
+        default_value: Some("0"),
+        primary_key_position: 0,
+    },
 ];
 
 #[cfg(test)]
@@ -2337,6 +2721,389 @@ mod tests {
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert!(busy_timeout >= 5_000);
+    }
+
+    #[test]
+    fn fresh_database_has_v4_user_lifecycle_columns_with_defaults() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let conn = Connection::open(temp.path().join("fresh.sqlite3")).expect("open");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        initialize_release_baseline(&conn).expect("baseline");
+
+        assert_eq!(
+            schema_version_from_connection(&conn).expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
+
+        for (column, type_name, not_null, default_value) in [
+            ("follow_approval_required", "INTEGER", true, Some("0")),
+            ("must_change_password", "INTEGER", true, Some("0")),
+            ("deletion_requested_at", "TEXT", false, None),
+            ("deletion_scheduled_at", "TEXT", false, None),
+        ] {
+            let actual = users_column(&conn, column);
+            assert_eq!(actual.type_name, type_name, "users.{column} type");
+            assert_eq!(actual.not_null, not_null, "users.{column} nullability");
+            assert_eq!(
+                actual.default_value.as_deref(),
+                default_value,
+                "users.{column} default"
+            );
+            assert_eq!(actual.primary_key_position, 0, "users.{column} primary key");
+        }
+
+        conn.execute(
+            "INSERT INTO users (id, username, normalized_username, password_hash, display_name) VALUES (1, 'Alice', 'alice', 'hash', 'Alice')",
+            [],
+        )
+        .expect("user");
+        let defaults: (i64, i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT follow_approval_required, must_change_password, deletion_requested_at, deletion_scheduled_at FROM users WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("defaults");
+        assert_eq!(defaults, (0, 0, None, None));
+        assert!(
+            inspect_schema(&conn).expect("schema").is_compatible(),
+            "fresh baseline must satisfy its own schema requirements"
+        );
+    }
+
+    #[test]
+    fn fresh_database_has_v4_follow_tables_with_expected_columns() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let conn = Connection::open(temp.path().join("fresh.sqlite3")).expect("open");
+        initialize_release_baseline(&conn).expect("baseline");
+
+        for table in ["follow_requests", "username_history"] {
+            assert!(
+                table_exists(&conn, table).expect("table lookup"),
+                "missing table {table}"
+            );
+        }
+
+        assert_eq!(
+            column_shapes(&conn, "follow_requests"),
+            vec![
+                (
+                    "requester_id".to_owned(),
+                    "INTEGER".to_owned(),
+                    true,
+                    None,
+                    1
+                ),
+                ("target_id".to_owned(), "INTEGER".to_owned(), true, None, 2),
+                (
+                    "created_at".to_owned(),
+                    "TEXT".to_owned(),
+                    true,
+                    Some("CURRENT_TIMESTAMP".to_owned()),
+                    0
+                ),
+            ]
+        );
+        assert_eq!(
+            column_shapes(&conn, "username_history"),
+            vec![
+                ("id".to_owned(), "INTEGER".to_owned(), false, None, 1),
+                ("user_id".to_owned(), "INTEGER".to_owned(), true, None, 0),
+                ("username".to_owned(), "TEXT".to_owned(), true, None, 0),
+                (
+                    "normalized_username".to_owned(),
+                    "TEXT".to_owned(),
+                    true,
+                    None,
+                    0
+                ),
+                (
+                    "changed_at".to_owned(),
+                    "TEXT".to_owned(),
+                    true,
+                    Some("CURRENT_TIMESTAMP".to_owned()),
+                    0
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fresh_database_has_v4_instance_tables_with_expected_columns() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let conn = Connection::open(temp.path().join("fresh.sqlite3")).expect("open");
+        initialize_release_baseline(&conn).expect("baseline");
+
+        for table in ["instance_settings", "account_imports"] {
+            assert!(
+                table_exists(&conn, table).expect("table lookup"),
+                "missing table {table}"
+            );
+        }
+
+        assert_eq!(
+            column_shapes(&conn, "instance_settings"),
+            vec![
+                ("key".to_owned(), "TEXT".to_owned(), false, None, 1),
+                ("value".to_owned(), "TEXT".to_owned(), true, None, 0),
+                (
+                    "updated_at".to_owned(),
+                    "TEXT".to_owned(),
+                    true,
+                    Some("CURRENT_TIMESTAMP".to_owned()),
+                    0
+                ),
+            ]
+        );
+        assert_eq!(
+            column_shapes(&conn, "account_imports"),
+            vec![
+                ("id".to_owned(), "INTEGER".to_owned(), false, None, 1),
+                ("user_id".to_owned(), "INTEGER".to_owned(), true, None, 0),
+                ("archive_id".to_owned(), "TEXT".to_owned(), true, None, 0),
+                (
+                    "format_version".to_owned(),
+                    "INTEGER".to_owned(),
+                    true,
+                    None,
+                    0
+                ),
+                (
+                    "imported_at".to_owned(),
+                    "TEXT".to_owned(),
+                    true,
+                    Some("CURRENT_TIMESTAMP".to_owned()),
+                    0
+                ),
+                (
+                    "posts_imported".to_owned(),
+                    "INTEGER".to_owned(),
+                    true,
+                    Some("0".to_owned()),
+                    0
+                ),
+                (
+                    "media_imported".to_owned(),
+                    "INTEGER".to_owned(),
+                    true,
+                    Some("0".to_owned()),
+                    0
+                ),
+                (
+                    "follows_imported".to_owned(),
+                    "INTEGER".to_owned(),
+                    true,
+                    Some("0".to_owned()),
+                    0
+                ),
+                (
+                    "follows_pending".to_owned(),
+                    "INTEGER".to_owned(),
+                    true,
+                    Some("0".to_owned()),
+                    0
+                ),
+                (
+                    "follows_skipped".to_owned(),
+                    "INTEGER".to_owned(),
+                    true,
+                    Some("0".to_owned()),
+                    0
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fresh_database_enforces_v4_unique_constraints_indexes_and_foreign_keys() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let conn = Connection::open(temp.path().join("fresh.sqlite3")).expect("open");
+        initialize_release_baseline(&conn).expect("baseline");
+
+        assert_eq!(
+            unique_index_column_sets(&conn, "follow_requests"),
+            vec![vec!["requester_id".to_owned(), "target_id".to_owned()]]
+        );
+        assert!(
+            unique_index_column_sets(&conn, "username_history").contains(&vec![
+                "user_id".to_owned(),
+                "normalized_username".to_owned()
+            ]),
+            "username_history must keep UNIQUE(user_id, normalized_username)"
+        );
+        assert!(
+            unique_index_column_sets(&conn, "account_imports")
+                .contains(&vec!["user_id".to_owned(), "archive_id".to_owned()]),
+            "account_imports must keep UNIQUE(user_id, archive_id)"
+        );
+
+        for (table, name) in [
+            ("follow_requests", "idx_follow_requests_target"),
+            ("username_history", "idx_username_history_normalized"),
+            ("account_imports", "idx_account_imports_user"),
+        ] {
+            assert!(
+                table_indexes(&conn, table)
+                    .expect("indexes")
+                    .iter()
+                    .any(|(index, unique)| index == name && !unique),
+                "missing index {name}"
+            );
+        }
+        assert_eq!(
+            index_columns(&conn, "idx_follow_requests_target"),
+            vec!["target_id".to_owned(), "requester_id".to_owned()]
+        );
+        assert_eq!(
+            index_columns(&conn, "idx_username_history_normalized"),
+            vec!["normalized_username".to_owned()]
+        );
+        assert_eq!(
+            index_columns(&conn, "idx_account_imports_user"),
+            vec!["user_id".to_owned(), "imported_at".to_owned()]
+        );
+
+        assert_eq!(
+            foreign_key_actions(&conn, "follow_requests"),
+            vec![
+                (
+                    "users".to_owned(),
+                    "requester_id".to_owned(),
+                    "CASCADE".to_owned()
+                ),
+                (
+                    "users".to_owned(),
+                    "target_id".to_owned(),
+                    "CASCADE".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(
+            foreign_key_actions(&conn, "username_history"),
+            vec![(
+                "users".to_owned(),
+                "user_id".to_owned(),
+                "CASCADE".to_owned()
+            )]
+        );
+        assert_eq!(
+            foreign_key_actions(&conn, "account_imports"),
+            vec![(
+                "users".to_owned(),
+                "user_id".to_owned(),
+                "CASCADE".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn fresh_database_v4_rows_cascade_when_a_user_is_deleted() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let conn = Connection::open(temp.path().join("fresh.sqlite3")).expect("open");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        initialize_release_baseline(&conn).expect("baseline");
+        conn.execute_batch(
+            r#"
+            INSERT INTO users (id, username, normalized_username, password_hash, display_name)
+                VALUES (1, 'Alice', 'alice', 'hash', 'Alice');
+            INSERT INTO users (id, username, normalized_username, password_hash, display_name)
+                VALUES (2, 'Bob', 'bob', 'hash', 'Bob');
+            INSERT INTO follow_requests (requester_id, target_id) VALUES (1, 2);
+            INSERT INTO username_history (user_id, username, normalized_username) VALUES (2, 'Bobby', 'bobby');
+            INSERT INTO account_imports (user_id, archive_id, format_version) VALUES (2, 'archive-1', 1);
+            "#,
+        )
+        .expect("seed rows");
+
+        conn.execute("DELETE FROM users WHERE id = 2", [])
+            .expect("delete user");
+
+        assert_eq!(
+            table_count(&conn, "follow_requests").expect("follow requests"),
+            0
+        );
+        assert_eq!(
+            table_count(&conn, "username_history").expect("username history"),
+            0
+        );
+        assert_eq!(
+            table_count(&conn, "account_imports").expect("account imports"),
+            0
+        );
+    }
+
+    #[test]
+    fn fresh_database_rejects_duplicate_v4_rows() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let conn = Connection::open(temp.path().join("fresh.sqlite3")).expect("open");
+        initialize_release_baseline(&conn).expect("baseline");
+        conn.execute_batch(
+            r#"
+            INSERT INTO users (id, username, normalized_username, password_hash, display_name)
+                VALUES (1, 'Alice', 'alice', 'hash', 'Alice');
+            INSERT INTO users (id, username, normalized_username, password_hash, display_name)
+                VALUES (2, 'Bob', 'bob', 'hash', 'Bob');
+            "#,
+        )
+        .expect("users");
+
+        conn.execute(
+            "INSERT INTO follow_requests (requester_id, target_id) VALUES (1, 2)",
+            [],
+        )
+        .expect("first follow request");
+        assert!(
+            conn.execute(
+                "INSERT INTO follow_requests (requester_id, target_id) VALUES (1, 2)",
+                [],
+            )
+            .is_err(),
+            "duplicate follow requests must be rejected"
+        );
+
+        conn.execute(
+            "INSERT INTO username_history (user_id, username, normalized_username) VALUES (1, 'OldAlice', 'oldalice')",
+            [],
+        )
+        .expect("first history row");
+        assert!(
+            conn.execute(
+                "INSERT INTO username_history (user_id, username, normalized_username) VALUES (1, 'OlderAlice', 'oldalice')",
+                [],
+            )
+            .is_err(),
+            "duplicate username history rows for one account must be rejected"
+        );
+
+        conn.execute(
+            "INSERT INTO account_imports (user_id, archive_id, format_version) VALUES (1, 'archive-1', 1)",
+            [],
+        )
+        .expect("first import");
+        assert!(
+            conn.execute(
+                "INSERT INTO account_imports (user_id, archive_id, format_version) VALUES (1, 'archive-1', 2)",
+                [],
+            )
+            .is_err(),
+            "duplicate account imports for one archive must be rejected"
+        );
+
+        conn.execute(
+            "INSERT INTO instance_settings (key, value) VALUES ('announcement', 'hi')",
+            [],
+        )
+        .expect("first instance setting");
+        assert!(
+            conn.execute(
+                "INSERT INTO instance_settings (key, value) VALUES ('announcement', 'again')",
+                [],
+            )
+            .is_err(),
+            "duplicate instance setting keys must be rejected"
+        );
     }
 
     #[tokio::test]
@@ -2422,30 +3189,30 @@ mod tests {
             .await
             .expect("connect");
         pool.call(|conn| {
-            initialize_release_baseline(conn)?;
-            conn.execute("DROP TABLE post_embeds", [])?;
-            reset_schema_migrations_to(conn, RELEASE_V1_SCHEMA_VERSION)?;
-            Ok(())
+            install_release_v1_fixture(conn)?;
+            insert_legacy_migration_fixture(conn)
         })
         .await
         .expect("version 1 fixture");
+        let legacy_before = pool
+            .call(|conn| legacy_rows(conn))
+            .await
+            .expect("legacy rows");
 
-        migrate(&pool).await.expect("migrate version 1");
+        assert_release_upgrade_preserves_data(&pool, legacy_before).await;
 
-        let (embed_count, version): (i64, i64) = pool
+        let (embed_count, version) = pool
             .call(|conn| {
                 Ok((
-                    conn.query_row("SELECT COUNT(*) FROM post_embeds", [], |row| row.get(0))?,
+                    table_count(conn, "post_embeds")?,
                     schema_version_from_connection(conn)?,
                 ))
             })
             .await
             .expect("post embeds");
-        let report = schema_report(&pool).await.expect("schema report");
 
         assert_eq!(embed_count, 0);
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert!(report.is_compatible(), "{}", report.summary());
     }
 
     #[tokio::test]
@@ -2455,46 +3222,230 @@ mod tests {
             .await
             .expect("connect");
         pool.call(|conn| {
-            initialize_release_baseline(conn)?;
-            conn.execute(
-                "INSERT INTO users (username, normalized_username, password_hash, display_name) VALUES ('Alice', 'alice', 'hash', 'Alice')",
-                [],
-            )?;
-            for index in [
-                "idx_posts_root",
-                "idx_media_owner",
-                "idx_sessions_user",
-                "idx_post_media_media",
-                "idx_rate_limit_created",
-            ] {
-                conn.execute(&format!("DROP INDEX {index}"), [])?;
-            }
-            reset_schema_migrations_to(conn, RELEASE_V2_SCHEMA_VERSION)?;
-            Ok(())
+            install_release_v2_fixture(conn)?;
+            insert_legacy_migration_fixture(conn)
         })
         .await
         .expect("version 2 fixture");
+        let legacy_before = pool
+            .call(|conn| legacy_rows(conn))
+            .await
+            .expect("legacy rows");
 
-        migrate(&pool).await.expect("migrate version 2");
+        assert_release_upgrade_preserves_data(&pool, legacy_before).await;
 
-        let (version, users, root_index) = pool
+        let root_index = pool
+            .call(|conn| {
+                Ok(table_indexes(conn, "posts")?
+                    .iter()
+                    .any(|(name, _unique)| name == "idx_posts_root"))
+            })
+            .await
+            .expect("release index");
+
+        assert!(root_index, "version 3 migration must add idx_posts_root");
+    }
+
+    #[tokio::test]
+    async fn release_version_3_databases_gain_account_lifecycle_state_without_data_loss() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        pool.call(|conn| {
+            install_release_v3_fixture(conn)?;
+            insert_legacy_migration_fixture(conn)
+        })
+        .await
+        .expect("version 3 fixture");
+        let legacy_before = pool
+            .call(|conn| legacy_rows(conn))
+            .await
+            .expect("legacy rows");
+
+        assert_release_upgrade_preserves_data(&pool, legacy_before).await;
+    }
+
+    #[tokio::test]
+    async fn release_version_3_wrong_type_v4_column_is_rejected_without_data_loss() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        pool.call(|conn| {
+            install_release_v3_fixture(conn)?;
+            insert_legacy_migration_fixture(conn)?;
+            conn.execute_batch(
+                r#"
+                ALTER TABLE users ADD COLUMN follow_approval_required TEXT;
+                "#,
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("wrong-typed version 3 fixture");
+        let legacy_before = pool
+            .call(|conn| legacy_rows(conn))
+            .await
+            .expect("legacy rows");
+
+        let error = migrate(&pool)
+            .await
+            .expect_err("wrong column type must be rejected");
+        let message = format!("{error:#}");
+        let (version, legacy_after, v4_tables) = pool
             .call(|conn| {
                 Ok((
                     schema_version_from_connection(conn)?,
-                    conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))?,
-                    table_indexes(conn, "posts")?
-                        .iter()
-                        .any(|(name, _unique)| name == "idx_posts_root"),
+                    legacy_rows(conn)?,
+                    existing_v4_tables(conn),
                 ))
             })
             .await
-            .expect("post-migration state");
-        let report = schema_report(&pool).await.expect("schema report");
+            .expect("state after rejected migration");
+
+        assert!(
+            message.contains("users.follow_approval_required"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("expected INTEGER"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(version, RELEASE_V3_SCHEMA_VERSION);
+        assert_eq!(legacy_after, legacy_before);
+        assert!(v4_tables.is_empty(), "rolled back tables: {v4_tables:?}");
+    }
+
+    #[tokio::test]
+    async fn release_version_3_partial_v4_table_is_rejected_without_data_loss() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        pool.call(|conn| {
+            install_release_v3_fixture(conn)?;
+            insert_legacy_migration_fixture(conn)?;
+            conn.execute_batch(
+                r#"
+                CREATE TABLE username_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    username TEXT NOT NULL,
+                    normalized_username TEXT NOT NULL
+                );
+                "#,
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("partial version 3 fixture");
+        let legacy_before = pool
+            .call(|conn| legacy_rows(conn))
+            .await
+            .expect("legacy rows");
+
+        let error = migrate(&pool)
+            .await
+            .expect_err("partial v4 table must be rejected");
+        let message = format!("{error:#}");
+        let (version, legacy_after, user_columns, follow_requests, history_rows) = pool
+            .call(|conn| {
+                Ok((
+                    schema_version_from_connection(conn)?,
+                    legacy_rows(conn)?,
+                    table_columns(conn, "users")?
+                        .into_iter()
+                        .map(|column| column.name)
+                        .collect::<Vec<_>>(),
+                    table_exists(conn, "follow_requests")?,
+                    table_count(conn, "username_history")?,
+                ))
+            })
+            .await
+            .expect("state after rejected migration");
+
+        assert!(
+            message.contains("table username_history columns differ"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("changed_at"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(version, RELEASE_V3_SCHEMA_VERSION);
+        assert_eq!(legacy_after, legacy_before);
+        assert!(
+            !user_columns
+                .iter()
+                .any(|column| column == "follow_approval_required"),
+            "v4 user columns must be rolled back: {user_columns:?}"
+        );
+        assert!(
+            !follow_requests,
+            "v4 tables created during the failed migration must be rolled back"
+        );
+        assert_eq!(history_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn alpha_schema_missing_v4_account_lifecycle_state_is_adopted_without_data_loss() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = connect(&temp.path().join("test.sqlite3"))
+            .await
+            .expect("connect");
+        pool.call(|conn| {
+            install_latest_alpha_fixture(conn)?;
+            insert_preservation_fixture(conn)?;
+            for (column, _definition) in USER_COLUMNS_ADDED_IN_V4 {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE users DROP COLUMN {};",
+                    quoted_identifier(column)
+                ))?;
+            }
+            conn.execute_batch(
+                r#"
+                DROP TABLE follow_requests;
+                DROP TABLE username_history;
+                DROP TABLE instance_settings;
+                DROP TABLE account_imports;
+                "#,
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("alpha fixture without v4 account lifecycle state");
+
+        migrate(&pool).await.expect("adopt alpha schema");
+
+        let (version, presence, users, posts, media, defaults) = pool
+            .call(|conn| {
+                Ok((
+                    schema_version_from_connection(conn)?,
+                    v4_presence(conn)?,
+                    table_count(conn, "users")?,
+                    table_count(conn, "posts")?,
+                    table_count(conn, "media")?,
+                    conn.query_row(
+                        "SELECT follow_approval_required, must_change_password FROM users WHERE id = 1",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )?,
+                ))
+            })
+            .await
+            .expect("adopted state");
 
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(users, 1);
-        assert!(root_index);
-        assert!(report.is_compatible(), "{}", report.summary());
+        assert_eq!(presence.tables.len(), 4);
+        assert!(presence.user_columns.ends_with(&[
+            "follow_approval_required".to_owned(),
+            "must_change_password".to_owned(),
+            "deletion_requested_at".to_owned(),
+            "deletion_scheduled_at".to_owned(),
+        ]));
+        assert_eq!((users, posts, media), (2, 2, 1));
+        assert_eq!(defaults, (0, 0));
     }
 
     #[tokio::test]
@@ -2905,6 +3856,407 @@ mod tests {
 
         assert_eq!(search_count, 1);
         assert_eq!(social_count, 5);
+    }
+
+    fn users_column(conn: &Connection, name: &str) -> ColumnInfo {
+        table_columns(conn, "users")
+            .expect("users columns")
+            .into_iter()
+            .find(|column| column.name == name)
+            .unwrap_or_else(|| panic!("missing users.{name}"))
+    }
+
+    fn column_shapes(
+        conn: &Connection,
+        table: &str,
+    ) -> Vec<(String, String, bool, Option<String>, i64)> {
+        table_columns(conn, table)
+            .expect("table columns")
+            .into_iter()
+            .map(|column| {
+                (
+                    column.name,
+                    column.type_name,
+                    column.not_null,
+                    column.default_value,
+                    column.primary_key_position,
+                )
+            })
+            .collect()
+    }
+
+    fn unique_index_column_sets(conn: &Connection, table: &str) -> Vec<Vec<String>> {
+        let mut sets = Vec::new();
+        for (name, unique) in table_indexes(conn, table).expect("indexes") {
+            if unique {
+                sets.push(index_columns(conn, &name));
+            }
+        }
+        sets
+    }
+
+    fn index_columns(conn: &Connection, name: &str) -> Vec<String> {
+        let sql = format!("PRAGMA index_info({})", quoted_identifier(name));
+        let mut stmt = conn.prepare(&sql).expect("index info");
+        stmt.query_map([], |row| row.get::<_, String>(2))
+            .expect("index columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("index column rows")
+    }
+
+    fn foreign_key_actions(conn: &Connection, table: &str) -> Vec<(String, String, String)> {
+        let sql = format!("PRAGMA foreign_key_list({})", quoted_identifier(table));
+        let mut stmt = conn.prepare(&sql).expect("foreign key list");
+        let mut actions = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .expect("foreign keys")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("foreign key rows");
+        actions.sort();
+        actions
+    }
+
+    fn install_release_v3_fixture(conn: &Connection) -> anyhow::Result<()> {
+        initialize_release_baseline(conn)?;
+        for (column, _definition) in USER_COLUMNS_ADDED_IN_V4 {
+            conn.execute_batch(&format!(
+                "ALTER TABLE users DROP COLUMN {};",
+                quoted_identifier(column)
+            ))?;
+        }
+        conn.execute_batch(
+            r#"
+            DROP TABLE follow_requests;
+            DROP TABLE username_history;
+            DROP TABLE instance_settings;
+            DROP TABLE account_imports;
+            "#,
+        )?;
+        reset_schema_migrations_to(conn, RELEASE_V3_SCHEMA_VERSION)
+    }
+
+    fn install_release_v2_fixture(conn: &Connection) -> anyhow::Result<()> {
+        install_release_v3_fixture(conn)?;
+        for index in [
+            "idx_posts_root",
+            "idx_media_owner",
+            "idx_sessions_user",
+            "idx_post_media_media",
+            "idx_rate_limit_created",
+        ] {
+            conn.execute(&format!("DROP INDEX {index}"), [])?;
+        }
+        reset_schema_migrations_to(conn, RELEASE_V2_SCHEMA_VERSION)
+    }
+
+    fn install_release_v1_fixture(conn: &Connection) -> anyhow::Result<()> {
+        install_release_v2_fixture(conn)?;
+        conn.execute_batch("DROP TABLE post_embeds;")?;
+        reset_schema_migrations_to(conn, RELEASE_V1_SCHEMA_VERSION)
+    }
+
+    fn insert_legacy_migration_fixture(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            r#"
+            INSERT INTO users (id, username, normalized_username, password_hash, display_name, created_at, updated_at)
+                VALUES (1, 'Alice', 'alice', 'hash', 'Alice', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z');
+            INSERT INTO users (id, username, normalized_username, password_hash, display_name, created_at, updated_at)
+                VALUES (2, 'Bob', 'bob', 'hash', 'Bob', '2024-01-02T00:00:00Z', '2024-01-02T00:00:00Z');
+            INSERT INTO posts (id, user_id, text, created_at)
+                VALUES (1, 1, 'alpha post', '2024-01-03T00:00:00Z');
+            INSERT INTO posts (id, user_id, text, created_at)
+                VALUES (2, 2, 'beta post', '2024-01-04T00:00:00Z');
+            INSERT INTO media (id, owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, original_sha256)
+                VALUES (1, 1, 'alpha.png', '/data/uploads/images/alpha.webp', '/uploads/images/alpha.webp', 'image/webp', 'image', 42, 'legacy-sha');
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn insert_v4_account_lifecycle_fixture(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            r#"
+            UPDATE users SET
+                follow_approval_required = 1,
+                must_change_password = 1,
+                deletion_requested_at = '2026-01-01T00:00:00Z',
+                deletion_scheduled_at = '2026-02-01T00:00:00Z'
+                WHERE id = 1;
+            INSERT INTO follow_requests (requester_id, target_id, created_at)
+                VALUES (1, 2, '2026-01-02T00:00:00Z');
+            INSERT INTO username_history (user_id, username, normalized_username, changed_at)
+                VALUES (1, 'OldAlice', 'oldalice', '2026-01-03T00:00:00Z');
+            INSERT INTO username_history (user_id, username, normalized_username, changed_at)
+                VALUES (1, 'OlderAlice', 'olderalice', '2026-01-04T00:00:00Z');
+            INSERT INTO instance_settings (key, value, updated_at)
+                VALUES ('announcement', 'hello', '2026-01-05T00:00:00Z');
+            INSERT INTO instance_settings (key, value, updated_at)
+                VALUES ('maintenance_mode', '1', '2026-01-06T00:00:00Z');
+            INSERT INTO account_imports (
+                user_id, archive_id, format_version, imported_at,
+                posts_imported, media_imported, follows_imported, follows_pending, follows_skipped
+            )
+                VALUES (1, 'archive-1', 2, '2026-01-07T00:00:00Z', 3, 4, 5, 6, 7);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct LegacyRows {
+        users: Vec<(i64, String, String, String)>,
+        posts: Vec<(i64, String, String)>,
+        media: Vec<(i64, String, String)>,
+    }
+
+    fn legacy_rows(conn: &Connection) -> anyhow::Result<LegacyRows> {
+        let mut users_stmt =
+            conn.prepare("SELECT id, username, display_name, created_at FROM users ORDER BY id")?;
+        let users = users_stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut posts_stmt = conn.prepare("SELECT id, text, created_at FROM posts ORDER BY id")?;
+        let posts = posts_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut media_stmt =
+            conn.prepare("SELECT id, stored_path, original_sha256 FROM media ORDER BY id")?;
+        let media = media_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(LegacyRows {
+            users,
+            posts,
+            media,
+        })
+    }
+
+    type UserLifecycleRow = (i64, i64, i64, Option<String>, Option<String>);
+    type AccountImportRow = (i64, String, i64, String, i64, i64, i64, i64, i64);
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AccountLifecycleRows {
+        users: Vec<UserLifecycleRow>,
+        follow_requests: Vec<(i64, i64, String)>,
+        username_history: Vec<(i64, String, String, String)>,
+        instance_settings: Vec<(String, String, String)>,
+        account_imports: Vec<AccountImportRow>,
+    }
+
+    fn account_lifecycle_rows(conn: &Connection) -> anyhow::Result<AccountLifecycleRows> {
+        let mut users_stmt = conn.prepare(
+            "SELECT id, follow_approval_required, must_change_password, deletion_requested_at, deletion_scheduled_at FROM users ORDER BY id",
+        )?;
+        let users = users_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut follow_stmt = conn.prepare(
+            "SELECT requester_id, target_id, created_at FROM follow_requests ORDER BY requester_id, target_id",
+        )?;
+        let follow_requests = follow_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut history_stmt = conn.prepare(
+            "SELECT user_id, username, normalized_username, changed_at FROM username_history ORDER BY user_id, normalized_username",
+        )?;
+        let username_history = history_stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut settings_stmt =
+            conn.prepare("SELECT key, value, updated_at FROM instance_settings ORDER BY key")?;
+        let instance_settings = settings_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut imports_stmt = conn.prepare(
+            "SELECT user_id, archive_id, format_version, imported_at, posts_imported, media_imported, follows_imported, follows_pending, follows_skipped FROM account_imports ORDER BY id",
+        )?;
+        let account_imports = imports_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(AccountLifecycleRows {
+            users,
+            follow_requests,
+            username_history,
+            instance_settings,
+            account_imports,
+        })
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct V4Presence {
+        tables: Vec<&'static str>,
+        user_columns: Vec<String>,
+        indexes: Vec<&'static str>,
+    }
+
+    fn v4_presence(conn: &Connection) -> anyhow::Result<V4Presence> {
+        let mut tables = Vec::new();
+        for table in [
+            "follow_requests",
+            "username_history",
+            "instance_settings",
+            "account_imports",
+        ] {
+            if table_exists(conn, table)? {
+                tables.push(table);
+            }
+        }
+        let user_columns = table_columns(conn, "users")?
+            .into_iter()
+            .map(|column| column.name)
+            .collect();
+        let mut indexes = Vec::new();
+        for (table, name) in [
+            ("follow_requests", "idx_follow_requests_target"),
+            ("username_history", "idx_username_history_normalized"),
+            ("account_imports", "idx_account_imports_user"),
+        ] {
+            if table_indexes(conn, table)?
+                .iter()
+                .any(|(index, unique)| index == name && !unique)
+            {
+                indexes.push(name);
+            }
+        }
+        Ok(V4Presence {
+            tables,
+            user_columns,
+            indexes,
+        })
+    }
+
+    fn existing_v4_tables(conn: &Connection) -> Vec<&'static str> {
+        let mut tables = Vec::new();
+        for table in [
+            "follow_requests",
+            "username_history",
+            "instance_settings",
+            "account_imports",
+        ] {
+            if table_exists(conn, table).expect("table lookup") {
+                tables.push(table);
+            }
+        }
+        tables
+    }
+
+    async fn assert_release_upgrade_preserves_data(pool: &SqlitePool, legacy_before: LegacyRows) {
+        migrate(pool)
+            .await
+            .expect("migrate historical release schema");
+
+        let (issues, version, presence, defaults, legacy_after) = pool
+            .call(|conn| {
+                Ok((
+                    inspect_schema(conn)?.issues().to_vec(),
+                    schema_version_from_connection(conn)?,
+                    v4_presence(conn)?,
+                    conn.query_row(
+                        "SELECT follow_approval_required, must_change_password, deletion_requested_at, deletion_scheduled_at FROM users WHERE id = 1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    )?,
+                    legacy_rows(conn)?,
+                ))
+            })
+            .await
+            .expect("post-migration state");
+
+        assert!(issues.is_empty(), "{}", issues.join("; "));
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            presence.tables,
+            vec![
+                "follow_requests",
+                "username_history",
+                "instance_settings",
+                "account_imports"
+            ]
+        );
+        assert!(
+            presence.user_columns.ends_with(&[
+                "follow_approval_required".to_owned(),
+                "must_change_password".to_owned(),
+                "deletion_requested_at".to_owned(),
+                "deletion_scheduled_at".to_owned(),
+            ]),
+            "missing v4 users columns: {:?}",
+            presence.user_columns
+        );
+        assert_eq!(
+            presence.indexes,
+            vec![
+                "idx_follow_requests_target",
+                "idx_username_history_normalized",
+                "idx_account_imports_user"
+            ]
+        );
+        assert_eq!(defaults, (0, 0, None, None));
+        assert_eq!(legacy_after, legacy_before);
+
+        pool.call(|conn| insert_v4_account_lifecycle_fixture(conn))
+            .await
+            .expect("v4 rows");
+        let lifecycle_before = pool
+            .call(|conn| account_lifecycle_rows(conn))
+            .await
+            .expect("lifecycle rows");
+
+        migrate(pool)
+            .await
+            .expect("second migrate must be idempotent");
+
+        let (version_again, lifecycle_after, legacy_again) = pool
+            .call(|conn| {
+                Ok((
+                    schema_version_from_connection(conn)?,
+                    account_lifecycle_rows(conn)?,
+                    legacy_rows(conn)?,
+                ))
+            })
+            .await
+            .expect("idempotent state");
+
+        assert_eq!(version_again, CURRENT_SCHEMA_VERSION);
+        assert_eq!(lifecycle_after, lifecycle_before);
+        assert_eq!(legacy_again, legacy_before);
     }
 
     fn install_latest_alpha_fixture(conn: &Connection) -> anyhow::Result<()> {

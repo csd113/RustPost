@@ -2,6 +2,22 @@
 
 ## v1.0.0 - First Release
 
+### Instance and social controls
+- Protected accounts: users can require approval before someone follows them. Requests are pending until approved, never count as followers, can be rejected or cancelled, and are cleared by blocks.
+- Instance announcements: administrators can publish, disable, or clear an announcement rendered next to the site name in the top bar.
+- Maintenance mode: administrators can disable registration and post creation (including replies, edits, quotes, reposts, and account imports) while the site stays readable; administrators keep posting access to verify the instance, and the block policy is a single table-driven rule set.
+
+### Account lifecycle
+- Account export/import: versioned `.tar.gz` archives with posts, profile data, media bytes, media list, outgoing follows, and settings; imports are validated, staged, remapped, and protected by repeat-import tracking.
+- Archive hardening: compressed upload/export and decompressed-content limits are independent and configurable, structural limits are enforced incrementally while streaming, media bytes must match their declared size/hash/type, and failed imports leave no partial state.
+- Admin forced password reset: a flagged account is restricted to the password-change and logout flows until the password changes, including on existing sessions.
+- Admin forced logout: every active session for one account can be revoked without affecting other accounts.
+- Account deletion grace period: deletion requests store a deadline (default 30 days, configurable), can be cancelled, block publishing while pending, and are finalized idempotently from persisted state with a durable media-cleanup journal.
+- Username changes and history: handles are validated and changed atomically, previous handles stay reserved, same-owner reclamation is allowed, and old profile URLs render a history or released-handle page instead of silently resolving to a different person.
+
+### Database
+- Schema version `4` adds account lifecycle columns, `follow_requests`, `username_history`, `instance_settings`, and `account_imports` with a forward migration from versions `1`–`3` and alpha adoption.
+
 ### Runtime and Dependency Baseline
 - Raised the minimum supported Rust version to `1.91` and updated local, CI, and release-build documentation accordingly.
 - Upgraded the embedded Arti and Tor crate family to `0.45.0`, including the onion-stream API migration required by that release.
@@ -29,13 +45,13 @@
 - Audited the release build, clean temporary-runtime first-run flow, restart persistence, backup/restore behavior, runtime permissions, and operator documentation before tagging.
 
 ### Database Lineage
-- Squashed the pre-release internal migration chain into a clean first-release SQLite schema baseline at database schema version `2`.
+- Squashed the pre-release internal migration chain into a clean first-release SQLite schema baseline at database schema version `4`.
 - Fresh databases are now initialized directly from the baseline instead of replaying alpha development migrations.
-- Existing current alpha databases that structurally match the baseline are marked as baseline version `2` without destructive changes or data loss.
+- Existing compatible alpha and release-candidate databases are migrated to schema version `4` without destructive changes or data loss.
 - Incomplete, unknown, or structurally unsafe pre-release databases now fail closed with administrator guidance to back up/export/recreate/restore instead of attempting blind migration.
 - Added stricter schema diagnostics for required tables, columns, indexes, and triggers so startup, backups, restores, and admin health can report incompatible or corrupt database structure clearly.
 - `check` now reports database schema status without creating or migrating the database during diagnostics.
-- Future post-release database changes should use normal forward migrations after baseline version `2`; released migration history must not be squashed or rewritten after the first public release.
+- Future post-release database changes should use normal forward migrations after baseline version `4`; released migration history must not be squashed or rewritten after the first public release.
 
 ## v0.1.6 - Pinned Profiles
 

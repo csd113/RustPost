@@ -21,6 +21,8 @@
 
 [**Getting Started**](#-getting-started) · [**Configuration**](#-configuration) · [**CLI Reference**](#-cli-reference) · [**Security**](#-security-model) · [**Tor / Arti**](#-tor--arti)
 
+**First stable release:** [v1.0.0](https://github.com/csd113/RustPost/releases/tag/v1.0.0) · [Changelog](CHANGELOG.md)
+
 </div>
 
 ---
@@ -44,6 +46,10 @@ This repository is intended for operators who want a small, understandable self-
 | Sessions | Server-side, HttpOnly, SameSite=Lax cookies |
 | Profile customization | Bio, avatar, and banner with WebP conversion |
 | Admin CLI | Create admins and reset passwords from the command line |
+| Username changes | Users can change their @handle; previous handles stay reserved to prevent impersonation, with history shown on profiles |
+| Account deletion | Deletion starts a configurable grace period with a visible deadline, cancellation, and restart-safe finalization |
+| Account export/import | Versioned `.tar.gz` archives with posts, profile, media bytes, media list, outgoing follows, and settings |
+| Admin account controls | Forced password reset on next login and forced logout of every session |
 
 ### Social Features
 | Feature | Details |
@@ -52,6 +58,7 @@ This repository is intended for operators who want a small, understandable self-
 | Replies & Threads | Threaded conversations with full timeline rendering |
 | Reposts | First-class timeline events; deleted originals render gracefully |
 | Follows, Blocks & Mutes | Standard social graph primitives |
+| Protected accounts | Optional approval for new followers: pending requests never count as followers until approved |
 | Likes & Bookmarks | Likes are public; bookmarks are private |
 | Notifications | In-app notification feed |
 | Muted words | Per-user phrase list applied server-side |
@@ -82,11 +89,13 @@ Block and mute rows are deleted when either account is deleted, and deleting a p
 ### Operations
 | Feature | Details |
 |---|---|
-| Database | SQLite with WAL, foreign keys, a release schema baseline, FTS5, and timeline indexes |
+| Database | SQLite with WAL, foreign keys, schema version 4, FTS5, and timeline indexes |
 | Rate limiting | SQLite-backed per-user and per-IP limits for all write operations |
 | Backups | Deterministic tar archive with manifest, hashes, DB snapshot, settings, media, assets, and optional Tor keys |
 | Restore | Staged manifest/hash/SQLite/settings validation before runtime file swaps |
 | Admin dashboard | Site health, users, media jobs, conversion state, and backup management |
+| Announcements | Admin-controlled banner rendered next to the site name in the top bar |
+| Maintenance mode | Admin toggle that disables posting and registration while the site stays readable |
 | HTTP compression | Browser text responses use gzip when requested; media and binary uploads are intentionally left uncompressed |
 | Tor / Arti | Embedded onion-service startup — clearnet-only, Tor-only, or dual mode |
 
@@ -133,7 +142,7 @@ This produces the release binary in `target/release/`:
 
 ### Install a release archive
 
-Download the archive and matching `.sha256` file for your platform from the GitHub release, verify the checksum, then extract it. Unix archives contain `rustpost/rustpost-cli`; the Windows archive contains `rustpost/rustpost-cli.exe`.
+Download the archive and matching `.sha256` file for your platform from the [v1.0.0 GitHub release](https://github.com/csd113/RustPost/releases/tag/v1.0.0), verify the checksum, then extract it. Unix archives contain `rustpost/rustpost-cli`; the Windows archive contains `rustpost/rustpost-cli.exe`.
 
 Example Unix user-local install:
 
@@ -257,6 +266,22 @@ registration_captcha_enabled = false
 ```
 
 `registration_captcha_enabled` adds a single-use CAPTCHA challenge to registration only. Login is unchanged.
+
+### Account lifecycle
+
+```toml
+[accounts]
+deletion_grace_period_days = 30
+max_archive_upload_bytes = 314572800
+max_archive_expanded_bytes = 1073741824
+max_archive_entries = 10000
+```
+
+Deleting an account stores a deletion deadline instead of removing data immediately; the owner can cancel until the deadline, and finalization runs from the maintenance scheduler (including after a restart). The default is 30 days; `0` deletes immediately after password confirmation.
+
+The three archive ceilings are independent and documented in [docs/account-and-instance-features.md](docs/account-and-instance-features.md): the compressed upload/export size, the total decompressed media size accepted during import, and the entry count. The `/settings/import` body limit is derived from the compressed ceiling plus a small multipart allowance, so archive imports never depend on the global media body limit, and an oversized upload is rejected with a clear `413` page before any account state changes.
+
+Announcements and maintenance mode are managed from the admin dashboard and stored in the database, so they survive restarts and are included in backups. See [docs/account-and-instance-features.md](docs/account-and-instance-features.md) for the full behavior and policy details.
 
 ### Post editing
 
@@ -521,7 +546,7 @@ CI runs: format check → Clippy → tests → release build. A separate strict 
 
 ### Release Artifacts
 
-For this release, tag `v1.0.0`. Tagged releases matching `v*` produce:
+The `v1.0.0` tag triggers release builds for:
 
 ```
 rustpost-linux-x86_64.tar.gz
@@ -560,7 +585,7 @@ Each archive contains `rustpost-cli` (`rustpost-cli.exe` on Windows), `README.md
 
 ## ✅ Release Verification
 
-*Last sweep: **August 15, 2026***
+*Live-flow sweep: **August 15, 2026**. Rust release gates and advisory review: **September 29, 2026**.*
 
 Release validation distinguishes the required Rust gates from the dependency-advisory review:
 

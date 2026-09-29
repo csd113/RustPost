@@ -1,9 +1,46 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Context as _;
 use tracing::{info, warn};
+
+/// Number of in-flight operations that stage files under the runtime temp
+/// directory (media uploads, account archive export/import, restore uploads).
+/// File cleanup is skipped while any operation is active so a slow but healthy
+/// operation can never have its staging directory removed underneath it.
+static ACTIVE_TEMP_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Maximum directory entries inspected in one cleanup pass. Cleanup is
+/// opportunistic; bounding each pass keeps a pathological temp directory from
+/// stalling the maintenance scheduler.
+const MAX_CLEANUP_SCAN_ENTRIES: usize = 10_000;
+
+/// Marks one long-running operation that stages files under
+/// [`RuntimePaths::tmp_dir`]. The guard must live for the whole operation.
+#[must_use]
+pub struct TempOperationGuard {
+    _private: (),
+}
+
+/// Begins a temp-staging operation. See [`TempOperationGuard`].
+pub fn begin_temp_operation() -> TempOperationGuard {
+    ACTIVE_TEMP_OPERATIONS.fetch_add(1, Ordering::SeqCst);
+    TempOperationGuard { _private: () }
+}
+
+impl Drop for TempOperationGuard {
+    fn drop(&mut self) {
+        ACTIVE_TEMP_OPERATIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether any operation is currently staging files under `tmp_dir`.
+#[must_use]
+pub fn temp_operations_active() -> bool {
+    ACTIVE_TEMP_OPERATIONS.load(Ordering::SeqCst) > 0
+}
 
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
@@ -193,10 +230,24 @@ impl RuntimePaths {
         self.db_dir.join(format!("rustpost.sqlite3-{suffix}"))
     }
 
-    /// Removes leftover upload staging files and abandoned restore uploads
-    /// older than `max_age`. Called with a zero age during startup, where no
-    /// request can be in flight, and with a grace period while running.
+    /// Removes leftover upload staging files, abandoned restore uploads, and
+    /// staged account export/import archives older than `max_age`. Called with
+    /// a zero age during startup, where no request can be in flight, and with
+    /// a grace period while running.
+    ///
+    /// Safety properties:
+    /// * Returns without touching anything while a staged operation is active,
+    ///   so in-flight uploads/imports/exports are never removed.
+    /// * Only entries directly inside `tmp_dir` whose names match the known
+    ///   staging prefixes are candidates; symlinks are unlinked, never
+    ///   followed, and directories are removed only with `remove_dir_all`
+    ///   after confirming they are not symlinks.
+    /// * Each pass inspects at most [`MAX_CLEANUP_SCAN_ENTRIES`] entries.
     pub fn cleanup_stale_temp_files(&self, max_age: std::time::Duration) -> anyhow::Result<usize> {
+        if temp_operations_active() {
+            tracing::debug!("skipping temp cleanup while a staged operation is active");
+            return Ok(0);
+        }
         let mut removed = 0usize;
         let entries = match fs::read_dir(&self.tmp_dir) {
             Ok(entries) => entries,
@@ -207,27 +258,53 @@ impl RuntimePaths {
                 });
             }
         };
-        for entry in entries {
+        for (scanned, entry) in entries.enumerate() {
+            if scanned >= MAX_CLEANUP_SCAN_ENTRIES {
+                tracing::warn!(
+                    limit = MAX_CLEANUP_SCAN_ENTRIES,
+                    "temp cleanup stopped early; too many entries in the runtime temp directory"
+                );
+                break;
+            }
             let entry = entry?;
             let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if !(name.ends_with(".upload") || name.starts_with("restore-upload-")) {
+            let is_staging_name = name.ends_with(".upload")
+                || Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
+                || name.starts_with("restore-upload-")
+                || name.starts_with(crate::portability::EXPORT_TMP_PREFIX)
+                || name.starts_with(crate::portability::IMPORT_TMP_PREFIX);
+            if !is_staging_name {
                 continue;
             }
-            let stale = match fs::metadata(&path).and_then(|metadata| metadata.modified()) {
-                Ok(modified) => modified
-                    .elapsed()
-                    .map(|age| age >= max_age)
-                    .unwrap_or(false),
-                Err(_error) => false,
+            // Use `symlink_metadata` so a symlink is treated as a link (never
+            // followed) and only real directories are recursively removed.
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
             };
-            if stale && fs::remove_file(&path).is_ok() {
+            let is_symlink = metadata.file_type().is_symlink();
+            if !is_symlink && !metadata.is_file() && !metadata.is_dir() {
+                continue;
+            }
+            let stale = metadata
+                .modified()
+                .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age >= max_age));
+            if !stale {
+                continue;
+            }
+            let removed_entry = if is_symlink || metadata.is_file() {
+                fs::remove_file(&path).is_ok()
+            } else {
+                fs::remove_dir_all(&path).is_ok()
+            };
+            if removed_entry {
                 removed += 1;
+            } else {
+                tracing::warn!(path = %path.display(), "failed to remove stale temp entry");
             }
         }
         Ok(removed)
@@ -394,6 +471,147 @@ mod tests {
         assert_eq!(
             fs::read(data_dir.join("db/rustpost.sqlite3-wal")).expect("new wal"),
             b"new wal"
+        );
+    }
+
+    fn staging_paths() -> (tempfile::TempDir, RuntimePaths) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = RuntimePaths::from_data_dir(temp.path().join("data"));
+        paths.ensure().expect("ensure paths");
+        (temp, paths)
+    }
+
+    fn age_file(path: &Path, age: std::time::Duration) {
+        let modified = std::time::SystemTime::now()
+            .checked_sub(age)
+            .expect("system time supports subtraction");
+        let file = fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime");
+        file.set_modified(modified).expect("set modified");
+    }
+
+    #[test]
+    fn cleanup_removes_stale_known_staging_entries_only() {
+        let (_temp, paths) = staging_paths();
+        let stale = std::time::Duration::from_hours(2);
+        let staging_file = paths.tmp_dir.join("account-import-abc.tar.gz");
+        let export_file = paths.tmp_dir.join("account-export-def.tar.gz");
+        let restore_file = paths.tmp_dir.join("restore-upload-1.tar");
+        let upload_file = paths.tmp_dir.join("staged.upload");
+        let tmp_file = paths.tmp_dir.join("scratch.tmp");
+        let unrelated = paths.tmp_dir.join("keep.txt");
+        for file in [
+            &staging_file,
+            &export_file,
+            &restore_file,
+            &upload_file,
+            &tmp_file,
+            &unrelated,
+        ] {
+            fs::write(file, b"staged").expect("write staging file");
+            age_file(file, stale);
+        }
+
+        let removed = paths
+            .cleanup_stale_temp_files(std::time::Duration::from_hours(1))
+            .expect("cleanup");
+
+        assert_eq!(removed, 5);
+        assert!(!staging_file.exists());
+        assert!(!export_file.exists());
+        assert!(!restore_file.exists());
+        assert!(!upload_file.exists());
+        assert!(!tmp_file.exists());
+        assert!(unrelated.exists(), "unrelated files must be preserved");
+    }
+
+    #[test]
+    fn cleanup_removes_abandoned_import_staging_directories() {
+        let (_temp, paths) = staging_paths();
+        let staging_dir = paths.tmp_dir.join("account-import-extract");
+        fs::create_dir_all(&staging_dir).expect("staging dir");
+        fs::write(staging_dir.join("media.bin"), b"staged").expect("staged media");
+        let unrelated_dir = paths.tmp_dir.join("keep-dir");
+        fs::create_dir_all(&unrelated_dir).expect("unrelated dir");
+
+        let removed = paths
+            .cleanup_stale_temp_files(std::time::Duration::ZERO)
+            .expect("startup cleanup");
+
+        assert_eq!(removed, 1);
+        assert!(!staging_dir.exists());
+        assert!(unrelated_dir.is_dir(), "unrelated directories must remain");
+    }
+
+    #[test]
+    fn cleanup_respects_the_age_threshold() {
+        let (_temp, paths) = staging_paths();
+        let fresh = paths.tmp_dir.join("account-import-fresh.tar.gz");
+        fs::write(&fresh, b"fresh").expect("staging file");
+
+        let removed = paths
+            .cleanup_stale_temp_files(std::time::Duration::from_hours(1))
+            .expect("cleanup");
+        assert_eq!(removed, 0);
+        assert!(fresh.exists(), "a fresh upload must not be removed");
+
+        let removed = paths
+            .cleanup_stale_temp_files(std::time::Duration::ZERO)
+            .expect("startup cleanup");
+        assert_eq!(removed, 1);
+        assert!(!fresh.exists());
+    }
+
+    #[test]
+    fn cleanup_skips_while_a_staged_operation_is_active() {
+        let (_temp, paths) = staging_paths();
+        let stale = paths.tmp_dir.join("account-import-active.tar.gz");
+        fs::write(&stale, b"active").expect("staging file");
+        age_file(&stale, std::time::Duration::from_hours(4));
+
+        let operation = begin_temp_operation();
+        assert!(temp_operations_active());
+        let removed = paths
+            .cleanup_stale_temp_files(std::time::Duration::ZERO)
+            .expect("cleanup");
+        assert_eq!(removed, 0);
+        assert!(
+            stale.exists(),
+            "an active operation's staging file must survive cleanup"
+        );
+
+        drop(operation);
+        assert!(!temp_operations_active());
+        let removed = paths
+            .cleanup_stale_temp_files(std::time::Duration::from_hours(1))
+            .expect("cleanup");
+        assert_eq!(removed, 1);
+        assert!(!stale.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_never_follows_staging_symlinks() {
+        let (_temp, paths) = staging_paths();
+        let target_dir = paths.data_dir.join("outside");
+        fs::create_dir_all(&target_dir).expect("target dir");
+        let target_file = target_dir.join("important.bin");
+        fs::write(&target_file, b"important").expect("target file");
+        let link = paths.tmp_dir.join("account-import-link");
+        std::os::unix::fs::symlink(&target_dir, &link).expect("symlink");
+
+        let removed = paths
+            .cleanup_stale_temp_files(std::time::Duration::ZERO)
+            .expect("cleanup");
+
+        assert_eq!(removed, 1);
+        assert!(!link.exists());
+        assert!(target_dir.is_dir(), "symlink target directory must remain");
+        assert_eq!(
+            fs::read(&target_file).expect("target file survives"),
+            b"important"
         );
     }
 }

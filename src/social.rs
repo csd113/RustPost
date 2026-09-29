@@ -744,26 +744,94 @@ pub async fn unrepost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::
     .await
 }
 
-pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> anyhow::Result<bool> {
+/// Result of asking to follow an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowOutcome {
+    /// A follow row was created immediately.
+    Followed,
+    /// The target requires approval and a pending request was recorded.
+    Requested,
+    /// The viewer already follows the target.
+    AlreadyFollowing,
+    /// A pending request already exists for this pair.
+    AlreadyRequested,
+}
+
+/// Follows an account, or records a request when the target requires approval.
+///
+/// Targets with `users.follow_approval_required = 1` receive a
+/// `follow_request` notification and must approve the request before the
+/// follow counts or grants follower privileges. Existing followers are never
+/// removed when an account enables protection. Repeated and concurrent
+/// requests are idempotent, and blocks in either direction reject the action.
+/// Deleted or suspended accounts can neither follow nor be followed.
+pub async fn follow(
+    pool: &SqlitePool,
+    follower_id: i64,
+    followed_id: i64,
+) -> anyhow::Result<FollowOutcome> {
     if follower_id == followed_id {
         anyhow::bail!("cannot follow yourself");
     }
     pool.call(move |conn| {
         let tx = conn.transaction()?;
-        let target_available = tx
+        let actor_available = tx
             .query_row(
                 "SELECT is_deleted = 0 AND is_suspended = 0 FROM users WHERE id = ?",
-                [followed_id],
+                [follower_id],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?
             .unwrap_or(0)
             != 0;
-        if !target_available {
+        if !actor_available {
+            anyhow::bail!("account cannot follow");
+        }
+        let target = tx
+            .query_row(
+                "SELECT is_deleted = 0 AND is_suspended = 0, follow_approval_required FROM users WHERE id = ?",
+                [followed_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((available, approval_required)) = target else {
+            anyhow::bail!("account cannot be followed");
+        };
+        if available == 0 || blocks_exist_tx(&tx, follower_id, followed_id)? {
             anyhow::bail!("account cannot be followed");
         }
-        if blocks_exist_tx(&tx, follower_id, followed_id)? {
-            anyhow::bail!("account cannot be followed");
+        if follow_exists_tx(&tx, follower_id, followed_id)? {
+            tx.commit()?;
+            return Ok(FollowOutcome::AlreadyFollowing);
+        }
+        // Pending requests stay pending even after the target disables
+        // protection: the owner can still approve or reject them, and asking
+        // again does not create a second request.
+        if follow_request_exists_tx(&tx, follower_id, followed_id)? {
+            tx.commit()?;
+            return Ok(FollowOutcome::AlreadyRequested);
+        }
+        if approval_required != 0 {
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO follow_requests (requester_id, target_id) VALUES (?, ?)",
+                params![follower_id, followed_id],
+            )?;
+            if changed > 0 {
+                create_notification_tx(
+                    &tx,
+                    followed_id,
+                    Some(follower_id),
+                    None,
+                    "follow_request",
+                    "requested to follow you",
+                )?;
+            }
+            tx.commit()?;
+            return Ok(if changed > 0 {
+                FollowOutcome::Requested
+            } else {
+                FollowOutcome::AlreadyRequested
+            });
         }
         let changed = tx.execute(
             "INSERT OR IGNORE INTO follows (follower_id, followed_id) VALUES (?, ?)",
@@ -780,7 +848,255 @@ pub async fn follow(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> an
             )?;
         }
         tx.commit()?;
+        Ok(if changed > 0 {
+            FollowOutcome::Followed
+        } else {
+            FollowOutcome::AlreadyFollowing
+        })
+    })
+    .await
+}
+
+fn follow_exists_tx(
+    tx: &rusqlite::Transaction<'_>,
+    follower_id: i64,
+    followed_id: i64,
+) -> anyhow::Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?",
+            params![follower_id, followed_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn follow_request_exists_tx(
+    tx: &rusqlite::Transaction<'_>,
+    requester_id: i64,
+    target_id: i64,
+) -> anyhow::Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+            params![requester_id, target_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// An account involved in a pending follow request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowRequestView {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub bio: String,
+    pub profile_picture_path: Option<String>,
+    pub created_at: String,
+}
+
+/// Approves a pending request, creating the follow and notifying the requester.
+///
+/// The request row is deleted first and only a successful delete allows the
+/// follow to be created. Requests from deleted, suspended, or blocked
+/// accounts are discarded without creating a follow or notification.
+/// Returns `true` when a pending request was consumed; when the follow already
+/// exists the request is still consumed, but the follow row and the approval
+/// notification are never duplicated.
+pub async fn approve_follow_request(
+    pool: &SqlitePool,
+    target_id: i64,
+    requester_id: i64,
+) -> anyhow::Result<bool> {
+    pool.call(move |conn| {
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "DELETE FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+            params![requester_id, target_id],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let requester_available = tx
+            .query_row(
+                "SELECT is_deleted = 0 AND is_suspended = 0 FROM users WHERE id = ?",
+                [requester_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            != 0;
+        if !requester_available || blocks_exist_tx(&tx, requester_id, target_id)? {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO follows (follower_id, followed_id) VALUES (?, ?)",
+            params![requester_id, target_id],
+        )?;
+        if inserted > 0 {
+            create_notification_tx(
+                &tx,
+                requester_id,
+                Some(target_id),
+                None,
+                "follow_request_approved",
+                "approved your follow request",
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    })
+    .await
+}
+
+/// Rejects a pending request. Returns `true` when a request existed.
+pub async fn reject_follow_request(
+    pool: &SqlitePool,
+    target_id: i64,
+    requester_id: i64,
+) -> anyhow::Result<bool> {
+    pool.call(move |conn| {
+        let changed = conn.execute(
+            "DELETE FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+            params![requester_id, target_id],
+        )?;
         Ok(changed > 0)
+    })
+    .await
+}
+
+/// Cancels the viewer's own pending request to another account.
+pub async fn cancel_follow_request(
+    pool: &SqlitePool,
+    requester_id: i64,
+    target_id: i64,
+) -> anyhow::Result<bool> {
+    pool.call(move |conn| {
+        let changed = conn.execute(
+            "DELETE FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+            params![requester_id, target_id],
+        )?;
+        Ok(changed > 0)
+    })
+    .await
+}
+
+/// Pending incoming requests awaiting `user_id`'s approval, oldest first.
+///
+/// Blocked pairs are hidden in both directions. Suspended requesters are not
+/// filtered here because approval re-validates the requester and discards
+/// requests that can no longer be approved.
+pub async fn incoming_follow_requests(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> anyhow::Result<Vec<FollowRequestView>> {
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name, u.bio,
+              COALESCE(pic.thumbnail_public_path, pic.public_path),
+              r.created_at
+            FROM follow_requests r
+            JOIN users u ON u.id = r.requester_id
+            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+            WHERE r.target_id = ? AND u.is_deleted = 0
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = u.id)
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = u.id AND blocked_id = ?)
+            ORDER BY r.created_at ASC, r.requester_id ASC
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![user_id, user_id, user_id], map_follow_request_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+/// Pending outgoing requests created by `user_id`, oldest first.
+///
+/// The returned accounts are the request targets, so the UI can link to them.
+pub async fn outgoing_follow_requests(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> anyhow::Result<Vec<FollowRequestView>> {
+    pool.call(move |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT u.id, u.username, u.display_name, u.bio,
+              COALESCE(pic.thumbnail_public_path, pic.public_path),
+              r.created_at
+            FROM follow_requests r
+            JOIN users u ON u.id = r.target_id
+            LEFT JOIN media pic ON pic.id = u.profile_picture_media_id
+            WHERE r.requester_id = ? AND u.is_deleted = 0 AND u.is_suspended = 0
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = u.id)
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = u.id AND blocked_id = ?)
+            ORDER BY r.created_at ASC, r.target_id ASC
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![user_id, user_id, user_id], map_follow_request_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+fn map_follow_request_row(row: &Row<'_>) -> rusqlite::Result<FollowRequestView> {
+    Ok(FollowRequestView {
+        user_id: row.get(0)?,
+        username: row.get(1)?,
+        display_name: row.get(2)?,
+        bio: row.get(3)?,
+        profile_picture_path: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+/// Number of pending incoming requests for `user_id`.
+pub async fn pending_follow_request_count(pool: &SqlitePool, user_id: i64) -> anyhow::Result<i64> {
+    pool.call(move |conn| {
+        Ok(conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM follow_requests r
+            JOIN users u ON u.id = r.requester_id
+            WHERE r.target_id = ? AND u.is_deleted = 0
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = u.id)
+              AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker_id = u.id AND blocked_id = ?)
+            "#,
+            params![user_id, user_id, user_id],
+            |row| row.get(0),
+        )?)
+    })
+    .await
+}
+
+/// Enables or disables follow approval for an account.
+///
+/// Enabling protection never removes existing follows. Disabling protection
+/// leaves existing pending requests pending: the owner can still approve or
+/// reject them, and new follows are accepted directly.
+pub async fn set_follow_approval_required(
+    pool: &SqlitePool,
+    user_id: i64,
+    required: bool,
+) -> anyhow::Result<()> {
+    pool.call(move |conn| {
+        let changed = conn.execute(
+            "UPDATE users SET follow_approval_required = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
+            params![i64::from(required), user_id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("account not found");
+        }
+        Ok(())
     })
     .await
 }
@@ -815,16 +1131,26 @@ pub async fn active_follow_targets(pool: &SqlitePool, ids: &[i64]) -> anyhow::Re
         .collect())
 }
 
+/// Removes a follow, or cancels the viewer's pending request in that direction.
+///
+/// Returns `true` only when a follow row was deleted; cancelling a pending
+/// request is a side effect so the button works in the requested state too.
 pub async fn unfollow(
     pool: &SqlitePool,
     follower_id: i64,
     followed_id: i64,
 ) -> anyhow::Result<bool> {
     pool.call(move |conn| {
-        let changed = conn.execute(
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "DELETE FROM follows WHERE follower_id = ? AND followed_id = ?",
             params![follower_id, followed_id],
         )?;
+        tx.execute(
+            "DELETE FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+            params![follower_id, followed_id],
+        )?;
+        tx.commit()?;
         Ok(changed > 0)
     })
     .await
@@ -835,6 +1161,8 @@ pub async fn unfollow(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProfileRelationship {
     pub following: bool,
+    /// The viewer has a pending follow request to this profile.
+    pub requested: bool,
     pub blocked: bool,
     pub muted: bool,
     pub blocks_viewer: bool,
@@ -865,11 +1193,12 @@ pub async fn profile_relationship(
               EXISTS(SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?),
               EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?),
               EXISTS(SELECT 1 FROM mutes WHERE muter_id = ? AND muted_id = ?),
-              EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?)
+              EXISTS(SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?),
+              EXISTS(SELECT 1 FROM follow_requests WHERE requester_id = ? AND target_id = ?)
             "#,
             params![
                 viewer_id, profile_id, viewer_id, profile_id, viewer_id, profile_id, profile_id,
-                viewer_id
+                viewer_id, viewer_id, profile_id
             ],
             |row| {
                 Ok(ProfileRelationship {
@@ -877,6 +1206,7 @@ pub async fn profile_relationship(
                     blocked: row.get::<_, i64>(1)? != 0,
                     muted: row.get::<_, i64>(2)? != 0,
                     blocks_viewer: row.get::<_, i64>(3)? != 0,
+                    requested: row.get::<_, i64>(4)? != 0,
                 })
             },
         )?)
@@ -1113,6 +1443,10 @@ pub async fn block(pool: &SqlitePool, blocker_id: i64, blocked_id: i64) -> anyho
         )?;
         tx.execute(
             "DELETE FROM follows WHERE (follower_id = ? AND followed_id = ?) OR (follower_id = ? AND followed_id = ?)",
+            params![blocker_id, blocked_id, blocked_id, blocker_id],
+        )?;
+        tx.execute(
+            "DELETE FROM follow_requests WHERE (requester_id = ? AND target_id = ?) OR (requester_id = ? AND target_id = ?)",
             params![blocker_id, blocked_id, blocked_id, blocker_id],
         )?;
         tx.commit()?;
@@ -4255,6 +4589,66 @@ mod tests {
         .await
     }
 
+    async fn notification_message(
+        pool: &SqlitePool,
+        user_id: i64,
+        kind: &str,
+    ) -> anyhow::Result<Option<(String, Option<i64>)>> {
+        let kind = kind.to_owned();
+        pool.call(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT message, actor_user_id FROM notifications WHERE user_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+                    params![user_id, kind],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    async fn follow_request_count(pool: &SqlitePool, requester_id: i64, target_id: i64) -> i64 {
+        pool.call(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+                params![requester_id, target_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .expect("follow request count")
+    }
+
+    async fn follow_row_count(pool: &SqlitePool, follower_id: i64, followed_id: i64) -> i64 {
+        pool.call(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM follows WHERE follower_id = ? AND followed_id = ?",
+                params![follower_id, followed_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .expect("follow row count")
+    }
+
+    async fn register_account(pool: &SqlitePool, settings: &Settings, username: &str) -> i64 {
+        auth::register_user(pool, settings, username, "very secure password", false)
+            .await
+            .expect("register account")
+    }
+
+    async fn set_account_flags(pool: &SqlitePool, user_id: i64, deleted: bool, suspended: bool) {
+        pool.call(move |conn| {
+            conn.execute(
+                "UPDATE users SET is_deleted = ?, is_suspended = ? WHERE id = ?",
+                params![i64::from(deleted), i64::from(suspended), user_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("account flags");
+    }
+
     #[tokio::test]
     async fn repost_notification_created_only_once() {
         let (pool, settings, alice, bob) = fixture().await;
@@ -4798,8 +5192,14 @@ mod tests {
     async fn follow_unfollow_is_idempotent_and_counts_once() {
         let (pool, _settings, alice, bob) = fixture().await;
 
-        assert!(follow(&pool, bob, alice).await.expect("first follow"));
-        assert!(!follow(&pool, bob, alice).await.expect("duplicate follow"));
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("first follow"),
+            FollowOutcome::Followed
+        );
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("duplicate follow"),
+            FollowOutcome::AlreadyFollowing
+        );
         assert!(is_following(&pool, bob, alice).await.expect("is following"));
         assert_eq!(
             follow_counts(&pool, alice).await.expect("alice counts"),
@@ -4829,6 +5229,500 @@ mod tests {
             !is_following(&pool, bob, alice)
                 .await
                 .expect("not following")
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_account_records_follow_request() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_profile_picture(
+            &pool,
+            alice,
+            "/uploads/images/alice.webp",
+            Some("/uploads/thumbs/alice-profile.webp"),
+        )
+        .await;
+        set_profile_picture(&pool, bob, "/uploads/images/bob.webp", None).await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request follow"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+        assert!(
+            !is_following(&pool, bob, alice)
+                .await
+                .expect("not following")
+        );
+        assert_eq!(
+            follow_counts(&pool, alice).await.expect("alice counts"),
+            (0, 0)
+        );
+        assert!(
+            followers_accounts(&pool, alice, Some(bob), None)
+                .await
+                .expect("followers list")
+                .0
+                .is_empty()
+        );
+        assert!(
+            following_accounts(&pool, bob, None)
+                .await
+                .expect("bob following list")
+                .0
+                .is_empty()
+        );
+
+        let relationship = profile_relationship(&pool, Some(bob), alice)
+            .await
+            .expect("relationship");
+        assert!(!relationship.following);
+        assert!(relationship.requested);
+
+        let incoming = incoming_follow_requests(&pool, alice)
+            .await
+            .expect("incoming requests");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].user_id, bob);
+        assert_eq!(incoming[0].username, "bob");
+        assert_eq!(
+            incoming[0].profile_picture_path.as_deref(),
+            Some("/uploads/images/bob.webp")
+        );
+        let outgoing = outgoing_follow_requests(&pool, bob)
+            .await
+            .expect("outgoing requests");
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].user_id, alice);
+        assert_eq!(outgoing[0].username, "alice");
+        assert_eq!(
+            outgoing[0].profile_picture_path.as_deref(),
+            Some("/uploads/thumbs/alice-profile.webp")
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("alice pending count"),
+            1
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, bob)
+                .await
+                .expect("bob pending count"),
+            0
+        );
+
+        let (message, actor) = notification_message(&pool, alice, "follow_request")
+            .await
+            .expect("lookup")
+            .expect("follow_request notification");
+        assert_eq!(message, "requested to follow you");
+        assert_eq!(actor, Some(bob));
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("duplicate request"),
+            FollowOutcome::AlreadyRequested
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+    }
+
+    #[tokio::test]
+    async fn approving_request_creates_follow_and_notifies_requester() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request follow"),
+            FollowOutcome::Requested
+        );
+
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert!(
+            !approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("re-approve")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert!(is_following(&pool, bob, alice).await.expect("following"));
+        assert_eq!(
+            follow_counts(&pool, alice).await.expect("alice counts"),
+            (1, 0)
+        );
+        let relationship = profile_relationship(&pool, Some(bob), alice)
+            .await
+            .expect("relationship after approval");
+        assert!(relationship.following);
+        assert!(!relationship.requested);
+
+        let (message, actor) = notification_message(&pool, bob, "follow_request_approved")
+            .await
+            .expect("lookup")
+            .expect("approval notification");
+        assert_eq!(message, "approved your follow request");
+        assert_eq!(actor, Some(alice));
+    }
+
+    #[tokio::test]
+    async fn follow_request_reject_and_cancel_are_direction_sensitive() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        // Only the requester may cancel and only the target may approve/reject.
+        assert!(
+            !approve_follow_request(&pool, bob, alice)
+                .await
+                .expect("wrong-direction approve")
+        );
+        assert!(
+            !reject_follow_request(&pool, bob, alice)
+                .await
+                .expect("wrong-direction reject")
+        );
+        assert!(
+            !cancel_follow_request(&pool, alice, bob)
+                .await
+                .expect("wrong-direction cancel")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+
+        assert!(
+            reject_follow_request(&pool, alice, bob)
+                .await
+                .expect("reject")
+        );
+        assert!(
+            !reject_follow_request(&pool, alice, bob)
+                .await
+                .expect("re-reject")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert!(!is_following(&pool, bob, alice).await.expect("no follow"));
+        assert_eq!(
+            follow_counts(&pool, alice).await.expect("alice counts"),
+            (0, 0)
+        );
+        assert!(
+            notification_message(&pool, bob, "follow_request_approved")
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request again"),
+            FollowOutcome::Requested
+        );
+        assert!(
+            cancel_follow_request(&pool, bob, alice)
+                .await
+                .expect("cancel")
+        );
+        assert!(
+            !cancel_follow_request(&pool, bob, alice)
+                .await
+                .expect("re-cancel")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert!(
+            !is_following(&pool, bob, alice)
+                .await
+                .expect("still no follow")
+        );
+    }
+
+    #[tokio::test]
+    async fn block_removes_pending_follow_requests_in_both_directions() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+
+        // Blocking removes the blocker's own outgoing request.
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        block(&pool, bob, alice).await.expect("bob blocks alice");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+
+        // Blocking also removes requests targeting the blocker.
+        set_follow_approval_required(&pool, carol, true)
+            .await
+            .expect("protect carol");
+        assert_eq!(
+            follow(&pool, alice, carol).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        block(&pool, carol, alice)
+            .await
+            .expect("carol blocks alice");
+        assert_eq!(follow_request_count(&pool, alice, carol).await, 0);
+
+        // A block in either direction rejects new follows.
+        assert!(follow(&pool, alice, bob).await.is_err());
+        assert!(follow(&pool, alice, carol).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unfollow_cancels_a_pending_follow_request() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        assert!(
+            !unfollow(&pool, bob, alice)
+                .await
+                .expect("unfollow cancels request")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert!(
+            outgoing_follow_requests(&pool, bob)
+                .await
+                .expect("outgoing")
+                .is_empty()
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_toggle_keeps_followers_and_pending_requests() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        let dave = auth::register_user(&pool, &settings, "dave", "very secure password", false)
+            .await
+            .expect("dave");
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("bob follows"),
+            FollowOutcome::Followed
+        );
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("enable protection");
+        assert!(
+            is_following(&pool, bob, alice)
+                .await
+                .expect("existing follow kept")
+        );
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("bob again"),
+            FollowOutcome::AlreadyFollowing
+        );
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("carol requests"),
+            FollowOutcome::Requested
+        );
+
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("disable protection");
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 1);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(
+            follow(&pool, dave, alice).await.expect("dave follows"),
+            FollowOutcome::Followed
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (2, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+
+        // The owner can still approve the request made while protection was on.
+        assert!(
+            approve_follow_request(&pool, alice, carol)
+                .await
+                .expect("approve")
+        );
+        assert!(
+            is_following(&pool, carol, alice)
+                .await
+                .expect("carol follow")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (3, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("disable again");
+        assert_eq!(
+            set_follow_approval_required(&pool, dave + 10_000, true)
+                .await
+                .expect_err("missing account")
+                .to_string(),
+            "account not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_request_lists_apply_visibility_filters() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = auth::register_user(&pool, &settings, "carol", "very secure password", false)
+            .await
+            .expect("carol");
+        let dave = auth::register_user(&pool, &settings, "dave", "very secure password", false)
+            .await
+            .expect("dave");
+
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        for requester in [bob, carol, dave] {
+            assert_eq!(
+                follow(&pool, requester, alice).await.expect("request"),
+                FollowOutcome::Requested
+            );
+        }
+        // These states cannot be produced by block()/account deletion without
+        // deleting the request, so insert them directly to exercise the
+        // list/count visibility filters.
+        pool.call(move |conn| {
+            conn.execute("UPDATE users SET is_deleted = 1 WHERE id = ?", [dave])?;
+            conn.execute(
+                "INSERT INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
+                params![bob, alice],
+            )?;
+            conn.execute(
+                "INSERT INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
+                params![alice, carol],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("mark states");
+
+        assert!(
+            incoming_follow_requests(&pool, alice)
+                .await
+                .expect("incoming")
+                .is_empty()
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending count"),
+            0
+        );
+        assert!(
+            outgoing_follow_requests(&pool, bob)
+                .await
+                .expect("bob outgoing")
+                .is_empty()
+        );
+        assert!(
+            outgoing_follow_requests(&pool, carol)
+                .await
+                .expect("carol outgoing")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_request_notifications_are_grouped_and_markable() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread"),
+            1
+        );
+        let groups = notification_groups(&pool, alice).await.expect("groups");
+        let request_group = groups
+            .iter()
+            .find(|group| group.kind == "follow_request")
+            .expect("follow_request group");
+        assert_eq!(request_group.total_count, 1);
+        assert_eq!(request_group.unread_count, 1);
+        assert_eq!(request_group.actors.len(), 1);
+        assert_eq!(request_group.actors[0].username.as_deref(), Some("bob"));
+
+        // Non-post notifications are marked read through the ids-based path.
+        mark_notification_ids_read(&pool, alice, &request_group.notification_ids)
+            .await
+            .expect("mark request read");
+        assert_eq!(
+            unread_notification_count(&pool, alice)
+                .await
+                .expect("unread"),
+            0
+        );
+
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(
+            unread_notification_count(&pool, bob)
+                .await
+                .expect("bob unread"),
+            1
+        );
+        let groups = notification_groups(&pool, bob).await.expect("bob groups");
+        let approved_group = groups
+            .iter()
+            .find(|group| group.kind == "follow_request_approved")
+            .expect("approval group");
+        assert_eq!(approved_group.total_count, 1);
+        assert_eq!(approved_group.actors.len(), 1);
+        assert_eq!(approved_group.actors[0].username.as_deref(), Some("alice"));
+        mark_notification_ids_read(&pool, bob, &approved_group.notification_ids)
+            .await
+            .expect("mark approval read");
+        assert_eq!(
+            unread_notification_count(&pool, bob)
+                .await
+                .expect("bob unread"),
+            0
         );
     }
 
@@ -4970,7 +5864,11 @@ mod tests {
             handles.push(tokio::spawn(async move { follow(&pool, alice, bob).await }));
         }
         for handle in handles {
-            handle.await.expect("task").expect("follow");
+            let outcome = handle.await.expect("task").expect("follow");
+            assert!(matches!(
+                outcome,
+                FollowOutcome::Followed | FollowOutcome::AlreadyFollowing
+            ));
         }
         let rows: i64 = pool
             .call(move |conn| {
@@ -4983,6 +5881,63 @@ mod tests {
             .await
             .expect("follow count");
         assert_eq!(rows, 1);
+        assert_eq!(
+            notification_count(&pool, bob, "follow")
+                .await
+                .expect("follow notifications"),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_follow_requests_create_one_row_and_notification() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move { follow(&pool, bob, alice).await }));
+        }
+        for handle in handles {
+            let outcome = handle.await.expect("task").expect("follow");
+            assert!(matches!(
+                outcome,
+                FollowOutcome::Requested | FollowOutcome::AlreadyRequested
+            ));
+        }
+        let (requests, follows): (i64, i64) = pool
+            .call(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM follow_requests WHERE requester_id = ? AND target_id = ?",
+                        params![bob, alice],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM follows WHERE follower_id = ? AND followed_id = ?",
+                        params![bob, alice],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .expect("request state");
+        assert_eq!(requests, 1);
+        assert_eq!(follows, 0);
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("request notifications"),
+            1
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("approval notifications"),
+            0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5159,5 +6114,1025 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn enabling_protection_keeps_followers_and_only_requests_new_follows() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("bob follows"),
+            FollowOutcome::Followed
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert!(
+            followers_accounts(&pool, alice, None, None)
+                .await
+                .expect("followers")
+                .0
+                .iter()
+                .any(|account| account.id == bob)
+        );
+        assert!(
+            following_accounts(&pool, bob, None)
+                .await
+                .expect("bob following")
+                .0
+                .iter()
+                .any(|account| account.id == alice)
+        );
+
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        // Existing followers survive the toggle untouched.
+        assert!(is_following(&pool, bob, alice).await.expect("kept follow"));
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert!(
+            followers_accounts(&pool, alice, None, None)
+                .await
+                .expect("followers")
+                .0
+                .iter()
+                .any(|account| account.id == bob)
+        );
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("bob repeats"),
+            FollowOutcome::AlreadyFollowing
+        );
+
+        // New follows become pending requests only.
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("carol requests"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(follow_row_count(&pool, carol, alice).await, 0);
+        assert!(
+            !is_following(&pool, carol, alice)
+                .await
+                .expect("not following")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert!(
+            followers_accounts(&pool, alice, None, None)
+                .await
+                .expect("followers")
+                .0
+                .iter()
+                .all(|account| account.id != carol)
+        );
+        assert!(
+            following_accounts(&pool, carol, None)
+                .await
+                .expect("carol following")
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 1);
+        let relationship = profile_relationship(&pool, Some(carol), alice)
+            .await
+            .expect("relationship");
+        assert!(!relationship.following);
+        assert!(relationship.requested);
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            1
+        );
+        let (message, actor) = notification_message(&pool, alice, "follow_request")
+            .await
+            .expect("lookup")
+            .expect("notification");
+        assert_eq!(message, "requested to follow you");
+        assert_eq!(actor, Some(carol));
+    }
+
+    #[tokio::test]
+    async fn disabling_protection_keeps_pending_requests_until_approved() {
+        let (pool, settings, alice, _bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("unprotect alice");
+
+        // Disabling protection neither approves nor deletes the pending request.
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 1);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(follow_row_count(&pool, carol, alice).await, 0);
+        assert!(
+            !is_following(&pool, carol, alice)
+                .await
+                .expect("no auto follow")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+
+        // New follows are immediate while the old request stays pending.
+        assert_eq!(
+            follow(&pool, dave, alice).await.expect("dave"),
+            FollowOutcome::Followed
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 1);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+
+        // The owner can still approve the request created while protected.
+        assert!(
+            approve_follow_request(&pool, alice, carol)
+                .await
+                .expect("approve")
+        );
+        assert!(is_following(&pool, carol, alice).await.expect("approved"));
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 0);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (2, 0));
+        assert_eq!(follow_row_count(&pool, carol, alice).await, 1);
+        assert_eq!(
+            notification_count(&pool, carol, "follow_request_approved")
+                .await
+                .expect("notification"),
+            1
+        );
+        let (message, actor) = notification_message(&pool, carol, "follow_request_approved")
+            .await
+            .expect("lookup")
+            .expect("notification");
+        assert_eq!(message, "approved your follow request");
+        assert_eq!(actor, Some(alice));
+
+        // Re-approving consumes nothing and duplicates nothing.
+        assert!(
+            !approve_follow_request(&pool, alice, carol)
+                .await
+                .expect("re-approve")
+        );
+        assert_eq!(follow_row_count(&pool, carol, alice).await, 1);
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (2, 0));
+        assert_eq!(
+            notification_count(&pool, carol, "follow_request_approved")
+                .await
+                .expect("notification"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario proves pending requests survive repeated enable/disable cycles without auto-approval or duplicates"
+    )]
+    async fn repeated_protection_toggles_never_approve_or_duplicate_pending_requests() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        for round in 0..3 {
+            set_follow_approval_required(&pool, alice, false)
+                .await
+                .expect("unprotect alice");
+            assert_eq!(
+                follow_request_count(&pool, bob, alice).await,
+                1,
+                "round {round}"
+            );
+            assert_eq!(
+                pending_follow_request_count(&pool, alice)
+                    .await
+                    .expect("pending"),
+                1,
+                "round {round}"
+            );
+            assert_eq!(
+                follow_row_count(&pool, bob, alice).await,
+                0,
+                "round {round}"
+            );
+            assert_eq!(
+                follow(&pool, bob, alice).await.expect("repeat"),
+                FollowOutcome::AlreadyRequested,
+                "round {round}"
+            );
+
+            set_follow_approval_required(&pool, alice, true)
+                .await
+                .expect("protect alice");
+            assert_eq!(
+                follow_request_count(&pool, bob, alice).await,
+                1,
+                "round {round}"
+            );
+            assert_eq!(
+                pending_follow_request_count(&pool, alice)
+                    .await
+                    .expect("pending"),
+                1,
+                "round {round}"
+            );
+            assert_eq!(
+                follow_row_count(&pool, bob, alice).await,
+                0,
+                "round {round}"
+            );
+            assert_eq!(
+                follow(&pool, bob, alice).await.expect("repeat"),
+                FollowOutcome::AlreadyRequested,
+                "round {round}"
+            );
+        }
+
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            1
+        );
+        assert_eq!(
+            notification_count(&pool, alice, "follow")
+                .await
+                .expect("notification"),
+            0
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("unprotect alice");
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 1);
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_requests_are_visible_only_to_requester_and_target() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        let incoming = incoming_follow_requests(&pool, alice)
+            .await
+            .expect("incoming");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].user_id, bob);
+        assert!(
+            incoming_follow_requests(&pool, bob)
+                .await
+                .expect("bob")
+                .is_empty()
+        );
+        assert!(
+            incoming_follow_requests(&pool, carol)
+                .await
+                .expect("carol")
+                .is_empty()
+        );
+        assert!(
+            incoming_follow_requests(&pool, dave)
+                .await
+                .expect("dave")
+                .is_empty()
+        );
+
+        let outgoing = outgoing_follow_requests(&pool, bob)
+            .await
+            .expect("outgoing");
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].user_id, alice);
+        assert!(
+            outgoing_follow_requests(&pool, alice)
+                .await
+                .expect("alice")
+                .is_empty()
+        );
+        assert!(
+            outgoing_follow_requests(&pool, carol)
+                .await
+                .expect("carol")
+                .is_empty()
+        );
+        assert!(
+            outgoing_follow_requests(&pool, dave)
+                .await
+                .expect("dave")
+                .is_empty()
+        );
+
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        for unrelated in [bob, carol, dave] {
+            assert_eq!(
+                pending_follow_request_count(&pool, unrelated)
+                    .await
+                    .expect("pending"),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_request_resolution_picks_exactly_one_winner() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        let (approved, cancelled) = tokio::join!(
+            approve_follow_request(&pool, alice, bob),
+            cancel_follow_request(&pool, bob, alice)
+        );
+        let approved = approved.expect("approve");
+        let cancelled = cancelled.expect("cancel");
+        assert_ne!(approved, cancelled, "exactly one must resolve the request");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        let expected_rows = i64::from(approved);
+        let expected_notifications = i64::from(approved);
+        assert_eq!(follow_row_count(&pool, bob, alice).await, expected_rows);
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            expected_notifications
+        );
+
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        let (approved, rejected) = tokio::join!(
+            approve_follow_request(&pool, alice, carol),
+            reject_follow_request(&pool, alice, carol)
+        );
+        let approved = approved.expect("approve");
+        let rejected = rejected.expect("reject");
+        assert_ne!(approved, rejected, "exactly one must resolve the request");
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 0);
+        assert_eq!(
+            follow_row_count(&pool, carol, alice).await,
+            i64::from(approved)
+        );
+        assert_eq!(
+            notification_count(&pool, carol, "follow_request_approved")
+                .await
+                .expect("notification"),
+            i64::from(approved)
+        );
+
+        // Cancelling and approving in the same tick resolves the request once.
+        assert_eq!(
+            follow(&pool, dave, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        let (cancelled, approved) = tokio::join!(
+            cancel_follow_request(&pool, dave, alice),
+            approve_follow_request(&pool, alice, dave)
+        );
+        let cancelled = cancelled.expect("cancel");
+        let approved = approved.expect("approve");
+        assert_ne!(cancelled, approved, "exactly one must resolve the request");
+        assert_eq!(follow_request_count(&pool, dave, alice).await, 0);
+        assert_eq!(
+            follow_row_count(&pool, dave, alice).await,
+            i64::from(approved)
+        );
+        assert_eq!(
+            notification_count(&pool, dave, "follow_request_approved")
+                .await
+                .expect("notification"),
+            i64::from(approved)
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_clear_pending_requests_and_unblock_does_not_restore_them() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        // The requester blocking the target clears the pending request.
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        block(&pool, bob, alice).await.expect("bob blocks alice");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert!(follow(&pool, bob, alice).await.is_err());
+        assert!(
+            !approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert!(
+            !reject_follow_request(&pool, alice, bob)
+                .await
+                .expect("reject")
+        );
+        assert!(
+            !cancel_follow_request(&pool, bob, alice)
+                .await
+                .expect("cancel")
+        );
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 0);
+
+        // Unblocking leaves the cleared request gone; a new one is a fresh row.
+        unblock(&pool, bob, alice).await.expect("unblock");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("re-request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+
+        // The target blocking the requester clears it from the other direction.
+        block(&pool, alice, bob).await.expect("alice blocks bob");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert!(follow(&pool, bob, alice).await.is_err());
+        unblock(&pool, alice, bob).await.expect("unblock");
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+
+        // A third account's block also prevents new pending requests.
+        set_follow_approval_required(&pool, carol, true)
+            .await
+            .expect("protect carol");
+        block(&pool, carol, bob).await.expect("carol blocks bob");
+        assert!(follow(&pool, bob, carol).await.is_err());
+        assert_eq!(follow_request_count(&pool, bob, carol).await, 0);
+        assert_eq!(follow_row_count(&pool, bob, carol).await, 0);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario covers deleted and suspended targets, requesters, and pending requests in sequence"
+    )]
+    async fn follow_transitions_skip_deleted_and_suspended_accounts() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+        let grace = register_account(&pool, &settings, "grace").await;
+        set_account_flags(&pool, carol, true, false).await;
+        set_account_flags(&pool, dave, false, true).await;
+
+        // Unavailable targets cannot be followed...
+        assert_eq!(
+            follow(&pool, alice, carol)
+                .await
+                .expect_err("deleted target")
+                .to_string(),
+            "account cannot be followed"
+        );
+        assert_eq!(
+            follow(&pool, alice, dave)
+                .await
+                .expect_err("suspended target")
+                .to_string(),
+            "account cannot be followed"
+        );
+        // ...and unavailable accounts cannot follow or request either.
+        assert_eq!(
+            follow(&pool, carol, alice)
+                .await
+                .expect_err("deleted requester")
+                .to_string(),
+            "account cannot follow"
+        );
+        assert_eq!(
+            follow(&pool, dave, alice)
+                .await
+                .expect_err("suspended requester")
+                .to_string(),
+            "account cannot follow"
+        );
+        assert_eq!(follow_row_count(&pool, carol, alice).await, 0);
+        assert_eq!(follow_row_count(&pool, dave, alice).await, 0);
+        assert_eq!(follow_request_count(&pool, carol, alice).await, 0);
+        assert_eq!(follow_request_count(&pool, dave, alice).await, 0);
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        // A suspended requester's pending request is discarded on approval.
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        set_account_flags(&pool, bob, false, true).await;
+        assert!(
+            !approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 0);
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        // A deleted requester's request is hidden and discarded the same way.
+        assert_eq!(
+            follow(&pool, grace, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        set_account_flags(&pool, grace, true, false).await;
+        assert!(
+            !incoming_follow_requests(&pool, alice)
+                .await
+                .expect("incoming")
+                .iter()
+                .any(|request| request.user_id == grace)
+        );
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+        assert!(
+            !approve_follow_request(&pool, alice, grace)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_request_count(&pool, grace, alice).await, 0);
+        assert_eq!(follow_row_count(&pool, grace, alice).await, 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_follow_requests_create_exactly_one_row_and_notification() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                follow(&pool, bob, alice).await.expect("duplicate"),
+                FollowOutcome::AlreadyRequested
+            );
+        }
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            1
+        );
+        assert_eq!(
+            incoming_follow_requests(&pool, alice)
+                .await
+                .expect("incoming")
+                .len(),
+            1
+        );
+        assert_eq!(
+            outgoing_follow_requests(&pool, bob)
+                .await
+                .expect("outgoing")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_counts_and_pending_counts_stay_consistent_across_states() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            2
+        );
+        assert_eq!(
+            incoming_follow_requests(&pool, alice)
+                .await
+                .expect("incoming")
+                .len(),
+            2
+        );
+        assert!(
+            followers_accounts(&pool, alice, None, None)
+                .await
+                .expect("followers")
+                .0
+                .is_empty()
+        );
+
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(
+            incoming_follow_requests(&pool, alice)
+                .await
+                .expect("incoming")
+                .len(),
+            1
+        );
+        assert_eq!(
+            following_accounts(&pool, bob, None)
+                .await
+                .expect("bob following")
+                .0
+                .len(),
+            1
+        );
+
+        assert!(
+            reject_follow_request(&pool, alice, carol)
+                .await
+                .expect("reject")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            0
+        );
+
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("unprotect alice");
+        assert_eq!(
+            follow(&pool, dave, alice).await.expect("follow"),
+            FollowOutcome::Followed
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (2, 0));
+        assert_eq!(
+            follow_counts(&pool, dave).await.expect("dave counts"),
+            (0, 1)
+        );
+
+        assert!(unfollow(&pool, dave, alice).await.expect("unfollow"));
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(
+            follow_counts(&pool, dave).await.expect("dave counts"),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_a_request_whose_follow_already_exists_is_a_no_op() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        // Simulate a racing approval that already created the follow row.
+        pool.call(move |conn| {
+            conn.execute(
+                "INSERT INTO follows (follower_id, followed_id) VALUES (?, ?)",
+                params![bob, alice],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed follow");
+
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 1);
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        // Approving, rejecting, or cancelling a resolved request is a no-op.
+        assert!(
+            !approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("re-approve")
+        );
+        assert!(
+            !reject_follow_request(&pool, alice, bob)
+                .await
+                .expect("reject")
+        );
+        assert!(
+            !cancel_follow_request(&pool, bob, alice)
+                .await
+                .expect("cancel")
+        );
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 1);
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_request_lifecycle_creates_expected_notifications_only() {
+        let (pool, settings, alice, bob) = fixture().await;
+        let carol = register_account(&pool, &settings, "carol").await;
+        let dave = register_account(&pool, &settings, "dave").await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            1
+        );
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            1
+        );
+
+        assert_eq!(
+            follow(&pool, carol, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert!(
+            reject_follow_request(&pool, alice, carol)
+                .await
+                .expect("reject")
+        );
+        assert_eq!(
+            notification_count(&pool, carol, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        assert_eq!(
+            follow(&pool, dave, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+        assert!(
+            cancel_follow_request(&pool, dave, alice)
+                .await
+                .expect("cancel")
+        );
+        assert_eq!(
+            notification_count(&pool, dave, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+
+        assert_eq!(
+            notification_count(&pool, alice, "follow_request")
+                .await
+                .expect("notification"),
+            3
+        );
+        assert_eq!(
+            notification_count(&pool, alice, "follow")
+                .await
+                .expect("notification"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_protection_never_promotes_pending_requests() {
+        let (pool, _settings, alice, bob) = fixture().await;
+        set_follow_approval_required(&pool, alice, true)
+            .await
+            .expect("protect alice");
+        assert_eq!(
+            follow(&pool, bob, alice).await.expect("request"),
+            FollowOutcome::Requested
+        );
+
+        for _ in 0..3 {
+            set_follow_approval_required(&pool, alice, false)
+                .await
+                .expect("unprotect alice");
+            assert_eq!(follow_row_count(&pool, bob, alice).await, 0);
+            set_follow_approval_required(&pool, alice, true)
+                .await
+                .expect("protect alice");
+            assert_eq!(follow_row_count(&pool, bob, alice).await, 0);
+        }
+        assert!(
+            !is_following(&pool, bob, alice)
+                .await
+                .expect("not following")
+        );
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (0, 0));
+        assert_eq!(follow_request_count(&pool, bob, alice).await, 1);
+        assert_eq!(
+            pending_follow_request_count(&pool, alice)
+                .await
+                .expect("pending"),
+            1
+        );
+        assert_eq!(
+            notification_count(&pool, bob, "follow_request_approved")
+                .await
+                .expect("notification"),
+            0
+        );
+        let relationship = profile_relationship(&pool, Some(bob), alice)
+            .await
+            .expect("relationship");
+        assert!(!relationship.following);
+        assert!(relationship.requested);
+
+        // Only explicit approval promotes the request to a real follow.
+        set_follow_approval_required(&pool, alice, false)
+            .await
+            .expect("unprotect alice");
+        assert!(
+            approve_follow_request(&pool, alice, bob)
+                .await
+                .expect("approve")
+        );
+        assert_eq!(follow_row_count(&pool, bob, alice).await, 1);
+        assert_eq!(follow_counts(&pool, alice).await.expect("counts"), (1, 0));
     }
 }

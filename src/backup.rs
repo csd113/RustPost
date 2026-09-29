@@ -1550,13 +1550,156 @@ mod tests {
         test_db(&target.database_path, CURRENT_SCHEMA_VERSION);
         test_settings(&target.settings_path);
         fs::write(target.uploads_images.join("old.webp"), b"old").expect("old");
+        let live_db = fs::read(&target.database_path).expect("live database");
+        let live_settings = fs::read_to_string(&target.settings_path).expect("live settings");
         let corrupted = corrupt_first_file_hash(&archive, target_temp.path());
 
         let error = restore_backup(&target, &corrupted, false).expect_err("restore must fail");
 
-        assert!(error.to_string().contains("validation"));
+        assert!(format!("{error:#}").contains("validation"));
+        assert_eq!(
+            fs::read(&target.database_path).expect("live database"),
+            live_db
+        );
+        assert_eq!(
+            fs::read_to_string(&target.settings_path).expect("live settings"),
+            live_settings
+        );
         assert!(target.uploads_images.join("old.webp").is_file());
         assert!(!target.uploads_images.join("restored.webp").exists());
+    }
+
+    #[test]
+    fn backup_restore_round_trip_preserves_v4_account_lifecycle_state() {
+        let source_temp = tempfile::tempdir().expect("source");
+        let source = RuntimePaths::from_data_dir(source_temp.path().join("source"));
+        source.ensure().expect("source ensure");
+        test_db(&source.database_path, CURRENT_SCHEMA_VERSION);
+        test_settings(&source.settings_path);
+        {
+            let conn = Connection::open(&source.database_path).expect("source database");
+            conn.execute_batch(
+                r#"
+                INSERT INTO users (id, username, normalized_username, password_hash, display_name, follow_approval_required, must_change_password, deletion_requested_at, deletion_scheduled_at)
+                    VALUES (1, 'Alice', 'alice', 'hash', 'Alice', 1, 1, '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z');
+                INSERT INTO users (id, username, normalized_username, password_hash, display_name)
+                    VALUES (2, 'Bob', 'bob', 'hash', 'Bob');
+                INSERT INTO follow_requests (requester_id, target_id, created_at)
+                    VALUES (2, 1, '2026-01-03T00:00:00Z');
+                INSERT INTO username_history (user_id, username, normalized_username, changed_at)
+                    VALUES (1, 'OldAlice', 'oldalice', '2026-01-04T00:00:00Z');
+                INSERT INTO username_history (user_id, username, normalized_username, changed_at)
+                    VALUES (1, 'OlderAlice', 'olderalice', '2026-01-05T00:00:00Z');
+                INSERT INTO instance_settings (key, value, updated_at)
+                    VALUES ('announcement', 'Maintenance on Sunday', '2026-01-06T00:00:00Z');
+                INSERT INTO instance_settings (key, value, updated_at)
+                    VALUES ('announcement_enabled', '1', '2026-01-06T00:00:01Z');
+                INSERT INTO instance_settings (key, value, updated_at)
+                    VALUES ('maintenance_mode', '1', '2026-01-06T00:00:02Z');
+                INSERT INTO instance_settings (key, value, updated_at)
+                    VALUES ('maintenance_message', 'Back at 06:00 UTC', '2026-01-06T00:00:03Z');
+                INSERT INTO account_imports (
+                    user_id, archive_id, format_version, imported_at,
+                    posts_imported, media_imported, follows_imported, follows_pending, follows_skipped
+                )
+                    VALUES (1, 'archive-abc', 2, '2026-01-07T00:00:00Z', 11, 4, 7, 2, 1);
+                "#,
+            )
+            .expect("seed v4 rows");
+        }
+        let source_snapshot = account_lifecycle_snapshot(&source.database_path);
+
+        let archive = create_backup(&source, false).expect("backup");
+        let manifest = read_manifest_from_archive(&archive).expect("manifest");
+        assert_eq!(manifest.db_schema_version, Some(CURRENT_SCHEMA_VERSION));
+
+        let target_temp = tempfile::tempdir().expect("target");
+        let target = RuntimePaths::from_data_dir(target_temp.path().join("target"));
+        target.ensure().expect("target ensure");
+        test_db(&target.database_path, CURRENT_SCHEMA_VERSION);
+        test_settings(&target.settings_path);
+
+        let report = restore_backup(&target, &archive, false).expect("restore");
+
+        assert!(!report.tor_keys_restored);
+        assert_eq!(
+            account_lifecycle_snapshot(&target.database_path),
+            source_snapshot
+        );
+        let conn = Connection::open(&target.database_path).expect("restored database");
+        assert_eq!(
+            db::schema_version_from_connection(&conn).expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn restore_rejects_newer_database_schema_version_without_touching_live_data() {
+        assert_crafted_backup_rejected(
+            |staging, staged| {
+                bump_staged_schema_version(staging, CURRENT_SCHEMA_VERSION + 1);
+                staged.manifest.db_schema_version = Some(CURRENT_SCHEMA_VERSION + 1);
+            },
+            "migration metadata is not compatible",
+        );
+    }
+
+    #[test]
+    fn restore_rejects_manifest_schema_version_mismatch_without_touching_live_data() {
+        assert_crafted_backup_rejected(
+            |_staging, staged| {
+                staged.manifest.db_schema_version = Some(CURRENT_SCHEMA_VERSION - 1);
+            },
+            "manifest schema version does not match restored database",
+        );
+    }
+
+    #[test]
+    fn restore_rejects_newer_manifest_format_without_touching_live_data() {
+        assert_crafted_backup_rejected(
+            |_staging, staged| {
+                staged.manifest.format_version = FORMAT_VERSION + 1;
+            },
+            "unsupported backup manifest format version",
+        );
+    }
+
+    #[test]
+    fn restore_rejects_malformed_database_schema_without_touching_live_data() {
+        assert_crafted_backup_rejected(
+            |staging, _staged| {
+                let conn =
+                    Connection::open(staging.join("db/rustpost.sqlite3")).expect("staged database");
+                conn.execute("DROP INDEX idx_posts_created", [])
+                    .expect("drop staged index");
+            },
+            "missing index idx_posts_created",
+        );
+    }
+
+    #[test]
+    fn restore_rejects_malformed_manifest_without_touching_live_data() {
+        let target_temp = tempfile::tempdir().expect("target");
+        let (paths, db_bytes, settings) = live_target(target_temp.path(), "target");
+        let staging = tempfile::tempdir().expect("staging");
+        let archive = staging.path().join("malformed-manifest.tar");
+        let file = File::create(&archive).expect("archive");
+        let mut builder = Builder::new(file);
+        append_bytes(
+            &mut builder,
+            MANIFEST_PATH,
+            b"format_version = \"one\"",
+            0o600,
+            EntryType::Regular,
+        )
+        .expect("manifest");
+        builder.finish().expect("finish");
+
+        let error = restore_backup(&paths, &archive, false).expect_err("malformed manifest");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("malformed"), "unexpected error: {message}");
+        assert_live_target_untouched(&paths, &db_bytes, &settings);
     }
 
     #[test]
@@ -1586,10 +1729,11 @@ mod tests {
         let archive = paths.tmp_dir.join("duplicate.tar");
         let file = File::create(&archive).expect("archive");
         let mut builder = Builder::new(file);
+        let manifest_toml = toml::to_string(&minimal_manifest()).expect("manifest toml");
         append_bytes(
             &mut builder,
             MANIFEST_PATH,
-            b"not toml",
+            manifest_toml.as_bytes(),
             0o600,
             EntryType::Regular,
         )
@@ -1614,7 +1758,10 @@ mod tests {
 
         let error = restore_backup(&paths, &archive, false).expect_err("duplicate");
 
-        assert!(error.to_string().contains("validation"));
+        assert!(
+            format!("{error:#}").contains("duplicate entry settings.toml"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
@@ -1731,6 +1878,223 @@ mod tests {
                 .join("rustpost-20260526T000003000000Z.tar")
                 .exists()
         );
+    }
+
+    type SnapshotUserRow = (i64, String, i64, i64, Option<String>, Option<String>);
+    type SnapshotAccountImportRow = (i64, String, i64, String, i64, i64, i64, i64, i64);
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct V4AccountLifecycleSnapshot {
+        users: Vec<SnapshotUserRow>,
+        follow_requests: Vec<(i64, i64, String)>,
+        username_history: Vec<(i64, String, String, String)>,
+        instance_settings: Vec<(String, String, String)>,
+        account_imports: Vec<SnapshotAccountImportRow>,
+    }
+
+    fn account_lifecycle_snapshot(path: &Path) -> V4AccountLifecycleSnapshot {
+        let conn = Connection::open(path).expect("snapshot database");
+        let users = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, username, follow_approval_required, must_change_password, deletion_requested_at, deletion_scheduled_at FROM users ORDER BY id",
+                )
+                .expect("users statement");
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .expect("users query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("users rows")
+        };
+        let follow_requests = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT requester_id, target_id, created_at FROM follow_requests ORDER BY requester_id, target_id",
+                )
+                .expect("follow requests statement");
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("follow requests query")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("follow request rows")
+        };
+        let username_history = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT user_id, username, normalized_username, changed_at FROM username_history ORDER BY user_id, normalized_username",
+                )
+                .expect("username history statement");
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("username history query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("username history rows")
+        };
+        let instance_settings = {
+            let mut stmt = conn
+                .prepare("SELECT key, value, updated_at FROM instance_settings ORDER BY key")
+                .expect("instance settings statement");
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("instance settings query")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("instance settings rows")
+        };
+        let account_imports = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT user_id, archive_id, format_version, imported_at, posts_imported, media_imported, follows_imported, follows_pending, follows_skipped FROM account_imports ORDER BY id",
+                )
+                .expect("account imports statement");
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            })
+            .expect("account imports query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("account import rows")
+        };
+        V4AccountLifecycleSnapshot {
+            users,
+            follow_requests,
+            username_history,
+            instance_settings,
+            account_imports,
+        }
+    }
+
+    fn minimal_manifest() -> BackupManifest {
+        BackupManifest {
+            format_version: FORMAT_VERSION,
+            rustpost_version: "test".to_owned(),
+            db_schema_version: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            tor_keys_included: false,
+            components: Vec::new(),
+        }
+    }
+
+    fn live_target(root: &Path, tag: &str) -> (RuntimePaths, Vec<u8>, String) {
+        let paths = RuntimePaths::from_data_dir(root.join(tag));
+        paths.ensure().expect("ensure target");
+        test_db(&paths.database_path, CURRENT_SCHEMA_VERSION);
+        test_settings(&paths.settings_path);
+        let db_bytes = fs::read(&paths.database_path).expect("live database bytes");
+        let settings = fs::read_to_string(&paths.settings_path).expect("live settings");
+        (paths, db_bytes, settings)
+    }
+
+    fn assert_live_target_untouched(paths: &RuntimePaths, db_bytes: &[u8], settings: &str) {
+        assert_eq!(
+            fs::read(&paths.database_path).expect("live database"),
+            db_bytes
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.settings_path).expect("live settings"),
+            settings
+        );
+        assert!(
+            list_backups(paths).expect("backup list").is_empty(),
+            "a rejected restore must not create backups"
+        );
+    }
+
+    fn crafted_backup(
+        mutate: impl FnOnce(&Path, &mut StagedBackup),
+    ) -> (tempfile::TempDir, PathBuf) {
+        let source_temp = tempfile::tempdir().expect("source");
+        let source = RuntimePaths::from_data_dir(source_temp.path().join("source"));
+        source.ensure().expect("source ensure");
+        test_db(&source.database_path, CURRENT_SCHEMA_VERSION);
+        test_settings(&source.settings_path);
+        let archive = create_backup(&source, false).expect("backup");
+
+        let staging = tempfile::tempdir().expect("staging");
+        let mut staged =
+            extract_archive_to_stage(&archive, staging.path(), false).expect("extract archive");
+        mutate(staging.path(), &mut staged);
+        let crafted = staging.path().join("crafted.tar");
+        repack_archive(staging.path(), &mut staged, &crafted).expect("repack archive");
+        (staging, crafted)
+    }
+
+    fn repack_archive(
+        staging_dir: &Path,
+        staged: &mut StagedBackup,
+        destination: &Path,
+    ) -> anyhow::Result<()> {
+        for component in &mut staged.manifest.components {
+            if component.kind == ManifestEntryKind::File {
+                let (size, hash) = hash_file(&staging_dir.join(&component.archive_path))?;
+                component.size = size;
+                component.sha256 = Some(hash);
+            }
+        }
+        let manifest_toml = toml::to_string(&staged.manifest)?;
+        let file = File::create(destination)?;
+        let mut builder = Builder::new(file);
+        append_bytes(
+            &mut builder,
+            MANIFEST_PATH,
+            manifest_toml.as_bytes(),
+            0o600,
+            EntryType::Regular,
+        )?;
+        for (path, entry) in &staged.entries {
+            match entry.kind {
+                ManifestEntryKind::Directory => {
+                    append_bytes(&mut builder, path, &[], 0o700, EntryType::Directory)?;
+                }
+                ManifestEntryKind::File => {
+                    let bytes = fs::read(staging_dir.join(path))?;
+                    append_bytes(&mut builder, path, &bytes, 0o600, EntryType::Regular)?;
+                }
+            }
+        }
+        builder.finish()?;
+        Ok(())
+    }
+
+    fn bump_staged_schema_version(staging_dir: &Path, version: i64) {
+        let conn = Connection::open(staging_dir.join("db/rustpost.sqlite3")).expect("staged db");
+        conn.execute("DELETE FROM schema_migrations", [])
+            .expect("clear staged version");
+        conn.execute(
+            "INSERT INTO schema_migrations (version) VALUES (?)",
+            [version],
+        )
+        .expect("staged version");
+    }
+
+    fn assert_crafted_backup_rejected(
+        mutate: impl FnOnce(&Path, &mut StagedBackup),
+        expected: &str,
+    ) {
+        let (_staging, archive) = crafted_backup(mutate);
+        let target_temp = tempfile::tempdir().expect("target");
+        let (paths, db_bytes, settings) = live_target(target_temp.path(), "target");
+
+        let error = restore_backup(&paths, &archive, false).expect_err("crafted backup");
+
+        let message = format!("{error:#}");
+        assert!(message.contains(expected), "unexpected error: {message}");
+        assert_live_target_untouched(&paths, &db_bytes, &settings);
     }
 
     fn archive_names(path: &Path) -> Vec<String> {

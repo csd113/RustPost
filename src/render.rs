@@ -2,8 +2,8 @@ use std::fmt::Write as _;
 
 use crate::auth::{CurrentUser, Theme};
 use crate::social::{
-    AccountView, MediaView, NotificationGroupView, PostView, ProfileTimelineTab, QuotePreview,
-    TimelineEventKind,
+    AccountView, FollowRequestView, MediaView, NotificationGroupView, PostView, ProfileTimelineTab,
+    QuotePreview, TimelineEventKind,
 };
 use crate::youtube::{self, YoutubeEmbed};
 use axum::http::StatusCode;
@@ -17,6 +17,14 @@ pub struct LayoutContext {
     pub following_count: Option<i64>,
     pub notification_unread_count: Option<i64>,
     pub favicon_content_type: &'static str,
+    /// Enabled instance announcement, rendered beside the site name.
+    pub announcement: Option<String>,
+    /// Maintenance notice, rendered under the header while maintenance is on.
+    pub maintenance_notice: Option<String>,
+    /// Notice for accounts with a pending deletion deadline.
+    pub account_notice: Option<String>,
+    /// Pending incoming follow requests, shown as a nav badge.
+    pub pending_follow_requests: Option<i64>,
 }
 
 impl Default for LayoutContext {
@@ -28,6 +36,10 @@ impl Default for LayoutContext {
             following_count: None,
             notification_unread_count: None,
             favicon_content_type: "image/x-icon",
+            announcement: None,
+            maintenance_notice: None,
+            account_notice: None,
+            pending_follow_requests: None,
         }
     }
 }
@@ -147,6 +159,7 @@ pub fn layout_with_context(
             String::new()
         };
         let notifications = notification_nav_link(context.notification_unread_count.unwrap_or(0));
+        let requests = follow_requests_nav_link(context.pending_follow_requests.unwrap_or(0));
         let logout = csrf.map_or_else(String::new, |token| {
             format!(
                 r#"<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button>{}<span>Log out</span></button></form>"#,
@@ -156,7 +169,7 @@ pub fn layout_with_context(
         });
         let profile = nav_link(&format!("/users/{}", user.username), "Profile", "profile");
         format!(
-            "{}{}{}{notifications}{}{}{admin}{logout}",
+            "{}{}{}{notifications}{requests}{}{}{admin}{logout}",
             nav_link("/home", "Home Feed", "home"),
             nav_link("/following", "Following", "users"),
             nav_link("/search", "Search", "search"),
@@ -177,6 +190,9 @@ pub fn layout_with_context(
     let side_panel = dashboard_panel(user, context);
     let theme = user.map_or(Theme::Light, |user| user.theme).as_str();
     let header_tor = tor_header_indicator(context.tor_onion_address.as_deref());
+    let announcement = announcement_banner(context.announcement.as_deref());
+    let maintenance = maintenance_banner(context.maintenance_notice.as_deref());
+    let account_notice = account_notice_banner(context.account_notice.as_deref());
     format!(
         r#"<!doctype html>
 <html lang="en" data-theme="{}">
@@ -193,7 +209,8 @@ pub fn layout_with_context(
 <script src="/assets/rustpost.js" defer></script>
 </head>
 <body>
-<header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}</div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
+<header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}{}</div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
+{maintenance}{account_notice}
 <noscript><section class="noscript-banner" role="status"><strong>JavaScript is disabled.</strong> RustPost will use standard links and forms.</section></noscript>
 <main><div class="app-shell" data-testid="app-shell">{}<section class="primary-column" data-testid="primary-column">{} </section>{}</div></main>
 <footer class="site-footer">{}</footer>
@@ -206,6 +223,7 @@ pub fn layout_with_context(
         CSS,
         html_escape::encode_text(&brand_mark.to_string()),
         html_escape::encode_text(site_name),
+        announcement,
         header_tor,
         auth_nav,
         left_rail,
@@ -213,6 +231,33 @@ pub fn layout_with_context(
         side_panel,
         html_escape::encode_text(site_name),
     )
+}
+
+fn announcement_banner(announcement: Option<&str>) -> String {
+    announcement.map_or_else(String::new, |announcement| {
+        format!(
+            r#"<span class="announcement" role="status" data-testid="announcement">{}</span>"#,
+            html_escape::encode_text(announcement)
+        )
+    })
+}
+
+fn maintenance_banner(notice: Option<&str>) -> String {
+    notice.map_or_else(String::new, |notice| {
+        format!(
+            r#"<section class="notice maintenance-notice" role="status" data-testid="maintenance-notice"><p>{}</p></section>"#,
+            html_escape::encode_text(notice)
+        )
+    })
+}
+
+fn account_notice_banner(notice: Option<&str>) -> String {
+    notice.map_or_else(String::new, |notice| {
+        format!(
+            r#"<section class="notice error account-notice" role="alert" data-testid="account-notice"><p>{}</p><p><a href="/settings/delete">Review account deletion</a></p></section>"#,
+            html_escape::encode_text(notice)
+        )
+    })
 }
 
 fn tor_header_indicator(onion: Option<&str>) -> String {
@@ -277,6 +322,17 @@ fn notification_nav_link(unread_count: i64) -> String {
         )
     } else {
         nav_link("/notifications", "Notifications", "bell")
+    }
+}
+
+fn follow_requests_nav_link(pending_count: i64) -> String {
+    if pending_count > 0 {
+        format!(
+            r#"<a href="/follow-requests">{}<span>Requests</span> <span class="nav-badge" aria-label="{pending_count} pending follow requests">{pending_count}</span></a>"#,
+            icon_svg("user-check")
+        )
+    } else {
+        nav_link("/follow-requests", "Requests", "user-check")
     }
 }
 
@@ -1125,11 +1181,13 @@ document.addEventListener("submit", async (event) => {
         followForm.action = data.action;
         const button = followForm.querySelector("button");
         if (button) {
+          const label = data.following ? "Following" : (data.requested ? "Requested" : "Follow");
+          const aria = data.following ? "Unfollow this account" : (data.requested ? "Cancel follow request" : "Follow this account");
           button.classList.toggle("active", data.following);
-          button.textContent = data.following ? "Following" : "Follow";
+          button.textContent = label;
           button.setAttribute("aria-pressed", data.following ? "true" : "false");
-          button.setAttribute("aria-label", data.following ? "Unfollow this account" : "Follow this account");
-          button.setAttribute("title", data.following ? "Unfollow this account" : "Follow this account");
+          button.setAttribute("aria-label", aria);
+          button.setAttribute("title", aria);
         }
       }
       document.querySelectorAll(`[data-profile-followers="${data.user_id}"]`).forEach((node) => {
@@ -1381,11 +1439,15 @@ pub fn accounts(accounts: &[AccountView], csrf: &str) -> String {
                     )
                 },
             );
-            let action = if account.viewer_following {
-                follow_form(account.id, csrf, true)
-            } else {
-                follow_form(account.id, csrf, false)
-            };
+            let action = follow_form(
+                account.id,
+                csrf,
+                if account.viewer_following {
+                    FollowButtonState::Following
+                } else {
+                    FollowButtonState::Follow
+                },
+            );
             format!(
                 r#"<article class="account-row">{}<div><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span><p>{}</p></div><div>{}</div></article>"#,
                 avatar,
@@ -1647,27 +1709,58 @@ fn search_user_results(users: &[AccountView]) -> String {
     )
 }
 
-pub fn follow_form(user_id: i64, csrf: &str, following: bool) -> String {
-    let (action, label, aria_label) = if following {
-        (
+/// Follow button state on profiles, account lists, and search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowButtonState {
+    /// No relationship; submitting sends a follow or a follow request.
+    Follow,
+    /// An accepted follow exists; submitting unfollows.
+    Following,
+    /// A pending request exists; submitting cancels the request.
+    Requested,
+}
+
+impl FollowButtonState {
+    #[must_use]
+    pub const fn from_flags(following: bool, requested: bool) -> Self {
+        if following {
+            Self::Following
+        } else if requested {
+            Self::Requested
+        } else {
+            Self::Follow
+        }
+    }
+}
+
+pub fn follow_form(user_id: i64, csrf: &str, state: FollowButtonState) -> String {
+    let (action, label, aria_label, active) = match state {
+        FollowButtonState::Following => (
             format!("/users/{user_id}/unfollow"),
             "Following",
             "Unfollow this account",
-        )
-    } else {
-        (
+            true,
+        ),
+        FollowButtonState::Requested => (
+            format!("/users/{user_id}/follow/cancel"),
+            "Requested",
+            "Cancel follow request",
+            false,
+        ),
+        FollowButtonState::Follow => (
             format!("/users/{user_id}/follow"),
             "Follow",
             "Follow this account",
-        )
+            false,
+        ),
     };
     format!(
         r#"<form method="post" action="{}" data-enhance="follow" data-follow-user="{}"><input type="hidden" name="csrf" value="{}"><button class="follow-button{}" type="submit" aria-pressed="{}" aria-label="{}" title="{}">{}</button></form>"#,
         html_escape::encode_double_quoted_attribute(&action),
         user_id,
         html_escape::encode_double_quoted_attribute(csrf),
-        if following { " active" } else { "" },
-        if following { "true" } else { "false" },
+        if active { " active" } else { "" },
+        if active { "true" } else { "false" },
         html_escape::encode_double_quoted_attribute(aria_label),
         html_escape::encode_double_quoted_attribute(aria_label),
         html_escape::encode_text(label)
@@ -2752,18 +2845,28 @@ fn notification_open_control(
         .map_or_else(String::new, |id| {
             format!(r#"<input type="hidden" name="group_target_post_id" value="{id}">"#)
         });
+    // Group kinds without a post target (for example follow requests) are
+    // marked read through their explicit notification ids.
+    let group_kind = if notification.kind == "follow" || notification.group_target_post_id.is_some()
+    {
+        format!(
+            r#"<input type="hidden" name="group_kind" value="{}">"#,
+            html_escape::encode_double_quoted_attribute(&notification.kind)
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<form id="{}" class="notification-open-form" method="post" action="/notifications/open"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="notification_ids" value="{}"><input type="hidden" name="group_kind" value="{}">{group_target}<input type="hidden" name="return_to" value="{}"><button class="button-link notification-open" type="submit">Open</button></form>"#,
+        r#"<form id="{}" class="notification-open-form" method="post" action="/notifications/open"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="notification_ids" value="{}">{group_kind}{group_target}<input type="hidden" name="return_to" value="{}"><button class="button-link notification-open" type="submit">Open</button></form>"#,
         html_escape::encode_double_quoted_attribute(form_id),
         html_escape::encode_double_quoted_attribute(csrf),
         html_escape::encode_double_quoted_attribute(&notification_ids),
-        html_escape::encode_double_quoted_attribute(&notification.kind),
         html_escape::encode_double_quoted_attribute(target)
     )
 }
 
 fn notification_preview(notification: &NotificationGroupView, target: Option<&str>) -> String {
-    if notification.kind == "follow" {
+    if is_account_notification(&notification.kind) {
         return String::new();
     }
     let text = if notification.post_available {
@@ -2790,8 +2893,19 @@ fn notification_preview(notification: &NotificationGroupView, target: Option<&st
     }
 }
 
+/// Notification kinds that point at an account rather than a post.
+fn is_account_notification(kind: &str) -> bool {
+    matches!(
+        kind,
+        "follow" | "follow_request" | "follow_request_approved"
+    )
+}
+
 fn notification_target(notification: &NotificationGroupView) -> Option<String> {
-    if notification.kind == "follow" {
+    if notification.kind == "follow_request" {
+        return Some("/follow-requests".to_owned());
+    }
+    if is_account_notification(&notification.kind) {
         return notification
             .actors
             .first()
@@ -2855,6 +2969,8 @@ fn notification_action_text(kind: &str) -> &'static str {
         "quote" => "quoted your post",
         "follow" => "followed you",
         "mention" => "mentioned you in a post",
+        "follow_request" => "requested to follow you",
+        "follow_request_approved" => "approved your follow request",
         _ => "sent you a notification",
     }
 }
@@ -2867,6 +2983,8 @@ fn notification_group_action_text(kind: &str) -> &'static str {
         "quote" => "quoted your post",
         "follow" => "followed you",
         "mention" => "mentioned you in a post",
+        "follow_request" => "requested to follow you",
+        "follow_request_approved" => "approved your follow request",
         _ => "sent you notifications",
     }
 }
@@ -2877,7 +2995,7 @@ fn notification_kind_label(kind: &str) -> &'static str {
         "like" => "L",
         "repost" => "Re",
         "quote" => "Q",
-        "follow" => "F",
+        "follow" | "follow_request" | "follow_request_approved" => "F",
         "mention" => "@",
         _ => "N",
     }
@@ -2928,6 +3046,191 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
 pub fn thread_back_control() -> String {
     r##"<div class="thread-nav"><a class="thread-back" href="/home" data-history-back aria-label="Back" title="Back"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M11 5 4 12l7 7 1.8-1.8L8.9 13H20v-2H8.9l3.9-4.2L11 5z"/></svg><span class="sr-only">Back</span></a></div>"##
         .to_owned()
+}
+
+/// "Previously known as" note for profiles that changed handles.
+pub fn username_history_note(history: &[crate::identity::UsernameHistoryEntry]) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let handles = history
+        .iter()
+        .map(|entry| format!("@{}", entry.username))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"<p class="username-history" data-testid="username-history">Previously known as {}</p>"#,
+        html_escape::encode_text(&handles)
+    )
+}
+
+/// Renders the page for a handle that no current account owns but that has
+/// history on this instance, so old profile links cannot silently resolve to a
+/// different person.
+pub fn historical_username_page(
+    requested: &str,
+    holders: &[crate::identity::HistoricalUsernameHolder],
+) -> String {
+    let rows = holders
+        .iter()
+        .map(|holder| {
+            format!(
+                r#"<li><a class="author-name" href="/users/{}">{}</a> <span class="username">@{}</span> <span class="muted">held until {}</span></li>"#,
+                html_escape::encode_double_quoted_attribute(&holder.username),
+                html_escape::encode_text(&holder.display_name),
+                html_escape::encode_text(&holder.username),
+                html_escape::encode_text(&holder.changed_at),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<section class="panel" data-testid="historical-username"><h1>No account uses @{requested}</h1><p>This handle is not in use right now, but it was used before. RustPost does not redirect old profile links so they cannot silently point at a different person.</p><h2>Accounts that previously used this handle</h2><ul class="username-history-list">{rows}</ul></section>"#,
+        requested = html_escape::encode_text(requested),
+    )
+}
+
+/// Notice rendered on a profile whose handle was previously held by a
+/// permanently deleted account, so an old link cannot silently appear to
+/// represent the deleted account.
+pub fn released_username_profile_note() -> String {
+    r#"<p class="username-history" data-testid="released-username-note">This handle was previously used by an account that has since been permanently deleted. The current profile is a different account.</p>"#
+        .to_owned()
+}
+
+/// Page rendered for a handle released by a permanently deleted account.
+///
+/// Used when no current account owns the handle. Old profile URLs remain
+/// distinguishable from the deleted account without blocking the handle from
+/// being claimed again.
+pub fn released_username_page(requested: &str) -> String {
+    format!(
+        r#"<section class="panel" data-testid="released-username"><h1>No account uses @{requested}</h1><p>This handle was used by an account that has since been permanently deleted. The name is available again, and this page does not represent the deleted account.</p><p><a class="button-link" href="/register">Register this handle</a></p></section>"#,
+        requested = html_escape::encode_text(requested),
+    )
+}
+
+/// Renders the maintenance page shown for state-changing requests that are
+/// disabled while maintenance mode is on.
+pub fn maintenance_page(site_name: &str, notice: &str) -> String {
+    let body = format!(
+        r#"<section class="panel error-panel"><p class="eyebrow">503 unavailable</p><h1>Maintenance in progress</h1><p>{}</p><p><a class="button-link" href="/home">Back to Home Feed</a></p></section>"#,
+        html_escape::encode_text(notice)
+    );
+    layout(None, "Maintenance in progress", &body, site_name)
+}
+
+/// Pending follow requests, split into incoming requests awaiting the viewer's
+/// decision and outgoing requests the viewer can cancel.
+pub fn follow_requests_page(
+    incoming: &[FollowRequestView],
+    outgoing: &[FollowRequestView],
+    csrf: &str,
+) -> String {
+    format!(
+        r#"{}{}"#,
+        follow_request_section(
+            "Follow requests",
+            "Accounts that need your approval before they can follow you.",
+            incoming,
+            csrf,
+            FollowRequestDirection::Incoming,
+        ),
+        follow_request_section(
+            "Sent requests",
+            "Requests you sent to protected accounts. You can cancel them here.",
+            outgoing,
+            csrf,
+            FollowRequestDirection::Outgoing,
+        ),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowRequestDirection {
+    Incoming,
+    Outgoing,
+}
+
+fn follow_request_section(
+    title: &str,
+    help: &str,
+    requests: &[FollowRequestView],
+    csrf: &str,
+    direction: FollowRequestDirection,
+) -> String {
+    let content = if requests.is_empty() {
+        match direction {
+            FollowRequestDirection::Incoming => compact_empty_state(
+                "No follow requests.",
+                "Requests appear here when someone asks to follow a protected account.",
+            ),
+            FollowRequestDirection::Outgoing => compact_empty_state(
+                "No sent requests.",
+                "Requests you send to protected accounts appear here.",
+            ),
+        }
+    } else {
+        let rows = requests
+            .iter()
+            .map(|request| follow_request_row(request, csrf, direction))
+            .collect::<Vec<_>>()
+            .join("");
+        format!(r#"<div class="follow-request-list">{rows}</div>"#)
+    };
+    format!(
+        r#"<section class="panel" data-testid="follow-requests-panel"><h2>{}</h2><p class="muted">{}</p>{content}</section>"#,
+        html_escape::encode_text(title),
+        html_escape::encode_text(help),
+    )
+}
+
+fn follow_request_row(
+    request: &FollowRequestView,
+    csrf: &str,
+    direction: FollowRequestDirection,
+) -> String {
+    let csrf = html_escape::encode_double_quoted_attribute(csrf);
+    let username = html_escape::encode_double_quoted_attribute(&request.username);
+    let actions = match direction {
+        FollowRequestDirection::Incoming => {
+            let approve = format!(
+                r#"<form method="post" action="/users/{}/follow/approve"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">Approve</button></form>"#,
+                request.user_id
+            );
+            let reject = format!(
+                r#"<form method="post" action="/users/{}/follow/reject"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">Reject</button></form>"#,
+                request.user_id
+            );
+            format!("{approve}{reject}")
+        }
+        FollowRequestDirection::Outgoing => format!(
+            r#"<form method="post" action="/users/{}/follow/cancel"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">Cancel request</button></form>"#,
+            request.user_id
+        ),
+    };
+    let avatar = request.profile_picture_path.as_ref().map_or_else(
+        || {
+            let initial = request.display_name.chars().next().unwrap_or('R');
+            format!(
+                r#"<span class="post-avatar placeholder" aria-hidden="true">{}</span>"#,
+                html_escape::encode_text(&initial.to_string())
+            )
+        },
+        |path| {
+            format!(
+                r#"<img class="post-avatar" src="{}" alt="" loading="lazy">"#,
+                html_escape::encode_double_quoted_attribute(path)
+            )
+        },
+    );
+    format!(
+        r#"<article class="follow-request-row" data-testid="follow-request-row">{avatar}<div><a class="author-name" href="/users/{username}">{}</a> <span class="username">@{}</span><p>{}</p><p class="muted">Requested {}</p></div><div class="actions">{actions}</div></article>"#,
+        html_escape::encode_text(&request.display_name),
+        html_escape::encode_text(&request.username),
+        html_escape::encode_text(&request.bio),
+        html_escape::encode_text(&request.created_at),
+    )
 }
 
 pub fn notice(kind: &str, message: &str) -> String {
@@ -2996,9 +3299,16 @@ nav button{border-color:transparent;background:transparent;color:var(--link-stro
 .profile-title-row>div{min-width:0}.profile-title-row h1{margin:0;overflow-wrap:anywhere}.profile-bio{margin:.55rem 0 0;overflow-wrap:anywhere}.profile-state-note{color:var(--muted-strong);font-weight:700}
 .notice.info{border-color:var(--border-strong);background:var(--surface-subtle)}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms !important;animation-duration:.01ms !important}}
+.announcement{min-width:0;max-width:min(34rem,100%);color:var(--muted-strong);font-size:.86rem;font-weight:600;line-height:1.25;overflow-wrap:anywhere;white-space:normal;flex:0 1 auto}
+.maintenance-notice{margin:0 0 var(--section-gap);border-color:var(--border-strong);background:var(--surface-subtle)}
+.account-notice{margin:0 0 var(--section-gap)}
+.follow-request-row{display:grid;gap:.55rem;border:1px solid var(--border);border-radius:8px;padding:.75rem;background:var(--surface)}
+.follow-request-row .actions{display:flex;gap:.45rem;flex-wrap:wrap;align-items:center}
+.username-history{margin:.35rem 0 0;color:var(--muted);font-size:.9rem}
+.username-history-list{list-style:none;margin:.35rem 0 0;padding:0;display:grid;gap:.2rem}
 @media (max-width:1100px){.app-shell{--shell-side:220px;--shell-max:880px;grid-template-columns:var(--shell-side) minmax(0,var(--shell-primary))}.right-rail{display:none}}
 @media (max-width:820px){.app-shell{grid-template-columns:minmax(0,680px)}.left-rail,.right-rail{display:none}.mobile-nav{display:flex}}
-@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.header-brand-row{align-items:center;width:100%;gap:.55rem}.tor-indicator{max-width:calc(100% - 7rem);margin-left:auto}.tor-details{left:auto;right:0;max-width:calc(100vw - 1.5rem)}.site-header{position:static}nav{justify-content:flex-start}.mobile-nav{width:100%}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group,.admin-user-search,.admin-user-row,.onboarding-media-row{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar,.notifications-hero{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.composer-footer,.composer-media-selection{align-items:flex-start;flex-direction:column}.composer-file-input{max-width:100%}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-switch-row{grid-template-columns:1fr;gap:.55rem}.settings-switch-toggle,.settings-switch-control{justify-self:start}.settings-form-actions{justify-content:stretch}.settings-form-actions button,.settings-danger-action .button-link{width:100%;justify-content:center}.settings-item-list li{align-items:stretch;flex-direction:column}.admin-user-search-actions,.admin-user-actions{align-items:stretch;flex-direction:column}.admin-user-search-actions button,.admin-user-search-actions .button-link,.admin-user-actions button{width:100%;justify-content:center}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1,.notifications-hero h1{font-size:1.25rem}.notification-row{grid-template-columns:auto minmax(0,1fr);gap:.6rem}.unread-dot{position:absolute;right:.75rem;top:.75rem;margin:0}.notification-preview{padding:.5rem}}
+@media (max-width:600px){main{padding:.75rem}.header-inner{align-items:flex-start;flex-direction:column}.header-brand-row{align-items:center;flex-wrap:wrap;width:100%;gap:.55rem}.announcement{flex-basis:100%;max-width:100%}.tor-indicator{max-width:calc(100% - 7rem);margin-left:auto}.tor-details{left:auto;right:0;max-width:calc(100vw - 1.5rem)}.site-header{position:static}nav{justify-content:flex-start}.mobile-nav{width:100%}.search-form,.inline-settings-form,.settings-grid,.deep-settings-group,.admin-user-search,.admin-user-row,.onboarding-media-row{grid-template-columns:1fr}.search-form button,.inline-settings-form button{width:100%}.composer-tools,.post-header,.profile-heading,.profile-title-row,.account-row,.settings-editor-bar,.notifications-hero{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.composer-footer,.composer-media-selection{align-items:flex-start;flex-direction:column}.composer-file-input{max-width:100%}.settings-banner-preview{height:150px}.settings-picture-row{grid-template-columns:1fr;margin-top:-38px;gap:.5rem}.settings-picture-preview{width:92px;height:92px}.settings-media-controls{padding-top:0}.media-control-row{align-items:flex-start}.settings-switch-row{grid-template-columns:1fr;gap:.55rem}.settings-switch-toggle,.settings-switch-control{justify-self:start}.settings-form-actions{justify-content:stretch}.settings-form-actions button,.settings-danger-action .button-link{width:100%;justify-content:center}.settings-item-list li{align-items:stretch;flex-direction:column}.admin-user-search-actions,.admin-user-actions{align-items:stretch;flex-direction:column}.admin-user-search-actions button,.admin-user-search-actions .button-link,.admin-user-actions button{width:100%;justify-content:center}.panel dl:not(.dashboard-list){grid-template-columns:1fr}table{display:block;max-width:100%;overflow-x:auto}.author-block{align-items:flex-start}.reply-post{margin-left:.65rem;padding-left:.8rem}.reply-post::before{left:-.65rem;width:.65rem}.button-link{padding:.42rem .55rem}.counts{gap:.45rem}.page-header h1,.section-heading h1,.panel h1,.notifications-hero h1{font-size:1.25rem}.notification-row{grid-template-columns:auto minmax(0,1fr);gap:.6rem}.unread-dot{position:absolute;right:.75rem;top:.75rem;margin:0}.notification-preview{padding:.5rem}}
 "#;
 
 #[cfg(test)]
@@ -3033,6 +3343,8 @@ mod tests {
             is_suspended: false,
             theme: Theme::Dark,
             nsfw_blur_enabled: true,
+            must_change_password: false,
+            deletion_scheduled_at: None,
         };
         let body = layout(Some(&user), "Home Feed", "<p>body</p>", "My Microblog");
 
@@ -3133,6 +3445,8 @@ mod tests {
             is_suspended: false,
             theme: Theme::Light,
             nsfw_blur_enabled: true,
+            must_change_password: false,
+            deletion_scheduled_at: None,
         };
         let body = layout_with_csrf(
             Some(&user),
@@ -3169,6 +3483,8 @@ mod tests {
             is_suspended: false,
             theme: Theme::Light,
             nsfw_blur_enabled: true,
+            must_change_password: false,
+            deletion_scheduled_at: None,
         };
         let body = layout_with_context(
             Some(&user),
@@ -3466,6 +3782,8 @@ mod tests {
             is_suspended: false,
             theme: Theme::Light,
             nsfw_blur_enabled: true,
+            must_change_password: false,
+            deletion_scheduled_at: None,
         };
         let mut post = test_post();
         post.user_id = Some(2);
@@ -3500,6 +3818,8 @@ mod tests {
             is_suspended: false,
             theme: Theme::Light,
             nsfw_blur_enabled: true,
+            must_change_password: false,
+            deletion_scheduled_at: None,
         };
         let mut post = test_post();
         post.user_id = Some(2);

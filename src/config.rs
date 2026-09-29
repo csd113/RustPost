@@ -5,6 +5,29 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_POST_EDIT_WINDOW_SECONDS: u64 = 15;
 pub const MAX_POST_EDIT_WINDOW_SECONDS: u64 = 300;
+pub const DEFAULT_DELETION_GRACE_PERIOD_DAYS: u64 = 30;
+pub const MAX_DELETION_GRACE_PERIOD_DAYS: u64 = 3_650;
+
+/// Default ceiling for the compressed size of one account archive.
+///
+/// Applies both to upload (`/settings/import`) and to export output. This is
+/// the *compressed* limit; see [`DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES`] for the
+/// independent decompressed-content ceiling.
+pub const DEFAULT_MAX_ARCHIVE_UPLOAD_BYTES: u64 = 300 * 1024 * 1024;
+/// Default ceiling for the total decompressed media bytes extracted from one
+/// account archive. Independent of the compressed upload limit so a small
+/// archive can never expand into unbounded disk use.
+pub const DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES: u64 = 1024 * 1024 * 1024;
+/// Default ceiling for the number of tar entries in one account archive.
+pub const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 10_000;
+/// Upper bound accepted for `accounts.max_archive_upload_bytes`.
+pub const MAX_ARCHIVE_UPLOAD_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Upper bound accepted for `accounts.max_archive_expanded_bytes`.
+pub const MAX_ARCHIVE_EXPANDED_LIMIT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Upper bound accepted for `accounts.max_archive_entries`.
+pub const MAX_ARCHIVE_ENTRY_LIMIT: usize = 100_000;
+/// Smallest limit operators may configure for either archive byte ceiling.
+pub const MIN_ARCHIVE_LIMIT_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -55,6 +78,21 @@ pub struct AccountSettings {
     pub max_bio_len: usize,
     pub allow_profile_banners: bool,
     pub allow_profile_pictures: bool,
+    /// Days an account remains recoverable after requesting deletion. A value
+    /// of zero finalizes deletion immediately.
+    #[serde(default = "default_deletion_grace_period_days")]
+    pub deletion_grace_period_days: u64,
+    /// Compressed-size ceiling for account archives, in bytes. Applies to the
+    /// import upload and to export output. Independent of the expanded limit.
+    #[serde(default = "default_max_archive_upload_bytes")]
+    pub max_archive_upload_bytes: u64,
+    /// Maximum total decompressed media bytes accepted from one account
+    /// archive, in bytes. Checked incrementally while extracting.
+    #[serde(default = "default_max_archive_expanded_bytes")]
+    pub max_archive_expanded_bytes: u64,
+    /// Maximum number of tar entries accepted in one account archive.
+    #[serde(default = "default_max_archive_entries")]
+    pub max_archive_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +210,10 @@ impl Default for Settings {
                 max_bio_len: 240,
                 allow_profile_banners: true,
                 allow_profile_pictures: true,
+                deletion_grace_period_days: DEFAULT_DELETION_GRACE_PERIOD_DAYS,
+                max_archive_upload_bytes: DEFAULT_MAX_ARCHIVE_UPLOAD_BYTES,
+                max_archive_expanded_bytes: DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES,
+                max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
             },
             posts: PostSettings {
                 max_text_chars: 280,
@@ -275,12 +317,54 @@ impl Settings {
         validate_onion_service_name(&self.tor.onion_service_name)?;
         validate_display_onion_address(&self.tor.display_onion_address)?;
         validate_post_edit_window(self.posts.post_edit_window_seconds)?;
+        if self.accounts.deletion_grace_period_days > MAX_DELETION_GRACE_PERIOD_DAYS {
+            anyhow::bail!(
+                "accounts.deletion_grace_period_days must be {MAX_DELETION_GRACE_PERIOD_DAYS} days or less"
+            );
+        }
+        if self.accounts.max_archive_upload_bytes < MIN_ARCHIVE_LIMIT_BYTES
+            || self.accounts.max_archive_upload_bytes > MAX_ARCHIVE_UPLOAD_LIMIT_BYTES
+        {
+            anyhow::bail!(
+                "accounts.max_archive_upload_bytes must be between {MIN_ARCHIVE_LIMIT_BYTES} and {MAX_ARCHIVE_UPLOAD_LIMIT_BYTES} bytes"
+            );
+        }
+        if self.accounts.max_archive_expanded_bytes < MIN_ARCHIVE_LIMIT_BYTES
+            || self.accounts.max_archive_expanded_bytes > MAX_ARCHIVE_EXPANDED_LIMIT_BYTES
+        {
+            anyhow::bail!(
+                "accounts.max_archive_expanded_bytes must be between {MIN_ARCHIVE_LIMIT_BYTES} and {MAX_ARCHIVE_EXPANDED_LIMIT_BYTES} bytes"
+            );
+        }
+        if self.accounts.max_archive_entries == 0
+            || self.accounts.max_archive_entries > MAX_ARCHIVE_ENTRY_LIMIT
+        {
+            anyhow::bail!(
+                "accounts.max_archive_entries must be between 1 and {MAX_ARCHIVE_ENTRY_LIMIT}"
+            );
+        }
         Ok(())
     }
 }
 
 const fn default_post_edit_window_seconds() -> u64 {
     DEFAULT_POST_EDIT_WINDOW_SECONDS
+}
+
+const fn default_deletion_grace_period_days() -> u64 {
+    DEFAULT_DELETION_GRACE_PERIOD_DAYS
+}
+
+const fn default_max_archive_upload_bytes() -> u64 {
+    DEFAULT_MAX_ARCHIVE_UPLOAD_BYTES
+}
+
+const fn default_max_archive_expanded_bytes() -> u64 {
+    DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES
+}
+
+const fn default_max_archive_entries() -> usize {
+    DEFAULT_MAX_ARCHIVE_ENTRIES
 }
 
 fn validate_post_edit_window(seconds: u64) -> anyhow::Result<()> {
@@ -373,6 +457,22 @@ allow_profile_banners = {allow_profile_banners}
 
 # Allow users to upload profile picture images.
 allow_profile_pictures = {allow_profile_pictures}
+
+# Days an account stays recoverable after deletion is requested. Set to 0 to
+# delete immediately after password confirmation.
+deletion_grace_period_days = {deletion_grace_period_days}
+
+# SECURITY: Maximum compressed size in bytes of one account archive. Applies to
+# the /settings/import upload and to exported archives. Independent of the
+# expanded limit below, so this value never controls decompressed content.
+max_archive_upload_bytes = {max_archive_upload_bytes}
+
+# SECURITY: Maximum total decompressed media bytes accepted when importing one
+# account archive. Enforced incrementally during extraction.
+max_archive_expanded_bytes = {max_archive_expanded_bytes}
+
+# SECURITY: Maximum number of entries accepted in one account archive.
+max_archive_entries = {max_archive_entries}
 
 
 # Posts and interactions
@@ -558,6 +658,10 @@ automatic_include_tor_keys = {backup_automatic_include_tor_keys}
         max_bio_len = settings.accounts.max_bio_len,
         allow_profile_banners = settings.accounts.allow_profile_banners,
         allow_profile_pictures = settings.accounts.allow_profile_pictures,
+        deletion_grace_period_days = settings.accounts.deletion_grace_period_days,
+        max_archive_upload_bytes = settings.accounts.max_archive_upload_bytes,
+        max_archive_expanded_bytes = settings.accounts.max_archive_expanded_bytes,
+        max_archive_entries = settings.accounts.max_archive_entries,
         max_text_chars = settings.posts.max_text_chars,
         post_edit_window_seconds = settings.posts.post_edit_window_seconds,
         max_images_per_post = settings.posts.max_images_per_post,
