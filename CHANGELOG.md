@@ -2,6 +2,8 @@
 
 ## v1.0.0 - First Release
 
+- Published a Linux amd64/arm64 container image as `ghcr.io/csd113/rustpost:1.0.0` and `ghcr.io/csd113/rustpost:latest`, with persistent state under `/data` and bundled `ffmpeg`.
+
 ### Instance and social controls
 - Protected accounts: users can require approval before someone follows them. Requests are pending until approved, never count as followers, can be rejected or cancelled, and are cleared by blocks.
 - Instance announcements: administrators can publish, disable, or clear an announcement rendered next to the site name in the top bar.

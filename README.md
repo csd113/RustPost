@@ -157,6 +157,21 @@ rustpost-cli --version
 
 Use an explicit `--data-dir` for installed deployments. Without it, RustPost places `rustpost-data` beside the executable.
 
+### Run the container
+
+The multi-platform image is published at `ghcr.io/csd113/rustpost:1.0.0` for Linux amd64 and arm64. `ghcr.io/csd113/rustpost:latest` points to the same release. The image includes `ffmpeg` and runs as UID/GID `10001`.
+
+```sh
+docker volume create rustpost-data
+docker run -d --name rustpost \
+  -p 127.0.0.1:8080:8080 \
+  -v rustpost-data:/data \
+  ghcr.io/csd113/rustpost:1.0.0
+docker exec -it rustpost rustpost-cli --data-dir /data create-admin-interactive
+```
+
+Open `http://127.0.0.1:8080`. The container stores settings, SQLite, uploads, backups, and Tor state in `/data`. On the first boot only, it creates `settings.toml` with `server.host = "0.0.0.0"` so Docker can forward port 8080. Existing settings are preserved; if you mount an existing data directory, set `server.host` to `0.0.0.0` yourself. For a bind mount, make the directory writable by UID/GID `10001`. Keep the published port bound to loopback unless you have configured a reverse proxy and appropriate public access settings.
+
 ### First Run
 
 ```sh

@@ -1,0 +1,8 @@
+.git
+.github
+target
+rustpost-data
+queue-demo
+*.tar.gz
+*.zip
+*.sha256
