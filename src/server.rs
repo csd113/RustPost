@@ -47,7 +47,7 @@ pub struct AppState {
     /// deep settings.
     pub nsfw_blur_default: Arc<std::sync::atomic::AtomicBool>,
     /// Set after an in-process restore swaps the runtime directories. The
-    /// running process still holds the previous SQLite connection, so writes
+    /// running process still holds the previous `SQLite` connection, so writes
     /// are refused until the operator restarts `RustPost`.
     pub restart_required: Arc<std::sync::atomic::AtomicBool>,
 }

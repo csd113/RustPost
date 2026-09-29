@@ -67,7 +67,7 @@ pub enum LoginFailure {
 
 pub const USERNAME_TAKEN_MESSAGE: &str = "username is already taken";
 
-/// SQLite extended result code for a UNIQUE constraint failure.
+/// `SQLite` extended result code for a `UNIQUE` constraint failure.
 const SQLITE_CONSTRAINT_UNIQUE: i32 = 2067;
 
 fn is_unique_violation(error: &rusqlite::Error) -> bool {

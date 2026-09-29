@@ -161,7 +161,7 @@ const HASH_PREFIX_LEN: usize = 16;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const ALREADY_IMPORTED_MESSAGE: &str = "this archive has already been imported into this account";
 
-/// SQLite extended result codes for the `UNIQUE(user_id, archive_id)`
+/// `SQLite` extended result codes for the `UNIQUE(user_id, archive_id)`
 /// constraint on `account_imports`.
 const SQLITE_CONSTRAINT_UNIQUE: i32 = 2_067;
 const SQLITE_CONSTRAINT_PRIMARYKEY: i32 = 1_555;

@@ -82,7 +82,7 @@ fn open_connection(path: &Path) -> anyhow::Result<Connection> {
 /// Registers the Rust-backed SQL helpers used by application queries.
 ///
 /// `rustpost_muted_word_match(text, term)` performs a Unicode-aware,
-/// case-insensitive substring test. SQLite's built-in `lower()` only folds
+/// case-insensitive substring test. `SQLite`'s built-in `lower()` only folds
 /// ASCII characters, which made muted-word matching miss uppercase accented
 /// text. Registering this on the connection keeps the check inside SQL so
 /// muted rows are filtered before `LIMIT` is applied.

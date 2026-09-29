@@ -104,7 +104,7 @@ pub async fn run() -> anyhow::Result<()> {
         .with_backup_dir(&settings.backup.backup_dir);
     // Keep backup and restore pointed at the settings file the operator
     // actually loaded, including an explicit --config path.
-    paths.settings_path = settings_path.clone();
+    paths.settings_path.clone_from(&settings_path);
     paths.ensure()?;
     info!(data_dir = %paths.data_dir.display(), settings = %settings_path.display(), "runtime paths ready");
 
