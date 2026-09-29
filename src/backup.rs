@@ -895,9 +895,14 @@ fn rewrite_restored_media_paths(database_path: &Path, paths: &RuntimePaths) -> a
 }
 
 fn remap_media_path(path: &str, roots: &[(&str, &PathBuf)]) -> String {
+    let normalized = if path.contains('\\') {
+        std::borrow::Cow::Owned(path.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    };
     for (marker, root) in roots {
-        if let Some(index) = path.find(marker) {
-            let relative = &path[index + marker.len()..];
+        if let Some(index) = normalized.find(marker) {
+            let relative = &normalized[index + marker.len()..];
             if relative.is_empty() {
                 return path.to_owned();
             }
@@ -1398,14 +1403,19 @@ mod tests {
     fn restored_media_paths_are_remapped_to_the_destination() {
         let originals = PathBuf::from("/new/data/uploads/originals");
         let roots: [(&str, &PathBuf); 1] = [("/uploads/originals/", &originals)];
+        let expected = originals.join("a.png").to_string_lossy().to_string();
 
         assert_eq!(
             remap_media_path("/old/data/uploads/originals/a.png", &roots),
-            "/new/data/uploads/originals/a.png"
+            expected
+        );
+        assert_eq!(
+            remap_media_path(r"C:\old\data\uploads\originals\a.png", &roots),
+            expected
         );
         assert_eq!(
             remap_media_path("/new/data/uploads/originals/a.png", &roots),
-            "/new/data/uploads/originals/a.png"
+            expected
         );
         assert_eq!(
             remap_media_path("/unrelated/place/a.png", &roots),
