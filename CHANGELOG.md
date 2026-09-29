@@ -34,6 +34,7 @@
 - Enforced configured per-post image and video attachment limits and raised the multipart body limit to cover valid configured media mixes.
 - Hardened invalid upload cleanup with a cancellation-safe staged-file guard so rejected malformed, oversized, or staging-error uploads do not leave orphaned files under `tmp/uploads`.
 - Fixed restored media path remapping for Windows paths so backups remain usable after restoring into a different data directory.
+- Return a signed-out response when account finalization races settings page loading, instead of surfacing a server error.
 - Corrected generated settings copy for username, display name, and bio limits from bytes to characters.
 
 ### Release Validation

@@ -2647,8 +2647,9 @@ struct SettingsProfile {
 
 async fn settings_profile(pool: &SqlitePool, user_id: i64) -> AppResult<SettingsProfile> {
     pool.call(move |conn| {
-        conn.query_row(
-            r#"
+        Ok(conn
+            .query_row(
+                r#"
         SELECT u.display_name, u.bio, u.location, u.website, u.theme, u.nsfw_blur_enabled,
           u.liked_posts_public, u.follow_approval_required,
           pic.public_path AS profile_picture_path,
@@ -2658,26 +2659,26 @@ async fn settings_profile(pool: &SqlitePool, user_id: i64) -> AppResult<Settings
         LEFT JOIN media banner ON banner.id = u.banner_media_id
         WHERE u.id = ?
         "#,
-            [user_id],
-            |row| {
-                Ok(SettingsProfile {
-                    display_name: row.get(0)?,
-                    bio: row.get(1)?,
-                    location: row.get(2)?,
-                    website: row.get(3)?,
-                    theme: row.get(4)?,
-                    nsfw_blur_enabled: row.get::<_, i64>(5)? != 0,
-                    liked_posts_public: row.get::<_, i64>(6)? != 0,
-                    follow_approval_required: row.get::<_, i64>(7)? != 0,
-                    picture_path: row.get(8)?,
-                    banner_path: row.get(9)?,
-                })
-            },
-        )
-        .map_err(Into::into)
+                [user_id],
+                |row| {
+                    Ok(SettingsProfile {
+                        display_name: row.get(0)?,
+                        bio: row.get(1)?,
+                        location: row.get(2)?,
+                        website: row.get(3)?,
+                        theme: row.get(4)?,
+                        nsfw_blur_enabled: row.get::<_, i64>(5)? != 0,
+                        liked_posts_public: row.get::<_, i64>(6)? != 0,
+                        follow_approval_required: row.get::<_, i64>(7)? != 0,
+                        picture_path: row.get(8)?,
+                        banner_path: row.get(9)?,
+                    })
+                },
+            )
+            .optional()?)
     })
-    .await
-    .map_err(Into::into)
+    .await?
+    .ok_or(AppError::Unauthorized)
 }
 
 fn settings_profile_media(
