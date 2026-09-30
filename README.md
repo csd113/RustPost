@@ -1,671 +1,232 @@
-<div align="center">
+# RustPost
 
-<br/>
+**Your own small social network, on your own computer or server.**
 
-```
-██████╗ ██╗   ██╗███████╗████████╗██████╗  ██████╗ ███████╗████████╗
-██╔══██╗██║   ██║██╔════╝╚══██╔══╝██╔══██╗██╔═══██╗██╔════╝╚══██╔══╝
-██████╔╝██║   ██║███████╗   ██║   ██████╔╝██║   ██║███████╗   ██║   
-██╔══██╗██║   ██║╚════██║   ██║   ██╔═══╝ ██║   ██║╚════██║   ██║   
-██║  ██║╚██████╔╝███████║   ██║   ██║     ╚██████╔╝███████║   ██║   
-╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝   ╚═╝      ╚═════╝ ╚══════╝   ╚═╝   
-```
+[![CI](https://img.shields.io/github/actions/workflow/status/csd113/RustPost/ci.yml?branch=main&label=CI)](https://github.com/csd113/RustPost/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/csd113/RustPost)](https://github.com/csd113/RustPost/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**A single-binary, self-hosted microblog — yours alone, with no cloud required.**
+RustPost is a place to share short posts, photos, and videos, follow people, and join conversations. You run the site and control its accounts, settings, and data. People use it through a web browser, including on phones.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/csd113/RustPost/ci.yml?branch=main&style=flat-square&label=CI&logo=github)](https://github.com/csd113/RustPost/actions)
-[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![SQLite](https://img.shields.io/badge/database-SQLite-blue?style=flat-square&logo=sqlite)](https://www.sqlite.org/)
-[![Embedded Arti](https://img.shields.io/badge/embedded%20Arti-0.46.0-7D4698?style=flat-square&logo=torproject)](https://www.torproject.org/)
-[![License](https://img.shields.io/badge/license-see%20LICENSE-green?style=flat-square)](./LICENSE)
+It runs as one application with a local database. No separate database server or cloud account is required. Each RustPost site is its own community; accounts and posts are not shared with other social networks.
 
-[**Getting Started**](#-getting-started) · [**Configuration**](#-configuration) · [**CLI Reference**](#-cli-reference) · [**Security**](#-security-model) · [**Tor / Arti**](#-tor--arti)
+[See the app](#see-the-app) · [Get started](#getting-started) · [Docker setup](#run-the-container) · [Settings](#settings-and-administration) · [Documentation](#documentation)
 
-**First stable release:** [v1.0.0](https://github.com/csd113/RustPost/releases/tag/v1.0.0) · [Changelog](CHANGELOG.md)
+## What you can do
 
-</div>
+- **Post and talk:** share up to 280 characters, reply in threads, repost, like, and save private bookmarks.
+- **Share media:** attach images and videos, and add a profile picture, banner, and bio.
+- **Find your people:** follow accounts, search posts and users, and receive notifications.
+- **Control your experience:** block or mute accounts, hide words, or require approval for new followers.
+- **Manage your account:** change your username, export or import your data, or request deletion with a configurable grace period.
+- **Run your community:** manage users, publish announcements, pause posting with maintenance mode, and create or restore backups.
 
----
+Optional Tor support lets the same site be reached through an onion address. See the [operator guide](docs/operator-guide.md#tor--arti) for setup and limitations.
 
-## Overview
+## See the app
 
-RustPost is a **single-binary, self-hosted microblogging platform** written in Rust. It is deliberately single-instance and non-federated: one operator runs one SQLite-backed site with full social features, served as plain server-rendered HTML with no frontend build chain.
+### Home feed
 
-> **Design philosophy:** Small, auditable modules over framework magic. Security-sensitive behavior centralized. No JavaScript bundler. No cloud dependency. No federation surface.
+Read posts from the community and share an update from the same page.
 
-This repository is intended for operators who want a small, understandable self-hosted service. Operators remain responsible for deployment hardening, monitoring, backups, upgrades, and deciding whether RustPost is appropriate for their environment.
+![RustPost home feed with a post composer, community posts, and social actions](docs/screenshots/home-feed.png)
 
----
+### Profiles and conversations
 
-## ✨ Features
+Profiles bring a person's bio, follows, and posts together. Replies stay with their original post so conversations are easy to follow.
 
-### Accounts & Identity
-| Feature | Details |
-|---|---|
-| Password hashing | Argon2id — never stored in plaintext |
-| Sessions | Server-side, HttpOnly, SameSite=Lax cookies |
-| Profile customization | Bio, avatar, and banner with WebP conversion |
-| Admin CLI | Create admins and reset passwords from the command line |
-| Username changes | Users can change their @handle; previous handles stay reserved to prevent impersonation, with history shown on profiles |
-| Account deletion | Deletion starts a configurable grace period with a visible deadline, cancellation, and restart-safe finalization |
-| Account export/import | Versioned `.tar.gz` archives with posts, profile, media bytes, media list, outgoing follows, and settings |
-| Admin account controls | Forced password reset on next login and forced logout of every session |
+| Profile | Conversation |
+| --- | --- |
+| ![Profile with a banner, avatar, bio, and post tabs](docs/screenshots/profile.png) | ![Post thread with replies from several people](docs/screenshots/post-thread.png) |
 
-### Social Features
-| Feature | Details |
-|---|---|
-| Posts | Up to 280 Unicode characters |
-| Replies & Threads | Threaded conversations with full timeline rendering |
-| Reposts | First-class timeline events; deleted originals render gracefully |
-| Follows, Blocks & Mutes | Standard social graph primitives |
-| Protected accounts | Optional approval for new followers: pending requests never count as followers until approved |
-| Likes & Bookmarks | Likes are public; bookmarks are private |
-| Notifications | In-app notification feed |
-| Muted words | Per-user phrase list applied server-side |
-| Search | Full-text search via SQLite FTS5 + user matching |
-| Anonymous posting | Supported but **disabled by default** |
+### Media and mobile
 
-### Blocking, muting, and muted words
+Images appear within posts, and the layout adapts to smaller screens.
 
-RustPost enforces these rules in the database and query layer, not only in the UI.
+| Image post | Phone layout |
+| --- | --- |
+| ![Image attachment and replies in a RustPost post](docs/screenshots/media-posts.png) | <img src="docs/screenshots/mobile.png" alt="RustPost home feed on a phone-sized screen" width="300"> |
 
-| Action | Effect |
-|---|---|
-| Block | Removes follow relationships in both directions. The blocker and the blocked account cannot follow, reply to, quote, like, repost, bookmark, or mention each other's content, and neither account's posts appear in the other's feeds, threads, search results, mention suggestions, or notifications. The blocked account sees the profile without activity; neither account's display name, bio, or counts are removed from the database. Unblocking restores normal visibility and interactions. |
-| Mute | Hides the muted account's posts from the muter's feeds, search, mention suggestions, notifications, and profile activity. Mutes do not notify the muted account. |
-| Muted words | Per-user list, editable in Settings. Matching is case-insensitive (Unicode-aware), does not use regular expressions, and matches anywhere in the post text, so muting `cat` also hides `concatenate`. Matching applies to home, profile, media, likes, search, and quote previews, and to notification previews for other people's posts. Your own posts are never hidden by your own muted words. |
+These screenshots use fictional accounts and locally generated sample media. You can [run the same demo](docs/demo-preview.md) without using real account data.
 
-Block and mute rows are deleted when either account is deleted, and deleting a post or account removes the associated media files once no other row references them.
+## Getting started
 
-### Media Pipeline
-| Feature | Details |
-|---|---|
-| Upload handling | Multipart with content sniffing and size limits |
-| Image conversion | JPEG / PNG / GIF / WebP → WebP (requires `ffmpeg`) |
-| Video conversion | MP4 / WebM / QuickTime → WebM VP9 (requires `ffmpeg`) |
-| Fallback | Serves original format safely when conversion is unavailable |
-| Timeouts | 120 s for images · 300 s for video |
+Choose the installation method that suits you:
 
-### Operations
-| Feature | Details |
-|---|---|
-| Database | SQLite with WAL, foreign keys, schema version 4, FTS5, and timeline indexes |
-| Rate limiting | SQLite-backed per-user and per-IP limits for all write operations |
-| Backups | Deterministic tar archive with manifest, hashes, DB snapshot, settings, media, assets, and optional Tor keys |
-| Restore | Staged manifest/hash/SQLite/settings validation before runtime file swaps |
-| Admin dashboard | Site health, users, media jobs, conversion state, and backup management |
-| Announcements | Admin-controlled banner rendered next to the site name in the top bar |
-| Maintenance mode | Admin toggle that disables posting and registration while the site stays readable |
-| HTTP compression | Browser text responses use gzip when requested; media and binary uploads are intentionally left uncompressed |
-| Tor / Arti | Embedded onion-service startup — clearnet-only, Tor-only, or dual mode |
+| Method | What you need | Best for |
+| --- | --- | --- |
+| [Docker container](#run-the-container) | Docker installed and running | Running the ready-made app with media conversion included |
+| [Download the app](#download-the-app) | A matching release for your computer | Running RustPost without Docker or a Rust installation |
+| [Build from source](#build-from-source) | Rust 1.91 or newer | Developers and people who want to build it themselves |
 
----
-
-## Platform Preview
-
-RustPost renders as plain server-side HTML with full social interactions, profiles, threads, and media attachments.
-
-| Home feed | Profile |
-|---|---|
-| ![RustPost home feed with reposted media and social actions](docs/screenshots/home-feed.png) | ![RustPost profile page with banner, avatar, bio, and posts](docs/screenshots/profile.png) |
-
-| Threaded replies | Media posts |
-|---|---|
-| ![RustPost post thread with replies from multiple users](docs/screenshots/post-thread.png) | ![RustPost media post thread showing image attachment rendering](docs/screenshots/media-posts.png) |
-
-| Mobile layout |
-|---|
-| ![RustPost mobile home feed layout](docs/screenshots/mobile.png) |
-
-The screenshots above were captured from a local generated demo instance with fictional accounts and local placeholder media only. To inspect the same style of demo locally, see [Demo Preview](docs/demo-preview.md).
-
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-
-- **Rust 1.91+** — install via [rustup](https://rustup.rs/)
-- **ffmpeg** *(optional)* — enables image and video conversion. RustPost boots and runs without it.
-
-### Build from source
-
-```sh
-cargo build --release
-```
-
-This produces the release binary in `target/release/`:
-
-| Binary | Purpose |
-|---|---|
-| `rustpost-cli` | Server and administration CLI |
-
-### Install a release archive
-
-Download the archive and matching `.sha256` file for your platform from the [v1.0.0 GitHub release](https://github.com/csd113/RustPost/releases/tag/v1.0.0), verify the checksum, then extract it. Unix archives contain `rustpost/rustpost-cli`; the Windows archive contains `rustpost/rustpost-cli.exe`.
-
-Example Unix user-local install:
-
-```sh
-# Linux checksum verification
-sha256sum -c rustpost-linux-x86_64.tar.gz.sha256
-# macOS checksum verification uses: shasum -a 256 -c <archive>.sha256
-tar -xzf rustpost-linux-x86_64.tar.gz
-install -m 0755 rustpost/rustpost-cli "$HOME/.local/bin/rustpost-cli"
-rustpost-cli --version
-```
-
-Use an explicit `--data-dir` for installed deployments. Without it, RustPost places `rustpost-data` beside the executable.
+The current release is **[v1.0.0](https://github.com/csd113/RustPost/releases/tag/v1.0.0)**. It includes downloadable apps and the new Docker image. See the [changelog](CHANGELOG.md) for the full release notes.
 
 ### Run the container
 
-The multi-platform image is published at `ghcr.io/csd113/rustpost:1.0.0` for Linux amd64 and arm64. `ghcr.io/csd113/rustpost:latest` points to the same release. The image includes `ffmpeg` and runs as UID/GID `10001`.
+The Docker image packages RustPost and `ffmpeg`, the tool used to convert uploaded photos and videos. It supports Linux **amd64** and **arm64**, including Docker environments on compatible Windows and macOS computers.
+
+**1. Start RustPost.** Open a terminal and run:
 
 ```sh
 docker volume create rustpost-data
 docker run -d --name rustpost \
   -p 127.0.0.1:8080:8080 \
   -v rustpost-data:/data \
+  --restart unless-stopped \
   ghcr.io/csd113/rustpost:1.0.0
+```
+
+Docker downloads the image if needed. The `rustpost-data` volume holds your settings, accounts, posts, uploads, and backups, so they survive replacing the container. Keep this volume when upgrading.
+
+**2. Create your administrator account.** This account manages the site:
+
+```sh
 docker exec -it rustpost rustpost-cli --data-dir /data create-admin-interactive
 ```
 
-Open `http://127.0.0.1:8080`. The container stores settings, SQLite, uploads, backups, and Tor state in `/data`. On the first boot only, it creates `settings.toml` with `server.host = "0.0.0.0"` so Docker can forward port 8080. Existing settings are preserved; if you mount an existing data directory, set `server.host` to `0.0.0.0` yourself. For a bind mount, make the directory writable by UID/GID `10001`. Keep the published port bound to loopback unless you have configured a reverse proxy and appropriate public access settings.
+Follow the username and password prompts. Your password is hidden as you type.
 
-### First Run
+**3. Open [http://127.0.0.1:8080](http://127.0.0.1:8080)** in your browser and log in. This setup makes the site available on your computer only. To let others visit, follow [Making your site public](#making-your-site-public).
+
+Useful container commands:
 
 ```sh
-# Linux / macOS
+docker logs rustpost       # View startup messages and errors
+docker stop rustpost       # Stop the app
+docker start rustpost      # Start it again
+docker restart rustpost    # Reload after changing settings
+```
+
+Use `ghcr.io/csd113/rustpost:1.0.0` to select this release explicitly. The `latest` tag currently points to the same release, but can change when a newer version is published.
+
+For custom storage mounts, configuration, backups, and upgrades, see the [Docker guide](docs/docker.md).
+
+### Download the app
+
+Open the [v1.0.0 downloads](https://github.com/csd113/RustPost/releases/tag/v1.0.0) and choose the archive for your computer. Download its matching `.sha256` file too; it lets you check that the download is intact.
+
+| Computer | Archive |
+| --- | --- |
+| Linux, Intel/AMD 64-bit | `rustpost-linux-x86_64.tar.gz` |
+| Linux, ARM64 | `rustpost-linux-aarch64.tar.gz` |
+| macOS, Apple Silicon | `rustpost-macos-aarch64.tar.gz` |
+| Windows, Intel/AMD 64-bit | `rustpost-windows-x86_64.zip` |
+
+Check the archive before extracting it. For example, on Linux:
+
+```sh
+sha256sum -c rustpost-linux-x86_64.tar.gz.sha256
+tar -xzf rustpost-linux-x86_64.tar.gz
+```
+
+On macOS, use `shasum -a 256 -c rustpost-macos-aarch64.tar.gz.sha256`, then extract the archive. On Windows, compare `Get-FileHash .\rustpost-windows-x86_64.zip -Algorithm SHA256` with the checksum file, then extract the ZIP.
+
+From the folder where you extracted the archive, start the app:
+
+```sh
+# Linux or macOS
+./rustpost/rustpost-cli --data-dir ./rustpost-data serve
+```
+
+```powershell
+# Windows PowerShell
+.\rustpost\rustpost-cli.exe --data-dir .\rustpost-data serve
+```
+
+Follow the first-run administrator prompts. If no prompt appears, open a second terminal in the same folder and run:
+
+```sh
+./rustpost/rustpost-cli --data-dir ./rustpost-data create-admin-interactive
+```
+
+On Windows, use `.\rustpost\rustpost-cli.exe` instead. Then open [http://127.0.0.1:8080](http://127.0.0.1:8080) and log in.
+
+Installing `ffmpeg` is optional for downloaded apps. Without it, RustPost can serve allowed uploads in their original format.
+
+### Build from source
+
+With [Rust 1.91 or newer](https://rustup.rs/) installed, run these commands from the repository folder:
+
+```sh
+cargo build --release --locked
 ./target/release/rustpost-cli --data-dir ./rustpost-data serve
-
-# Windows (PowerShell)
-.\target\release\rustpost-cli.exe --data-dir .\rustpost-data serve
 ```
 
-> If no subcommand is provided, `serve` is assumed.
+Follow the first-run administrator prompts, then open [http://127.0.0.1:8080](http://127.0.0.1:8080). On Windows, the executable is `.\target\release\rustpost-cli.exe`.
 
-On first boot, RustPost initializes the data directory automatically:
+## Using your site
 
-```
-rustpost-data/
-├── settings.toml          ← generated config with safe defaults
-├── db/
-│   ├── rustpost.sqlite3   ← main database
-│   ├── rustpost.sqlite3-wal
-│   └── rustpost.sqlite3-shm
-├── uploads/
-│   ├── originals/
-│   ├── images/
-│   ├── videos/
-│   └── thumbs/
-├── assets/
-├── tmp/
-│   └── uploads/           ← interrupted upload staging only
-├── backups/
-├── logs/
-└── tor/
-    └── onion-service/
-```
+After logging in, use the post box to share an update. Open a post to read or write replies, or visit someone's profile to follow them. The Home Feed shows public posts from your site; replies appear in their conversations.
 
-> **Note:** All runtime paths are derived from `--data-dir` (or the executable location as fallback). RustPost does not rely on the current working directory.
-> Runtime data is local operator state. Databases, uploads, logs, backups, Tor key material, and temporary upload files under `rustpost-data/` should not be committed to git. On Unix, RustPost restricts the runtime data directory to mode `0700`.
-> Existing data directories that still contain `app.sqlite3` at the data-dir root are migrated to `db/rustpost.sqlite3` on startup. If both old and new database files exist, RustPost stops with a conflict error and does not overwrite either file.
+Use **Settings** to edit your profile and account preferences. Administrators also have an **Admin** area for users, site announcements, maintenance mode, media status, and backups.
 
-### Create Your First Admin
+Registration is enabled by default. Anonymous posting is disabled by default.
 
-If `admin.create_admin_on_first_boot` is enabled and no admin exists, interactive `serve` startup enters a `Create admin account` step before the server begins accepting requests. If stdin is not interactive, RustPost prints the bootstrap commands instead of waiting for input. Startup then prints the data directory, settings path, database path, upload/media paths, log path, backup path, bind address, local URL, and whether an admin account exists.
+## Settings and administration
 
-You can also create the first admin explicitly. The preferred local setup path hides the password while you type:
+RustPost creates a `settings.toml` file on first run. This is a plain text settings file; its comments explain each option. Edit the existing entries and restart RustPost to apply file changes.
+
+- **Docker:** the file is `/data/settings.toml` inside the saved volume. See [Editing Docker settings](docs/docker.md#editing-settings).
+- **Downloaded or source-built app:** the examples above save it at `rustpost-data/settings.toml`.
+
+For example, change `name` under `[site]` to rename your community, or set `registration_enabled = false` under `[accounts]` to close new signups. Detailed settings are in the [operator guide](docs/operator-guide.md#configuration).
+
+Always use the same `--data-dir` when starting the app or running administrator commands. That folder contains the database, uploads, settings, and other site files. Keep it private and out of Git.
+
+### Making your site public
+
+The setup examples above accept visits from your own computer. For a public site, use a server and a reverse proxy—a service that provides HTTPS and forwards visitors to RustPost.
+
+Set `server.public_url` to your HTTPS address and `server.cookie_secure = true`. Keep the app's port private behind the proxy. IP-based rate limits use the direct connection address, so visitors behind a proxy can share a limit. The [operator guide](docs/operator-guide.md#security-model) and generated settings explain the security controls.
+
+The Docker image sets its internal listener to `0.0.0.0` on first boot so port forwarding works. The example still keeps the published port on your computer's loopback address, `127.0.0.1`.
+
+### Backups
+
+Use **Admin → Backups** to create and download a backup, configure automatic backups, or restore an archive. Automatic backups are off by default. Keep a copy outside the computer running RustPost.
+
+You can also create a backup from the terminal:
 
 ```sh
-./target/release/rustpost-cli --data-dir ./rustpost-data create-admin-interactive
+# Docker
+docker exec rustpost rustpost-cli --data-dir /data backup
+
+# Downloaded app (Linux or macOS)
+./rustpost/rustpost-cli --data-dir ./rustpost-data backup
 ```
 
-For scripted deployments, the non-interactive command is still available. After setting `RUSTPOST_ADMIN_PASSWORD` from the deployment's secret source, run the following. Be aware that command-line arguments can be visible to other local processes on some systems:
+Backups include the database, settings, and media. Tor private keys are excluded unless you explicitly include them. **Restart RustPost after restoring through the admin page.** See the [backup and restore reference](docs/operator-guide.md#backup-and-restore) for restore commands and safeguards.
 
-```sh
-./target/release/rustpost-cli --data-dir ./rustpost-data create-admin alice "$RUSTPOST_ADMIN_PASSWORD"
-```
+## Documentation
 
-Then open [http://127.0.0.1:8080](http://127.0.0.1:8080) and log in.
+| Guide | What it covers |
+| --- | --- |
+| [Docker guide](docs/docker.md) | Persistent storage, editing settings, backups, and replacing the container |
+| [Operator guide](docs/operator-guide.md) | Commands, detailed settings, security controls, Tor, media, and release verification |
+| [Account and site features](docs/account-and-instance-features.md) | Protected accounts, account transfers and deletion, announcements, and maintenance mode |
+| [Local demo](docs/demo-preview.md) | Sample accounts and how to reproduce the screenshots |
+| [Changelog](CHANGELOG.md) | Changes in each release |
 
-### Timeline
+### Current limitations
 
-| Label | Meaning |
-|---|---|
-| Home Feed | Public top-level posts from your configured site |
+RustPost is designed for a single site and does not connect to federated social networks. Media conversion happens during upload, so large files can take time. Search is basic, some reporting and moderation tools are limited, and broader accessibility review is still pending.
 
-Replies remain attached to their parent thread. They render inside the thread view and are not shown as unrelated top-level Home Feed posts.
+The v1.0.0 release also has a documented upstream dependency advisory and maintenance warnings from its Tor libraries. Read the [release verification notes](docs/operator-guide.md#release-verification), including the accepted `RUSTSEC-2023-0071` exception, before deploying. Tor support does not guarantee anonymity; verify access from a separate Tor client if you rely on it.
 
----
+## Development
 
-## 🖥 CLI Reference
+The app is written in Rust, uses SQLite for local storage, and serves HTML directly. No frontend build step is needed.
 
-```sh
-rustpost-cli init                                       # Initialize data directory
-rustpost-cli check                                      # Validate config, data directory, and DB schema status
-rustpost-cli create-admin <username> <password>         # Create an admin account
-rustpost-cli create-admin-interactive                   # Create an admin with hidden password prompts
-rustpost-cli reset-admin-password <username> <password> # Reset an admin's password
-rustpost-cli seed-demo                                  # Seed a guarded local demo instance under target/debug/rustpost-demo
-rustpost-cli serve                                      # Start the HTTP server (default)
-rustpost-cli backup                                     # Create a backup archive
-rustpost-cli backup --include-tor-keys                  # Backup including Tor private keys
-rustpost-cli restore <archive.tar>                      # Restore from a backup
-rustpost-cli restore <archive.tar> --include-tor-keys   # Restore including Tor keys
-```
-
----
-
-## ⚙ Configuration
-
-`settings.toml` is generated on first run with conservative, safe defaults. Edit it to match your deployment.
-
-### Site name
-
-The visible site name is configured in `settings.toml`:
-
-```toml
-[site]
-name = "RustPost"
-```
-
-Changing `site.name` updates the rendered browser title, header brand, footer, and user-facing site copy. The executable remains `rustpost-cli`; package names, cookie names, and data paths remain `rustpost` for compatibility.
-
-### Account creation
-
-```toml
-[accounts]
-registration_enabled = true
-registration_captcha_enabled = false
-```
-
-`registration_captcha_enabled` adds a single-use CAPTCHA challenge to registration only. Login is unchanged.
-
-### Account lifecycle
-
-```toml
-[accounts]
-deletion_grace_period_days = 30
-max_archive_upload_bytes = 314572800
-max_archive_expanded_bytes = 1073741824
-max_archive_entries = 10000
-```
-
-Deleting an account stores a deletion deadline instead of removing data immediately; the owner can cancel until the deadline, and finalization runs from the maintenance scheduler (including after a restart). The default is 30 days; `0` deletes immediately after password confirmation.
-
-The three archive ceilings are independent and documented in [docs/account-and-instance-features.md](docs/account-and-instance-features.md): the compressed upload/export size, the total decompressed media size accepted during import, and the entry count. The `/settings/import` body limit is derived from the compressed ceiling plus a small multipart allowance, so archive imports never depend on the global media body limit, and an oversized upload is rejected with a clear `413` page before any account state changes.
-
-Announcements and maintenance mode are managed from the admin dashboard and stored in the database, so they survive restarts and are included in backups. See [docs/account-and-instance-features.md](docs/account-and-instance-features.md) for the full behavior and policy details.
-
-### Post editing
-
-```toml
-[posts]
-post_edit_window_seconds = 15
-```
-
-Users can edit their own post text only during this short server-enforced window. The default is 15 seconds; set it to `0` to disable post editing.
-
-### Clearnet only (default)
-
-```toml
-[server]
-host = "127.0.0.1"
-port = 8080
-cookie_secure = false   # set true when running behind HTTPS
-
-[tor]
-enabled = false
-tor_only = false
-```
-
-### Tor only
-
-```toml
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[tor]
-enabled = true
-tor_only = true                        # binds only the loopback Arti forwarder
-data_dir = "tor"
-onion_service_name = "microblog"
-bootstrap_timeout_secs = 120
-max_concurrent_streams = 512
-```
-
-### Dual mode (clearnet + onion simultaneously)
-
-```toml
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[tor]
-enabled = true
-tor_only = false                       # clearnet starts immediately; onion boots in background
-data_dir = "tor"
-onion_service_name = "microblog"
-bootstrap_timeout_secs = 120
-max_concurrent_streams = 512
-```
-
-### Rate limiting
-
-All limits are configured under `[moderation]`:
-
-```toml
-[moderation]
-posts_per_minute                    = 5
-replies_per_minute                  = 10
-reposts_per_minute                  = 10
-account_creations_per_ip_per_day    = 3
-failed_login_attempts_per_15m       = 10
-anonymous_posts_per_ip_per_hour     = 10
-```
-
-> Authenticated limits are keyed by user ID. Registration, failed login, and anonymous limits are keyed by direct peer IP. Forwarded headers are **not trusted by default**.
-
----
-
-## 🔒 Security Model
-
-| Control | Implementation |
-|---|---|
-| Passwords | Argon2id — never stored in plaintext |
-| Session cookies | HttpOnly · SameSite=Lax · `Secure` controlled by config |
-| CSRF | All state-changing authenticated routes require a CSRF token |
-| Output escaping | User content is HTML-escaped before rendering |
-| Upload safety | Filenames ignored; content sniffed; stored under fixed upload roots |
-| SVG | Not an allowed default upload type |
-| Admin routes | Require an admin session **and** CSRF protection |
-| Trusted proxies | Explicit config; forwarded headers are not blindly trusted |
-| Tor key material | Not stored in SQLite, not logged, not rendered in UI or admin health |
-
----
-
-## 🧅 Tor / Arti
-
-RustPost embeds [Arti](https://gitlab.torproject.org/tpo/core/arti) (the Rust Tor implementation) directly in the binary. No external `tor` daemon required.
-
-Embedded Arti provides an onion-service transport option, not an anonymity or security guarantee. Real onion reachability depends on Tor network access, bootstrap, descriptor publication, and client routing; verify reachability from a separate Tor client before relying on it.
-The active onion address is shown by the running server in its startup/status output, public header, and admin health page; it is not derived from configuration alone.
-
-**Behavior by config:**
-
-| `tor.enabled` | `tor_only` | Behavior |
-|---|---|---|
-| `false` | — | No Arti tasks started. Pure clearnet. |
-| `true` | `false` | Clearnet binds immediately. Arti onion service starts in background. If Tor fails, clearnet keeps running and admin health reports the error. |
-| `true` | `true` | Only a loopback listener is bound for Arti forwarding. Startup **fails** if Arti/onion startup fails. |
-
-**Current pinned Arti/Tor crates in `Cargo.toml`:**
-
-```
-arti-client      = 0.46.0   # bootstraps the embedded Tor client and onion service
-tor-hsservice    = 0.46.0   # onion-service config, handle, and rendezvous streams
-tor-proto        = 0.46.0   # inspect and accept incoming onion stream requests
-tor-cell         = 0.46.0   # cell-level protocol handling
-tor-rtcompat     = 0.46.0   # Tokio-compatible Arti runtime
-rustls           = 0.23     # ring crypto provider required by Arti's rustls stack
-```
-
-> **Dependency note:** `cargo tree -i libsqlite3-sys` should show exactly one version. RustPost uses `rusqlite` specifically to keep the `libsqlite3-sys` dependency unified with the Arti family.
-
-**Tor data layout:**
-
-```
-rustpost-data/tor/
-├── cache/                     ← Arti directory cache
-└── onion-service/
-    └── state/                 ← onion-service private keys (mode 0700 on Unix)
-```
-
-**Backups and Tor keys:**
-
-```sh
-rustpost-cli backup                          # excludes Tor keys (safe default)
-rustpost-cli backup --include-tor-keys       # opt-in to include keys
-rustpost-cli restore archive.tar             # rejects Tor key paths unless flag given
-rustpost-cli restore archive.tar --include-tor-keys
-```
-
-On Unix, the backup directory is mode `0700` and created backup archives are mode `0600`.
-Restore path validation rejects: absolute paths, traversal sequences, symlinks/hardlinks, duplicate entries, duplicate separators, Windows drive prefixes, backslash paths, encoded traversal or slash markers, and slash-like Unicode bypass characters.
-
-**Live/local Tor smoke validation:**
-
-- Start dual mode with a fresh explicit `--data-dir`, then confirm Arti bootstrap and onion descriptor publication in the logs.
-- Valid public local smoke endpoints are `/`, `/home`, `/login`, and `/register`. RustPost does not implement `/healthz` or `/readyz`; use the startup/status output and authenticated `/admin/health` page for operational status.
-- The active v3 onion hostname must contain 56 characters followed by `.onion`, and the same address must appear in startup/status output and the public Tor pill.
-- Confirm the printed loopback Arti forwarder target serves the same local page as the clearnet listener.
-- Onion-routed validation requires a reachable SOCKS proxy. Prefer Tor Browser at `127.0.0.1:9150`, then system Tor at `127.0.0.1:9050`:
-
-```sh
-if nc -z 127.0.0.1 9150; then
-  socks_proxy=127.0.0.1:9150
-elif nc -z 127.0.0.1 9050; then
-  socks_proxy=127.0.0.1:9050
-else
-  echo "SOCKS unavailable"
-fi
-
-test -n "${socks_proxy:-}" &&
-  curl --socks5-hostname "$socks_proxy" -fsS "http://<56-character-v3-address>.onion/"
-```
-
-No available SOCKS proxy is an environment limitation, not a RustPost product failure. The smoke can still validate Arti bootstrap, descriptor publication, UI onion-address consistency, local HTTP, and the loopback Arti forwarder.
-
----
-
-## 🎬 Media & FFmpeg
-
-RustPost **boots and runs without `ffmpeg`**. Conversion is optional and detected at runtime. Admin health reports whether `ffmpeg` is present and whether WebP/VP9 encoders are available.
-
-**When `ffmpeg` is detected:**
-
-- Images (JPEG, PNG, GIF, WebP) → converted to **WebP**
-- Videos (MP4, WebM, QuickTime) → converted to **WebM VP9** with `yuv420p` and explicit BT.709 color metadata to avoid browser playback issues
-- Image conversions: **120 s timeout**
-- Video conversions: **300 s timeout**
-- Conversion status (successes, fallbacks, stderr summaries) visible in admin media/health pages
-
-**When `ffmpeg` is absent or conversion fails:** RustPost serves the original upload, provided it is an allowed content type.
-
-Profile pictures and banners follow the same media pipeline as post uploads.
-
----
-
-## 💾 Backup & Restore
-
-```sh
-# Create a backup (SQLite DB snapshot + settings + media/assets)
-rustpost-cli backup
-
-# Include Tor onion-service keys
-rustpost-cli backup --include-tor-keys
-
-# Restore into a fresh data directory
-rustpost-cli restore rustpost-20260526T....tar
-
-# Restore including Tor keys
-rustpost-cli restore rustpost-20260526T....tar --include-tor-keys
-```
-
-Backups are also available from **Admin → Backups**. The page supports manual backup creation, admin-only downloads, restore from uploaded `.tar` archives, automatic backup settings, safe retention controls, recent archive history, and no-JS form flows.
-
-Archive format:
-
-- Tar entries are written in deterministic order with normalized header metadata.
-- `manifest.toml` records the RustPost version, DB schema version, created timestamp, included components, runtime-relative paths, file sizes, SHA-256 hashes, and whether Tor keys are included.
-- The durable runtime state covered by the format is `db/rustpost.sqlite3`, `settings.toml`, `uploads/originals`, `uploads/images`, `uploads/videos`, `uploads/thumbs`, `assets`, and required empty runtime directories.
-- Runtime `tmp`, `logs`, `backups`, cache junk, Playwright artifacts, symlinks, and non-durable files are not included.
-- Tor onion-service private keys are excluded by default. `--include-tor-keys` or the admin checkbox is required to include or restore them. Restored Tor key files are permission-restricted on Unix.
-
-Restore safety:
-
-- Backups are treated as hostile input. RustPost validates the manifest, hashes, entry types, paths, settings file, SQLite integrity, foreign keys, and schema compatibility before touching live runtime files.
-- Restore stages into `tmp/`, creates a pre-restore safety backup, then swaps approved runtime roots. On failure it rolls back moved live paths and leaves the old runtime in place.
-- Concurrent backup/restore attempts are rejected with a lock under `tmp/`.
-- Admin-upload restore writes the restored files for the runtime, but the already-running process keeps its existing SQLite connection. Restart RustPost after a successful admin restore so it reopens the restored database and settings.
-
-Automatic backups:
-
-```toml
-[backup]
-enabled = true
-backup_dir = "backups"
-automatic_enabled = false
-automatic_interval_minutes = 1440
-retention_keep_last = 10
-retention_max_age_days = 30
-automatic_include_tor_keys = false
-```
-
-Automatic backups are disabled by default. Retention deletes only automatic archives (`rustpost-auto-*.tar`), always keeps the newest `retention_keep_last`, and never prunes manual or pre-restore safety backups.
-
----
-
-## 🧪 Development
-
-```sh
-cargo update                                                           # update dependencies
-cargo fmt --all --check                                                # check formatting
-cargo clippy --workspace --all-targets --all-features -- -D warnings  # lint
-cargo test --workspace --all-features                                  # run tests
-```
-
-### Local UI Regression Pass
-
-Run the app locally with a disposable data directory:
-
-```sh
-cargo build --workspace --all-features
-./target/debug/rustpost-cli --data-dir /tmp/rustpost-ui serve
-```
-
-Then open [http://127.0.0.1:8080](http://127.0.0.1:8080). The server initializes the data directory on first boot.
-
-**CI matrix** (GitHub Actions, Rust 1.91):
-
-| Platform | Arch |
-|---|---|
-| Linux | x86\_64 |
-| Linux | ARM64 |
-| macOS | Apple Silicon |
-| Windows | x86\_64 |
-
-CI runs: format check → Clippy → tests → release build. A separate strict Clippy job runs `clippy::all`, `clippy::pedantic`, `clippy::nursery`, and `clippy::cargo`.
-
-### Release Artifacts
-
-The `v1.0.0` tag triggers release builds for:
-
-```
-rustpost-linux-x86_64.tar.gz
-rustpost-linux-aarch64.tar.gz
-rustpost-macos-aarch64.tar.gz
-rustpost-windows-x86_64.zip
-```
-
-Each archive contains `rustpost-cli` (`rustpost-cli.exe` on Windows), `README.md`, `LICENSE`, and optional notice files. A `.sha256` checksum is generated for each archive. Runtime data (databases, uploads, backups, logs, Tor keys) is never included.
-
----
-
-## 📦 Dependencies
-
-| Crate | Role |
-|---|---|
-| `axum` | HTTP routing and multipart handling |
-| `tokio` | Async runtime, filesystem, process, and signals |
-| `rusqlite` | SQLite access via a dedicated DB worker; WAL, FK, baseline schema plus forward migrations |
-| `argon2` | Argon2id password hashing |
-| `getrandom` + `uuid` | OS-generated password salts and opaque generated tokens/filenames |
-| `infer` | Content-based media type detection |
-| `flate2` | Gzip response compression for browser text responses |
-| `tower-http` | Static upload serving and HTTP tracing |
-| `clap` | CLI argument parsing |
-| `toml` + `serde` | Config load/save |
-| `tar` + `walkdir` | Backup and restore archive handling |
-| `arti-client` | Bootstraps the embedded Tor client and onion service |
-| `tor-hsservice` | Onion-service config, running handle, and rendezvous streams |
-| `tor-proto` + `tor-cell` | Inspect and accept incoming onion stream requests |
-| `tor-rtcompat` | Tokio-compatible Arti runtime |
-| `rustls` | Ring crypto provider for Arti's rustls stack |
-| `tracing` | Privacy-conscious operational logging |
-
----
-
-## ✅ Release Verification
-
-*Live-flow sweep: **August 15, 2026**. Rust release gates and advisory review: **September 29, 2026**.*
-
-Release validation distinguishes the required Rust gates from the dependency-advisory review:
+Run the project's checks from the repository folder:
 
 ```sh
 cargo fmt --all --check
-cargo build --release --bins
 cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::all -D clippy::pedantic -D clippy::nursery -D clippy::cargo
 cargo test --workspace --all-features
-cargo audit
 ```
 
-The format, release build, strict Clippy, and test commands must pass. `cargo audit` is reviewed separately and is **not fully clean** for v1.0.0 because of this documented upstream exception:
+GitHub Actions also builds and tests on Linux x86_64, Linux ARM64, macOS Apple Silicon, and Windows x86_64. Use the [local demo guide](docs/demo-preview.md) to review the interface with sample content.
 
-> **Accepted v1.0.0 upstream audit exception:** `RUSTSEC-2023-0071` affects transitive `rsa 0.9.10` through the current pinned Arti/Tor dependency family. The advisory reports a potential key-recovery timing side channel, and no fixed upgrade is currently available. This is an upstream dependency risk, not a verified RustPost application vulnerability. Re-evaluate it when updating Arti or before the next release.
+## License
 
-`cargo audit` also reports unmaintained transitive `bincode 2.0.1` (`RUSTSEC-2025-0141`) and `paste 1.0.15` (`RUSTSEC-2024-0436`) dependencies inherited through the Arti dependency family. These are tracked as upstream maintenance caveats, not RustPost application vulnerabilities.
-
-<details>
-<summary>Verified locally</summary>
-
-- Fresh `--data-dir` boot creates `settings.toml`, `db/rustpost.sqlite3`, upload roots, temp upload staging, backup/log dirs, and Tor state dirs.
-- `rustpost-cli check` passes on a fresh data directory with `tor.enabled = false`.
-- Clearnet serving on `127.0.0.1:8080` loads `/home`.
-- Registration with CAPTCHA, login, post creation, replies, quote reposts, repost rendering, likes, bookmarks, followers/following pages, notifications, admin health, and CSRF-protected logout all work through live HTTP/browser flows.
-- Anonymous posting is disabled by default — anonymous users cannot see the composer and anonymous post attempts are rejected.
-- Non-admin users cannot access admin health; anonymous users cannot access authenticated pages.
-- `ffmpeg` 8.1.1 detected with WebP and VP9 support. Image, profile picture/banner, and small video uploads live-tested; WebP and WebM outputs produced; admin media/health pages reported conversion state correctly.
-- Normal backups include DB, settings, and media; exclude Tor keys. `--include-tor-keys` includes them only when explicitly requested. Restores into fresh data directories completed and `check` passed with and without controlled test Tor key material.
-- Backup archive names include subsecond precision — no same-second overwrite collisions.
-- Tor health/status fields render in admin health with Tor disabled in the current local sweep.
-- `rustpost-cli --version`, `rustpost-cli --help`, and `rustpost-cli check` report the final release CLI and pass on a fresh data directory.
-
-</details>
-
-<details>
-<summary>Partially verified / environment-dependent</summary>
-
-- Live Tor reachability depends on Tor network access, descriptor publication time, and a separate Tor client. The June 2026 live/local smoke verified embedded Arti bootstrap and descriptor publication; onion-over-SOCKS reachability remained untested because no local SOCKS proxy was available.
-- Tor private key material was not rendered in admin health or normal logs during the sweep. Operational text may reference key paths or the `--include-tor-keys` flag but does not print key contents.
-
-</details>
-
----
-
-## ⚠ Known Limitations
-
-- **Tor verification requires network access** — may time out in restricted build or CI environments.
-- **Onion virtual port** — HTTP virtual port 80 is mapped to the RustPost listener; custom onion virtual ports are not yet configurable.
-- **Synchronous media conversion** — conversion happens inline during upload; no background queue.
-- **Reports and admin toggles** — present in schema and admin structure but functionality is minimal in this release.
-- **Search** — uses SQLite FTS5 with simple user matching and fixed result limits; no ranking tuning yet.
-- **UI polish** — server-rendered HTML/CSS covers the core flows, but final visual design and broader accessibility review are still future work.
-
----
-
-## 📄 License
-
-See [LICENSE](./LICENSE) for terms.
-
----
-
-<div align="center">
-
-Built with Rust 🦀 · Powered by SQLite · Optional Tor via Arti
-
-[github.com/csd113/RustPost](https://github.com/csd113/RustPost)
-
-</div>
+RustPost is available under the [MIT License](LICENSE).
