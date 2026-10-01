@@ -1,0 +1,28 @@
+[Unit]
+Description=RustPost web application
+After=network-online.target rustpost-updater.service
+Wants=network-online.target
+Wants=rustpost-updater.service
+
+[Service]
+User=rustpost
+Group=rustpost
+Environment=RUSTPOST_MANAGED=1
+UMask=0007
+ExecStart=/opt/rustpost/current/rustpost-cli --data-dir /var/lib/rustpost --config /var/lib/rustpost/settings.toml serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/rustpost
+
+[Install]
+WantedBy=multi-user.target

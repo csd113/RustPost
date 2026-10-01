@@ -95,3 +95,11 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Build CLI
         run: cargo build --workspace --all-features --bin rustpost-cli
+
+  release-tools:
+    name: Signed update packaging tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release signatures and rejection paths
+        run: python3 tools/test-release-tools.py

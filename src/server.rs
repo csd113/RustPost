@@ -32,11 +32,20 @@ use crate::{
     render, social,
 };
 
+mod update_routes;
+pub use update_routes::UpdateHealth;
+use update_routes::{
+    admin_check_updates, admin_install_update, admin_update_status, admin_updates,
+    managed_update_guard, update_backup_panel, update_health, updater_script,
+};
+
 const CSRF_TOKEN_HISTORY_LIMIT: usize = 32;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
+    pub update_status: Arc<tokio::sync::Mutex<crate::updates::Status>>,
+    update_socket: Option<PathBuf>,
     configuration_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub settings: Settings,
     pub paths: RuntimePaths,
@@ -65,6 +74,11 @@ impl AppState {
         let nsfw_blur_default = settings.media.nsfw_blur_enabled;
         Arc::new(Self {
             pool,
+            update_status: Arc::new(tokio::sync::Mutex::new(crate::updates::Status {
+                installed: crate::updates::VERSION.into(),
+                ..crate::updates::Status::default()
+            })),
+            update_socket: crate::updates::managed().then(|| PathBuf::from(crate::updates::SOCKET)),
             configuration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             settings,
             paths,
@@ -297,7 +311,20 @@ pub fn spawn_maintenance_scheduler(
         const RATE_LIMIT_RETENTION_SECS: i64 = 2 * 60 * 60;
         const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(30);
         let mut first_cycle = true;
+        let update_socket =
+            crate::updates::managed().then(|| PathBuf::from(crate::updates::SOCKET));
         loop {
+            // Upgraded startup may migrate the DB, but it must not delete media
+            // before health verification: rollback preserves the old references.
+            if !crate::updates::mutations_allowed(update_socket.as_deref()).await {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() { break; }
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
+                continue;
+            }
             match crate::account::recover_pending_media_deletions(&paths).await {
                 Ok(0) => {}
                 Ok(recovered) => tracing::info!(
@@ -358,6 +385,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(home))
         .route("/assets/rustpost-boot.js", get(client_boot_script))
         .route("/assets/rustpost.js", get(client_script))
+        .route("/assets/rustpost-updates.js", get(updater_script))
         .route("/favicon.ico", get(site_favicon))
         .route("/local", get(local_redirect))
         .route("/home", get(home))
@@ -418,6 +446,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mentions", get(mention_suggestions))
         .route("/search", get(search))
         .route("/tags/{tag}", get(tag))
+        .route("/internal/update-health", get(update_health))
+        .route("/admin/updates", get(admin_updates))
+        .route("/admin/updates/status", get(admin_update_status))
+        .route("/admin/updates/check", post(admin_check_updates))
+        .route("/admin/updates/install", post(admin_install_update))
         .route("/admin", get(admin_dashboard))
         .route("/admin/users", get(admin_users))
         .route("/admin/users/{id}/suspend", post(admin_suspend))
@@ -483,6 +516,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         .layer(middleware::from_fn(
             crate::compression::response_compression,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            managed_update_guard,
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -862,6 +899,7 @@ async fn page_layout(
                 | "Media jobs"
                 | "Deep server settings"
                 | "Backups"
+                | "Software updates"
         ) {
         let navigation = [
             ("/admin", "Overview", "Admin"),
@@ -874,6 +912,7 @@ async fn page_layout(
                 "Deep server settings",
             ),
             ("/admin/backups", "Backups", "Backups"),
+            ("/admin/updates", "Updates", "Software updates"),
         ]
         .into_iter()
         .fold(String::new(), |mut links, (href, label, page)| {
@@ -4855,7 +4894,7 @@ async fn admin_dashboard(
             "Manage site health, users, media jobs, settings, and backups."
         ),
         saved_notice,
-        r#"<section class="grid admin-nav-grid"><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/health">Site health</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/users">Users</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/media">Media jobs</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/deep-settings">Deep server settings</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/backups">Backups</a></section>"#,
+        r#"<section class="grid admin-nav-grid"><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/health">Site health</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/users">Users</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/media">Media jobs</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/deep-settings">Deep server settings</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/backups">Backups</a><a class="panel admin-card admin-nav-card" data-testid="admin-card" href="/admin/updates">Software updates</a></section>"#,
         instance_panels,
         favicon_panel
     );
@@ -6305,7 +6344,7 @@ async fn backups_page_submission(
     let notice_html =
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
     let body = format!(
-        "{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}",
         notice_html,
         render::page_header(
             "Backups",
@@ -6315,6 +6354,7 @@ async fn backups_page_submission(
         render_automatic_backup_panel(csrf, &settings, submitted),
         render_backup_history(&archives, backup::operation_in_progress(&state.paths)),
         render_restore_panel(csrf),
+        update_backup_panel(state).await,
     );
     Ok(Html(
         page_layout(state, Some(user), Some(csrf), "Backups", &body).await?,
@@ -6597,6 +6637,7 @@ mod tests {
         data_dir: PathBuf,
         pool: SqlitePool,
         registration_captcha: RegistrationCaptchaStore,
+        update_status: Arc<tokio::sync::Mutex<crate::updates::Status>>,
         _task: tokio::task::JoinHandle<()>,
         _temp: tempfile::TempDir,
     }
@@ -6606,6 +6647,193 @@ mod tests {
         headers: Vec<(String, String)>,
         body_bytes: Vec<u8>,
         body: String,
+    }
+
+    #[tokio::test]
+    async fn software_updates_require_admin_csrf_password_and_post() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = get_with_cookie(&server, "/admin/updates", &cookie).await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("Software updates"));
+        assert!(page.body.contains("v1.0.0"));
+        let token = csrf_token(&page.body);
+        assert_eq!(
+            get_with_cookie(&server, "/admin/updates/install", &cookie)
+                .await
+                .status,
+            405
+        );
+        assert_eq!(
+            get_with_cookie(&server, "/admin/updates/check", &cookie)
+                .await
+                .status,
+            405
+        );
+        assert_eq!(
+            post_form_with_cookie(&server, "/admin/updates/check", &cookie, "csrf=invalid")
+                .await
+                .status,
+            403
+        );
+        let wrong = format!("csrf={}&approval=bogus&password=wrong", form_encode(&token));
+        assert_eq!(
+            post_form_with_cookie(&server, "/admin/updates/install", &cookie, &wrong)
+                .await
+                .status,
+            403
+        );
+        let correct = format!(
+            "csrf={}&approval=bogus&password=very%20secure%20password",
+            form_encode(&token)
+        );
+        assert_eq!(
+            post_form_with_cookie(&server, "/admin/updates/install", &cookie, &correct)
+                .await
+                .status,
+            400
+        );
+        let member_cookie = register_test_user(&server, "member").await;
+        for route in ["/admin/updates", "/admin/updates/status"] {
+            assert_eq!(
+                get_with_cookie(&server, route, &member_cookie).await.status,
+                403
+            );
+        }
+        assert_eq!(
+            post_form_with_cookie(&server, "/admin/updates/install", &member_cookie, &correct)
+                .await
+                .status,
+            403
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn software_update_admin_approval_crosses_restricted_ipc_once() {
+        use crate::updates::{Reply, Request as UpdateRequest, Status as UpdateStatus};
+        let temporary = tempfile::tempdir().expect("IPC fixture");
+        let socket = temporary.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("temporary socket");
+        let approval = Uuid::new_v4().to_string();
+        let expected_approval = approval.clone();
+        let installs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received_installs = installs.clone();
+        let daemon = tokio::spawn(async move {
+            loop {
+                let (mut client, _) = listener.accept().await.expect("accept");
+                let mut bytes = Vec::new();
+                client.read_to_end(&mut bytes).await.expect("request");
+                let request: UpdateRequest =
+                    serde_json::from_slice(&bytes).expect("closed IPC request");
+                let mut reply = Reply {
+                    status: UpdateStatus::default(),
+                    error: None,
+                    ready: true,
+                };
+                if let UpdateRequest::Install {
+                    approval,
+                    administrator,
+                } = request
+                {
+                    assert!(administrator > 0);
+                    assert_eq!(approval, expected_approval);
+                    if received_installs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                        reply.error = Some("Update approval was already consumed.".into());
+                    }
+                }
+                client
+                    .write_all(&serde_json::to_vec(&reply).expect("response"))
+                    .await
+                    .expect("write");
+            }
+        });
+        let server =
+            spawn_test_server_with_update_socket(true, Settings::default(), Some(socket)).await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = get_with_cookie(&server, "/admin/updates", &cookie).await;
+        let token = csrf_token(&page.body);
+        let body = format!(
+            "csrf={}&approval={}&password=very%20secure%20password",
+            form_encode(&token),
+            form_encode(&approval)
+        );
+        assert_eq!(
+            post_form_with_cookie(
+                &server,
+                "/admin/updates/install",
+                &cookie,
+                "csrf=bad&approval=bad&password=bad"
+            )
+            .await
+            .status,
+            403
+        );
+        assert_eq!(installs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            post_form_with_cookie(&server, "/admin/updates/install", &cookie, &body)
+                .await
+                .status,
+            303
+        );
+        assert_eq!(
+            post_form_with_cookie(&server, "/admin/updates/install", &cookie, &body)
+                .await
+                .status,
+            400
+        );
+        assert_eq!(installs.load(std::sync::atomic::Ordering::SeqCst), 2);
+        daemon.abort();
+    }
+
+    #[tokio::test]
+    async fn software_update_results_and_external_notes_render_safely() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        for phase in [
+            crate::updates::Phase::Succeeded,
+            crate::updates::Phase::RolledBack,
+            crate::updates::Phase::FailedManualIntervention,
+        ] {
+            *server.update_status.lock().await = crate::updates::Status {
+                phase,
+                job: Some("saved-test-job".into()),
+                previous_version: Some("1.0.0".into()),
+                target_version: Some("1.1.0".into()),
+                message: "Persisted transaction result".into(),
+                discovery: Some(crate::updates::Discovery::Available(Box::new(
+                    crate::updates::Release {
+                        id: 1,
+                        version: "1.1.0".into(),
+                        published_at: "today".into(),
+                        notes: "<script>alert(1)</script>".into(),
+                        manifest: None,
+                        size: Some(1024),
+                        compatible: false,
+                        verification: "Unverified".into(),
+                    },
+                ))),
+                ..crate::updates::Status::default()
+            };
+            let page = get_with_cookie(&server, "/admin/updates", &cookie).await;
+            assert_eq!(page.status, 200);
+            assert!(page.body.contains("Persisted transaction result"));
+            assert!(page.body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+            assert!(!page.body.contains("<script>alert(1)</script>"));
+            assert!(!page.body.contains("id=\"update-password\""));
+        }
+        let health = request(
+            &server.base_url,
+            "GET",
+            "/internal/update-health",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(health.status, 200);
+        let health: UpdateHealth = serde_json::from_str(&health.body).expect("health JSON");
+        assert!(health.ready);
+        assert_eq!(health.schema, crate::db::CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -11792,6 +12020,14 @@ mod tests {
     }
 
     async fn spawn_test_server_inner(create_admin: bool, settings: Settings) -> TestServer {
+        spawn_test_server_with_update_socket(create_admin, settings, None).await
+    }
+
+    async fn spawn_test_server_with_update_socket(
+        create_admin: bool,
+        settings: Settings,
+        socket: Option<PathBuf>,
+    ) -> TestServer {
         let temp = tempfile::tempdir().expect("temp dir");
         let paths = RuntimePaths::from_data_dir(temp.path().to_path_buf())
             .with_tor_data_dir(&settings.tor.data_dir)
@@ -11821,8 +12057,14 @@ mod tests {
             error: Some("disabled in tests".to_owned()),
         };
         let tor = crate::tor::validate_startup(&settings.tor);
-        let state = AppState::new(pool.clone(), settings, paths, ffmpeg, tor);
+        let mut state = AppState::new(pool.clone(), settings, paths, ffmpeg, tor);
+        if let Some(socket) = socket {
+            Arc::get_mut(&mut state)
+                .expect("unshared test state")
+                .update_socket = Some(socket);
+        }
         let registration_captcha = state.registration_captcha.clone();
+        let update_status = state.update_status.clone();
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -11841,6 +12083,7 @@ mod tests {
             data_dir,
             pool,
             registration_captcha,
+            update_status,
             _task: task,
             _temp: temp,
         }

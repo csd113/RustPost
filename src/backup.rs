@@ -219,7 +219,18 @@ pub fn spawn_automatic_scheduler(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
+        let update_socket =
+            crate::updates::managed().then(|| PathBuf::from(crate::updates::SOCKET));
         loop {
+            if !crate::updates::mutations_allowed(update_socket.as_deref()).await {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() { break; }
+                    }
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                continue;
+            }
             match Settings::load(&settings_path).and_then(|settings| {
                 settings.validate()?;
                 run_automatic_backup_if_due(&base_paths, &settings)
@@ -1338,16 +1349,35 @@ fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Cross-process coordination between ordinary backups/restores and updates.
+/// OS locking releases on interruption; the file itself is never removed.
+pub(crate) fn update_coordination_lock(paths: &RuntimePaths) -> anyhow::Result<File> {
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.tmp_dir.join("update-coordination.lock"))?;
+    file.try_lock()
+        .with_context(|| "another backup, restore, or update is running")?;
+    Ok(file)
+}
+
 struct OperationLock {
     path: PathBuf,
+    _coordination: File,
 }
 
 impl OperationLock {
     fn acquire(paths: &RuntimePaths) -> anyhow::Result<Self> {
         fs::create_dir_all(&paths.tmp_dir)?;
+        let coordination = update_coordination_lock(paths)?;
         let path = paths.tmp_dir.join(LOCK_DIR);
         match fs::create_dir(&path) {
-            Ok(()) => Ok(Self { path }),
+            Ok(()) => Ok(Self {
+                path,
+                _coordination: coordination,
+            }),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 anyhow::bail!("another backup or restore is already running");
             }

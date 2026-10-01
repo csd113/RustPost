@@ -230,3 +230,7 @@ GitHub Actions also builds and tests on Linux x86_64, Linux ARM64, macOS Apple S
 ## License
 
 RustPost is available under the [MIT License](LICENSE).
+
+### Administrator software updates
+
+[Software update guide](docs/software-updates.md) covers panel checks, signed native Linux installation, mandatory verified backups, automatic rollback, restricted updater deployment, and release-signing setup. Containers and unmanaged installations use their deployment mechanism.

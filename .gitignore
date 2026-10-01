@@ -85,3 +85,9 @@ uploads/**/*
 !/tests/playwright/configuration-admin.spec.mjs
 !/tests/playwright/configuration-admin.config.mjs
 !/tests/playwright/configuration-admin.helpers.mjs
+
+# Durable software-update browser regression suite
+!/tests/playwright/software-updates.spec.mjs
+!/tests/playwright/software-updates.config.mjs
+
+!tests/playwright/software-updates.helpers.mjs

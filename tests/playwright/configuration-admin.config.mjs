@@ -10,7 +10,7 @@ export default defineConfig({
   projects: [
     { name: 'chromium', use: { browserName: 'chromium' } },
     { name: 'chromium-no-js', use: { browserName: 'chromium', javaScriptEnabled: false } },
-    { name: 'firefox-no-js', use: { browserName: 'firefox', javaScriptEnabled: false } },
+    { name: 'firefox-no-js', use: { browserName: 'firefox', javaScriptEnabled: false, ...(process.env.RUSTPOST_FIREFOX_EXECUTABLE ? { launchOptions: { executablePath: process.env.RUSTPOST_FIREFOX_EXECUTABLE } } : {}) } },
     { name: 'webkit', use: { browserName: 'webkit' } },
   ],
 });

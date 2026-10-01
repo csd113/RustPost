@@ -43,3 +43,5 @@ pub mod terminal;
 pub mod tor;
 pub mod validation;
 pub mod youtube;
+
+pub mod updates;

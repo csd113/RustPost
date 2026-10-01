@@ -14,6 +14,10 @@ autobins = false
 name = "rustpost-cli"
 path = "src/bin/rustpost-cli.rs"
 
+[[bin]]
+name = "rustpost-updater"
+path = "src/bin/rustpost-updater.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 arti-client = { version = "=0.46.0", default-features = false, features = ["tokio", "rustls", "onion-service-service"] }
@@ -31,6 +35,9 @@ getrandom = "0.4.3"
 safelog = "0.9.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+semver = "1.0.28"
+ring = "0.17.14"
+rustix = { version = "1.1.5", features = ["fs"] }
 sha2 = "0.11.0"
 rusqlite = { version = "0.36.0", features = ["bundled", "functions"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring"] }

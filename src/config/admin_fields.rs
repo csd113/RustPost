@@ -340,7 +340,7 @@ mod tests {
             .iter()
             .map(|(key, reason)| {
                 assert!(!reason.is_empty());
-                key.to_string()
+                (*key).to_string()
             })
             .collect();
         assert_eq!(

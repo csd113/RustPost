@@ -10,6 +10,8 @@ pub enum Scope {
     FailedLogin,
     Registration,
     AnonymousPost,
+    UpdateCheck,
+    UpdateReauthentication,
 }
 
 impl Scope {
@@ -22,6 +24,8 @@ impl Scope {
             Self::FailedLogin => "failed_login",
             Self::Registration => "registration",
             Self::AnonymousPost => "anonymous_post",
+            Self::UpdateCheck => "update_check",
+            Self::UpdateReauthentication => "update_reauthentication",
         }
     }
 }

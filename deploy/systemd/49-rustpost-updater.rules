@@ -1,0 +1,10 @@
+// Only the updater account can start/stop the single installed RustPost unit.
+// The web account gets no systemd/polkit authority.
+polkit.addRule(function(action, subject) {
+    if (subject.user === "rustpost-updater" &&
+        action.id === "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") === "rustpost.service" &&
+        (action.lookup("verb") === "start" || action.lookup("verb") === "stop")) {
+        return polkit.Result.YES;
+    }
+});
