@@ -37,6 +37,7 @@ const CSRF_TOKEN_HISTORY_LIMIT: usize = 32;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
+    configuration_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub settings: Settings,
     pub paths: RuntimePaths,
     pub ffmpeg: FfmpegStatus,
@@ -64,6 +65,7 @@ impl AppState {
         let nsfw_blur_default = settings.media.nsfw_blur_enabled;
         Arc::new(Self {
             pool,
+            configuration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             settings,
             paths,
             ffmpeg,
@@ -850,6 +852,46 @@ async fn page_layout(
     body: &str,
 ) -> AppResult<String> {
     let context = layout_context(state, user).await?;
+    let admin_body;
+    let body = if user.is_some_and(|user| user.is_admin)
+        && matches!(
+            title,
+            "Admin"
+                | "Site health"
+                | "Admin users"
+                | "Media jobs"
+                | "Deep server settings"
+                | "Backups"
+        ) {
+        let navigation = [
+            ("/admin", "Overview", "Admin"),
+            ("/admin/health", "Site health", "Site health"),
+            ("/admin/users", "Users", "Admin users"),
+            ("/admin/media", "Media jobs", "Media jobs"),
+            (
+                "/admin/deep-settings",
+                "Configuration",
+                "Deep server settings",
+            ),
+            ("/admin/backups", "Backups", "Backups"),
+        ]
+        .into_iter()
+        .fold(String::new(), |mut links, (href, label, page)| {
+            let current = if title == page {
+                " aria-current=\"page\""
+            } else {
+                ""
+            };
+            let _ = write!(links, r#"<a href="{href}"{current}>{label}</a>"#);
+            links
+        });
+        admin_body = format!(
+            r#"<nav class="admin-console-nav" aria-label="Administration">{navigation}</nav>{body}"#
+        );
+        &admin_body
+    } else {
+        body
+    };
     Ok(render::layout_with_context(
         user,
         csrf,
@@ -5383,10 +5425,14 @@ async fn admin_deep_settings(
 ) -> AppResult<Html<String>> {
     let user = require_admin(&state, &headers).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let _configuration_guard = state.configuration_write_lock.lock().await;
     let current = load_deep_settings(&state)?;
     let values = admin::DeepSettingsValues::from_settings(&current);
     let notice = if query.saved.is_some() {
-        Some(("success", "Settings saved successfully"))
+        Some((
+            "success",
+            "Settings saved successfully. Restart required for startup settings; blur applies immediately and backup policy takes effect on the next check.",
+        ))
     } else if query.discarded.is_some() {
         Some(("info", "Changes discarded."))
     } else {
@@ -5404,6 +5450,7 @@ async fn admin_deep_settings_update(
     let user = require_admin(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let _configuration_guard = state.configuration_write_lock.lock().await;
     let current = load_deep_settings(&state)?;
     if form.intent.as_deref() == Some("discard") {
         let values = admin::DeepSettingsValues::from_settings(&current);
@@ -5411,12 +5458,34 @@ async fn admin_deep_settings_update(
         return deep_settings_html(&state, &user, &csrf, &body).await;
     }
 
+    if form.revision.as_ref().is_none_or(|revision| {
+        configuration_revision(&state).map_or(true, |current| &current != revision)
+    }) {
+        let values = admin::DeepSettingsValues::from_settings(&current);
+        let body = render_deep_settings_submission(
+            &csrf,
+            &values,
+            Some((
+                "error",
+                "Settings changed since this form was opened. Reload the page and review the latest values before saving.",
+            )),
+            None,
+        );
+        return deep_settings_html(&state, &user, &csrf, &body).await;
+    }
+    if !matches!(form.intent.as_deref(), Some("preview" | "confirm")) {
+        return Err(AppError::BadRequest("Unknown settings action".to_owned()));
+    }
     let values = match admin::parse_deep_settings_form(&form, &current) {
         Ok(values) => values,
         Err(err) => {
             let fallback = admin::DeepSettingsValues::from_settings(&current);
-            let body =
-                render_deep_settings_form(&csrf, &fallback, Some(("error", &err.to_string())));
+            let body = render_deep_settings_submission(
+                &csrf,
+                &fallback,
+                Some(("error", &err.to_string())),
+                Some(&form),
+            );
             return deep_settings_html(&state, &user, &csrf, &body).await;
         }
     };
@@ -5458,7 +5527,10 @@ async fn admin_deep_settings_update(
         let body = render_deep_settings_form(
             &csrf,
             &values,
-            Some(("success", "Settings saved successfully")),
+            Some((
+                "success",
+                "Settings saved successfully. Restart required for startup settings; blur applies immediately and backup policy takes effect on the next check.",
+            )),
         );
         return deep_settings_html(&state, &user, &csrf, &body).await;
     }
@@ -5467,14 +5539,81 @@ async fn admin_deep_settings_update(
     deep_settings_html(&state, &user, &csrf, &body).await
 }
 
+fn configuration_revision(state: &AppState) -> AppResult<String> {
+    use sha2::{Digest as _, Sha256};
+    let raw = std::fs::read(&state.paths.settings_path)?;
+    Ok(Sha256::digest(&raw)
+        .iter()
+        .fold(String::new(), |mut output, byte| {
+            let _ = write!(output, "{byte:02x}");
+            output
+        }))
+}
+
 async fn deep_settings_html(
     state: &AppState,
     user: &CurrentUser,
     csrf: &str,
     body: &str,
 ) -> AppResult<Html<String>> {
+    let revision = configuration_revision(state)?;
+    let body = body.replace(r#"<input type="hidden" name="csrf""#,
+        &format!(r#"<input type="hidden" name="revision" value="{revision}"><input type="hidden" name="csrf""#));
+    let settings = load_deep_settings(state)?;
+    let configured = admin::DeepSettingsValues::from_settings(&settings);
+    let running = admin::DeepSettingsValues::from_settings(&state.settings);
+    let mut body = body;
+    for field in admin::DeepSettingsField::ALL {
+        if !field.applies_live() && configured.form_value(field) != running.form_value(field) {
+            let marker = format!(
+                r#"id="deep-{}-help" class="muted field-help">"#,
+                field.form_name()
+            );
+            let effective = format!(
+                "{marker}<strong>Restart pending. Running value: {}.</strong> ",
+                html_escape::encode_text(&running.form_value(field))
+            );
+            body = body.replace(&marker, &effective);
+        }
+    }
+    for (key, value) in [
+        ("media.ffmpeg_path", settings.media.ffmpeg_path.as_str()),
+        ("tor.data_dir", settings.tor.data_dir.as_str()),
+        ("backup.backup_dir", settings.backup.backup_dir.as_str()),
+        (
+            "tor.include_tor_keys_in_backups_by_default",
+            if settings.tor.include_tor_keys_in_backups_by_default {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+    ] {
+        let marker = format!("<strong>{key}</strong>:");
+        body = body.replace(
+            &marker,
+            &format!(
+                "{marker} Configured value: <code>{}</code>. ",
+                html_escape::encode_text(value)
+            ),
+        );
+    }
+    let source = format!(
+        r#"<section class="panel configuration-source"><p>Source: <strong>{}</strong>. No environment or CLI value overrides apply to these settings. CLI options select the configuration file and data directory.</p><p>Stored values are shown below. Startup settings keep their running values until restart.</p></section>"#,
+        html_escape::encode_text(&state.paths.settings_path.display().to_string())
+    );
     Ok(Html(
-        page_layout(state, Some(user), Some(csrf), "Deep server settings", body).await?,
+        page_layout(
+            state,
+            Some(user),
+            Some(csrf),
+            "Deep server settings",
+            &body.replace(
+                r#"<nav class="settings-category-nav""#,
+                &format!(r#"{source}<nav class="settings-category-nav""#),
+            ),
+        )
+        .await?,
     ))
 }
 
@@ -5489,71 +5628,169 @@ fn render_deep_settings_form(
     values: &admin::DeepSettingsValues,
     notice: Option<(&str, &str)>,
 ) -> String {
-    let notice_html =
-        notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
-    let fields = render_deep_settings_groups(values);
-    format!(
-        r#"{notice_html}<section class="panel admin-card deep-settings-panel" data-testid="admin-card"><div class="settings-editor-bar"><div><h1>Deep server settings</h1><p class="muted">Durable settings from settings.toml. Saved changes require a RustPost restart before this running server uses them.</p></div><button class="primary" type="submit" form="deep-settings-form">Save</button></div><form id="deep-settings-form" method="post" action="/admin/deep-settings" class="deep-settings-form"><input type="hidden" name="csrf" value="{}">{fields}<input type="hidden" name="intent" value="preview"></form></section>"#,
-        html_escape::encode_double_quoted_attribute(csrf),
-    )
+    render_deep_settings_submission(csrf, values, notice, None)
 }
 
-fn render_deep_settings_groups(values: &admin::DeepSettingsValues) -> String {
-    let mut body = String::new();
+fn render_deep_settings_submission(
+    csrf: &str,
+    values: &admin::DeepSettingsValues,
+    notice: Option<(&str, &str)>,
+    submitted: Option<&admin::DeepSettingsForm>,
+) -> String {
+    let notice_html = notice.map_or_else(String::new, |(kind, message)| {
+        format!(
+            r#"<div id="settings-error">{}</div>"#,
+            render::notice(kind, message)
+        )
+    });
+    let defaults = admin::DeepSettingsValues::from_settings(&Settings::default());
+    let mut fields = String::new();
+    let mut navigation = String::new();
     let mut active_section = "";
     for field in admin::DeepSettingsField::ALL {
         if field.section() != active_section {
             if !active_section.is_empty() {
-                body.push_str("</fieldset>");
+                fields.push_str("</fieldset>");
             }
             active_section = field.section();
             let _ = write!(
-                body,
-                r#"<fieldset class="deep-settings-group"><legend>{}</legend>"#,
+                fields,
+                r#"<fieldset id="settings-{}" class="deep-settings-group"><legend>{}</legend>"#,
+                field.toml_section(),
+                html_escape::encode_text(active_section)
+            );
+            let _ = write!(
+                navigation,
+                r##"<a href="#settings-{}">{}</a>"##,
+                field.toml_section(),
                 html_escape::encode_text(active_section)
             );
         }
-        body.push_str(&render_deep_settings_field(field, values));
+        fields.push_str(&render_deep_settings_field(
+            field,
+            values,
+            submitted,
+            notice
+                .filter(|(kind, _)| *kind == "error")
+                .map(|(_, message)| message),
+            &defaults,
+        ));
     }
-    if !active_section.is_empty() {
-        body.push_str("</fieldset>");
-    }
-    body
+    fields.push_str("</fieldset>");
+    let exclusions = crate::config::admin_fields::NON_WEB_SETTINGS.iter().fold(
+        String::new(),
+        |mut items, (key, reason)| {
+            let _ = write!(
+                items,
+                "<li><strong>{}</strong>: {}</li>",
+                html_escape::encode_text(key),
+                html_escape::encode_text(reason)
+            );
+            items
+        },
+    );
+    format!(
+        r#"{notice_html}<section class="panel admin-card deep-settings-panel" data-testid="admin-card"><div class="settings-editor-bar"><div><h1>Deep server settings</h1><p class="muted">View configured values from settings.toml, then review changes before saving. Each setting shows when it takes effect.</p></div><button class="primary" type="submit" form="deep-settings-form">Save</button></div><nav class="settings-category-nav" aria-label="Settings categories">{navigation}</nav><div class="settings-search" hidden><label for="settings-search">Find a setting</label><input id="settings-search" type="search" placeholder="Registration, upload size, rate limit…"><p id="settings-search-status" role="status"></p></div><form id="deep-settings-form" method="post" action="/admin/deep-settings" class="deep-settings-form"><input type="hidden" name="csrf" value="{}">{fields}<input type="hidden" name="intent" value="preview"><div class="settings-form-actions"><button class="primary" type="submit">Review changes</button></div></form><details class="deployment-settings"><summary>Deployment-managed settings</summary><p>These four settings remain in the configuration file for the following reasons.</p><ul>{exclusions}</ul><p>Database credentials and master keys are not TOML options. Onion private keys and password hashes are never returned by this editor.</p></details></section>"#,
+        html_escape::encode_double_quoted_attribute(csrf),
+    )
 }
 
 fn render_deep_settings_field(
     field: admin::DeepSettingsField,
     values: &admin::DeepSettingsValues,
+    submitted: Option<&admin::DeepSettingsForm>,
+    error: Option<&str>,
+    defaults: &admin::DeepSettingsValues,
 ) -> String {
     let name = field.form_name();
     let id = format!("deep-{name}");
-    let value = values.form_value(field);
+    let value = submitted.map_or_else(
+        || values.form_value(field),
+        |form| form.submitted_value(field).to_owned(),
+    );
+    let escaped = html_escape::encode_double_quoted_attribute(&value);
+    let described = format!(
+        r#"aria-describedby="{id}-help{}""#,
+        if submitted.is_some() {
+            " settings-error"
+        } else {
+            ""
+        }
+    );
+    let described = if error.is_some_and(|message| message.starts_with(field.label())) {
+        format!("{described} aria-invalid=\"true\"")
+    } else {
+        described
+    };
     let control = match field.input_kind() {
-        admin::DeepSettingsInputKind::Text => format!(
-            r#"<input id="{id}" name="{name}" type="text" value="{}">"#,
-            html_escape::encode_double_quoted_attribute(&value),
-        ),
-        admin::DeepSettingsInputKind::Number => format!(
-            r#"<input id="{id}" name="{name}" type="text" inputmode="numeric" pattern="[0-9]+" value="{}">"#,
-            html_escape::encode_double_quoted_attribute(&value),
-        ),
-        admin::DeepSettingsInputKind::Boolean => {
-            let true_selected = if value == "true" { " selected" } else { "" };
-            let false_selected = if value == "false" { " selected" } else { "" };
+        admin::DeepSettingsInputKind::Text | admin::DeepSettingsInputKind::Url => {
+            let kind = if field.input_kind() == admin::DeepSettingsInputKind::Url {
+                "url"
+            } else {
+                "text"
+            };
             format!(
-                r#"<select id="{id}" name="{name}"><option value="true"{true_selected}>true</option><option value="false"{false_selected}>false</option></select>"#
+                r#"<input id="{id}" name="{name}" type="{kind}" {described} value="{escaped}">"#
             )
         }
+        admin::DeepSettingsInputKind::Number | admin::DeepSettingsInputKind::Size => {
+            let step = if field.input_kind() == admin::DeepSettingsInputKind::Size {
+                "any"
+            } else {
+                "1"
+            };
+            // Signed rate-limit values <= 0 deliberately block the action.
+            let min = if field.toml_section() == "moderation" {
+                ""
+            } else {
+                "min=\"0\""
+            };
+            format!(
+                r#"<input id="{id}" name="{name}" type="number" {described} inputmode="decimal" {min} step="{step}" value="{escaped}">"#
+            )
+        }
+        admin::DeepSettingsInputKind::Boolean => {
+            let checked = if value == "true" { " checked" } else { "" };
+            format!(
+                r#"<input id="{id}" name="{name}" type="checkbox" {described} value="true"{checked}>"#
+            )
+        }
+        admin::DeepSettingsInputKind::List => format!(
+            r#"<textarea id="{id}" name="{name}" {described} rows="4">{}</textarea>"#,
+            html_escape::encode_text(&value)
+        ),
+        admin::DeepSettingsInputKind::Encoding => {
+            let options = crate::config::VideoEncodingSpeed::ALL.into_iter().fold(
+                String::new(),
+                |mut options, speed| {
+                    let option = speed.as_str();
+                    let selected = if value == option { " selected" } else { "" };
+                    let _ = write!(
+                        options,
+                        r#"<option value="{option}"{selected}>{option}</option>"#
+                    );
+                    options
+                },
+            );
+            format!(r#"<select id="{id}" name="{name}" {described}>{options}</select>"#)
+        }
     };
-    let helper = field.helper().map_or_else(String::new, |helper| {
-        format!(
-            r#"<p class="muted field-help">{}</p>"#,
-            html_escape::encode_text(helper)
-        )
-    });
+    let helper = field.helper().unwrap_or_default();
+    let default = defaults.form_value(field);
+    let timing = if field.applies_live() {
+        if field.toml_section() == "backup" {
+            "Next backup check"
+        } else {
+            "Applies immediately"
+        }
+    } else {
+        "Restart required"
+    };
     format!(
-        r#"<div class="deep-settings-field"><label for="{id}">{}</label>{control}{helper}</div>"#,
+        r#"<div class="deep-settings-field"><label for="{id}">{}</label>{control}<p id="{id}-help" class="muted field-help">{} <span class="setting-default">Default: {}.</span> <span class="setting-timing">{timing}</span></p></div>"#,
         html_escape::encode_text(field.label()),
+        html_escape::encode_text(helper),
+        html_escape::encode_text(&default)
     )
 }
 
@@ -5579,7 +5816,7 @@ fn render_deep_settings_confirmation(
         .join("");
     let hidden = render_deep_settings_hidden_fields(values);
     format!(
-        r#"{notice_html}<section class="panel admin-card deep-settings-confirm" data-testid="admin-card"><h1>These settings are about to be changed</h1><p class="muted">Review the changed values before writing settings.toml. Saved changes require a RustPost restart before this running server uses them.</p><ul class="settings-item-list">{rows}</ul><div class="actions"><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="confirm">{hidden}<button class="primary" type="submit">Confirm/Save</button></form><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="discard">{hidden}<button type="submit">Discard Changes</button></form></div></section>"#,
+        r#"{notice_html}<section class="panel admin-card deep-settings-confirm" data-testid="admin-card"><h1>These settings are about to be changed</h1><p class="muted">Review the changed values before writing settings.toml. Restart required for startup settings. Blur applies immediately; backup policy takes effect on the next check.</p><ul class="settings-item-list">{rows}</ul><div class="actions"><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="confirm">{hidden}<button class="primary" type="submit">Confirm/Save</button></form><form method="post" action="/admin/deep-settings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="intent" value="discard">{hidden}<button type="submit">Discard Changes</button></form></div></section>"#,
         html_escape::encode_double_quoted_attribute(csrf),
         html_escape::encode_double_quoted_attribute(csrf),
     )
@@ -5807,12 +6044,20 @@ async fn admin_backup_settings_update(
     let user = require_admin(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     let csrf = form_csrf(&state, &headers).await.unwrap_or_default();
+    let _configuration_guard = state.configuration_write_lock.lock().await;
     let current = load_deep_settings(&state)?;
     let values = match admin::parse_backup_settings_form(&form, &current) {
         Ok(values) => values,
         Err(err) => {
             let message = err.to_string();
-            return backups_page(&state, &user, &csrf, Some(("error", &message))).await;
+            return backups_page_submission(
+                &state,
+                &user,
+                &csrf,
+                Some(("error", &message)),
+                Some(&form),
+            )
+            .await;
         }
     };
     let updated = values.apply_to(&current);
@@ -6045,6 +6290,16 @@ async fn backups_page(
     csrf: &str,
     notice: Option<(&str, &str)>,
 ) -> AppResult<Html<String>> {
+    backups_page_submission(state, user, csrf, notice, None).await
+}
+
+async fn backups_page_submission(
+    state: &AppState,
+    user: &CurrentUser,
+    csrf: &str,
+    notice: Option<(&str, &str)>,
+    submitted: Option<&admin::BackupSettingsForm>,
+) -> AppResult<Html<String>> {
     let settings = load_deep_settings(state)?;
     let archives = backup::list_backups(&state.paths)?;
     let notice_html =
@@ -6057,7 +6312,7 @@ async fn backups_page(
             "Create, download, schedule, and restore full-site runtime backups."
         ),
         render_manual_backup_panel(csrf, &settings),
-        render_automatic_backup_panel(csrf, &settings),
+        render_automatic_backup_panel(csrf, &settings, submitted),
         render_backup_history(&archives, backup::operation_in_progress(&state.paths)),
         render_restore_panel(csrf),
     );
@@ -6078,35 +6333,48 @@ fn render_manual_backup_panel(csrf: &str, settings: &Settings) -> String {
     )
 }
 
-fn render_automatic_backup_panel(csrf: &str, settings: &Settings) -> String {
-    let values = admin::BackupSettingsValues::from_settings(settings);
+fn render_automatic_backup_panel(
+    csrf: &str,
+    settings: &Settings,
+    submitted: Option<&admin::BackupSettingsForm>,
+) -> String {
+    let shared = admin::DeepSettingsForm::from_settings(settings);
+    let fallback = admin::BackupSettingsForm {
+        csrf: csrf.to_owned(),
+        enabled: shared.backup_enabled,
+        automatic_enabled: shared.automatic_enabled,
+        automatic_interval_minutes: shared.automatic_interval_minutes,
+        retention_keep_last: shared.retention_keep_last,
+        retention_max_age_days: shared.retention_max_age_days,
+        automatic_include_tor_keys: shared.automatic_include_tor_keys,
+    };
+    let values = submitted.unwrap_or(&fallback);
     format!(
-        r#"<section class="panel admin-card" data-testid="admin-card"><h2>Automatic backups</h2><form method="post" action="/admin/backups/settings" class="deep-settings-form"><input type="hidden" name="csrf" value="{}"><div class="deep-settings-field"><label for="backup-enabled">Backups enabled</label>{}</div><div class="deep-settings-field"><label for="backup-auto-enabled">Scheduled backups</label>{}</div><div class="deep-settings-field"><label for="backup-interval">Interval minutes</label><input id="backup-interval" name="automatic_interval_minutes" type="text" inputmode="numeric" pattern="[0-9]+" value="{}"></div><div class="deep-settings-field"><label for="backup-keep">Keep newest automatic backups</label><input id="backup-keep" name="retention_keep_last" type="text" inputmode="numeric" pattern="[0-9]+" value="{}"></div><div class="deep-settings-field"><label for="backup-age">Delete automatic backups older than days</label><input id="backup-age" name="retention_max_age_days" type="text" inputmode="numeric" pattern="[0-9]+" value="{}"><p class="muted field-help">Set 0 to disable age cleanup. Manual and pre-restore backups are not pruned.</p></div><div class="deep-settings-field"><label for="backup-auto-tor">Automatic backups include Tor keys</label>{}</div><button class="primary" type="submit">Save backup settings</button></form></section>"#,
+        r#"<section class="panel admin-card" data-testid="admin-card"><h2>Automatic backups</h2><form method="post" action="/admin/backups/settings" class="deep-settings-form"><input type="hidden" name="csrf" value="{}"><div class="deep-settings-field"><label for="backup-enabled">Backups enabled</label>{}</div><div class="deep-settings-field"><label for="backup-auto-enabled">Scheduled backups</label>{}</div><div class="deep-settings-field"><label for="backup-interval">Interval minutes</label><input id="backup-interval" name="automatic_interval_minutes" type="number" inputmode="numeric" min="0" step="1" value="{}"></div><div class="deep-settings-field"><label for="backup-keep">Keep newest automatic backups</label><input id="backup-keep" name="retention_keep_last" type="number" inputmode="numeric" min="0" step="1" value="{}"></div><div class="deep-settings-field"><label for="backup-age">Delete automatic backups older than days</label><input id="backup-age" name="retention_max_age_days" type="number" inputmode="numeric" min="0" step="1" value="{}"><p class="muted field-help">Set 0 to disable age cleanup. Manual and pre-restore backups are not pruned.</p></div><div class="deep-settings-field"><label for="backup-auto-tor">Automatic backups include Tor keys</label>{}</div><button class="primary" type="submit">Save backup settings</button></form></section>"#,
         html_escape::encode_double_quoted_attribute(csrf),
-        bool_select("backup-enabled", "enabled", values.enabled),
-        bool_select(
+        bool_checkbox("backup-enabled", "enabled", values.enabled == "true"),
+        bool_checkbox(
             "backup-auto-enabled",
             "automatic_enabled",
-            values.automatic_enabled
+            values.automatic_enabled == "true"
         ),
-        values.automatic_interval_minutes,
-        values.retention_keep_last,
-        values.retention_max_age_days,
-        bool_select(
+        html_escape::encode_double_quoted_attribute(&values.automatic_interval_minutes),
+        html_escape::encode_double_quoted_attribute(&values.retention_keep_last),
+        html_escape::encode_double_quoted_attribute(&values.retention_max_age_days),
+        bool_checkbox(
             "backup-auto-tor",
             "automatic_include_tor_keys",
-            values.automatic_include_tor_keys
+            values.automatic_include_tor_keys == "true"
         ),
     )
 }
 
-fn bool_select(id: &str, name: &str, value: bool) -> String {
-    let true_selected = if value { " selected" } else { "" };
-    let false_selected = if value { "" } else { " selected" };
+fn bool_checkbox(id: &str, name: &str, value: bool) -> String {
+    let checked = if value { " checked" } else { "" };
     format!(
-        r#"<select id="{}" name="{}"><option value="true"{true_selected}>true</option><option value="false"{false_selected}>false</option></select>"#,
+        r#"<input id="{}" name="{}" type="checkbox" value="true"{checked}>"#,
         html_escape::encode_double_quoted_attribute(id),
-        html_escape::encode_double_quoted_attribute(name),
+        html_escape::encode_double_quoted_attribute(name)
     )
 }
 
@@ -10002,6 +10270,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configuration_requests_require_admin_csrf_and_well_formed_fields() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = get_with_cookie(&server, "/admin/deep-settings", &cookie).await;
+        let csrf = csrf_token(&page.body);
+        let before = std::fs::read(server.data_dir.join("settings.toml")).expect("settings");
+        let body = deep_settings_form_body(&server, &csrf, "confirm", &[("max_bio_len", "301")]);
+        let unauthorized = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            body.clone(),
+        )
+        .await;
+        assert_eq!(unauthorized.status, 401);
+        let wrong_csrf = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(&server, "incorrect", "confirm", &[("max_bio_len", "301")]),
+        )
+        .await;
+        assert_eq!(wrong_csrf.status, 403);
+        for suffix in [
+            "&unexpected=1",
+            "&max_bio_len=999",
+            "&media.ffmpeg_path=unsafe",
+        ] {
+            let mut malformed = body.clone();
+            malformed.extend_from_slice(suffix.as_bytes());
+            let response = request(
+                &server.base_url,
+                "POST",
+                "/admin/deep-settings",
+                &[
+                    ("cookie", &cookie),
+                    ("content-type", "application/x-www-form-urlencoded"),
+                ],
+                malformed,
+            )
+            .await;
+            assert_eq!(response.status, 422);
+        }
+        let incomplete = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            format!("csrf={csrf}&intent=confirm").into_bytes(),
+        )
+        .await;
+        assert_eq!(incomplete.status, 422);
+        let bad_intent = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(&server, &csrf, "unexpected", &[]),
+        )
+        .await;
+        assert_eq!(bad_intent.status, 400);
+        assert_eq!(
+            std::fs::read(server.data_dir.join("settings.toml")).expect("settings"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_configuration_confirmation_cannot_overwrite_another_save() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = get_with_cookie(&server, "/admin/deep-settings", &cookie).await;
+        let csrf = csrf_token(&page.body);
+        let stale = deep_settings_form_body(&server, &csrf, "confirm", &[("max_bio_len", "999")]);
+        let path = server.data_dir.join("settings.toml");
+        let mut settings = Settings::load(&path).expect("load");
+        settings.accounts.max_bio_len = 302;
+        admin::write_deep_settings(&path, &settings).expect("concurrent save");
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            stale,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        assert!(
+            response
+                .body
+                .contains("Settings changed since this form was opened")
+        );
+        assert_eq!(
+            Settings::load(&path).expect("load").accounts.max_bio_len,
+            302
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_configuration_preserves_other_values_and_escapes_submitted_text() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = get_with_cookie(&server, "/admin/deep-settings", &cookie).await;
+        let csrf = csrf_token(&page.body);
+        let response = request(
+            &server.base_url,
+            "POST",
+            "/admin/deep-settings",
+            &[
+                ("cookie", &cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            deep_settings_form_body(
+                &server,
+                &csrf,
+                "preview",
+                &[
+                    ("max_bio_len", "bad"),
+                    ("site_name", "<script>alert(1)</script>"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        assert!(
+            response
+                .body
+                .contains("&lt;script&gt;alert(1)&lt;/script&gt;")
+        );
+        assert!(!response.body.contains("<script>alert(1)</script>"));
+        assert!(response.body.contains(r#"value="bad""#));
+        assert!(response.body.contains("settings-error"));
+    }
+
+    #[tokio::test]
+    async fn backup_settings_share_validation_and_preserve_submitted_values() {
+        let server = spawn_test_server_with_admin().await;
+        let cookie = admin_session_cookie(&server).await;
+        let page = get_with_cookie(&server, "/admin/backups", &cookie).await;
+        let csrf = csrf_token(&page.body);
+        let before = std::fs::read(server.data_dir.join("settings.toml")).expect("settings");
+        let response = request(&server.base_url, "POST", "/admin/backups/settings",
+            &[("cookie", &cookie), ("content-type", "application/x-www-form-urlencoded")],
+            format!("csrf={csrf}&enabled=true&automatic_enabled=false&automatic_interval_minutes=9&retention_keep_last=0&retention_max_age_days=45&automatic_include_tor_keys=false").into_bytes()).await;
+        assert_eq!(response.status, 200);
+        assert!(
+            response
+                .body
+                .contains("Automatic backups to keep must be at least 1")
+        );
+        assert!(response.body.contains(r#"id="backup-interval" name="automatic_interval_minutes" type="number" inputmode="numeric" min="0" step="1" value="9""#));
+        assert!(response.body.contains(r#"id="backup-age" name="retention_max_age_days" type="number" inputmode="numeric" min="0" step="1" value="45""#));
+        assert_eq!(
+            std::fs::read(server.data_dir.join("settings.toml")).expect("settings"),
+            before
+        );
+    }
+
+    #[tokio::test]
     async fn admin_get_renders_deep_server_settings_groups() {
         let server = spawn_test_server_with_admin().await;
         let cookie = admin_session_cookie(&server).await;
@@ -10029,7 +10470,11 @@ mod tests {
                 .contains(r#"name="registration_captcha_enabled""#)
         );
         assert!(response.body.contains("<select"));
-        assert!(response.body.contains(r#"name="max_bio_len" type="text""#));
+        assert!(
+            response
+                .body
+                .contains(r#"name="max_bio_len" type="number""#)
+        );
     }
 
     #[test]
@@ -10074,6 +10519,7 @@ mod tests {
                 ("content-type", "application/x-www-form-urlencoded"),
             ],
             deep_settings_form_body(
+                &server,
                 &csrf,
                 "preview",
                 &[("max_bio_len", "300"), ("allow_profile_pictures", "false")],
@@ -10124,7 +10570,7 @@ mod tests {
                 ("cookie", &cookie),
                 ("content-type", "application/x-www-form-urlencoded"),
             ],
-            deep_settings_form_body(&csrf, "discard", &[("max_bio_len", "300")]),
+            deep_settings_form_body(&server, &csrf, "discard", &[("max_bio_len", "300")]),
         )
         .await;
         let after =
@@ -10134,7 +10580,7 @@ mod tests {
         assert_eq!(before, after);
         assert!(response.body.contains("Changes discarded."));
         assert!(response.body.contains(
-            r#"name="max_bio_len" type="text" inputmode="numeric" pattern="[0-9]+" value="240""#
+            r#"name="max_bio_len" type="number" aria-describedby="deep-max_bio_len-help" inputmode="decimal" min="0" step="1" value="240""#
         ));
     }
 
@@ -10161,6 +10607,7 @@ mod tests {
                 ("content-type", "application/x-www-form-urlencoded"),
             ],
             deep_settings_form_body(
+                &server,
                 &csrf,
                 "confirm",
                 &[
@@ -10176,7 +10623,7 @@ mod tests {
         let saved = Settings::load(&server.data_dir.join("settings.toml")).expect("settings");
 
         assert_eq!(response.status, 200);
-        assert!(response.body.contains("Settings saved successfully"));
+        assert!(response.body.contains("Settings saved successfully. Restart required for startup settings; blur applies immediately and backup policy takes effect on the next check."));
         assert_eq!(saved.accounts.max_bio_len, 300);
         assert_eq!(saved.posts.post_edit_window_seconds, 20);
         assert!(!saved.accounts.allow_profile_pictures);
@@ -10192,15 +10639,15 @@ mod tests {
         )
         .await;
         assert!(fresh.body.contains(
-            r#"name="max_bio_len" type="text" inputmode="numeric" pattern="[0-9]+" value="300""#
+            r#"name="max_bio_len" type="number" aria-describedby="deep-max_bio_len-help" inputmode="decimal" min="0" step="1" value="300""#
         ));
         assert!(fresh.body.contains(
-            r#"name="post_edit_window_seconds" type="text" inputmode="numeric" pattern="[0-9]+" value="20""#
+            r#"name="post_edit_window_seconds" type="number" aria-describedby="deep-post_edit_window_seconds-help" inputmode="decimal" min="0" step="1" value="20""#
         ));
         assert!(
             fresh
                 .body
-                .contains(r#"<option value="false" selected>false</option>"#)
+                .contains(r#"id="deep-allow_profile_pictures" name="allow_profile_pictures" type="checkbox" aria-describedby="deep-allow_profile_pictures-help" value="true">"#)
         );
     }
 
@@ -10228,7 +10675,7 @@ mod tests {
                 ("cookie", &cookie),
                 ("content-type", "application/x-www-form-urlencoded"),
             ],
-            deep_settings_form_body(&csrf, "preview", &[("min_password_length", "-1")]),
+            deep_settings_form_body(&server, &csrf, "preview", &[("min_password_length", "-1")]),
         )
         .await;
         let after =
@@ -10267,7 +10714,12 @@ mod tests {
                 ("cookie", &cookie),
                 ("content-type", "application/x-www-form-urlencoded"),
             ],
-            deep_settings_form_body(&csrf, "preview", &[("post_edit_window_seconds", "999")]),
+            deep_settings_form_body(
+                &server,
+                &csrf,
+                "preview",
+                &[("post_edit_window_seconds", "999")],
+            ),
         )
         .await;
         let after =
@@ -11520,11 +11972,25 @@ mod tests {
         output
     }
 
-    fn deep_settings_form_body(csrf: &str, intent: &str, overrides: &[(&str, &str)]) -> Vec<u8> {
+    fn deep_settings_form_body(
+        server: &TestServer,
+        csrf: &str,
+        intent: &str,
+        overrides: &[(&str, &str)],
+    ) -> Vec<u8> {
+        use sha2::{Digest as _, Sha256};
+        let raw = std::fs::read(server.data_dir.join("settings.toml")).expect("settings");
+        let revision = Sha256::digest(&raw)
+            .iter()
+            .fold(String::new(), |mut output, byte| {
+                let _ = write!(output, "{byte:02x}");
+                output
+            });
         let values = crate::admin::DeepSettingsValues::from_settings(&Settings::default());
         let mut pairs = vec![
             ("csrf".to_owned(), csrf.to_owned()),
             ("intent".to_owned(), intent.to_owned()),
+            ("revision".to_owned(), revision),
         ];
         for field in crate::admin::DeepSettingsField::ALL {
             let value = overrides

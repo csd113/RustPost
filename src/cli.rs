@@ -485,9 +485,7 @@ async fn serve_clearnet(
     settings: &config::ServerSettings,
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let addr: SocketAddr = format!("{}:{}", settings.host, settings.port)
-        .parse()
-        .with_context(|| "invalid server bind address")?;
+    let addr = settings.listener_address()?;
     let clearnet_listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind RustPost server at {addr}"))?;
