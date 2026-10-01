@@ -1010,7 +1010,7 @@ mod tests {
         let form = form_from_settings(&settings);
         let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
 
-        assert!(diff_deep_settings(&settings, &parsed).is_empty());
+        assert_eq!(diff_deep_settings(&settings, &parsed).len(), 0);
     }
 
     #[test]

@@ -339,7 +339,7 @@ mod tests {
         let excluded: BTreeSet<_> = NON_WEB_SETTINGS
             .iter()
             .map(|(key, reason)| {
-                assert!(!reason.is_empty());
+                assert_ne!(reason.len(), 0);
                 (*key).to_string()
             })
             .collect();

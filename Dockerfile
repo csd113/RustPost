@@ -1,4 +1,7 @@
-FROM rust:1.91-bookworm AS build
+# Bootstrap from the published Debian 12 image; install the exact release compiler.
+FROM rust:1.98.1-bookworm AS build
+RUN rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy \
+    && rustup default 1.99.0
 
 WORKDIR /usr/src/rustpost
 COPY Cargo.toml Cargo.lock ./

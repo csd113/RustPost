@@ -900,7 +900,7 @@ mod tests {
             .join("\n");
         let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
 
-        assert!(parsed.tor.display_onion_address.is_empty());
+        assert_eq!(parsed.tor.display_onion_address.len(), 0);
     }
 
     #[test]
