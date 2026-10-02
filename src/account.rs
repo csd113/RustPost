@@ -1250,7 +1250,7 @@ mod tests {
         let first = request_deletion(&pool, &settings, alice)
             .await
             .expect("request");
-        assert!(!first.requested_at.is_empty());
+        assert_ne!(first.requested_at.len(), 0);
         assert!(first.scheduled_at > first.requested_at);
         let second = request_deletion(&pool, &settings, alice)
             .await
@@ -1322,7 +1322,7 @@ mod tests {
         let re_requested = request_deletion(&pool, &settings, alice)
             .await
             .expect("re-request");
-        assert!(!re_requested.requested_at.is_empty());
+        assert_ne!(re_requested.requested_at.len(), 0);
     }
 
     #[tokio::test]
@@ -1585,7 +1585,7 @@ mod tests {
         );
         assert!(!user_exists(&pool, alice).await);
         assert!(!media_path.exists());
-        assert!(pending_media_journals(&paths).is_empty());
+        assert_eq!(pending_media_journals(&paths).len(), 0);
         let counts: (i64, i64) = pool
             .call(move |conn| {
                 Ok((
@@ -1745,7 +1745,7 @@ mod tests {
             assert_eq!(counts, (0, 0, 0), "deletion must remove every owned row");
             assert!(!media_path.exists());
         }
-        assert!(pending_media_journals(&paths).is_empty());
+        assert_eq!(pending_media_journals(&paths).len(), 0);
         assert_eq!(
             finalize_due_deletions(&pool, &paths)
                 .await
@@ -1806,7 +1806,7 @@ mod tests {
             .await
             .expect("counts");
         assert_eq!(counts, (1, 1));
-        assert!(pending_media_journals(&paths).is_empty());
+        assert_eq!(pending_media_journals(&paths).len(), 0);
 
         let fixed_path = paths.uploads_images.join("fixed.webp");
         fs::write(&fixed_path, b"image").expect("fixed media file");
@@ -1829,7 +1829,7 @@ mod tests {
         );
         assert!(!user_exists(&pool, alice).await);
         assert!(!fixed_path.exists());
-        assert!(pending_media_journals(&paths).is_empty());
+        assert_eq!(pending_media_journals(&paths).len(), 0);
     }
 
     #[tokio::test]
@@ -1867,7 +1867,7 @@ mod tests {
             1
         );
         assert!(!blocked_path.exists());
-        assert!(pending_media_journals(&paths).is_empty());
+        assert_eq!(pending_media_journals(&paths).len(), 0);
         assert_eq!(
             recover_pending_media_deletions(&paths)
                 .await
@@ -2026,7 +2026,7 @@ mod tests {
         recovered.expect("concurrent recovery");
         assert!(!user_exists(&pool, bob).await);
         assert!(!bob_media.exists());
-        assert!(pending_media_journals(&paths).is_empty());
+        assert_eq!(pending_media_journals(&paths).len(), 0);
         assert_eq!(
             recover_pending_media_deletions(&paths)
                 .await
@@ -2055,7 +2055,7 @@ mod tests {
         );
         assert!(!user_exists(&pool, alice).await);
         assert!(!media_path.exists());
-        assert!(pending_media_journals(&paths).is_empty());
+        assert_eq!(pending_media_journals(&paths).len(), 0);
     }
 
     #[tokio::test]

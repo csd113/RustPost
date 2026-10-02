@@ -1,7 +1,17 @@
 name: Container
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Published source tag to build (for example v1.0.0)
+        required: true
+        type: string
+
+env:
+  RUSTPOST_RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: read
@@ -21,10 +31,14 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - name: Verify v1.0.0 application source
+        with:
+          ref: ${{ env.RUSTPOST_RELEASE_TAG }}
+      - name: Resolve and validate version
+        id: version
         run: |
-          git fetch --depth=1 origin tag v1.0.0
-          git diff --quiet v1.0.0 -- Cargo.toml Cargo.lock src
+          version="${RUSTPOST_RELEASE_TAG#v}"
+          test "$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')" = "$version"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -36,7 +50,8 @@ jobs:
           context: .
           platforms: linux/${{ matrix.arch }}
           push: true
-          tags: ghcr.io/csd113/rustpost:1.0.0-${{ matrix.arch }}
+          tags: ghcr.io/csd113/rustpost:${{ steps.version.outputs.value }}-${{ matrix.arch }}
+          build-args: RUSTPOST_VERSION=${{ steps.version.outputs.value }}
           provenance: false
 
   publish:
@@ -52,10 +67,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create multi-platform tags
         run: |
-          docker buildx imagetools create \
-            --tag ghcr.io/csd113/rustpost:1.0.0 \
-            --tag ghcr.io/csd113/rustpost:latest \
-            ghcr.io/csd113/rustpost:1.0.0-amd64 \
-            ghcr.io/csd113/rustpost:1.0.0-arm64
+          version="${RUSTPOST_RELEASE_TAG#v}"
+          tags=(--tag "ghcr.io/csd113/rustpost:$version")
+          if [[ "$version" != *-* ]]; then tags+=(--tag ghcr.io/csd113/rustpost:latest); fi
+          docker buildx imagetools create "${tags[@]}" \
+            "ghcr.io/csd113/rustpost:$version-amd64" \
+            "ghcr.io/csd113/rustpost:$version-arm64"
       - name: Inspect published image
-        run: docker buildx imagetools inspect ghcr.io/csd113/rustpost:1.0.0
+        run: docker buildx imagetools inspect "ghcr.io/csd113/rustpost:${RUSTPOST_RELEASE_TAG#v}"

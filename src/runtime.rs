@@ -315,7 +315,14 @@ impl RuntimePaths {
 fn restrict_dir(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(if crate::updates::managed() {
+            0o770
+        } else {
+            0o700
+        }),
+    )?;
     Ok(())
 }
 

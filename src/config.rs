@@ -1,3 +1,5 @@
+pub mod admin_fields;
+
 use std::fs;
 use std::path::Path;
 
@@ -285,6 +287,7 @@ impl Settings {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_network_and_media()?;
         let site_name = self.site.name.trim();
         if site_name != self.site.name {
             anyhow::bail!("site.name must not contain surrounding whitespace");
@@ -342,6 +345,73 @@ impl Settings {
             anyhow::bail!(
                 "accounts.max_archive_entries must be between 1 and {MAX_ARCHIVE_ENTRY_LIMIT}"
             );
+        }
+        Ok(())
+    }
+    fn validate_network_and_media(&self) -> anyhow::Result<()> {
+        self.server.listener_address()?;
+        if !self.server.public_url.is_empty() {
+            let url: axum::http::Uri = self.server.public_url.parse().map_err(|_| {
+                anyhow::anyhow!("server.public_url must be an absolute HTTP(S) URL")
+            })?;
+            if !matches!(url.scheme_str(), Some("http" | "https"))
+                || url
+                    .authority()
+                    .is_none_or(|host| host.as_str().contains('@'))
+            {
+                anyhow::bail!(
+                    "server.public_url must be an absolute HTTP(S) URL without credentials"
+                );
+            }
+        }
+        for cidr in &self.server.trusted_proxy_cidrs {
+            let (address, prefix) = cidr.split_once('/').unwrap_or((cidr, ""));
+            let address: std::net::IpAddr = address.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "server.trusted_proxy_cidrs must contain valid IP addresses or CIDRs"
+                )
+            })?;
+            if !prefix.is_empty() {
+                let bits: u8 = prefix.parse().map_err(|_| {
+                    anyhow::anyhow!("server.trusted_proxy_cidrs contains an invalid prefix")
+                })?;
+                if bits > if address.is_ipv4() { 32 } else { 128 } {
+                    anyhow::bail!("server.trusted_proxy_cidrs contains an out-of-range prefix");
+                }
+            } else if cidr.contains('/') {
+                anyhow::bail!("server.trusted_proxy_cidrs contains an empty prefix");
+            }
+        }
+        if self.media.webp_quality > 100 {
+            anyhow::bail!("media.webp_quality must be 0–100");
+        }
+        if self.media.vp9_crf > 63 {
+            anyhow::bail!("media.vp9_crf must be 0–63");
+        }
+        self.media.vp9_deadline.parse::<VideoEncodingSpeed>()?;
+        for (key, types) in [
+            (
+                "media.allowed_image_mime_types",
+                &self.media.allowed_image_mime_types,
+            ),
+            (
+                "media.allowed_video_mime_types",
+                &self.media.allowed_video_mime_types,
+            ),
+        ] {
+            for mime in types {
+                if mime.split_once('/').is_none_or(|(kind, subtype)| {
+                    kind.is_empty() || subtype.is_empty() || subtype.contains('/')
+                }) || !mime
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/-+._".contains(&b))
+                {
+                    anyhow::bail!("{key} contains an invalid MIME type");
+                }
+            }
+        }
+        if self.tor.max_concurrent_streams > u32::MAX as usize {
+            anyhow::bail!("tor.max_concurrent_streams must fit in a 32-bit unsigned integer");
         }
         Ok(())
     }
@@ -830,7 +900,7 @@ mod tests {
             .join("\n");
         let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
 
-        assert!(parsed.tor.display_onion_address.is_empty());
+        assert_eq!(parsed.tor.display_onion_address.len(), 0);
     }
 
     #[test]
@@ -1066,5 +1136,51 @@ mod tests {
         let settings: Settings = toml::from_str(&without_captcha).expect("legacy settings parse");
 
         assert!(!settings.accounts.registration_captcha_enabled);
+    }
+}
+
+/// `FFmpeg` VP9 deadline choices, shared by configuration validation and admin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEncodingSpeed {
+    Best,
+    Good,
+    Realtime,
+}
+impl VideoEncodingSpeed {
+    pub const ALL: [Self; 3] = [Self::Best, Self::Good, Self::Realtime];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Best => "best",
+            Self::Good => "good",
+            Self::Realtime => "realtime",
+        }
+    }
+}
+impl std::str::FromStr for VideoEncodingSpeed {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|speed| speed.as_str() == value)
+            .ok_or_else(|| anyhow::anyhow!("media.vp9_deadline must be best, good or realtime"))
+    }
+}
+
+impl ServerSettings {
+    /// Validated listener address, preserving bracketed IPv6 TOML compatibility.
+    ///
+    /// # Errors
+    /// Returns an error if the host is not an IPv4 or IPv6 address.
+    pub fn listener_address(&self) -> anyhow::Result<std::net::SocketAddr> {
+        let host = self
+            .host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(&self.host);
+        let ip = host
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| anyhow::anyhow!("server.host must be an IP address"))?;
+        Ok(std::net::SocketAddr::new(ip, self.port))
     }
 }

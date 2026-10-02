@@ -3822,11 +3822,12 @@ mod tests {
 
         assert_eq!(muted, vec![(bob, "bob".to_owned(), "bob".to_owned())]);
         unmute(&pool, alice, bob).await.expect("unmute");
-        assert!(
+        assert_eq!(
             muted_users(&pool, alice)
                 .await
                 .expect("muted users after unmute")
-                .is_empty()
+                .len(),
+            0
         );
     }
 
@@ -5497,11 +5498,12 @@ mod tests {
                 .expect("unfollow cancels request")
         );
         assert_eq!(follow_request_count(&pool, bob, alice).await, 0);
-        assert!(
+        assert_eq!(
             outgoing_follow_requests(&pool, bob)
                 .await
                 .expect("outgoing")
-                .is_empty()
+                .len(),
+            0
         );
         assert_eq!(
             pending_follow_request_count(&pool, alice)
@@ -5632,11 +5634,12 @@ mod tests {
         .await
         .expect("mark states");
 
-        assert!(
+        assert_eq!(
             incoming_follow_requests(&pool, alice)
                 .await
                 .expect("incoming")
-                .is_empty()
+                .len(),
+            0
         );
         assert_eq!(
             pending_follow_request_count(&pool, alice)
@@ -5644,17 +5647,19 @@ mod tests {
                 .expect("pending count"),
             0
         );
-        assert!(
+        assert_eq!(
             outgoing_follow_requests(&pool, bob)
                 .await
                 .expect("bob outgoing")
-                .is_empty()
+                .len(),
+            0
         );
-        assert!(
+        assert_eq!(
             outgoing_follow_requests(&pool, carol)
                 .await
                 .expect("carol outgoing")
-                .is_empty()
+                .len(),
+            0
         );
     }
 
@@ -6440,23 +6445,26 @@ mod tests {
             .expect("incoming");
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].user_id, bob);
-        assert!(
+        assert_eq!(
             incoming_follow_requests(&pool, bob)
                 .await
                 .expect("bob")
-                .is_empty()
+                .len(),
+            0
         );
-        assert!(
+        assert_eq!(
             incoming_follow_requests(&pool, carol)
                 .await
                 .expect("carol")
-                .is_empty()
+                .len(),
+            0
         );
-        assert!(
+        assert_eq!(
             incoming_follow_requests(&pool, dave)
                 .await
                 .expect("dave")
-                .is_empty()
+                .len(),
+            0
         );
 
         let outgoing = outgoing_follow_requests(&pool, bob)
@@ -6464,23 +6472,26 @@ mod tests {
             .expect("outgoing");
         assert_eq!(outgoing.len(), 1);
         assert_eq!(outgoing[0].user_id, alice);
-        assert!(
+        assert_eq!(
             outgoing_follow_requests(&pool, alice)
                 .await
                 .expect("alice")
-                .is_empty()
+                .len(),
+            0
         );
-        assert!(
+        assert_eq!(
             outgoing_follow_requests(&pool, carol)
                 .await
                 .expect("carol")
-                .is_empty()
+                .len(),
+            0
         );
-        assert!(
+        assert_eq!(
             outgoing_follow_requests(&pool, dave)
                 .await
                 .expect("dave")
-                .is_empty()
+                .len(),
+            0
         );
 
         assert_eq!(

@@ -1,0 +1,27 @@
+[Unit]
+Description=Restricted RustPost software updater
+After=network-online.target polkit.service
+Wants=network-online.target
+
+[Service]
+User=rustpost-updater
+Group=rustpost
+UMask=0007
+RuntimeDirectory=rustpost-updater
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/libexec/rustpost-updater --config /etc/rustpost-updater/updater.toml
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+ReadWritePaths=/opt/rustpost /var/lib/rustpost /var/lib/rustpost-updater /run/rustpost-updater
+
+[Install]
+WantedBy=multi-user.target

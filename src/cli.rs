@@ -28,6 +28,10 @@ struct Cli {
     #[arg(long, help = "Runtime data directory")]
     data_dir: Option<PathBuf>,
 
+    /// Print machine-readable release compatibility without touching runtime state.
+    #[arg(long)]
+    update_info: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -92,6 +96,13 @@ enum Command {
 pub async fn run() -> anyhow::Result<()> {
     logging::init();
     let cli = Cli::parse();
+    if cli.update_info {
+        stdout_line(format_args!(
+            "{}",
+            serde_json::json!({ "version": crate::updates::VERSION, "schema": db::CURRENT_SCHEMA_VERSION, "minimum_schema": 1, "target": crate::updates::platform_target(), "updater_protocol": 1 })
+        ))?;
+        return Ok(());
+    }
     let explicit_data_dir = cli.data_dir.clone();
     let mut paths = runtime::RuntimePaths::discover(cli.data_dir.as_deref())?;
     paths.ensure()?;
@@ -317,6 +328,16 @@ async fn serve(
     settings_path: PathBuf,
     settings: config::Settings,
 ) -> anyhow::Result<()> {
+    if crate::updates::managed() {
+        let reply = crate::updates::request(&crate::updates::Request::Ready {
+            version: crate::updates::VERSION.into(),
+        })
+        .await?;
+        anyhow::ensure!(
+            reply.ready && reply.error.is_none(),
+            "updater recovery must complete before RustPost can migrate or start"
+        );
+    }
     let pool = db::connect(&paths.database_path).await?;
     db::migrate(&pool).await?;
     let admin_count = ensure_first_admin_interactive(&pool, &settings, &paths).await?;
@@ -485,9 +506,7 @@ async fn serve_clearnet(
     settings: &config::ServerSettings,
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let addr: SocketAddr = format!("{}:{}", settings.host, settings.port)
-        .parse()
-        .with_context(|| "invalid server bind address")?;
+    let addr = settings.listener_address()?;
     let clearnet_listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind RustPost server at {addr}"))?;

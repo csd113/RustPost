@@ -106,3 +106,7 @@ The `latest` tag currently points to v1.0.0. A version tag makes the release you
 | Permission errors under `/data` | For bind mounts, confirm the dedicated folder is writable by UID/GID `10001`. |
 | You cannot log in as administrator | Run the interactive administrator creation command from the README if no administrator exists. See the [CLI reference](operator-guide.md#cli-reference) for password reset commands. |
 | Settings changes have no effect | Validate with `rustpost-cli --data-dir /data check` inside the container, then restart it. |
+
+## Admin update checks
+
+**Admin → Software updates** can check official stable releases. This image declares container-managed deployment, so the panel does not replace binaries or control the host. Back up and verify the persistent `/data` state, stop the container, update its image through Docker/your deployment tool, retain `/data`, and verify application/database health. On failure, stop the new image and restore the pre-upgrade database/configuration before restarting the old image. Never mount a Docker socket into RustPost. See [the software update guide](software-updates.md).

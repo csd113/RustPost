@@ -1,8 +1,12 @@
-FROM rust:1.91-bookworm AS build
+# Bootstrap from the published Debian 12 image; install the exact release compiler.
+FROM rust:1.98.1-bookworm AS build
+RUN rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy \
+    && rustup default 1.99.0
 
 WORKDIR /usr/src/rustpost
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY assets ./assets
 RUN cargo build --release --locked --bin rustpost-cli
 
 FROM debian:bookworm-slim
@@ -18,10 +22,12 @@ RUN apt-get update \
 COPY --from=build /usr/src/rustpost/target/release/rustpost-cli /usr/local/bin/rustpost-cli
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
+ARG RUSTPOST_VERSION=1.0.0
 LABEL org.opencontainers.image.source="https://github.com/csd113/RustPost" \
       org.opencontainers.image.title="RustPost" \
-      org.opencontainers.image.version="1.0.0"
+      org.opencontainers.image.version="${RUSTPOST_VERSION}"
 
+ENV RUSTPOST_CONTAINER=1
 USER rustpost
 VOLUME /data
 EXPOSE 8080

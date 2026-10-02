@@ -117,15 +117,10 @@ fn should_buffer_head_response(path: &str, response: &Response) -> bool {
 async fn head_response_with_get_length(response: Response) -> Response {
     let (mut parts, body) = response.into_parts();
     match to_bytes(body, MAX_BUFFERED_RESPONSE_BYTES).await {
-        Ok(body) => {
-            set_content_length(&mut parts.headers, body.len());
-            Response::from_parts(parts, Body::empty())
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to buffer HEAD response");
-            Response::from_parts(parts, Body::empty())
-        }
+        Ok(body) => set_content_length(&mut parts.headers, body.len()),
+        Err(error) => tracing::warn!(error = %error, "failed to buffer HEAD response"),
     }
+    Response::from_parts(parts, Body::empty())
 }
 
 fn body_for_method(body: Vec<u8>, is_head: bool) -> Body {

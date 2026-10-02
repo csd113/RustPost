@@ -1,0 +1,10 @@
+# Root-owned, mode 0644. Never expose this file in the admin settings editor.
+install_dir = "/opt/rustpost"
+state_dir = "/var/lib/rustpost-updater"
+data_dir = "/var/lib/rustpost"
+settings_path = "/var/lib/rustpost/settings.toml"
+health_port = 8080
+# Replace with `id -u rustpost` when provisioning.
+web_uid = 10001
+public_key = "/etc/rustpost-updater/public-key.hex"
+retention = 5

@@ -624,7 +624,7 @@ mod tests {
         let history = username_history(&pool, alice).await.expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].username, "alice");
-        assert!(!history[0].changed_at.is_empty());
+        assert_ne!(history[0].changed_at.len(), 0);
     }
 
     #[tokio::test]
@@ -808,12 +808,13 @@ mod tests {
         assert_eq!(holders[0].user_id, alice);
         assert_eq!(holders[0].username, "alice_new");
         assert_eq!(holders[0].display_name, "alice");
-        assert!(!holders[0].changed_at.is_empty());
-        assert!(
+        assert_ne!(holders[0].changed_at.len(), 0);
+        assert_eq!(
             historical_username_holders(&pool, "never_used")
                 .await
                 .expect("empty")
-                .is_empty()
+                .len(),
+            0
         );
 
         pool.call(move |conn| {
@@ -822,11 +823,12 @@ mod tests {
         })
         .await
         .expect("mark deleted");
-        assert!(
+        assert_eq!(
             historical_username_holders(&pool, "alice")
                 .await
                 .expect("deleted")
-                .is_empty()
+                .len(),
+            0
         );
     }
 
