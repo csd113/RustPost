@@ -9,6 +9,7 @@
 - Stabilize session-bound CSRF tokens, validate origins/proxies/cookies consistently, and delay multipart asset publication until validation succeeds.
 - Replace automatic upgrade/install machinery with a read-only GitHub release check and link; remove its daemon, IPC, signing/package tools and deployment permissions.
 - Bound Tor forwarding concurrency and connection lifetimes; drain HTTP requests on SIGTERM.
+- Remove the unused systemd service example.
 
 - Simplify CI and issue forms; add versioned Intel/Apple Silicon Mac release ZIPs, checksums and draft releases, following RustChan.
 
