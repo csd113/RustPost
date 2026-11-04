@@ -3,7 +3,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use arti_client::{TorClient, config::TorClientConfigBuilder};
@@ -35,12 +35,14 @@ struct TorStatusSnapshot {
     state: String,
     bootstrap_status: Option<String>,
     error: Option<String>,
+    last_traffic: Option<Instant>,
 }
 
 struct TorRuntime {
     _client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
-    _service: Arc<RunningOnionService>,
+    service: Arc<RunningOnionService>,
     stream_task: tokio::task::JoinHandle<()>,
+    status: Arc<RwLock<TorStatusSnapshot>>,
 }
 
 impl Drop for TorRuntime {
@@ -110,6 +112,7 @@ impl TorStatus {
             state: "disabled".to_owned(),
             bootstrap_status: None,
             error: None,
+            last_traffic: None,
         })
     }
 
@@ -122,6 +125,7 @@ impl TorStatus {
             state: "starting".to_owned(),
             bootstrap_status: None,
             error: None,
+            last_traffic: None,
         })
     }
 
@@ -133,6 +137,7 @@ impl TorStatus {
             state: "error".to_owned(),
             bootstrap_status,
             error: Some(message),
+            last_traffic: None,
         })
     }
 
@@ -156,10 +161,87 @@ impl TorStatus {
         }
     }
 
+    fn source(&self) -> Arc<RwLock<TorStatusSnapshot>> {
+        self.runtime
+            .read()
+            .ok()
+            .and_then(|runtime| runtime.as_ref().map(|runtime| runtime.status.clone()))
+            .unwrap_or_else(|| self.inner.clone())
+    }
+
     fn snapshot(&self) -> TorStatusSnapshot {
-        self.inner
+        self.source()
             .read()
             .map_or_else(|_| TorStatusSnapshot::poisoned(), |guard| guard.clone())
+    }
+
+    pub(crate) fn fail(&self, reason: &str) {
+        if let Ok(mut snapshot) = self.source().write() {
+            snapshot.running = false;
+            snapshot.error = Some(reason.to_owned());
+            "failed".clone_into(&mut snapshot.state);
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        let mut final_status = self.snapshot();
+        final_status.running = false;
+        "stopped".clone_into(&mut final_status.state);
+        if let Ok(mut snapshot) = self.inner.write() {
+            *snapshot = final_status;
+        }
+        if let Ok(mut runtime) = self.runtime.write() {
+            *runtime = None;
+        }
+    }
+
+    /// Arti publication state and observed traffic are independent of address assignment.
+    #[must_use]
+    pub fn operational_summary(&self) -> String {
+        use tor_hsservice::status::State;
+        let snapshot = self.snapshot();
+        if !snapshot.enabled {
+            return "[DISABLED]".to_owned();
+        }
+        if let Some(error) = &snapshot.error {
+            return format!(
+                "[{}] {}",
+                if snapshot.running {
+                    "DEGRADED"
+                } else {
+                    "FAILED"
+                },
+                crate::terminal::display_text(error)
+            );
+        }
+        let publication = self.runtime.read().ok().and_then(|runtime| {
+            runtime
+                .as_ref()
+                .map(|runtime| runtime.service.status().state())
+        });
+        let state = match publication {
+            Some(State::Running) => {
+                "[READY] Arti reports introduction points and descriptor current"
+            }
+            Some(State::DegradedReachable) => {
+                "[DEGRADED] Arti reports reachable with reduced introduction points"
+            }
+            Some(State::DegradedUnreachable) => "[DEGRADED] descriptor publication incomplete",
+            Some(State::Recovering) => "[DEGRADED] recovering introduction points/publication",
+            Some(State::Broken) => "[FAILED] Arti service broken",
+            Some(State::Shutdown) => "[STOPPED] Arti service stopped",
+            Some(State::Bootstrapping) => "[STARTING] introduction points / descriptor publication",
+            Some(_) => "[UNAVAILABLE] unrecognized Arti service state",
+            None if snapshot.state == "stopped" => "[STOPPED]",
+            None => "[STARTING] bootstrap; service not launched",
+        };
+        format!(
+            "{state}; current external reachability unverified; last traffic {}",
+            snapshot.last_traffic.map_or_else(
+                || "never observed in this process".to_owned(),
+                |at| format!("{}s ago", at.elapsed().as_secs())
+            )
+        )
     }
 
     fn runtime_is_running(&self) -> bool {
@@ -178,6 +260,7 @@ impl TorStatusSnapshot {
             state: "error".to_owned(),
             bootstrap_status: None,
             error: Some("Tor status lock was poisoned".to_owned()),
+            last_traffic: None,
         }
     }
 }
@@ -284,6 +367,7 @@ async fn start_inner(
         state: "service active; external reachability unverified".to_owned(),
         bootstrap_status,
         error: None,
+        last_traffic: None,
     }));
     let runtime_slot = Arc::new(RwLock::new(None));
     let stream_task = spawn_stream_forwarder(
@@ -294,8 +378,9 @@ async fn start_inner(
     );
     let runtime = Arc::new(TorRuntime {
         _client: client,
-        _service: service,
+        service,
         stream_task,
+        status: inner.clone(),
     });
     if let Ok(mut slot) = runtime_slot.write() {
         *slot = Some(runtime);
@@ -341,7 +426,9 @@ fn spawn_stream_forwarder(
                         if let Some(status) = task_status.upgrade()
                             && let Ok(mut snapshot) = status.write()
                         {
-                            "reachable".clone_into(&mut snapshot.state);
+                            "traffic observed; current external reachability unverified"
+                                .clone_into(&mut snapshot.state);
+                            snapshot.last_traffic = Some(Instant::now());
                             snapshot.error = None;
                         }
                     }
@@ -459,4 +546,40 @@ fn restrict_dir(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn restrict_dir(_path: &Path) -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    #[test]
+    fn assigned_address_is_not_publication_and_forwarding_errors_take_precedence()
+    -> anyhow::Result<()> {
+        let status = TorStatus::starting();
+        {
+            let mut snapshot = status
+                .inner
+                .write()
+                .map_err(|_| anyhow::anyhow!("test lock"))?;
+            snapshot.onion_address = Some("fixture.onion".to_owned());
+            snapshot.running = true;
+            snapshot.error = Some("forwarding connection failed".to_owned());
+        }
+        let text = status.operational_summary();
+        assert!(text.contains("[DEGRADED]"));
+        assert!(text.contains("forwarding connection failed"));
+        {
+            let mut snapshot = status
+                .inner
+                .write()
+                .map_err(|_| anyhow::anyhow!("test lock"))?;
+            snapshot.error = None;
+        }
+        assert!(!status.operational_summary().contains("[READY]"));
+        assert!(
+            status
+                .operational_summary()
+                .contains("external reachability unverified")
+        );
+        Ok(())
+    }
 }

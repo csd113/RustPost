@@ -35,35 +35,80 @@ pub fn run_automatic_backup_if_due(
 pub fn spawn_automatic_scheduler(
     base_paths: RuntimePaths,
     settings_path: PathBuf,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 ) {
+    let _task = spawn_automatic_scheduler_observed(
+        base_paths,
+        settings_path,
+        shutdown_rx,
+        crate::console::operations::Operations::default(),
+    );
+}
+
+pub fn spawn_automatic_scheduler_observed(
+    base_paths: RuntimePaths,
+    settings_path: PathBuf,
+    mut shutdown_rx: watch::Receiver<bool>,
+    operations: crate::console::operations::Operations,
+) -> tokio::task::JoinHandle<()> {
+    use crate::console::operations::TaskState;
     tokio::spawn(async move {
         loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            operations.set(
+                0,
+                TaskState::Running,
+                "checking schedule / creating archive if due",
+            );
             let check_paths = base_paths.clone();
             let check_settings = settings_path.clone();
             let result = tokio::task::spawn_blocking(move || {
                 Settings::load(&check_settings).and_then(|settings| {
                     settings.validate()?;
+                    let enabled = settings.backup.enabled && settings.backup.automatic_enabled;
                     run_automatic_backup_if_due(&check_paths, &settings)
+                        .map(|archive| (enabled, archive))
                 })
             })
             .await;
             match result {
-                Ok(Ok(Some(path))) => info!(archive = %path.display(), "automatic backup created"),
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => warn!(error = %error, "automatic backup check failed"),
-                Err(error) => warn!(error = %error, "automatic backup worker failed"),
+                Ok(Ok((_, Some(path)))) => {
+                    operations.set(
+                        0,
+                        TaskState::Succeeded,
+                        "archive created and retention completed",
+                    );
+                    info!(archive = %path.display(), "automatic backup created");
+                }
+                Ok(Ok((true, None))) => {
+                    operations.set(0, TaskState::Skipped, "no automatic backup due")
+                }
+                Ok(Ok((false, None))) => {
+                    operations.set(0, TaskState::Skipped, "automatic backup disabled")
+                }
+                Ok(Err(error)) => {
+                    operations.set(
+                        0,
+                        TaskState::Failed,
+                        crate::console::operations::failure_reason(&error),
+                    );
+                    warn!(diagnostic = crate::console::operations::failure_reason(&error), error = %error, "automatic backup check failed");
+                }
+                Err(error) => {
+                    operations.set(0, TaskState::Failed, "backup worker failed");
+                    warn!(error = %error, "automatic backup worker failed");
+                }
             }
             tokio::select! {
                 changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        break;
-                    }
+                    if changed.is_err() || *shutdown_rx.borrow() { break; }
                 }
                 () = tokio::time::sleep(Duration::from_secs(AUTOMATIC_CHECK_INTERVAL_SECS)) => {}
             }
         }
-    });
+    })
 }
 
 pub fn apply_retention(paths: &RuntimePaths, settings: &BackupSettings) -> anyhow::Result<usize> {

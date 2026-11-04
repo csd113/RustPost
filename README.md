@@ -141,6 +141,8 @@ Follow the first-run administrator prompts. If no prompt appears, open a second 
 
 On Windows, use `.\rustpost\rustpost-cli.exe` instead. Then open [http://127.0.0.1:8080](http://127.0.0.1:8080) and log in.
 
+The live console shows server/Tor state, database footprint, content counts and failures. Use 1–6 or Tab to navigate, ? for help, and Q to confirm a graceful stop. `--console plain` provides line reports; `--console off` disables the console. See the [operator guide](docs/operator-guide.md#operational-console) for freshness, fallback and platform details.
+
 Installing `ffmpeg` is optional for downloaded apps. Without it, RustPost can serve allowed uploads in their original format.
 
 ### Build from source

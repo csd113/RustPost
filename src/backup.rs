@@ -230,7 +230,10 @@ use paths::{
     validate_entry_path,
 };
 mod scheduler;
-pub use scheduler::{apply_retention, run_automatic_backup_if_due, spawn_automatic_scheduler};
+pub use scheduler::{
+    apply_retention, run_automatic_backup_if_due, spawn_automatic_scheduler,
+    spawn_automatic_scheduler_observed,
+};
 mod storage;
 pub(crate) use storage::backup_coordination_lock;
 pub use storage::{backup_path_for_download, list_backups, operation_in_progress};

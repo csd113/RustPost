@@ -22,6 +22,7 @@ pub mod backup;
 pub mod cli;
 pub mod compression;
 pub mod config;
+pub mod console;
 pub mod csrf;
 pub mod db;
 pub mod demo_seed;

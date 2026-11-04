@@ -86,6 +86,8 @@ jobs:
           cache-bin: false
       - name: Build CLI
         run: cargo build --locked --workspace --all-features --target ${{ matrix.target }} --bin rustpost-cli
+      - name: Run native terminal and CLI regressions
+        run: cargo test --locked --workspace --all-features --target ${{ matrix.target }}
       - name: Verify native executable and architecture
         shell: bash
         env:

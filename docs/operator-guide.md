@@ -10,10 +10,10 @@ For an installed app, add `--data-dir /path/to/your/site` before the subcommand,
 
 ```sh
 rustpost-cli init                                       # Initialize data directory
-rustpost-cli check                                      # Validate config, data directory, and DB schema status
-rustpost-cli create-admin <username> <password>         # Create an admin account
+rustpost-cli check                                      # Read-only config/schema check; init first
+rustpost-cli create-admin USERNAME --password-stdin     # Read one password line from a protected pipe/file
 rustpost-cli create-admin-interactive                   # Create an admin with hidden password prompts
-rustpost-cli reset-admin-password <username> <password> # Reset an admin's password
+rustpost-cli reset-admin-password-interactive USERNAME  # Reset with hidden prompts
 rustpost-cli --data-dir target/debug/rustpost-demo seed-demo # Create local demo data
 rustpost-cli serve                                      # Start the HTTP server (default)
 rustpost-cli backup                                     # Create a backup archive
@@ -22,7 +22,25 @@ rustpost-cli restore <archive.tar>                      # Restore from a backup
 rustpost-cli restore <archive.tar> --include-tor-keys   # Restore including Tor keys
 ```
 
-Prefer `create-admin-interactive` for local setup: it hides the password while you type. Passwords passed as arguments to `create-admin` or `reset-admin-password` can be visible to other local processes.
+Prefer `create-admin-interactive` or `reset-admin-password-interactive USERNAME` locally. Hidden input requires terminal stdin and stderr; Ctrl-C, Ctrl-D, or Esc cancels, and password confirmation/validation failures allow retry. Unix uses saved terminal modes without an external `stty`; Windows saves the original console input/output modes. Legacy Windows consoles use console events without bracketed paste: paste only one line at a time. Console close/forced process termination cannot guarantee cleanup.
+
+For automation, `create-admin USERNAME --password-stdin` and `reset-admin-password USERNAME --password-stdin` read one UTF-8 line (maximum 4096 bytes), for example with stdin redirected from a protected password file. Avoid putting a literal secret in a shell pipeline/history. Legacy positional password arguments remain compatible but can appear in process listings and history.
+
+`check` does not initialize directories, generate settings, relocate a legacy DB, or migrate its schema. Run `init` first. It exits nonzero for corrupt/unreadable/incompatible DBs or layout conflicts; a missing fresh DB, an adoptable legacy schema, and optional FFmpeg absence are reported without failing. A legacy `app.sqlite3` is checked in place.
+
+### Operational console
+
+`serve` selects the full-screen console when stdin/stdout are terminals and `TERM` is not `dumb`. Use `--console auto|tui|plain|off`; terminal initialization or capability failure falls back to plain reports. `off` disables the console and its samplers. Command results stay on stdout; operational reports/logs use stderr. Redirected/dumb output contains no ANSI. The console uses monochrome text and ASCII borders; `--ascii` displays Unicode data as explicit code points.
+
+Destinations match RustChan: **1 Overview, 2 Tasks, 3 Content, 4 Logs, 5 System, 6 Configuration**. Use Tab/Shift-Tab or numbers, arrows/J/K, Page Up/Down, Home/End, R to refresh, and ?/H for help. Every content/help view scrolls, including below 44×14. Q confirms shutdown; Ctrl-C requests the same graceful drain directly. Raw mode and the alternate screen restore when stopping begins, while plain stopping reports can continue.
+
+Health and freshness are independent. Counts update every 3 seconds through a separate read-only SQLite connection with a 250 ms query budget; forced refreshes coalesce and run at most once/second. DB main/WAL/SHM file lengths update separately every 3 seconds. Upload file lengths are scanned every 30 seconds without following symlinks, with a 10,000-entry/200 ms cooperative budget. Incomplete/failed collections preserve last-good values as **STALE** with age/reason; missing values are **UNAVAILABLE**. File lengths are not allocated disk blocks. OS filesystem calls themselves have no hard deadline.
+
+Listeners display actual bound sockets, including ephemeral ports. Tor distinguishes address assignment, Arti introduction-point/descriptor status, forwarding errors, and the age of observed traffic; current external reachability remains unverified. Task failures and last failure age are retained for the process lifetime independently of log filtering. HTTP counters count handlers and 5xx responses; RSS/CPU and prior-process task outcomes are explicitly unavailable.
+
+Logs retain the last 200 safe event summaries and write `logs/events.log` (1 MiB plus one previous file). Only allowlisted messages/diagnostic categories and source metadata are retained; arbitrary diagnostic fields, request data and secrets are omitted. The Logs view identifies queue drops, evictions and persistence failures. Bounded nonblocking queues isolate logging IO; event-sink drain waits at most one second at exit. This is best-effort event retention, not a durable audit journal.
+
+Shutdown owns the scheduler tasks and finishes admitted backup/maintenance work. HTTP drain is capped at 30 seconds; transactional backup work is not force-aborted. There is no hard whole-process bound for a stuck filesystem. Native Windows console/VT/code-page behavior and Linux SSH/tmux behavior require native interactive validation; portable builds alone do not establish it.
 
 ### Runtime storage
 

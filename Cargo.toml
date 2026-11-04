@@ -14,7 +14,7 @@ autobenches = false
 
 [lib]
 doctest = false
-test = false
+test = true
 bench = false
 
 [[bin]]
@@ -32,6 +32,8 @@ base64 = "0.23.1"
 captcha = { version = "1.0", default-features = false }
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
+crossterm = "0.29.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 futures-util = "0.3.34"
 flate2 = "1.1.10"
 html-escape = "0.3.0"
@@ -48,7 +50,7 @@ sha2 = "0.11.1"
 # Already used by the Tor stack; constant-time CSRF digest comparison.
 subtle = "2.6.1"
 # Arti 0.48 requires rusqlite >=0.36,<0.41; SQLite can only be linked once.
-rusqlite = { version = "0.40.2", features = ["bundled", "functions", "backup"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "functions", "backup", "hooks"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 tar = "0.4.46"
 tempfile = "3.27.0"
@@ -65,6 +67,16 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 uuid = { version = "1.29.0", features = ["v4", "serde"] }
 walkdir = "2.5"
+zeroize = "1.9.1"
+unicode-segmentation = "1.13.3"
+
+[target.'cfg(windows)'.dependencies]
+# Crossterm's Windows raw-mode reset does not preserve initially disabled flags.
+crossterm_winapi = "0.9.1"
+
+[[test]]
+name = "terminal_regressions"
+path = "tests/terminal_regressions.rs"
 
 [profile.release]
 lto = true

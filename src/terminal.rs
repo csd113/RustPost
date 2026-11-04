@@ -6,6 +6,9 @@ use anyhow::Error;
 
 use crate::{config, ffmpeg, runtime, tor};
 
+pub(crate) mod input;
+pub(crate) mod session;
+
 const RULE: &str = "------------------------------------------------------------";
 
 #[derive(Debug, Clone, Copy)]
@@ -14,6 +17,7 @@ pub enum Status {
     Warn,
     Pending,
     Off,
+    Failed,
 }
 
 impl Status {
@@ -22,7 +26,8 @@ impl Status {
             Self::Ok => "[OK]",
             Self::Warn => "[WARN]",
             Self::Pending => "[PENDING]",
-            Self::Off => "[OFF]",
+            Self::Off => "[DISABLED]",
+            Self::Failed => "[FAILED]",
         }
     }
 }
@@ -59,6 +64,7 @@ pub enum DatabaseSchemaStatus {
     },
 }
 
+/// Legacy one-time snapshot. This does not establish listener readiness or freshness.
 #[must_use]
 pub fn render_startup_dashboard(input: &StartupDashboard<'_>) -> String {
     let mut out = String::with_capacity(1_800);
@@ -127,6 +133,7 @@ pub fn render_startup_dashboard(input: &StartupDashboard<'_>) -> String {
 
 #[must_use]
 pub fn render_check(
+    paths: &runtime::RuntimePaths,
     settings: &config::Settings,
     ffmpeg: &ffmpeg::FfmpegStatus,
     tor_status: &tor::TorStatus,
@@ -150,14 +157,22 @@ pub fn render_check(
                 "Anonymous posting",
                 enabled_label(settings.accounts.anonymous_mode_enabled),
             ),
-            row("Tor", tor_status_value(settings, tor_status)),
+            row(
+                "Tor",
+                if settings.tor.enabled {
+                    "[CONFIGURED] not started by check; publication/reachability unverified"
+                        .to_owned()
+                } else {
+                    tor_status_value(settings, tor_status)
+                },
+            ),
             row("FFmpeg", ffmpeg_status_value(ffmpeg)),
         ],
     );
     push_section(
         &mut out,
         "Next commands",
-        &[row("Start server", "rustpost-cli serve")],
+        &[row("Start server", instance_command(paths, "serve"))],
     );
     out.push_str(RULE);
     out.push('\n');
@@ -186,18 +201,9 @@ pub fn render_init(paths: &runtime::RuntimePaths, settings_path: &Path) -> Strin
         &[
             row(
                 "Create admin",
-                format!(
-                    "rustpost-cli --data-dir {} create-admin-interactive",
-                    display(paths.data_dir.as_path())
-                ),
+                instance_command(paths, "create-admin-interactive"),
             ),
-            row(
-                "Start server",
-                format!(
-                    "rustpost-cli --data-dir {} serve",
-                    display(paths.data_dir.as_path())
-                ),
-            ),
+            row("Start server", instance_command(paths, "serve")),
         ],
     );
     out.push_str(RULE);
@@ -225,7 +231,7 @@ pub fn render_first_admin_setup(paths: &runtime::RuntimePaths) -> String {
         &[
             row("Why", "no admin account exists"),
             row("Data directory", display(paths.data_dir.as_path())),
-            row("Password input", "hidden where supported"),
+            row("Password input", "hidden; Ctrl-C/Esc cancels"),
         ],
     );
     out.push_str(RULE);
@@ -242,20 +248,14 @@ pub fn render_first_admin_non_interactive(paths: &runtime::RuntimePaths) -> Stri
         "Setup",
         &[
             row("Status", "no admin account exists"),
-            row("Input", "stdin is not interactive, so setup was skipped"),
+            row("Input", "terminal stdin/stderr unavailable; setup skipped"),
             row(
                 "Create admin",
-                format!(
-                    "rustpost-cli --data-dir {} create-admin-interactive",
-                    display(paths.data_dir.as_path())
-                ),
+                instance_command(paths, "create-admin-interactive"),
             ),
             row(
                 "Alternative",
-                format!(
-                    "rustpost-cli --data-dir {} create-admin <username> <password>",
-                    display(paths.data_dir.as_path())
-                ),
+                instance_command(paths, "create-admin USERNAME --password-stdin"),
             ),
         ],
     );
@@ -272,8 +272,8 @@ pub fn render_error(error: &Error) -> String {
     let mut sources = error.chain().skip(1).peekable();
     if sources.peek().is_some() {
         out.push_str("Caused by\n");
-        for source in sources {
-            let _ = writeln!(out, "  - {source}");
+        for source in sources.take(8) {
+            let _ = writeln!(out, "  - {}", display_text(&source.to_string()));
         }
         out.push('\n');
     }
@@ -294,22 +294,22 @@ pub struct Row {
 #[must_use]
 pub fn row(label: impl Into<String>, value: impl Into<String>) -> Row {
     Row {
-        label: label.into(),
-        value: value.into(),
+        label: display_text(&label.into()),
+        value: display_text(&value.into()),
     }
 }
 
 fn push_header(out: &mut String, title: &str) {
     out.push_str(RULE);
     out.push('\n');
-    let _ = writeln!(out, " {title}");
+    let _ = writeln!(out, " {}", display_text(title));
     out.push_str(RULE);
     out.push('\n');
 }
 
 fn push_section(out: &mut String, title: &str, rows: &[Row]) {
     let label_width = rows.iter().map(|row| row.label.len()).max().unwrap_or(0);
-    let _ = writeln!(out, "{title}");
+    let _ = writeln!(out, "{}", display_text(title));
     for row in rows {
         let _ = writeln!(out, "  {:label_width$} : {}", row.label, row.value);
     }
@@ -322,7 +322,14 @@ fn endpoint_rows(
     onion_target: Option<SocketAddr>,
 ) -> Vec<Row> {
     let mut rows = vec![
-        row("Local URL", local_http_url(&settings.server)),
+        row(
+            "Local URL",
+            if settings.tor.tor_only {
+                "[DISABLED] clearnet".to_owned()
+            } else {
+                local_http_url(&settings.server)
+            },
+        ),
         row("Public URL", public_url(settings)),
     ];
     if let Some(addr) = onion_target {
@@ -341,25 +348,19 @@ fn next_command_rows(input: &StartupDashboard<'_>) -> Vec<Row> {
     if input.admin_count == 0 {
         rows.push(row(
             "Create admin",
-            format!(
-                "rustpost-cli --data-dir {} create-admin-interactive",
-                display(input.paths.data_dir.as_path())
-            ),
+            instance_command(input.paths, "create-admin-interactive"),
         ));
     }
-    rows.push(row(
-        "Check config",
-        format!(
-            "rustpost-cli --data-dir {} check",
-            display(input.paths.data_dir.as_path())
-        ),
-    ));
+    rows.push(row("Check config", instance_command(input.paths, "check")));
     rows.push(row("Stop server", "Press Ctrl-C"));
     rows
 }
 
 fn bind_address(settings: &config::ServerSettings) -> String {
-    format!("{}:{}", settings.host, settings.port)
+    settings.listener_address().map_or_else(
+        |_| "[UNAVAILABLE] invalid bind address".to_owned(),
+        |addr| addr.to_string(),
+    )
 }
 
 fn local_http_url(settings: &config::ServerSettings) -> String {
@@ -399,11 +400,11 @@ fn tor_status_value(settings: &config::Settings, tor_status: &tor::TorStatus) ->
     if !settings.tor.enabled {
         return status_value(Status::Off, "disabled");
     }
-    if tor_status.running() {
-        return status_value(Status::Ok, &tor_status.summary());
-    }
     if let Some(error) = tor_status.error() {
         return status_value(Status::Warn, &error);
+    }
+    if tor_status.running() {
+        return status_value(Status::Ok, &tor_status.summary());
     }
     status_value(Status::Pending, &tor_status.summary())
 }
@@ -442,11 +443,11 @@ fn database_schema_status_value(status: &DatabaseSchemaStatus) -> String {
             if *compatible {
                 status_value(Status::Ok, &summary)
             } else {
-                status_value(Status::Warn, &summary)
+                status_value(Status::Failed, &summary)
             }
         }
         DatabaseSchemaStatus::Unreadable { error } => {
-            status_value(Status::Warn, &format!("unreadable; {error}"))
+            status_value(Status::Failed, &format!("unreadable; {error}"))
         }
     }
 }
@@ -495,8 +496,80 @@ fn error_title(error: &Error) -> &'static str {
 fn error_text(error: &Error) -> String {
     error
         .chain()
-        .map(ToString::to_string)
+        .take(8)
+        .map(|source| display_text(&source.to_string()))
         .collect::<Vec<_>>()
         .join("\n")
         .to_ascii_lowercase()
+}
+
+/// One bounded, Unicode-safe display boundary. Controls are visible tokens,
+/// rather than deleted bytes which could concatenate unrelated identifiers.
+#[must_use]
+pub fn display_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(1024));
+    for (index, ch) in value.chars().enumerate() {
+        if index == 512 {
+            out.push_str(" [truncated]");
+            break;
+        }
+        if ch.is_control()
+            || matches!(ch, '\u{061c}' | '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+        {
+            let _ = write!(out, "<U+{:04X}>", u32::from(ch));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Suggestions retain the effective executable, data and configuration paths.
+/// POSIX sh on Unix; PowerShell on Windows. No secret is ever an argument.
+#[must_use]
+pub fn instance_command(paths: &runtime::RuntimePaths, command: &str) -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return "[UNAVAILABLE] executable path".to_owned();
+    };
+    let values = [&exe, &paths.data_dir, &paths.settings_path];
+    let mut quoted = Vec::new();
+    for path in values {
+        let Some(value) = path.to_str() else {
+            return "[UNAVAILABLE] command path is not Unicode".to_owned();
+        };
+        if value.len() > 2048 || display_text(value) != value {
+            return "[UNAVAILABLE] command path contains controls or exceeds the display limit"
+                .to_owned();
+        }
+        #[cfg(windows)]
+        quoted.push(format!("'{}'", value.replace('\'', "''")));
+        #[cfg(not(windows))]
+        quoted.push(format!("'{}'", value.replace('\'', "'\"'\"'")));
+    }
+    #[cfg(windows)]
+    let prefix = "& ";
+    #[cfg(not(windows))]
+    let prefix = "";
+    let suggestion = format!(
+        "{prefix}{} --data-dir {} --config {} {command}",
+        quoted[0], quoted[1], quoted[2]
+    );
+    if suggestion.chars().count() > 512 {
+        "[UNAVAILABLE] command exceeds display limit; pass effective --data-dir and --config separately".to_owned()
+    } else {
+        suggestion
+    }
+}
+
+/// ASCII fallback keeps Unicode values explicit instead of guessing a transliteration.
+pub fn ascii_text(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+        } else {
+            let _ = write!(out, "<U+{:04X}>", u32::from(ch));
+        }
+    }
+    out
 }

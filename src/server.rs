@@ -102,13 +102,37 @@ enum MaintenancePolicy {
 pub fn spawn_maintenance_scheduler(
     pool: SqlitePool,
     paths: RuntimePaths,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    let _task = spawn_maintenance_scheduler_observed(
+        pool,
+        paths,
+        shutdown_rx,
+        crate::console::operations::Operations::default(),
+    );
+}
+
+pub fn spawn_maintenance_scheduler_observed(
+    pool: SqlitePool,
+    paths: RuntimePaths,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    operations: crate::console::operations::Operations,
+) -> tokio::task::JoinHandle<()> {
+    use crate::console::operations::TaskState;
     tokio::spawn(async move {
         // The longest configured rate-limit window is one hour; keep two hours.
         const RATE_LIMIT_RETENTION_SECS: i64 = 2 * 60 * 60;
         const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(30);
         loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            let mut failed = false;
+            operations.set(
+                1,
+                TaskState::Running,
+                "account cleanup, sessions and rate-limit maintenance",
+            );
             if !backup::operation_in_progress(&paths)
                 && let Ok(_lease) = crate::runtime::snapshot_lease(&paths, false)
             {
@@ -119,6 +143,7 @@ pub fn spawn_maintenance_scheduler(
                         "recovered interrupted account deletion media cleanup"
                     ),
                     Err(error) => {
+                        failed = true;
                         tracing::warn!(error = %error, "pending media deletion recovery failed");
                     }
                 }
@@ -132,26 +157,56 @@ pub fn spawn_maintenance_scheduler(
                     Ok(Ok(removed)) => {
                         tracing::info!(removed, "removed stale upload staging files")
                     }
-                    Ok(Err(error)) => tracing::warn!(error = %error, "temp file cleanup failed"),
-                    Err(error) => tracing::warn!(error = %error, "temp cleanup worker failed"),
+                    Ok(Err(error)) => {
+                        failed = true;
+                        tracing::warn!(error = %error, "temp file cleanup failed");
+                    }
+                    Err(error) => {
+                        failed = true;
+                        tracing::warn!(error = %error, "temp cleanup worker failed");
+                    }
                 }
                 if let Err(error) =
                     crate::rate_limit::prune_old(&pool, RATE_LIMIT_RETENTION_SECS).await
                 {
+                    failed = true;
                     tracing::warn!(error = %error, "rate limit event pruning failed");
                 }
                 match crate::auth::prune_stale_sessions(&pool, 7).await {
                     Ok(0) => {}
                     Ok(removed) => tracing::info!(removed, "removed stale sessions"),
-                    Err(error) => tracing::warn!(error = %error, "session pruning failed"),
+                    Err(error) => {
+                        failed = true;
+                        tracing::warn!(error = %error, "session pruning failed");
+                    }
                 }
                 match crate::account::finalize_due_deletions(&pool, &paths).await {
                     Ok(0) => {}
                     Ok(removed) => tracing::info!(removed, "finalized scheduled account deletions"),
                     Err(error) => {
+                        failed = true;
                         tracing::warn!(error = %error, "scheduled account deletion finalization failed");
                     }
                 }
+                operations.set(
+                    1,
+                    if failed {
+                        TaskState::Failed
+                    } else {
+                        TaskState::Succeeded
+                    },
+                    if failed {
+                        "one or more maintenance steps failed; inspect web admin / event callsites"
+                    } else {
+                        "maintenance pass completed"
+                    },
+                );
+            } else {
+                operations.set(
+                    1,
+                    TaskState::Skipped,
+                    "backup/restore snapshot coordination busy",
+                );
             }
             tokio::select! {
                 changed = shutdown_rx.changed() => {
@@ -162,7 +217,7 @@ pub fn spawn_maintenance_scheduler(
                 () = tokio::time::sleep(MAINTENANCE_INTERVAL) => {}
             }
         }
-    });
+    })
 }
 
 #[expect(
