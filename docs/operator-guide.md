@@ -213,7 +213,7 @@ Restore path validation rejects: absolute paths, traversal sequences, symlinks/h
 **Live/local Tor smoke validation:**
 
 - Start dual mode with a fresh explicit `--data-dir`, then confirm Arti bootstrap and onion descriptor publication in the logs.
-- Valid public local smoke endpoints are `/`, `/home`, `/login`, and `/register`. RustPost does not implement `/healthz` or `/readyz`; managed updates use the loopback-only `/internal/update-health` endpoint. For ordinary operation use the startup/status output and authenticated `/admin/health` page for operational status.
+- Valid public local smoke endpoints are `/`, `/home`, `/login`, and `/register`. RustPost does not implement `/healthz` or `/readyz`. For ordinary operation use the startup/status output and authenticated `/admin/health` page for operational status.
 - The active v3 onion hostname must contain 56 characters followed by `.onion`, and the same address must appear in startup/status output and the public Tor pill.
 - Confirm the printed loopback Arti forwarder target serves the same local page as the clearnet listener.
 - Onion-routed validation requires a reachable SOCKS proxy. Prefer Tor Browser at `127.0.0.1:9150`, then system Tor at `127.0.0.1:9050`:
@@ -328,11 +328,10 @@ Release validation distinguishes the required Rust gates from the dependency-adv
 cargo fmt --all --check
 cargo build --release --bins
 cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::all -D clippy::pedantic -D clippy::nursery -D clippy::cargo
-cargo test --workspace --all-features
 cargo audit
 ```
 
-The format, release build, strict Clippy, and test commands must pass. `cargo audit` is reviewed separately and is **not fully clean** for v1.0.0 because of this documented upstream exception:
+The format, release build, and strict Clippy commands must pass. `cargo audit` is reviewed separately and is **not fully clean** for v1.0.0 because of this documented upstream exception:
 
 > **Accepted v1.0.0 upstream audit exception:** `RUSTSEC-2023-0071` affects transitive `rsa 0.9.10` through the current pinned Arti/Tor dependency family. The advisory reports a potential key-recovery timing side channel, and no fixed upgrade is currently available. This is an upstream dependency risk, not a verified RustPost application vulnerability. Re-evaluate it when updating Arti or before the next release.
 
@@ -378,4 +377,4 @@ The format, release build, strict Clippy, and test commands must pass. `cargo au
 
 ## Software updates
 
-Use **Admin → Software updates** for stable GitHub release checks. A configured native Linux updater supports signed installation with mandatory exact SQLite/config backups, atomic activation, bounded health checks and automatic binary/database rollback. Containers remain deployment-managed. See [software-updates.md](software-updates.md) for administrator behavior, provisioning, retention, troubleshooting and signing/release requirements.
+**Admin → Software updates** checks GitHub and links to a newer stable release. Installation is manual.

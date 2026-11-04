@@ -4,9 +4,6 @@ use axum::http::Uri;
 use futures_util::future::join_all;
 use serde::Deserialize;
 
-#[cfg(test)]
-use std::{future::Future, sync::Arc};
-
 pub const FALLBACK_TITLE: &str = "YouTube video";
 pub const MAX_EMBEDS_PER_POST: usize = 3;
 
@@ -22,23 +19,6 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const READ_TIMEOUT: Duration = Duration::from_millis(700);
 const FETCH_TIMEOUT: Duration = Duration::from_millis(1_300);
-
-#[cfg(test)]
-type TestOembedFetcher = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
-
-#[cfg(test)]
-tokio::task_local! {
-    static TEST_OEMBED_FETCHER: TestOembedFetcher;
-}
-
-#[cfg(test)]
-pub async fn with_test_oembed_fetcher<F, Fut, R>(fetcher: F, future: Fut) -> R
-where
-    F: Fn(&str) -> Option<String> + Send + Sync + 'static,
-    Fut: Future<Output = R>,
-{
-    TEST_OEMBED_FETCHER.scope(Arc::new(fetcher), future).await
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YoutubeEmbed {
@@ -122,12 +102,6 @@ async fn fetch_embed_title(mut embed: YoutubeEmbed) -> YoutubeEmbed {
 }
 
 async fn fetch_oembed_title(video_id: &str) -> Option<String> {
-    #[cfg(test)]
-    if let Ok(title) = TEST_OEMBED_FETCHER.try_with(|fetcher| fetcher(video_id)) {
-        let title = title?;
-        return sanitize_title(&title);
-    }
-
     let video_id = video_id.to_owned();
     tokio::task::spawn_blocking(move || fetch_oembed_title_blocking(&video_id))
         .await
@@ -313,120 +287,4 @@ fn thumbnail_url(video_id: &str) -> String {
 
 fn embed_url(video_id: &str) -> String {
     format!("https://www.youtube-nocookie.com/embed/{video_id}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn video_id_extraction_supports_common_url_shapes() {
-        let cases = [
-            ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
-            (
-                "https://youtube.com/watch?feature=share&v=dQw4w9WgXcQ",
-                "dQw4w9WgXcQ",
-            ),
-            ("https://youtu.be/dQw4w9WgXcQ?t=12", "dQw4w9WgXcQ"),
-            ("https://www.youtube.com/shorts/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
-            ("https://www.youtube.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
-            (
-                "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
-                "dQw4w9WgXcQ",
-            ),
-            ("youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
-        ];
-
-        for (url, expected) in cases {
-            let preview = embed_from_url(url).expect("valid YouTube URL");
-
-            assert_eq!(preview.video_id, expected);
-            assert_eq!(preview.canonical_url, canonical_watch_url(expected));
-        }
-    }
-
-    #[test]
-    fn video_id_extraction_rejects_invalid_and_spoofed_urls() {
-        let invalid = [
-            "https://youtube.com.evil/watch?v=dQw4w9WgXcQ",
-            "https://evil.example/youtube.com/watch?v=dQw4w9WgXcQ",
-            "https://youtube.com@evil.example/watch?v=dQw4w9WgXcQ",
-            "javascript:https://youtube.com/watch?v=dQw4w9WgXcQ",
-            "https://www.youtube.com/watch?v=dQw4w9WgXc",
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ%2F",
-            "https://youtu.be/dQw4w9WgXcQ/extra",
-            "https://www.youtube.com/shorts/../dQw4w9WgXcQ",
-            "https://www.youtube.com/embed/dQw4w9WgXcQ/../x",
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&v=aaaaaaaaaaa",
-        ];
-
-        for url in invalid {
-            assert!(embed_from_url(url).is_none(), "accepted invalid URL: {url}");
-        }
-    }
-
-    #[test]
-    fn text_extraction_deduplicates_and_caps_embeds() {
-        let embeds = embeds_for_text(
-            "https://youtu.be/dQw4w9WgXcQ https://youtube.com/watch?v=dQw4w9WgXcQ https://youtube.com/shorts/aaaaaaaaaaa https://youtube.com/embed/bbbbbbbbbbb https://youtube.com/watch?v=ccccccccccc",
-        );
-
-        assert_eq!(embeds.len(), MAX_EMBEDS_PER_POST);
-        assert_eq!(embeds[0].video_id, "dQw4w9WgXcQ");
-        assert_eq!(embeds[1].video_id, "aaaaaaaaaaa");
-        assert_eq!(embeds[2].video_id, "bbbbbbbbbbb");
-    }
-
-    #[test]
-    fn stored_embeds_validate_id_and_sanitize_title() {
-        let embed = embed_from_stored("dQw4w9WgXcQ", Some("  A title\nwith\tspacing  ".to_owned()))
-            .expect("valid stored embed");
-
-        assert_eq!(embed.display_title(), "A title with spacing");
-        assert_eq!(
-            embed.embed_url,
-            "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ"
-        );
-        assert!(embed_from_stored("bad", Some("title".to_owned())).is_none());
-    }
-
-    #[tokio::test]
-    async fn metadata_fetch_uses_sanitized_oembed_title_when_available() {
-        let embeds = with_test_oembed_fetcher(
-            |video_id| {
-                assert_eq!(video_id, "dQw4w9WgXcQ");
-                Some("  A fetched\n<title>  ".to_owned())
-            },
-            metadata_for_text("watch https://youtu.be/dQw4w9WgXcQ"),
-        )
-        .await;
-
-        assert_eq!(embeds.len(), 1);
-        assert_eq!(embeds[0].title.as_deref(), Some("A fetched <title>"));
-        assert_eq!(embeds[0].display_title(), "A fetched <title>");
-    }
-
-    #[tokio::test]
-    async fn metadata_fetch_keeps_fallback_title_when_oembed_fails() {
-        let embeds = with_test_oembed_fetcher(
-            |_video_id| None,
-            metadata_for_text("https://youtu.be/dQw4w9WgXcQ"),
-        )
-        .await;
-
-        assert_eq!(embeds.len(), 1);
-        assert_eq!(embeds[0].title, None);
-        assert_eq!(embeds[0].display_title(), FALLBACK_TITLE);
-    }
-
-    #[test]
-    fn oembed_title_parsing_rejects_invalid_or_empty_title() {
-        assert_eq!(
-            parse_oembed_title(r#"{"title":"  Valid\tTitle  "}"#),
-            Some("Valid Title".to_owned())
-        );
-        assert_eq!(parse_oembed_title(r#"{"title":" \n\t "}"#), None);
-        assert_eq!(parse_oembed_title(r#"{"title":42}"#), None);
-        assert_eq!(parse_oembed_title("not json"), None);
-    }
 }

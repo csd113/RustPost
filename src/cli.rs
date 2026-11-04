@@ -28,10 +28,6 @@ struct Cli {
     #[arg(long, help = "Runtime data directory")]
     data_dir: Option<PathBuf>,
 
-    /// Print machine-readable release compatibility without touching runtime state.
-    #[arg(long)]
-    update_info: bool,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -96,16 +92,10 @@ enum Command {
 pub async fn run() -> anyhow::Result<()> {
     logging::init();
     let cli = Cli::parse();
-    if cli.update_info {
-        stdout_line(format_args!(
-            "{}",
-            serde_json::json!({ "version": crate::updates::VERSION, "schema": db::CURRENT_SCHEMA_VERSION, "minimum_schema": 1, "target": crate::updates::platform_target(), "updater_protocol": 1 })
-        ))?;
-        return Ok(());
-    }
     let explicit_data_dir = cli.data_dir.clone();
     let mut paths = runtime::RuntimePaths::discover(cli.data_dir.as_deref())?;
     paths.ensure()?;
+    runtime::check_restore_recovery(&paths)?;
     let settings_path = cli.config.unwrap_or_else(|| paths.settings_path.clone());
     config::write_default_if_missing(&settings_path)?;
     let settings = config::Settings::load(&settings_path)?;
@@ -136,6 +126,17 @@ async fn run_command(
     settings: config::Settings,
     has_explicit_data_dir: bool,
 ) -> anyhow::Result<()> {
+    let _snapshot_lease = if matches!(
+        command,
+        Command::CreateAdmin { .. }
+            | Command::CreateAdminInteractive
+            | Command::ResetAdminPassword { .. }
+            | Command::SeedDemo
+    ) {
+        Some(runtime::snapshot_lease(&paths, false).context("a backup snapshot is in progress")?)
+    } else {
+        None
+    };
     let database = AdminDatabase {
         paths: &paths,
         settings: &settings,
@@ -328,16 +329,7 @@ async fn serve(
     settings_path: PathBuf,
     settings: config::Settings,
 ) -> anyhow::Result<()> {
-    if crate::updates::managed() {
-        let reply = crate::updates::request(&crate::updates::Request::Ready {
-            version: crate::updates::VERSION.into(),
-        })
-        .await?;
-        anyhow::ensure!(
-            reply.ready && reply.error.is_none(),
-            "updater recovery must complete before RustPost can migrate or start"
-        );
-    }
+    let _server_lease = runtime::acquire_server_lease(&paths)?;
     let pool = db::connect(&paths.database_path).await?;
     db::migrate(&pool).await?;
     let admin_count = ensure_first_admin_interactive(&pool, &settings, &paths).await?;
@@ -484,19 +476,38 @@ fn shutdown_receiver() -> watch::Receiver<bool> {
     shutdown_rx
 }
 
+async fn serve_until_shutdown<F>(server: F, shutdown: watch::Receiver<bool>) -> anyhow::Result<()>
+where
+    F: std::future::IntoFuture<Output = io::Result<()>>,
+{
+    let future = server.into_future();
+    tokio::pin!(future);
+    tokio::select! {
+        result = &mut future => result?,
+        () = wait_for_shutdown(shutdown) => {
+            if let Ok(result) = tokio::time::timeout(Duration::from_secs(30), &mut future).await { result?; } else { warn!("HTTP shutdown exceeded 30 seconds; cancelling active requests"); }
+        }
+    }
+    Ok(())
+}
+
 async fn serve_tor_only(
     onion_listener: Option<tokio::net::TcpListener>,
     app: axum::Router,
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let app = app.layer(axum::Extension(crate::csrf::OnionTransport));
     let listener = onion_listener.context("tor_only requires an internal onion listener")?;
     let addr = listener.local_addr()?;
     info!(%addr, "RustPost listening on loopback for Arti onion forwarding");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+    serve_until_shutdown(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone())),
+        shutdown_rx,
     )
-    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
     .await?;
     Ok(())
 }
@@ -517,7 +528,7 @@ async fn serve_clearnet(
             .into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
-    clearnet.await?;
+    serve_until_shutdown(clearnet, shutdown_rx).await?;
     Ok(())
 }
 
@@ -530,6 +541,7 @@ fn spawn_onion_forwarding(
     onion_target: Option<SocketAddr>,
     shutdown_rx: watch::Receiver<bool>,
 ) {
+    let app = app.layer(axum::Extension(crate::csrf::OnionTransport));
     tokio::spawn(async move {
         let started = match tor::start(&settings, &paths, onion_target).await {
             Ok(status) => status,
@@ -551,11 +563,14 @@ fn spawn_onion_forwarding(
             }
         };
         info!(%addr, "RustPost listening on loopback for Arti onion forwarding");
-        if let Err(error) = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
+        if let Err(error) = serve_until_shutdown(
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone())),
+            shutdown_rx,
         )
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
         .await
         {
             warn!(error = %error, "Tor onion forwarding listener failed");
@@ -720,6 +735,13 @@ impl Drop for EchoGuard {
 }
 
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    if let Ok(mut terminate) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+        return;
+    }
     let _ = tokio::signal::ctrl_c().await;
 }
 
@@ -755,131 +777,4 @@ fn stderr_line(args: std::fmt::Arguments<'_>) {
 fn stderr_raw(args: std::fmt::Arguments<'_>) {
     let mut stderr = io::stderr().lock();
     let _write_result = stderr.write_fmt(args);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn first_admin_credentials_reject_empty_username() {
-        let result = validate_first_admin_credentials(
-            &config::Settings::default(),
-            "   ",
-            "",
-            "very secure password".to_owned(),
-            "very secure password",
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            result.expect_err("empty username").to_string(),
-            "username cannot be empty"
-        );
-    }
-
-    #[test]
-    fn first_admin_credentials_validate_password_policy() {
-        let result = validate_first_admin_credentials(
-            &config::Settings::default(),
-            "admin-user",
-            "",
-            String::new(),
-            "",
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            result.expect_err("short password").to_string(),
-            "password is too short"
-        );
-    }
-
-    #[test]
-    fn first_admin_credentials_allow_empty_password_when_configured() {
-        let mut settings = config::Settings::default();
-        settings.accounts.min_password_length = 0;
-        let credentials =
-            validate_first_admin_credentials(&settings, "admin-user", "", String::new(), "")
-                .expect("valid credentials");
-
-        assert_eq!(credentials.password, "");
-    }
-
-    #[test]
-    fn first_admin_credentials_reject_password_mismatch() {
-        let result = validate_first_admin_credentials(
-            &config::Settings::default(),
-            "admin-user",
-            "",
-            "very secure password".to_owned(),
-            "very different password",
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            result.expect_err("mismatch").to_string(),
-            "passwords do not match"
-        );
-    }
-
-    #[test]
-    fn first_admin_credentials_accept_optional_display_name() {
-        let credentials = validate_first_admin_credentials(
-            &config::Settings::default(),
-            " Admin-User ",
-            " Ada Admin ",
-            "very secure password".to_owned(),
-            "very secure password",
-        )
-        .expect("valid credentials");
-
-        assert_eq!(
-            credentials,
-            FirstAdminCredentials {
-                username: "Admin-User".to_owned(),
-                display_name: Some("Ada Admin".to_owned()),
-                password: "very secure password".to_owned(),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn first_admin_creation_sets_optional_display_name() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        db::migrate(&pool).await.expect("migrate");
-        let settings = config::Settings::default();
-
-        let user_id = admin::create_admin_with_display_name(
-            &pool,
-            &settings,
-            "admin-user",
-            "very secure password",
-            Some("Ada Admin"),
-        )
-        .await
-        .expect("create admin");
-
-        let row: (String, bool, String) = pool
-            .call(move |conn| {
-                Ok(conn.query_row(
-                    "SELECT username, is_admin, display_name FROM users WHERE id = ?",
-                    [user_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)? != 0,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                )?)
-            })
-            .await
-            .expect("load admin");
-
-        assert_eq!(row, ("admin-user".to_owned(), true, "Ada Admin".to_owned()));
-    }
 }

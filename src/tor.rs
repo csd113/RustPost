@@ -15,6 +15,9 @@ use tor_hsservice::{HsNickname, RunningOnionService};
 use tor_proto::stream::IncomingStreamRequest;
 use tracing::{info, warn};
 
+mod activity;
+use activity::ObservedIo;
+
 use crate::config::TorSettings;
 use crate::runtime::RuntimePaths;
 
@@ -153,18 +156,6 @@ impl TorStatus {
         }
     }
 
-    fn record_error(&self, message: impl Into<String>) {
-        if let Ok(mut snapshot) = self.inner.write() {
-            snapshot.error = Some(message.into());
-        }
-    }
-
-    fn record_reachable(&self) {
-        if let Ok(mut snapshot) = self.inner.write() {
-            "reachable".clone_into(&mut snapshot.state);
-        }
-    }
-
     fn snapshot(&self) -> TorStatusSnapshot {
         self.inner
             .read()
@@ -295,27 +286,12 @@ async fn start_inner(
         error: None,
     }));
     let runtime_slot = Arc::new(RwLock::new(None));
-    let status = TorStatus {
-        inner: Arc::clone(&inner),
-        runtime: Arc::clone(&runtime_slot),
-    };
-    let task_status = status;
-    let mut stream_requests = tor_hsservice::handle_rend_requests(rend_requests);
-    let stream_task = tokio::spawn(async move {
-        while let Some(request) = stream_requests.next().await {
-            let task_status = task_status.clone();
-            tokio::spawn(async move {
-                match forward_stream_request(request, onion_target).await {
-                    Ok(()) => task_status.record_reachable(),
-                    Err(error) => {
-                        let message = format!("{error:#}");
-                        task_status.record_error(message.clone());
-                        warn!(error = %message, "Tor onion stream forwarding failed");
-                    }
-                }
-            });
-        }
-    });
+    let stream_task = spawn_stream_forwarder(
+        tor_hsservice::handle_rend_requests(rend_requests),
+        onion_target,
+        Arc::downgrade(&inner),
+        settings.max_concurrent_streams,
+    );
     let runtime = Arc::new(TorRuntime {
         _client: client,
         _service: service,
@@ -334,18 +310,84 @@ async fn start_inner(
     })
 }
 
+/// Bound total onion forwarding tasks across circuits without retaining the
+/// owning runtime through a status cycle.
+fn spawn_stream_forwarder(
+    mut stream_requests: impl futures_util::Stream<Item = tor_hsservice::StreamRequest>
+    + Send
+    + Unpin
+    + 'static,
+    onion_target: SocketAddr,
+    task_status: std::sync::Weak<RwLock<TorStatusSnapshot>>,
+    max_streams: usize,
+) -> tokio::task::JoinHandle<()> {
+    let stream_permits = Arc::new(tokio::sync::Semaphore::new(max_streams));
+    tokio::spawn(async move {
+        while let Some(request) = stream_requests.next().await {
+            let Ok(permit) = Arc::clone(&stream_permits).try_acquire_owned() else {
+                if let Err(error) = request
+                    .reject(End::new_with_reason(EndReason::RESOURCELIMIT))
+                    .await
+                {
+                    warn!(error = %error, "reject busy onion stream failed");
+                }
+                continue;
+            };
+            let task_status = task_status.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                match forward_stream_request(request, onion_target).await {
+                    Ok(true) => {
+                        if let Some(status) = task_status.upgrade()
+                            && let Ok(mut snapshot) = status.write()
+                        {
+                            "reachable".clone_into(&mut snapshot.state);
+                            snapshot.error = None;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        if let Some(status) = task_status.upgrade()
+                            && let Ok(mut snapshot) = status.write()
+                        {
+                            snapshot.error = Some(message.clone());
+                        }
+                        warn!(error = %message, "Tor onion stream forwarding failed");
+                    }
+                }
+            });
+        }
+        if let Some(status) = task_status.upgrade()
+            && let Ok(mut snapshot) = status.write()
+        {
+            snapshot.running = false;
+            "stopped".clone_into(&mut snapshot.state);
+            snapshot.error = Some("onion stream handler closed".to_owned());
+        }
+    })
+}
+
 async fn forward_stream_request(
     request: tor_hsservice::StreamRequest,
     target: SocketAddr,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if !is_supported_http_begin(request.request()) {
         request
             .reject(End::new_with_reason(EndReason::DONE))
             .await
             .context("reject unsupported onion stream")?;
-        return Ok(());
+        return Ok(false);
     }
-    let mut local = match TcpStream::connect(target).await {
+    let connection = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(target))
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "onion target connect timed out",
+            ))
+        });
+    let mut local = match connection {
         Ok(stream) => stream,
         Err(error) => {
             request
@@ -355,16 +397,29 @@ async fn forward_stream_request(
             anyhow::bail!("connect to onion target {target}: {error}");
         }
     };
-    let mut onion = request
-        .accept(Connected::new_empty())
-        .await
-        .context("accept onion stream")?;
-    match tokio::io::copy_bidirectional(&mut onion, &mut local).await {
-        Ok(_) => {}
-        Err(error) if is_clean_stream_close(&error) => {}
-        Err(error) => return Err(error).context("proxy onion stream to local RustPost listener"),
+    let mut onion = ObservedIo {
+        inner: request
+            .accept(Connected::new_empty())
+            .await
+            .context("accept onion stream")?,
+        transferred: false,
+    };
+    match tokio::time::timeout(
+        Duration::from_hours(1),
+        tokio::io::copy_bidirectional(&mut onion, &mut local),
+    )
+    .await
+    {
+        Ok(Ok((received, sent))) => Ok(received > 0 || sent > 0),
+        // Arti may end a successfully used stream with NotConnected/MISC
+        // rather than TCP EOF. Keep the observed traffic for reachability.
+        Ok(Err(error)) if is_clean_stream_close(&error) => Ok(onion.transferred),
+        Ok(Err(error)) => Err(error).context("proxy onion stream to local RustPost listener"),
+        Err(_) => {
+            tracing::debug!("onion forwarding connection lifetime expired");
+            Ok(false)
+        }
     }
-    Ok(())
 }
 
 fn is_supported_http_begin(request: &IncomingStreamRequest) -> bool {
@@ -404,135 +459,4 @@ fn restrict_dir(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn restrict_dir(_path: &Path) -> anyhow::Result<()> {
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn settings(enabled: bool, tor_only: bool) -> TorSettings {
-        TorSettings {
-            enabled,
-            tor_only,
-            data_dir: "tor".to_owned(),
-            onion_service_name: "microblog".to_owned(),
-            display_onion_address: String::new(),
-            bootstrap_timeout_secs: 120,
-            max_concurrent_streams: 512,
-            include_tor_keys_in_backups_by_default: false,
-        }
-    }
-
-    #[test]
-    fn tor_disabled_is_ok() {
-        let status = validate_startup(&settings(false, false));
-        assert!(!status.enabled());
-        assert!(!status.running());
-        assert_eq!(status.summary(), "disabled");
-    }
-
-    #[tokio::test]
-    async fn tor_disabled_start_does_not_need_internal_target() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let paths = RuntimePaths::from_data_dir(temp.path().join("data"));
-        let status = start(&settings(false, false), &paths, None)
-            .await
-            .expect("disabled Tor startup");
-        assert!(!status.enabled());
-        assert!(!status.running());
-        assert_eq!(status.summary(), "disabled");
-    }
-
-    #[test]
-    fn tor_enabled_reports_pending_before_runtime_start() {
-        let status = validate_startup(&settings(true, false));
-        assert!(status.enabled());
-        assert!(!status.running());
-        assert!(status.error().is_some());
-    }
-
-    #[tokio::test]
-    async fn tor_only_fails_clearly_without_internal_target() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let paths = RuntimePaths::from_data_dir(temp.path().join("data"));
-        let err = start(&settings(true, true), &paths, None)
-            .await
-            .expect_err("tor_only failure");
-        assert!(err.to_string().contains("Tor onion service startup failed"));
-    }
-
-    #[tokio::test]
-    async fn dual_mode_reports_error_without_internal_target() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let paths = RuntimePaths::from_data_dir(temp.path().join("data"));
-        let status = start(&settings(true, false), &paths, None)
-            .await
-            .expect("dual mode continues");
-        assert!(status.enabled());
-        assert!(!status.running());
-        assert!(status.error().is_some());
-    }
-
-    #[test]
-    fn status_does_not_expose_private_key_material() {
-        let status = TorStatus::startup_error(
-            "bootstrap failed while connecting to network".to_owned(),
-            Some("BootstrapStatus".to_owned()),
-        );
-        let rendered = format!(
-            "{} {:?} {:?}",
-            status.summary(),
-            status.bootstrap_status(),
-            status.error()
-        );
-        assert!(!rendered.contains("keystore"));
-        assert!(!rendered.contains("private"));
-        assert!(!rendered.contains("secret"));
-    }
-
-    #[test]
-    fn status_snapshot_sync_copies_later_runtime_errors() {
-        let visible = TorStatus::starting();
-        let running = TorStatus::new(TorStatusSnapshot {
-            enabled: true,
-            running: true,
-            onion_address: Some("example.onion".to_owned()),
-            state: "service active; external reachability unverified".to_owned(),
-            bootstrap_status: Some("ready".to_owned()),
-            error: None,
-        });
-
-        visible.replace_with(&running);
-        running.record_error("forwarding failed");
-        visible.replace_snapshot_with(&running);
-
-        assert_eq!(visible.error().as_deref(), Some("forwarding failed"));
-    }
-
-    #[test]
-    fn successful_stream_marks_status_reachable() {
-        let status = TorStatus::starting();
-
-        status.record_reachable();
-
-        assert_eq!(status.state(), "reachable");
-    }
-
-    #[test]
-    fn common_http_stream_close_errors_are_clean() {
-        for kind in [
-            io::ErrorKind::BrokenPipe,
-            io::ErrorKind::ConnectionAborted,
-            io::ErrorKind::ConnectionReset,
-            io::ErrorKind::NotConnected,
-            io::ErrorKind::TimedOut,
-            io::ErrorKind::UnexpectedEof,
-        ] {
-            let error = io::Error::from(kind);
-            assert!(is_clean_stream_close(&error));
-        }
-        assert!(is_clean_stream_close(&io::Error::other(
-            "Received an END cell with reason MISC"
-        )));
-    }
 }

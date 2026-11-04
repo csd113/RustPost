@@ -1,14 +1,12 @@
 [Unit]
 Description=RustPost web application
-After=network-online.target rustpost-updater.service
+After=network-online.target
 Wants=network-online.target
-Wants=rustpost-updater.service
 
 [Service]
 User=rustpost
 Group=rustpost
-Environment=RUSTPOST_MANAGED=1
-UMask=0007
+UMask=0077
 ExecStart=/opt/rustpost/current/rustpost-cli --data-dir /var/lib/rustpost --config /var/lib/rustpost/settings.toml serve
 Restart=on-failure
 RestartSec=5

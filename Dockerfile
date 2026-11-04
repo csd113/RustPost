@@ -1,7 +1,7 @@
 # Bootstrap from the published Debian 12 image; install the exact release compiler.
 FROM rust:1.98.1-bookworm AS build
-RUN rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy \
-    && rustup default 1.99.0
+RUN rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy \
+    && rustup default 1.99.1
 
 WORKDIR /usr/src/rustpost
 COPY Cargo.toml Cargo.lock ./
@@ -27,7 +27,6 @@ LABEL org.opencontainers.image.source="https://github.com/csd113/RustPost" \
       org.opencontainers.image.title="RustPost" \
       org.opencontainers.image.version="${RUSTPOST_VERSION}"
 
-ENV RUSTPOST_CONTAINER=1
 USER rustpost
 VOLUME /data
 EXPOSE 8080

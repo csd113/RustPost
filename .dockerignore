@@ -6,3 +6,18 @@ queue-demo
 *.tar.gz
 *.zip
 *.sha256
+
+# Runtime data and local build artifacts
+target-*
+/app-data
+/db
+/uploads
+/backups
+/logs
+/tmp
+/tor
+.env
+.env.*
+*.sqlite*
+*.db*
+*.tar

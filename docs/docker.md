@@ -109,4 +109,4 @@ The `latest` tag currently points to v1.0.0. A version tag makes the release you
 
 ## Admin update checks
 
-**Admin → Software updates** can check official stable releases. This image declares container-managed deployment, so the panel does not replace binaries or control the host. Back up and verify the persistent `/data` state, stop the container, update its image through Docker/your deployment tool, retain `/data`, and verify application/database health. On failure, stop the new image and restore the pre-upgrade database/configuration before restarting the old image. Never mount a Docker socket into RustPost. See [the software update guide](software-updates.md).
+**Admin → Software updates** checks GitHub and links to a newer stable release. Update the container image through your deployment system and retain the persistent `/data` volume.

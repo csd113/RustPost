@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Upgrade to Rust 1.99.1 and current dependencies, including Arti 0.48; retain rusqlite 0.40 for Arti compatibility. Upstream RUSTSEC-2023-0071 and RUSTSEC-2026-0387 remain open.
+- Split large source files into subsystem modules and extract embedded assets; remove project-owned Rust and Playwright tests and runners as requested.
+- Publish backups atomically with streaming checksums, online SQLite snapshots, bounded validation and safe retention; require offline restore and preserve rollback data on failure.
+- Bound media processing, uploads, password work and database queues; fix cancellation cleanup and make profile/onboarding updates atomic and keep video downloads accessible.
+- Stabilize session-bound CSRF tokens, validate origins/proxies/cookies consistently, and delay multipart asset publication until validation succeeds.
+- Replace automatic upgrade/install machinery with a read-only GitHub release check and link; remove its daemon, IPC, signing/package tools and deployment permissions.
+- Bound Tor forwarding concurrency and connection lifetimes; drain HTTP requests on SIGTERM.
+
+- Simplify CI and issue forms; add versioned Intel/Apple Silicon Mac release ZIPs, checksums and draft releases, following RustChan.
+
 ## v1.0.0 - First Release
 
 - Published a Linux amd64/arm64 container image as `ghcr.io/csd113/rustpost:1.0.0` and `ghcr.io/csd113/rustpost:latest`, with persistent state under `/data` and bundled `ffmpeg`.

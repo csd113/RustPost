@@ -11,7 +11,6 @@ pub enum Scope {
     Registration,
     AnonymousPost,
     UpdateCheck,
-    UpdateReauthentication,
 }
 
 impl Scope {
@@ -25,7 +24,6 @@ impl Scope {
             Self::Registration => "registration",
             Self::AnonymousPost => "anonymous_post",
             Self::UpdateCheck => "update_check",
-            Self::UpdateReauthentication => "update_reauthentication",
         }
     }
 }
@@ -116,78 +114,4 @@ pub async fn prune_old(pool: &SqlitePool, oldest_window_secs: i64) -> anyhow::Re
         Ok(())
     })
     .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db;
-
-    #[tokio::test]
-    async fn limit_blocks_only_matching_actor_and_scope() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        db::migrate(&pool).await.expect("migrate");
-
-        check_and_record(&pool, Scope::Post, "user:1", 1, 60)
-            .await
-            .expect("first post");
-        assert!(
-            check_and_record(&pool, Scope::Post, "user:1", 1, 60)
-                .await
-                .is_err()
-        );
-        check_and_record(&pool, Scope::Reply, "user:1", 1, 60)
-            .await
-            .expect("different scope");
-        check_and_record(&pool, Scope::Post, "user:2", 1, 60)
-            .await
-            .expect("different actor");
-    }
-
-    #[tokio::test]
-    async fn failed_login_limit_can_be_checked_before_recording() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        db::migrate(&pool).await.expect("migrate");
-
-        ensure_under_limit(&pool, Scope::FailedLogin, "ip:127.0.0.1", 1, 900)
-            .await
-            .expect("under limit");
-        record(&pool, Scope::FailedLogin, "ip:127.0.0.1")
-            .await
-            .expect("record");
-        assert!(
-            ensure_under_limit(&pool, Scope::FailedLogin, "ip:127.0.0.1", 1, 900)
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn configured_action_scopes_can_each_rate_limit() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        db::migrate(&pool).await.expect("migrate");
-
-        for scope in [
-            Scope::Post,
-            Scope::Reply,
-            Scope::Repost,
-            Scope::Registration,
-            Scope::AnonymousPost,
-        ] {
-            let actor = format!("actor:{}", scope.as_str());
-            check_and_record(&pool, scope, &actor, 1, 60)
-                .await
-                .expect("first action");
-            assert!(check_and_record(&pool, scope, &actor, 1, 60).await.is_err());
-        }
-    }
 }

@@ -147,7 +147,7 @@ Installing `ffmpeg` is optional for downloaded apps. Without it, RustPost can se
 
 With [rustup](https://rustup.rs/) installed, run these commands from the repository folder (rustup selects the pinned compiler):
 
-Development and release builds use the Rust 1.99.0 pin in `rust-toolchain.toml`. CI also checks the latest `stable` compiler so future compiler and Clippy changes are reviewed before updating the release pin. After each stable release, install that exact version with rustup, update the toolchain/CI/container pins together, and pass the full validation gates before using it for releases. `Cargo.toml` keeps Rust 1.91 as the minimum supported Rust version (MSRV); it is a compatibility floor, not the build compiler pin. Existing toolchains and the global rustup default need no changes.
+Development and release builds use the Rust 1.99.1 pin in `rust-toolchain.toml`. CI validates the pinned compiler on Linux, macOS and Windows. After each stable release, install that exact version with rustup, update the toolchain/CI/container pins together, and pass the full validation gates before using it for releases. `Cargo.toml` keeps Rust 1.99.1 as the minimum supported Rust version (MSRV); it is a compatibility floor, not the build compiler pin. Existing toolchains and the global rustup default need no changes.
 
 ```sh
 cargo build --release --locked
@@ -224,7 +224,6 @@ Run the project's checks from the repository folder:
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::all -D clippy::pedantic -D clippy::nursery -D clippy::cargo
-cargo test --workspace --all-features
 ```
 
 GitHub Actions also builds and tests on Linux x86_64, Linux ARM64, macOS Apple Silicon, and Windows x86_64. Use the [local demo guide](docs/demo-preview.md) to review the interface with sample content.
@@ -235,4 +234,4 @@ RustPost is available under the [MIT License](LICENSE).
 
 ### Administrator software updates
 
-[Software update guide](docs/software-updates.md) covers panel checks, signed native Linux installation, mandatory verified backups, automatic rollback, restricted updater deployment, and release-signing setup. Containers and unmanaged installations use their deployment mechanism.
+**Admin → Software updates** checks GitHub and links to a newer release. Installation is manual.
