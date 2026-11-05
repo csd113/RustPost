@@ -1,6 +1,11 @@
 # Changelog
 
+For installation, start with [Getting started](docs/getting-started.md). Entries below record changes for their own versions; use the [current guides](docs/README.md) for current behavior.
+
 ## Unreleased
+
+- Rewrite the guides around downloading, first run, and everyday use; separate administration and developer reference, preserve screenshots, and correct release packaging, proxy trust, manual updates, and offline restore instructions.
+- Document the live terminal console and protected password prompts added on dev.
 
 - Upgrade to Rust 1.99.1 and current dependencies, including Arti 0.48; retain rusqlite 0.40 for Arti compatibility. Upstream RUSTSEC-2023-0071 and RUSTSEC-2026-0387 remain open.
 - Split large source files into subsystem modules and extract embedded assets; remove project-owned Rust and Playwright tests and runners as requested.

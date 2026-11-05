@@ -2,26 +2,74 @@
 
 **Your own small social network, on your own computer or server.**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/csd113/RustPost/ci.yml?branch=main&label=CI)](https://github.com/csd113/RustPost/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/csd113/RustPost/ci.yml?branch=dev&label=CI)](https://github.com/csd113/RustPost/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/csd113/RustPost)](https://github.com/csd113/RustPost/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-RustPost is a place to share short posts, photos, and videos, follow people, and join conversations. You run the site and control its accounts, settings, and data. People use it through a web browser, including on phones.
+RustPost is a website for short posts, photos, videos, and conversations. **Self-hosted** means you run the app and look after your community's accounts, settings, and data. People visit your site in a web browser, including on phones.
 
-It runs as one application with a local database. No separate database server or cloud account is required. Each RustPost site is its own community; accounts and posts are not shared with other social networks.
+The app includes its own database. You do not need a separate database server, a cloud account, Docker, or Rust to run a downloaded copy. Each RustPost site is an independent community; it does not share accounts or posts with other social networks.
 
-[See the app](#see-the-app) · [Get started](#getting-started) · [Docker setup](#run-the-container) · [Settings](#settings-and-administration) · [Documentation](#documentation)
+[Get started](#getting-started) · [Screenshots](#see-the-app) · [Features](#what-you-can-do) · [Manage your site](#manage-your-site) · [All guides](docs/README.md)
+
+## Getting started
+
+### 1. Download the app
+
+Open the [latest published release](https://github.com/csd113/RustPost/releases/latest), expand **Assets**, and download the archive for your computer. Choose the app archive, not GitHub's **Source code** download.
+
+The published **v1.0.0** downloads are:
+
+| Your computer | Download |
+| --- | --- |
+| Linux, Intel or AMD 64-bit | `rustpost-linux-x86_64.tar.gz` |
+| Linux, ARM64 | `rustpost-linux-aarch64.tar.gz` |
+| macOS, Apple silicon | `rustpost-macos-aarch64.tar.gz` |
+| Windows, Intel or AMD 64-bit | `rustpost-windows-x86_64.zip` |
+
+Download the matching `.sha256` file if you want to [verify your download](docs/getting-started.md#verify-a-download). Extract the archive, then open a terminal **inside the extracted `rustpost` folder**, beside `rustpost-cli` (or `rustpost-cli.exe`).
+
+Intel Mac users can [build from source](docs/development.md#build-and-run) or use [Docker](docs/docker.md). The current dev release workflow adds Intel Mac ZIPs, but that does not add them to the already-published v1.0.0 release.
+
+### 2. Run it
+
+On Linux or macOS:
+
+```sh
+chmod +x rustpost-cli
+./rustpost-cli --data-dir ./rustpost-data serve
+```
+
+On Windows, open PowerShell in the extracted folder:
+
+```powershell
+.\rustpost-cli.exe --data-dir .\rustpost-data serve
+```
+
+Keep the terminal open while using your site. RustPost saves your site in the `rustpost-data` folder. **Keep that folder when updating the app**, and always run from this folder when using these relative-path commands.
+
+### 3. Create your administrator and open the site
+
+Follow the terminal's first-run prompts to choose an administrator username and password. An administrator manages the site. Use a unique password of at least 10 characters; hidden password prompts do not display the characters you type.
+
+Once the server has started, open **[http://127.0.0.1:8080](http://127.0.0.1:8080)** on the same computer and log in. Finish any profile setup shown in the browser, then try writing your first post.
+
+If no administrator prompt appears, open another terminal beside the executable and run `./rustpost-cli --data-dir ./rustpost-data create-admin-interactive` (on Windows, replace `./rustpost-cli` with `.\rustpost-cli.exe`). Use the same data folder as the running app.
+
+This first setup is available on your own computer only. When you are ready to invite people, follow [Make your site public](docs/deployment.md). To stop RustPost, press **Ctrl+C** and wait for it to exit. Run the same command to start it again; your data stays in its folder.
+
+Need more help? Read the [step-by-step setup and troubleshooting guide](docs/getting-started.md). Prefer a container? Use the [Docker quick start](docs/docker.md#start-rustpost). Developers can [build the current dev branch](docs/development.md#build-and-run).
 
 ## What you can do
 
-- **Post and talk:** share up to 280 characters, reply in threads, repost, like, and save private bookmarks.
-- **Share media:** attach images and videos, and add a profile picture, banner, and bio.
-- **Find your people:** follow accounts, search posts and users, and receive notifications.
-- **Control your experience:** block or mute accounts, hide words, or require approval for new followers.
-- **Manage your account:** change your username, export or import your data, or request deletion with a configurable grace period.
-- **Run your community:** manage users, publish announcements, pause posting with maintenance mode, and create or restore backups.
+- **Post and talk:** share short posts (280 characters by default), reply, quote, repost, like, and save private bookmarks.
+- **Share media:** upload images and videos; add a profile picture, banner, and bio.
+- **Find people:** follow accounts, search posts and users, and read notifications.
+- **Choose what you see:** block or mute accounts, hide words, and require approval for new followers.
+- **Manage your account:** change your username, export or import your data, or request deletion with time to cancel.
+- **Run your community:** manage users, publish announcements, pause posting, and create backups.
 
-Optional Tor support lets the same site be reached through an onion address. See the [operator guide](docs/operator-guide.md#tor--arti) for setup and limitations.
+See [Using RustPost](docs/account-and-instance-features.md) for everyday actions and their limits. Optional [Tor access](docs/operator-guide.md#tor--arti) lets people reach your site through an onion address.
 
 ## See the app
 
@@ -49,191 +97,35 @@ Images appear within posts, and the layout adapts to smaller screens.
 
 These screenshots use fictional accounts and locally generated sample media. You can [run the same demo](docs/demo-preview.md) without using real account data.
 
-## Getting started
+## Manage your site
 
-Choose the installation method that suits you:
+Sign in as an administrator and open **Admin**. Use **Deep server settings** to review settings before saving, **Users** to manage accounts, and **Backups** to save a copy of the site. Most configuration changes need a restart; the settings page explains when each change takes effect.
 
-| Method | What you need | Best for |
-| --- | --- | --- |
-| [Docker container](#run-the-container) | Docker installed and running | Running the ready-made app with media conversion included |
-| [Download the app](#download-the-app) | A matching release for your computer | Running RustPost without Docker or a Rust installation |
-| [Build from source](#build-from-source) | Rust 1.91 or newer | Developers and people who want to build it themselves |
+New registrations are enabled by default; anonymous posting and automatic backups are disabled. You can close registration, rename the site, and adjust post or upload limits. The [operator guide](docs/operator-guide.md) explains these tasks and where your data lives.
 
-The current release is **[v1.0.0](https://github.com/csd113/RustPost/releases/tag/v1.0.0)**. It includes downloadable apps and the new Docker image. See the [changelog](CHANGELOG.md) for the full release notes.
-
-### Run the container
-
-The Docker image packages RustPost and `ffmpeg`, the tool used to convert uploaded photos and videos. It supports Linux **amd64** and **arm64**, including Docker environments on compatible Windows and macOS computers.
-
-**1. Start RustPost.** Open a terminal and run:
-
-```sh
-docker volume create rustpost-data
-docker run -d --name rustpost \
-  -p 127.0.0.1:8080:8080 \
-  -v rustpost-data:/data \
-  --restart unless-stopped \
-  ghcr.io/csd113/rustpost:1.0.0
-```
-
-Docker downloads the image if needed. The `rustpost-data` volume holds your settings, accounts, posts, uploads, and backups, so they survive replacing the container. Keep this volume when upgrading.
-
-**2. Create your administrator account.** This account manages the site:
-
-```sh
-docker exec -it rustpost rustpost-cli --data-dir /data create-admin-interactive
-```
-
-Follow the username and password prompts. Your password is hidden as you type.
-
-**3. Open [http://127.0.0.1:8080](http://127.0.0.1:8080)** in your browser and log in. This setup makes the site available on your computer only. To let others visit, follow [Making your site public](#making-your-site-public).
-
-Useful container commands:
-
-```sh
-docker logs rustpost       # View startup messages and errors
-docker stop rustpost       # Stop the app
-docker start rustpost      # Start it again
-docker restart rustpost    # Reload after changing settings
-```
-
-Use `ghcr.io/csd113/rustpost:1.0.0` to select this release explicitly. The `latest` tag currently points to the same release, but can change when a newer version is published.
-
-For custom storage mounts, configuration, backups, and upgrades, see the [Docker guide](docs/docker.md).
-
-### Download the app
-
-Open the [v1.0.0 downloads](https://github.com/csd113/RustPost/releases/tag/v1.0.0) and choose the archive for your computer. Download its matching `.sha256` file too; it lets you check that the download is intact.
-
-| Computer | Archive |
-| --- | --- |
-| Linux, Intel/AMD 64-bit | `rustpost-linux-x86_64.tar.gz` |
-| Linux, ARM64 | `rustpost-linux-aarch64.tar.gz` |
-| macOS, Apple Silicon | `rustpost-macos-aarch64.tar.gz` |
-| Windows, Intel/AMD 64-bit | `rustpost-windows-x86_64.zip` |
-
-Check the archive before extracting it. For example, on Linux:
-
-```sh
-sha256sum -c rustpost-linux-x86_64.tar.gz.sha256
-tar -xzf rustpost-linux-x86_64.tar.gz
-```
-
-On macOS, use `shasum -a 256 -c rustpost-macos-aarch64.tar.gz.sha256`, then extract the archive. On Windows, compare `Get-FileHash .\rustpost-windows-x86_64.zip -Algorithm SHA256` with the checksum file, then extract the ZIP.
-
-From the folder where you extracted the archive, start the app:
-
-```sh
-# Linux or macOS
-./rustpost/rustpost-cli --data-dir ./rustpost-data serve
-```
-
-```powershell
-# Windows PowerShell
-.\rustpost\rustpost-cli.exe --data-dir .\rustpost-data serve
-```
-
-Follow the first-run administrator prompts. If no prompt appears, open a second terminal in the same folder and run:
-
-```sh
-./rustpost/rustpost-cli --data-dir ./rustpost-data create-admin-interactive
-```
-
-On Windows, use `.\rustpost\rustpost-cli.exe` instead. Then open [http://127.0.0.1:8080](http://127.0.0.1:8080) and log in.
-
-The live console shows server/Tor state, database footprint, content counts and failures. Use 1–6 or Tab to navigate, ? for help, and Q to confirm a graceful stop. `--console plain` provides line reports; `--console off` disables the console. See the [operator guide](docs/operator-guide.md#operational-console) for freshness, fallback and platform details.
-
-Installing `ffmpeg` is optional for downloaded apps. Without it, RustPost can serve allowed uploads in their original format.
-
-### Build from source
-
-With [rustup](https://rustup.rs/) installed, run these commands from the repository folder (rustup selects the pinned compiler):
-
-Development and release builds use the Rust 1.99.1 pin in `rust-toolchain.toml`. CI validates the pinned compiler on Linux, macOS and Windows. After each stable release, install that exact version with rustup, update the toolchain/CI/container pins together, and pass the full validation gates before using it for releases. `Cargo.toml` keeps Rust 1.99.1 as the minimum supported Rust version (MSRV); it is a compatibility floor, not the build compiler pin. Existing toolchains and the global rustup default need no changes.
-
-```sh
-cargo build --release --locked
-./target/release/rustpost-cli --data-dir ./rustpost-data serve
-```
-
-Follow the first-run administrator prompts, then open [http://127.0.0.1:8080](http://127.0.0.1:8080). On Windows, the executable is `.\target\release\rustpost-cli.exe`.
-
-## Using your site
-
-After logging in, use the post box to share an update. Open a post to read or write replies, or visit someone's profile to follow them. The Home Feed shows public posts from your site; replies appear in their conversations.
-
-Use **Settings** to edit your profile and account preferences. Administrators also have an **Admin** area for users, site announcements, maintenance mode, media status, and backups.
-
-Registration is enabled by default. Anonymous posting is disabled by default.
-
-## Settings and administration
-
-RustPost creates a `settings.toml` file on first run. This is a plain text settings file; its comments explain each option. Edit the existing entries and restart RustPost to apply file changes.
-
-- **Docker:** the file is `/data/settings.toml` inside the saved volume. See [Editing Docker settings](docs/docker.md#editing-settings).
-- **Downloaded or source-built app:** the examples above save it at `rustpost-data/settings.toml`.
-
-For example, change `name` under `[site]` to rename your community, or set `registration_enabled = false` under `[accounts]` to close new signups. Detailed settings are in the [operator guide](docs/operator-guide.md#configuration).
-
-Always use the same `--data-dir` when starting the app or running administrator commands. That folder contains the database, uploads, settings, and other site files. Keep it private and out of Git.
-
-### Making your site public
-
-The setup examples above accept visits from your own computer. For a public site, use a server and a reverse proxy—a service that provides HTTPS and forwards visitors to RustPost.
-
-Set `server.public_url` to your HTTPS address and `server.cookie_secure = true`. Keep the app's port private behind the proxy. IP-based rate limits use the direct connection address, so visitors behind a proxy can share a limit. The [operator guide](docs/operator-guide.md#security-model) and generated settings explain the security controls.
-
-The Docker image sets its internal listener to `0.0.0.0` on first boot so port forwarding works. The example still keeps the published port on your computer's loopback address, `127.0.0.1`.
-
-### Backups
-
-Use **Admin → Backups** to create and download a backup, configure automatic backups, or restore an archive. Automatic backups are off by default. Keep a copy outside the computer running RustPost.
-
-You can also create a backup from the terminal:
-
-```sh
-# Docker
-docker exec rustpost rustpost-cli --data-dir /data backup
-
-# Downloaded app (Linux or macOS)
-./rustpost/rustpost-cli --data-dir ./rustpost-data backup
-```
-
-Backups include the database, settings, and media. Tor private keys are excluded unless you explicitly include them. **Restart RustPost after restoring through the admin page.** See the [backup and restore reference](docs/operator-guide.md#backup-and-restore) for restore commands and safeguards.
+**Admin → Software updates** in current dev checks GitHub and links to a newer stable release. Installation is manual. Follow the [update guide](docs/software-updates.md) to preserve your data.
 
 ## Documentation
 
-| Guide | What it covers |
+| I want to… | Guide |
 | --- | --- |
-| [Docker guide](docs/docker.md) | Persistent storage, editing settings, backups, and replacing the container |
-| [Operator guide](docs/operator-guide.md) | Commands, detailed settings, security controls, Tor, media, and release verification |
-| [Account and site features](docs/account-and-instance-features.md) | Protected accounts, account transfers and deletion, announcements, and maintenance mode |
-| [Local demo](docs/demo-preview.md) | Sample accounts and how to reproduce the screenshots |
-| [Changelog](CHANGELOG.md) | Changes in each release |
+| Download, run, and troubleshoot my first site | [Getting started](docs/getting-started.md) |
+| Run a container with media tools included | [Docker](docs/docker.md) |
+| Learn posting, account settings, and community controls | [Using RustPost](docs/account-and-instance-features.md) |
+| Change settings, manage users, or back up and restore | [Operator guide](docs/operator-guide.md) |
+| Make the site public with HTTPS | [Deployment](docs/deployment.md) |
+| Install a newer version | [Software updates](docs/software-updates.md) |
+| Understand the live terminal display | [Terminal console](docs/terminal-console.md) |
+| Build, contribute, or prepare a release | [Development](docs/development.md) |
+| Explore sample content | [Local demo](docs/demo-preview.md) |
+| Browse reference material and history | [Documentation index](docs/README.md) · [Changelog](CHANGELOG.md) |
 
-### Current limitations
+Reading a README from an extracted app archive? The full guides and screenshots are available in the [online repository](https://github.com/csd113/RustPost/tree/dev).
 
-RustPost is designed for a single site and does not connect to federated social networks. Media conversion happens during upload, so large files can take time. Search is basic, some reporting and moderation tools are limited, and broader accessibility review is still pending.
+These guides describe **current `dev`** and identify published-release differences where needed. The package still reports version 1.0.0 on dev; that number alone does not mean a build matches the published v1.0.0 archive.
 
-The v1.0.0 release also has a documented upstream dependency advisory and maintenance warnings from its Tor libraries. Read the [release verification notes](docs/operator-guide.md#release-verification), including the accepted `RUSTSEC-2023-0071` exception, before deploying. Tor support does not guarantee anonymity; verify access from a separate Tor client if you rely on it.
-
-## Development
-
-The app is written in Rust, uses SQLite for local storage, and serves HTML directly. No frontend build step is needed.
-
-Run the project's checks from the repository folder:
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::all -D clippy::pedantic -D clippy::nursery -D clippy::cargo
-```
-
-GitHub Actions also builds and tests on Linux x86_64, Linux ARM64, macOS Apple Silicon, and Windows x86_64. Use the [local demo guide](docs/demo-preview.md) to review the interface with sample content.
+RustPost is designed for a single community. Search and reporting tools are basic, media conversion happens during upload, and broader accessibility review remains outstanding. For public deployments, read the [security and dependency notes](docs/deployment.md#security-and-dependency-review).
 
 ## License
 
-RustPost is available under the [MIT License](LICENSE).
-
-### Administrator software updates
-
-**Admin → Software updates** checks GitHub and links to a newer release. Installation is manual.
+RustPost is available under the [MIT License](LICENSE). Existing screenshot provenance is described above and in the [demo guide](docs/demo-preview.md).

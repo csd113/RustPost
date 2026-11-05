@@ -1,4 +1,12 @@
-# Rust 1.99 compiler upgrade — 2026-10-01
+# Compiler upgrade history
+
+For a current build, follow [Development](development.md): both the compiler pin and minimum supported version are now **Rust 1.99.1**. You do not need this historical report to run RustPost.
+
+[All guides](README.md) · [Current checks](development.md#checks) · [Changelog](../CHANGELOG.md)
+
+## Historical report: October 1, 2026
+
+The record below describes the earlier 1.99.0 migration and its validation at that time. It is preserved as project history. The old 1.91 minimum, floating-stable CI checks, updater binary, release-tool tests, and application test counts do not describe the current tree. Current dev removed the installer machinery and uses a manual release-link check; later work added terminal/CLI regressions.
 
 The new rust-toolchain.toml selects exact Rust 1.99.0 with rustfmt and Clippy.
 CI, releases and the container now build with 1.99.0 instead of 1.91.0.
@@ -20,7 +28,7 @@ Strict Clippy findings were fixed by sharing the identical HEAD response
 construction after its match and using diagnostic equality/length assertions
 in the existing tests. No test or lint gate was removed or suppressed.
 
-## Validation
+### Validation recorded at the time
 
 All checks passed locally on macOS Apple Silicon:
 

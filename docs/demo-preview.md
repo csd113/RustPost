@@ -1,21 +1,23 @@
 # Local demo and screenshots
 
+[All guides](README.md) · [Build from source](development.md#build-and-run) · [Screenshots](../README.md#see-the-app)
+
 The README screenshots show a local demo with fictional accounts, generated illustrations, and short sample videos. No real account data or internet media is used.
 
 The screenshot refresh for v1.0.0 was captured on September 29, 2026. Desktop images use a 1440 × 1200 browser viewport; the mobile image uses a 390 × 844 viewport.
 
 ## What you need
 
-- Rust 1.91 or newer to build the app.
+- Git and rustup, using the repository’s pinned Rust 1.99.1 compiler. Start from a current `dev` checkout; see [Build from source](development.md#build-and-run).
 - `ffmpeg` with the `drawtext` filter and the `libvpx-vp9` encoder to generate the sample videos. These are needed for this demo even though `ffmpeg` is optional for normal RustPost use. Check your build with `ffmpeg -filters` and `ffmpeg -encoders`.
 
-## Build
+## 1. Build
 
 ```sh
-cargo build --workspace --all-features
+cargo build --locked --workspace --all-features --bin rustpost-cli
 ```
 
-## Seed
+## 2. Add sample content
 
 ```sh
 ./target/debug/rustpost-cli --data-dir target/debug/rustpost-demo-screenshots seed-demo
@@ -23,15 +25,17 @@ cargo build --workspace --all-features
 
 The `seed-demo` command only accepts an explicit demo directory under `target/debug` whose name contains `rustpost-demo`. It refuses to seed a database that already has users. Use a new demo folder for another run instead of clearing existing data.
 
-## Run
+## 3. Run the demo
 
 ```sh
 ./target/debug/rustpost-cli --data-dir target/debug/rustpost-demo-screenshots serve
 ```
 
-Open [http://127.0.0.1:8098](http://127.0.0.1:8098).
+Open [http://127.0.0.1:8098](http://127.0.0.1:8098). The demo uses port **8098**, not the usual 8080. Keep the terminal open and press Ctrl+C when finished.
 
-## Demo Accounts
+On Windows, use `.\target\debug\rustpost-cli.exe` and the same explicit demo-directory argument. The seed command currently checks for the literal `target/debug/` path segment, so keep forward slashes in that argument.
+
+## Sign in to a demo account
 
 All demo accounts use the same local-only password:
 
