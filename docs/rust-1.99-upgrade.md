@@ -6,7 +6,7 @@ For a current build, follow [Development](development.md): both the compiler pin
 
 ## Historical report: October 1, 2026
 
-The record below describes the earlier 1.99.0 migration and its validation at that time. It is preserved as project history. The old 1.91 minimum, floating-stable CI checks, updater binary, release-tool tests, and application test counts do not describe the current tree. Current dev removed the installer machinery and uses a manual release-link check; later work added terminal/CLI regressions.
+The record below describes the earlier 1.99.0 migration and its validation at that time. It is preserved as project history. The old 1.91 minimum, floating-stable CI checks, updater binary, release-tool tests, and application test counts do not describe the current tree. Version 1.1.0 removed the installer machinery and uses a manual release-link check; later work added terminal/CLI regressions.
 
 The new rust-toolchain.toml selects exact Rust 1.99.0 with rustfmt and Clippy.
 CI, releases and the container now build with 1.99.0 instead of 1.91.0.

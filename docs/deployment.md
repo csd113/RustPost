@@ -34,7 +34,7 @@ Replace the example domain with your real HTTPS address; keep the rest of the ge
 
 The proxy must preserve the public **Host** header, supply a correct **X-Forwarded-Proto**, and build a trustworthy **X-Forwarded-For** chain. Strip or overwrite untrusted client-supplied forwarding headers at your public edge. Trust only the actual proxy addresses; avoid broad CIDRs that include visitors.
 
-On current dev, RustPost accepts forwarding metadata only from a direct peer listed in `trusted_proxy_cidrs`. It walks X-Forwarded-For from the right through trusted addresses to find the client IP. Untrusted peers use their direct address. Malformed or duplicate forwarding metadata can be rejected. This differs from older documentation describing the setting as unused.
+In v1.1.0, RustPost accepts forwarding metadata only from a direct peer listed in `trusted_proxy_cidrs`. It walks X-Forwarded-For from the right through trusted addresses to find the client IP. Untrusted peers use their direct address. Malformed or duplicate forwarding metadata can be rejected. This differs from older documentation describing the setting as unused.
 
 The request guard checks browser origin information and secure-cookie behavior against the request host and scheme. A wrong Host or scheme can cause rejected forms or login failures. Authenticated forms also require CSRF tokens. Test the whole login/posting flow through HTTPS, not just the home page.
 
@@ -46,7 +46,7 @@ Set `trusted_proxy_cidrs` to the actual proxy peer address seen by RustPost. Doc
 
 ## Tor alongside HTTPS
 
-You can add an [onion address](operator-guide.md#tor--arti) while keeping HTTPS available. Current dev distinguishes Arti-forwarded requests from ordinary proxy traffic, so onion clients cannot impersonate a trusted loopback proxy. Onion HTTP does not inherit the clearnet secure-cookie setting.
+You can add an [onion address](operator-guide.md#tor--arti) while keeping HTTPS available. Version 1.1.0 distinguishes Arti-forwarded requests from ordinary proxy traffic, so onion clients cannot impersonate a trusted loopback proxy. Onion HTTP does not inherit the clearnet secure-cookie setting.
 
 Test ordinary HTTPS and onion login separately. Publishing an onion address is not proof of external reachability or an anonymity guarantee.
 
@@ -60,7 +60,7 @@ Operational events are retained in a bounded in-memory log and `logs/events.log`
 
 RustPost hashes passwords with Argon2id, uses HttpOnly/SameSite=Lax session cookies, validates authenticated form tokens, escapes rendered user content, and validates uploaded content rather than trusting filenames. SVG is not an allowed default upload type. These controls still depend on correct deployment and maintained dependencies.
 
-Dependency review is separate from successful compilation and tests. The current development changelog records open upstream **RUSTSEC-2023-0071** and **RUSTSEC-2026-0387** findings. Do not treat an old advisory list as a fresh audit: inspect the latest [Dependency Audit workflow](https://github.com/csd113/RustPost/actions/workflows/audit.yml) report and run `cargo audit --file Cargo.lock` when evaluating a source build or release. The workflow is report-only; a successful workflow status can still include vulnerability findings.
+Dependency review is separate from successful compilation and tests. The v1.1.0 changelog records open upstream **RUSTSEC-2023-0071** and **RUSTSEC-2026-0387** findings. Do not treat an old advisory list as a fresh audit: inspect the latest [Dependency Audit workflow](https://github.com/csd113/RustPost/actions/workflows/audit.yml) report and run `cargo audit --file Cargo.lock` when evaluating a source build or release. The workflow is report-only; a successful workflow status can still include vulnerability findings.
 
 For historical context, v1.0.0 recorded the transitive `rsa 0.9.10` / RUSTSEC-2023-0071 exception and maintenance warnings for `bincode 2.0.1` and `paste 1.0.15`. Those notes are evidence about that release, not a claim that the current dependency graph is clean or identical. Keep the [changelog](../CHANGELOG.md) and the current audit report with your deployment review.
 

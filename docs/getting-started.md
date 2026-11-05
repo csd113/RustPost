@@ -11,7 +11,7 @@ RustPost runs a small social website from one application. This guide takes you 
 3. Extract the archive into a folder you can write to. Open the extracted folder until you see `rustpost-cli` (Linux/macOS) or `rustpost-cli.exe` (Windows).
 4. Open a terminal there. On Windows, use **Open in Terminal** from that folder and select PowerShell. In a terminal, `cd` changes folders; quote paths that contain spaces.
 
-The current public release is v1.0.0. Its archives contain a `rustpost` folder. Current dev's release workflow prepares versioned ZIP folders with different names; always work beside the executable rather than assuming the outer folder name. See [Release packaging](development.md#release-packaging) for that distinction.
+The v1.1.0 ZIPs contain a folder named for their version and platform, such as `rustpost-cli-v1.1.0-macos-apple-silicon`. Use them when v1.1.0 is published; older v1.0.0 archives contain a `rustpost` folder and use different archive/checksum names. Always work beside the executable. See [Release packaging](development.md#release-packaging) for the older names.
 
 ## Start the app
 
@@ -57,7 +57,7 @@ Wait for startup to finish, then visit **[http://127.0.0.1:8080](http://127.0.0.
 
 Keep the app running while you browse. To stop it, press **Ctrl+C** in its terminal and wait for shutdown to finish. Start it again with the same command and data directory. Your accounts and content remain saved.
 
-Current dev also has a [live console](terminal-console.md): press **1–6** to switch views, **?** for help, or **Q** to confirm shutdown. Published older builds may have a different terminal display.
+Version 1.1.0 has a [live console](terminal-console.md): press **1–6** to switch views, **?** for help, or **Q** to confirm shutdown. Published older builds may have a different terminal display.
 
 ## Optional media conversion
 
@@ -67,30 +67,32 @@ You can post allowed images and videos without installing extra tools. Installin
 
 ## Verify a download
 
-A checksum helps detect a damaged or mismatched download. Get the checksum from the same GitHub release as the archive and check it before extracting. These examples use the published v1.0.0 names and assume both files are in your terminal's current folder.
+A checksum helps detect a damaged or mismatched download. Get `SHA256SUMS.txt` from the same v1.1.0 GitHub release as the ZIP and check it before extracting. These examples assume the archive and manifest are in your terminal's current folder; substitute your platform's filename from the [download table](../README.md#1-download-the-app).
 
-Linux:
+Linux (one downloaded ZIP):
 
 ```sh
-sha256sum -c rustpost-linux-x86_64.tar.gz.sha256
+sha256sum rustpost-cli-v1.1.0-linux-x86_64.zip
+cat SHA256SUMS.txt
 ```
 
-macOS:
+macOS (Apple silicon; Intel uses `macos-intel`):
 
 ```sh
-shasum -a 256 -c rustpost-macos-aarch64.tar.gz.sha256
+shasum -a 256 rustpost-cli-v1.1.0-macos-apple-silicon.zip
+cat SHA256SUMS.txt
 ```
 
 Windows PowerShell:
 
 ```powershell
-Get-FileHash .\rustpost-windows-x86_64.zip -Algorithm SHA256
-Get-Content .\rustpost-windows-x86_64.zip.sha256
+Get-FileHash .\rustpost-cli-v1.1.0-windows-x86_64.zip -Algorithm SHA256
+Get-Content .\SHA256SUMS.txt
 ```
 
-On Windows, compare the two hash values, ignoring letter case. On Linux/macOS, the check should report `OK`. Do not run an archive whose hash differs; download it and the checksum again from the release page.
+Compare the complete hash with the manifest line for your exact ZIP filename, ignoring letter case. Do not run an archive whose hash differs; download it and the manifest again from the release page.
 
-Future releases built by the current dev workflow use `SHA256SUMS.txt` for all five ZIPs. Compare your archive's hash with its matching line. With all ZIPs downloaded, `sha256sum -c SHA256SUMS.txt` (Linux) or `shasum -a 256 -c SHA256SUMS.txt` (macOS) checks the full set; with only one ZIP, missing-file messages for the others are expected.
+With all five ZIPs downloaded, `sha256sum -c SHA256SUMS.txt` (Linux) or `shasum -a 256 -c SHA256SUMS.txt` (macOS) checks the full set and should report `OK` for each file. With only one ZIP, these full-set commands report missing files for the others. Older v1.0.0 downloads use individual `.sha256` files instead; follow the checksum names on that release.
 
 ## Troubleshooting
 

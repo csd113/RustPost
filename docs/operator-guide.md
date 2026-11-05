@@ -4,7 +4,7 @@ Start RustPost, sign in as your administrator, and open **Admin**. You can manag
 
 [All guides](README.md) · [Settings](#configuration) · [Backups](#backup-and-restore) · [Commands](#cli-reference) · [Public deployment](deployment.md) · [Updates](software-updates.md)
 
-This guide follows current **dev**. Published v1.0.0 differs in some operational behavior; in particular, current dev requires restoring with the server stopped.
+This guide describes **v1.1.0**. Older v1.0.0 differs in some operational behavior; in particular, v1.1.0 requires restoring with the server stopped.
 
 ## Everyday administration
 
@@ -91,7 +91,7 @@ For someone else's ordinary account, the **Users** page can require a password c
 
 ### Password input for automation
 
-Current dev supports `create-admin USERNAME --password-stdin` and `reset-admin-password USERNAME --password-stdin`. They read one UTF-8 line, up to 4096 bytes, from redirected input. Supply it from a protected file or secret-management tool; avoid literal passwords in commands or shell history. Legacy positional passwords still work but can appear in process listings.
+Version 1.1.0 supports `create-admin USERNAME --password-stdin` and `reset-admin-password USERNAME --password-stdin`. They read one UTF-8 line, up to 4096 bytes, from redirected input. Supply it from a protected file or secret-management tool; avoid literal passwords in commands or shell history. Legacy positional passwords still work but can appear in process listings.
 
 Hidden prompts require terminal stdin and stderr. Ctrl+C, Ctrl+D, or Esc cancels; validation or confirmation failures allow retry. On legacy Windows consoles, paste one line at a time. Forced termination or closing the terminal can prevent normal terminal cleanup.
 
@@ -123,7 +123,7 @@ Restoring replaces site data with the archive's contents. First preserve a separ
 
 Replace the archive path with your file. On Windows, use `.\rustpost-cli.exe` and a quoted Windows path if needed. Use the [Docker restore procedure](docker.md#backing-up-and-restoring) for a container.
 
-**Current dev disables browser/live restore** and takes a server lock during terminal restore. Older v1.0.0 guides described uploading a restore archive in Admin; that is not the current flow. If restore reports a recovery directory or rollback failure, preserve all recovery files and investigate the error before restarting. Startup deliberately refuses unresolved restore recovery state.
+**Version 1.1.0 disables browser/live restore** and takes a server lock during terminal restore. Older v1.0.0 guides described uploading a restore archive in Admin; that is not the current flow. If restore reports a recovery directory or rollback failure, preserve all recovery files and investigate the error before restarting. Startup deliberately refuses unresolved restore recovery state.
 
 ### Tor keys and backup contents
 

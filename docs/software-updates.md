@@ -6,13 +6,13 @@ Updates are installed by the person running the site. Save a backup, download th
 
 ## Check for a release
 
-In current dev, open **Admin → Software updates** and choose **Check for updates**. RustPost asks GitHub for the latest published stable release. If its version is newer than the running package version, the page shows a link to that release.
+In v1.1.0, open **Admin → Software updates** and choose **Check for updates**. RustPost asks GitHub for the latest published stable release. If its version is newer than the running package version, the page shows a link to that release.
 
 The check does not download, install, restart, or replace anything. Drafts and prereleases are excluded. Network failures leave the site running and show that the check could not complete; you can visit [GitHub Releases](https://github.com/csd113/RustPost/releases) directly or try later.
 
-Dev currently still reports version **1.0.0**. The checker compares version numbers, not Git commits, so “up to date” does not mean your dev checkout matches the latest dev commit or the contents of the published v1.0.0 archive. Keep the source commit with your build records.
+The v1.1.0 build reports version **1.1.0**. The checker compares version numbers, not Git commits, so “up to date” does not mean a development checkout matches the latest dev commit or a published archive. Before v1.1.0 is published, a prepared 1.1.0 build can also report “up to date” against the older published release. Keep the source commit with your build records.
 
-There is no automatic updater service, local updater IPC endpoint, or privileged installation helper in current dev. Older upgrade notes that describe those components are historical.
+There is no automatic updater service, local updater IPC endpoint, or privileged installation helper in v1.1.0. Older upgrade notes that describe those components are historical.
 
 ## Replace a downloaded app
 

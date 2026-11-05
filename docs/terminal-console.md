@@ -4,7 +4,7 @@ The terminal window lets you see how your running RustPost site is doing. It sta
 
 [All guides](README.md) · [First run](getting-started.md) · [Operator guide](operator-guide.md)
 
-This guide describes the live console on current dev. The published v1.0.0 build has an older display.
+This guide describes the live console in v1.1.0. The published v1.0.0 build has an older display.
 
 ## Everyday controls
 

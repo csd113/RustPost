@@ -17,7 +17,7 @@ cargo build --locked --release --bin rustpost-cli
 
 On Windows, run `.\target\release\rustpost-cli.exe --data-dir .\rustpost-data serve`. Follow the terminal's administrator prompts and visit **[http://127.0.0.1:8080](http://127.0.0.1:8080)**. The [first-run guide](getting-started.md) applies after the build.
 
-`dev` is the current development branch. It can contain changes that are not in a published release, even while `--version` still prints 1.0.0. Record `git rev-parse HEAD` with a build. To reproduce a release, check out that release's tag instead of assuming dev has the same content.
+`dev` is the current development branch. It can contain changes that are not in a published release, even when `--version` prints the same package version as a release (currently 1.1.0). Record `git rev-parse HEAD` with a build. To reproduce a release, check out that release's tag instead of assuming dev has the same content.
 
 RustPost uses SQLite and server-rendered HTML, CSS, and JavaScript. There is no separate database server or frontend build step. `ffmpeg` is optional for ordinary operation and required for the [demo's sample-video generation](demo-preview.md).
 
@@ -66,7 +66,7 @@ Remove-Item Env:RUSTDOCFLAGS
 
 Review `cargo audit --file Cargo.lock` separately (requires `cargo-audit`). Advisory review is not evidence of functional correctness, and passing CI is not a clean dependency-audit claim. See [dependency notes](deployment.md#security-and-dependency-review).
 
-Current CI runs formatting, strict Clippy, and rustdoc, then native CLI builds/tests on Linux x86_64, Linux ARM64, Intel Mac, Apple silicon Mac, and Windows x86_64. Current tests include terminal/CLI regressions; older compiler-upgrade records refer to application and Playwright suites that are no longer present. Use the current workflow and `Cargo.toml`, not historical test counts, to identify the active checks.
+Current CI runs formatting, strict Clippy, and rustdoc, then native CLI builds/tests on Linux x86_64, Linux ARM64, Intel Mac, Apple silicon Mac, and Windows x86_64. Current tests include terminal/CLI and CSRF route regressions; older compiler-upgrade records refer to application and Playwright suites that are no longer present. Use the current workflow and `Cargo.toml`, not historical test counts, to identify the active checks.
 
 ### Documentation checks
 
@@ -76,9 +76,9 @@ For setup changes, use a fresh disposable data directory to check `init`, `check
 
 ## Release packaging
 
-**Published v1.0.0** has the four older archives listed in the [README](../README.md#1-download-the-app), each with a matching `.sha256` file. Its macOS archive targets Apple silicon. Those existing artifacts are not renamed by changing the dev workflow.
+**Older v1.0.0** uses `rustpost-linux-x86_64.tar.gz`, `rustpost-linux-aarch64.tar.gz`, `rustpost-macos-aarch64.tar.gz` (Apple silicon), and `rustpost-windows-x86_64.zip`, each with a matching `.sha256` file. These archives contain a `rustpost` folder. Those existing artifacts are not renamed by changing the workflow.
 
-The **current release workflow** prepares these five ZIP patterns for a future `vVERSION` tag:
+The **v1.1.0 release workflow** prepares these five ZIP patterns for a `vVERSION` tag (`VERSION` is `1.1.0` for this release):
 
 | Platform | Archive pattern |
 | --- | --- |

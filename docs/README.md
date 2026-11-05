@@ -22,11 +22,11 @@ Start with [Getting started](getting-started.md) to download RustPost, run it, a
 - [Configuration reference](admin-configuration-audit.md): the complete settings inventory and web editor contract.
 - [Account behavior reference](account-reference.md): archive format, account rules, and implementation details.
 - [Compiler upgrade history](rust-1.99-upgrade.md): historical migration notes, separated from current build instructions.
-- [Changelog](../CHANGELOG.md): unreleased work and previous releases.
+- [Changelog](../CHANGELOG.md): release changes and previous versions.
 - [License](../LICENSE): RustPost's MIT license.
 
 ## Which version do these guides describe?
 
-The repository guides follow **`dev`**. The published **v1.0.0** binaries and container predate some current development changes, including the new terminal console, offline-only restore, and simplified release checker. Dev still reports package version 1.0.0, so record the source commit as well when building it yourself.
+The repository guides describe **v1.1.0**. Older **v1.0.0** binaries and containers predate the live terminal console, offline-only restore, simplified release checker, and final CSRF fixes. Record the source commit when building from `dev`; the package version alone does not identify a development build.
 
-The [download instructions](getting-started.md) name the assets actually available in v1.0.0. [Release packaging](development.md#release-packaging) describes what the current workflow will prepare for a future release. Historical changelog entries describe their own versions, not current guarantees.
+The [download instructions](getting-started.md) describe v1.1.0 ZIPs and checksums. Use the published release page to confirm availability; preparation on `dev` does not publish a release. [Release packaging](development.md#release-packaging) also records the older v1.0.0 archive names. Historical changelog entries describe their own versions, not current guarantees.
