@@ -695,7 +695,7 @@ pub(super) async fn delete_account_warning(
         .ok_or(AppError::Unauthorized)?;
     let deletion = account::deletion_status(&state.pool, user.id).await?;
     let body = deletion.map_or_else(
-        || render_delete_account_warning(state.settings.accounts.deletion_grace_period_days),
+        || render_delete_account_warning(state.settings.accounts.deletion_grace_period_days, &csrf),
         |deletion| render_delete_account_pending(&deletion, &csrf),
     );
     Ok(Html(
@@ -703,11 +703,13 @@ pub(super) async fn delete_account_warning(
     ))
 }
 
-pub(super) async fn delete_account_final_warning(
+pub(super) async fn prepare_delete_account(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
 ) -> AppResult<Html<String>> {
     let user = require_active_user(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
     let csrf = form_csrf(&state, &headers)
         .await?
         .ok_or(AppError::Unauthorized)?;
@@ -916,7 +918,7 @@ pub(super) async fn account_deleted(State(state): State<Arc<AppState>>) -> AppRe
     ))
 }
 
-pub(super) fn render_delete_account_warning(grace_days: u64) -> String {
+pub(super) fn render_delete_account_warning(grace_days: u64, csrf: &str) -> String {
     let grace = if grace_days == 0 {
         "With the current configuration the account is removed immediately after password confirmation."
             .to_owned()
@@ -926,8 +928,9 @@ pub(super) fn render_delete_account_warning(grace_days: u64) -> String {
         )
     };
     format!(
-        r#"<section class="panel danger-panel delete-account-panel"><h1>Delete account</h1><p>Permanent removal deletes your profile, posts, reposts, likes, follows, blocks, mutes, bookmarks, sessions, and uploaded media owned by your account.</p><p>{}</p><div class="actions"><form method="get" action="/settings/delete/confirm"><button class="danger" type="submit">Confirm delete account</button></form><a class="button-link" href="/settings">Cancel</a></div></section>"#,
+        r#"<section class="panel danger-panel delete-account-panel"><h1>Delete account</h1><p>Permanent removal deletes your profile, posts, reposts, likes, follows, blocks, mutes, bookmarks, sessions, and uploaded media owned by your account.</p><p>{}</p><div class="actions"><form method="post" action="/settings/delete/prepare"><input type="hidden" name="csrf" value="{}"><button class="danger" type="submit">Confirm delete account</button></form><a class="button-link" href="/settings">Cancel</a></div></section>"#,
         html_escape::encode_text(&grace),
+        html_escape::encode_double_quoted_attribute(csrf),
     )
 }
 

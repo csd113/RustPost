@@ -163,8 +163,8 @@ pub(super) async fn import_account(
     // The guard keeps runtime temp cleanup from removing this operation's
     // staged upload or export archive while it is in flight.
     let _operation = crate::runtime::begin_temp_operation();
-    // Imports publish content, so they share the post rate-limit budget.
-    rate_limit::check_and_record(
+    // Reject over-budget uploads early without charging unverified forms.
+    rate_limit::ensure_under_limit(
         &state.pool,
         rate_limit::Scope::Post,
         &user_actor(user.id),
@@ -174,6 +174,18 @@ pub(super) async fn import_account(
     .await
     .map_err(|err| AppError::RateLimited(err.to_string()))?;
     let staged = stage_account_import(&state, &headers, multipart).await?;
+    // Charge the shared posting budget only after the complete multipart form
+    // passes CSRF validation (including duplicate fields). The atomic check
+    // still arbitrates concurrent imports/posts; TempPath cleans up a loser.
+    rate_limit::check_and_record(
+        &state.pool,
+        rate_limit::Scope::Post,
+        &user_actor(user.id),
+        state.settings.moderation.posts_per_minute,
+        60,
+    )
+    .await
+    .map_err(|err| AppError::RateLimited(err.to_string()))?;
     let report =
         portability::import_account(&state.pool, &state.paths, &state.settings, user.id, &staged)
             .await;

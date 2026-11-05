@@ -52,6 +52,7 @@ pub(super) fn password_change_exempt(path: &str) -> bool {
             | "/favicon.ico"
             | "/local"
             | "/settings/delete"
+            | "/settings/delete/prepare"
             | "/settings/delete/confirm"
             | "/settings/delete/cancel"
             | "/settings/export"
@@ -64,7 +65,11 @@ pub(super) fn password_change_exempt(path: &str) -> bool {
 pub(super) fn pending_deletion_exempt(path: &str) -> bool {
     matches!(
         path,
-        "/logout" | "/settings/password" | "/settings/delete/cancel" | "/settings/delete/confirm"
+        "/logout"
+            | "/settings/password"
+            | "/settings/delete/cancel"
+            | "/settings/delete/prepare"
+            | "/settings/delete/confirm"
     )
 }
 

@@ -34,6 +34,9 @@ use crate::{
 mod update_routes;
 use update_routes::{admin_check_updates, admin_updates};
 
+#[cfg(test)]
+mod csrf_regressions;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -278,9 +281,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/settings/delete/cancel", post(cancel_deletion))
         .route("/settings/delete", get(delete_account_warning))
+        .route("/settings/delete/prepare", post(prepare_delete_account))
         .route(
             "/settings/delete/confirm",
-            get(delete_account_final_warning).post(delete_account_final),
+            // Old bookmarks and safe navigation show the initial warning;
+            // only the token-protected preparation POST may replace an intent.
+            get(delete_account_warning).post(delete_account_final),
         )
         .route("/account-deleted", get(account_deleted))
         .route("/following", get(following))
@@ -942,8 +948,8 @@ use profiles::{
 mod settings;
 use settings::{
     account_deleted, add_muted_word, cancel_deletion, change_password, change_username,
-    delete_account_final, delete_account_final_warning, delete_account_warning, mute,
-    password_change_page, remove_muted_word, render_profile_website_link, settings_form,
+    delete_account_final, delete_account_warning, mute, password_change_page,
+    prepare_delete_account, remove_muted_word, render_profile_website_link, settings_form,
     settings_profile, settings_update, unmute,
 };
 mod portability_routes;

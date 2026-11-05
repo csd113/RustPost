@@ -216,7 +216,12 @@ RustPost is non-federated and does not invent remote accounts.
 - Configuration: `[accounts] deletion_grace_period_days` in `settings.toml`,
   default **30 days**, maximum 3650, `0` means immediate deletion after
   password confirmation. Documented in the generated `settings.toml`.
-- The delete flow (`/settings/delete` → `/settings/delete/confirm`) verifies
+- The delete flow starts at `GET /settings/delete`. Its CSRF-protected
+  `POST /settings/delete/prepare` displays the final password form with a
+  session-bound, single-use intent that expires after ten minutes. This works
+  without JavaScript. `GET` and `HEAD /settings/delete/confirm` show the initial
+  warning without replacing an outstanding intent, so old links remain safe.
+  The final `POST /settings/delete/confirm` verifies
   the password and stores `deletion_requested_at` and `deletion_scheduled_at`
   instead of deleting immediately. The user sees the deadline and a cancel
   button on the settings page, plus a site-wide banner while the deletion is
