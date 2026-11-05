@@ -80,6 +80,10 @@ crossterm_winapi = "0.9.1"
 name = "terminal_regressions"
 path = "tests/terminal_regressions.rs"
 
+[[test]]
+name = "backup_interruptions"
+path = "tests/backup_interruptions.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

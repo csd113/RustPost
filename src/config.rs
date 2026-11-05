@@ -733,7 +733,8 @@ create_admin_on_first_boot = {create_admin_on_first_boot}
 
 # Storage guardrails. Quotas count logical uploaded bytes, including drafts and duplicate uploads.
 [storage]
-# Required available disk headroom. 0 disables the filesystem check.
+# Free-space admission target, not a reservation; concurrent work may consume the same capacity.
+# 0 disables the filesystem check.
 min_free_bytes = {storage_min_free_bytes}
 # Instance and per-account upload quotas. 0 means unlimited.
 max_upload_bytes = {storage_max_upload_bytes}

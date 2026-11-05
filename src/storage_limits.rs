@@ -19,6 +19,8 @@ pub fn available_space(path: &Path) -> anyhow::Result<u64> {
     disks.iter().filter(|d|path.starts_with(d.mount_point())).max_by_key(|d|d.mount_point().components().count()).map(sysinfo::Disk::available_space).ok_or_else(||anyhow::anyhow!("cannot inspect storage headroom; check the data filesystem or storage.min_free_bytes"))
 }
 
+/// Best-effort admission probe only: it does not reserve physical disk capacity.
+/// Concurrent uploads, conversion, backup and verification can pass against the same free bytes.
 pub fn ensure_headroom(path: &Path, minimum: u64, additional: u64) -> anyhow::Result<()> {
     if minimum == 0 {
         return Ok(());

@@ -63,8 +63,26 @@ pub fn backup_path_for_download(paths: &RuntimePaths, filename: &str) -> anyhow:
     Ok(canonical_path)
 }
 
+/// Recover an interrupted capture only while holding exclusive native backup ownership.
+/// Markers are intent signals; OS locks, which release on process death, establish ownership.
 pub fn operation_in_progress(paths: &RuntimePaths) -> bool {
-    paths.tmp_dir.join(CAPTURE_DIR).is_dir()
+    let capture = paths.tmp_dir.join(CAPTURE_DIR);
+    if !capture.is_dir() {
+        return false;
+    }
+    let Ok(_ownership) = backup_coordination_lock(paths) else {
+        // A live owner or an IO failure must never allow an unsafe capture bypass.
+        return true;
+    };
+    // Keep ownership through removal so another backup cannot replace the marker beneath us.
+    match fs::remove_dir(&capture) {
+        Ok(()) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            warn!(error=%error,"stale backup capture marker could not be removed");
+            true
+        }
+    }
 }
 
 pub(super) fn sync_directory(path: &Path) -> anyhow::Result<()> {

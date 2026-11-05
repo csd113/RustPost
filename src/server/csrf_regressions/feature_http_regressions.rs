@@ -21,6 +21,23 @@ fn multipart(fields: &[(&str, String)], image: Option<&[u8]>) -> Vec<u8> {
     body
 }
 
+const FORM: &str = "Content-Type: application/x-www-form-urlencoded\r\n";
+
+impl Fixture {
+    async fn count(&self, table: &'static str) -> anyhow::Result<i64> {
+        self.state
+            .pool
+            .call(move |conn| {
+                Ok(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .await
+    }
+}
+
 const MULTIPART: &str = "Content-Type: multipart/form-data; boundary=feature-boundary\r\n";
 
 async fn raw(
@@ -428,5 +445,292 @@ async fn undo_is_owner_bound_and_retained_media_is_not_public_while_deleted() ->
         303
     );
     assert_eq!(raw(&f, "GET", &file, None, &[], "").await?.0, 200);
+    Ok(())
+}
+
+async fn attachment_draft(f: &Fixture, key: &str) -> anyhow::Result<social::drafts::Draft> {
+    let body = multipart(
+        &[
+            ("csrf", f.session.csrf_token.clone()),
+            ("post_key", key.to_owned()),
+            ("text", key.to_owned()),
+            ("intent", "draft".into()),
+            ("alt_0", "Original caption".into()),
+        ],
+        Some(&png()?),
+    );
+    let response = f.request("POST", "/posts", &body, MULTIPART).await?;
+    assert_eq!(response.0, 303, "{}", response.1);
+    social::drafts::list(&f.state.pool, f.user_id)
+        .await?
+        .into_iter()
+        .find(|draft| draft.text == key)
+        .ok_or_else(|| anyhow::anyhow!("draft not found"))
+}
+
+#[tokio::test]
+async fn unchecked_draft_attachments_can_be_saved_scheduled_or_published() -> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    for intent in ["draft", "schedule", "publish"] {
+        let draft = attachment_draft(&f, intent).await?;
+        let removed = &draft.media[0];
+        let field = format!("existing_alt_{}", removed.id);
+        let body = multipart(
+            &[
+                ("csrf", f.session.csrf_token.clone()),
+                ("text", format!("Removed attachment: {intent}")),
+                ("revision", draft.revision.to_string()),
+                ("intent", intent.into()),
+                (
+                    "scheduled_at",
+                    (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                ),
+                (
+                    &field,
+                    "The native form still submits this unchecked attachment's description".into(),
+                ),
+            ],
+            None,
+        );
+        let result = f
+            .request("POST", &format!("/drafts/{}", draft.id), &body, MULTIPART)
+            .await?;
+        assert_eq!(result.0, 303, "{intent}: {}", result.1);
+        assert_eq!(f.count("media").await?, 0);
+        assert_eq!(
+            std::fs::read_dir(&f.state.paths.uploads_originals)?.count(),
+            0
+        );
+        assert_eq!(
+            raw(
+                &f,
+                "GET",
+                &removed.public_path,
+                Some(&f.session.token),
+                &[],
+                ""
+            )
+            .await?
+            .0,
+            404
+        );
+        if intent != "publish" {
+            let current = social::drafts::list(&f.state.pool, f.user_id)
+                .await?
+                .into_iter()
+                .find(|item| item.id == draft.id)
+                .ok_or_else(|| anyhow::anyhow!("missing edited draft"))?;
+            assert!(current.media.is_empty());
+            assert_eq!(
+                current.status,
+                if intent == "schedule" {
+                    "scheduled"
+                } else {
+                    "draft"
+                }
+            );
+        }
+    }
+    assert_eq!(f.count("posts").await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacing_draft_media_preserves_shared_bytes_and_rejects_stale_or_foreign_fields()
+-> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let draft = attachment_draft(&f, "replacement").await?;
+    let original = &draft.media[0];
+    let description = format!("existing_alt_{}", original.id);
+    let fields = [
+        ("csrf", f.session.csrf_token.clone()),
+        ("text", draft.text.clone()),
+        ("revision", draft.revision.to_string()),
+        ("intent", "draft".into()),
+        (&description, "Removed caption".into()),
+        ("alt_0", "Replacement caption".into()),
+    ];
+    let response = f
+        .request(
+            "POST",
+            &format!("/drafts/{}", draft.id),
+            &multipart(&fields, Some(&png()?)),
+            MULTIPART,
+        )
+        .await?;
+    assert_eq!(response.0, 303, "{}", response.1);
+    let current = social::drafts::list(&f.state.pool, f.user_id)
+        .await?
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("missing draft"))?;
+    assert_eq!(current.media.len(), 1);
+    assert_ne!(current.media[0].id, original.id);
+    assert_eq!(current.media[0].alt_text, "Replacement caption");
+    assert_eq!(current.media[0].public_path, original.public_path);
+    assert_eq!(
+        raw(
+            &f,
+            "GET",
+            &current.media[0].public_path,
+            Some(&f.session.token),
+            &[],
+            ""
+        )
+        .await?
+        .0,
+        200
+    );
+    // A stale editor must not detach the replacement or publish its newly uploaded bytes.
+    let response = f
+        .request(
+            "POST",
+            &format!("/drafts/{}", draft.id),
+            &multipart(&fields, Some(&png()?)),
+            MULTIPART,
+        )
+        .await?;
+    assert_eq!(response.0, 400);
+    let replacement = current.media[0].id;
+    let retained_description = format!("existing_alt_{replacement}");
+    let forged = multipart(
+        &[
+            ("csrf", f.session.csrf_token.clone()),
+            ("text", draft.text),
+            ("revision", current.revision.to_string()),
+            ("intent", "draft".into()),
+            ("retain_media", replacement.to_string()),
+            (&retained_description, "Keep caption".into()),
+            (
+                "existing_alt_9223372036854775807",
+                "Foreign description".into(),
+            ),
+        ],
+        Some(&png()?),
+    );
+    assert_eq!(
+        f.request("POST", &format!("/drafts/{}", draft.id), &forged, MULTIPART)
+            .await?
+            .0,
+        400
+    );
+    // Both rejected edits leave the committed draft, description and shared file intact.
+    let remaining = social::drafts::list(&f.state.pool, f.user_id)
+        .await?
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("missing draft"))?;
+    assert_eq!(remaining.revision, current.revision);
+    assert_eq!(remaining.media[0].alt_text, "Replacement caption");
+    for _ in 0..50 {
+        if f.count("media").await? == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(f.count("media").await?, 1);
+    assert_eq!(
+        std::fs::read_dir(&f.state.paths.uploads_originals)?.count(),
+        1
+    );
+    delete_attachment_draft(&f, &remaining).await
+}
+
+#[tokio::test]
+async fn concurrent_multipart_uploads_share_logical_quota_and_clean_the_rejected_file()
+-> anyhow::Result<()> {
+    let mut settings = Settings::default();
+    settings.storage.max_upload_bytes = 100;
+    settings.storage.max_user_upload_bytes = 100;
+    let f = Fixture::configured(
+        settings,
+        FfmpegStatus {
+            available: false,
+            version: String::new(),
+            supports_webp: false,
+            supports_vp9: false,
+            error: None,
+        },
+    )
+    .await?;
+    let image = png()?;
+    let first = multipart(
+        &[
+            ("csrf", f.session.csrf_token.clone()),
+            ("post_key", "quota-first".into()),
+            ("text", "first".into()),
+        ],
+        Some(&image),
+    );
+    let second = multipart(
+        &[
+            ("csrf", f.session.csrf_token.clone()),
+            ("post_key", "quota-second".into()),
+            ("text", "second".into()),
+        ],
+        Some(&image),
+    );
+    let (one, two) = tokio::join!(
+        f.request("POST", "/posts", &first, MULTIPART),
+        f.request("POST", "/posts", &second, MULTIPART)
+    );
+    let mut statuses = [one?.0, two?.0];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [303, 400]);
+    assert_eq!(f.count("posts").await?, 1);
+    assert_eq!(f.count("media").await?, 1);
+    for _ in 0..50 {
+        if f.count("storage_reservations").await? == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(f.count("storage_reservations").await?, 0);
+    assert_eq!(
+        std::fs::read_dir(&f.state.paths.uploads_originals)?.count(),
+        1
+    );
+    assert_eq!(std::fs::read_dir(&f.state.paths.tmp_uploads)?.count(), 0);
+    Ok(())
+}
+
+async fn delete_attachment_draft(f: &Fixture, draft: &social::drafts::Draft) -> anyhow::Result<()> {
+    let body = format!("csrf={}&revision={}", f.session.csrf_token, draft.revision);
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/drafts/{}/delete", draft.id),
+            body.as_bytes(),
+            FORM
+        )
+        .await?
+        .0,
+        303
+    );
+    assert_eq!(f.count("media").await?, 0);
+    assert_eq!(
+        std::fs::read_dir(&f.state.paths.uploads_originals)?.count(),
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_and_requests_recover_stale_capture_but_preserve_live_or_unexpected_state()
+-> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let marker = f.state.paths.tmp_dir.join("backup-capture.lock");
+    std::fs::create_dir(&marker)?;
+    let owner = crate::backup::backup_coordination_lock(&f.state.paths)?;
+    assert_eq!(raw(&f, "GET", "/health/live", None, &[], "").await?.0, 200);
+    assert_eq!(raw(&f, "GET", "/health/ready", None, &[], "").await?.0, 503);
+    assert_eq!(raw(&f, "GET", "/home", None, &[], "").await?.0, 503);
+    assert!(marker.is_dir());
+    drop(owner);
+    std::fs::write(marker.join("unexpected"), b"preserve evidence")?;
+    assert_eq!(raw(&f, "GET", "/health/ready", None, &[], "").await?.0, 503);
+    assert_eq!(raw(&f, "GET", "/home", None, &[], "").await?.0, 503);
+    std::fs::remove_file(marker.join("unexpected"))?;
+    assert_eq!(raw(&f, "GET", "/health/ready", None, &[], "").await?.0, 200);
+    assert_eq!(raw(&f, "GET", "/home", None, &[], "").await?.0, 200);
+    assert!(!marker.exists());
     Ok(())
 }

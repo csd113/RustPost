@@ -102,7 +102,7 @@ macro_rules! admin_fields {
 }
 
 admin_fields! {
-    StorageMinFreeBytes, storage_min_free_bytes: u64, storage.min_free_bytes, "Minimum free disk space", "Bytes reserved as free headroom; 0 disables filesystem checks.", Number, [];
+    StorageMinFreeBytes, storage_min_free_bytes: u64, storage.min_free_bytes, "Free-space admission target", "Free-space admission target in bytes; checks do not reserve disk capacity. 0 disables filesystem checks.", Number, [];
     StorageMaxUploadBytes, storage_max_upload_bytes: u64, storage.max_upload_bytes, "Instance upload quota", "Logical bytes across all media including drafts and duplicates; 0 is unlimited.", Number, [];
     StorageMaxUserUploadBytes, storage_max_user_upload_bytes: u64, storage.max_user_upload_bytes, "Per-account upload quota", "Logical bytes owned by each account; 0 is unlimited.", Number, [];
     SiteName, site_name: String, site.name, "Site name", "Shown in page titles, the header, and the footer. Empty hides the display name.", Text, [];

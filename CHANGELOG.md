@@ -4,6 +4,8 @@ For installation, start with [Getting started](docs/getting-started.md). Entries
 
 ## v1.2.0 - Community tools and reliable operations (unreleased)
 
+- Correct native draft edits that remove attachments while submitting their description fields; retain ownership/revision validation and shared-file safety. Recover interrupted backup capture markers under exclusive native ownership and report capture/recovery failures through readiness. Clarify that physical free-space checks are admission probes; atomic logical upload quotas remain separate.
+
 - Add private server-saved drafts, attachment descriptions, optimistic edits, UTC schedules, cancellation, and transactional restart-safe publication. Add optional browser-local description reminders and image previews.
 - Deduplicate posting retries with submission keys and atomically charge posting rates. Preserve committed attachments if response rendering fails.
 - Add single/multiple-choice polls with optional closing times, account-bound votes, and aggregate results. Votes remain visible to the database operator.

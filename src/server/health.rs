@@ -7,6 +7,9 @@ pub(super) async fn live() -> Response {
 }
 
 pub(super) async fn ready(State(state): State<Arc<AppState>>) -> Response {
+    if backup::operation_in_progress(&state.paths) {
+        return response(StatusCode::SERVICE_UNAVAILABLE, "not-ready");
+    }
     let check = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         state.pool.call(|conn| {

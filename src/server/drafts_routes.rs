@@ -56,6 +56,7 @@ fn input(form: &ParsedPostCreate, id: Option<i64>) -> AppResult<social::drafts::
     descriptions.extend(
         form.existing_descriptions
             .iter()
+            .filter(|(id, _)| form.retained_media.contains(id))
             .map(|(id, text)| (*id, text.clone())),
     );
     Ok(social::drafts::DraftInput {
@@ -89,7 +90,7 @@ pub(super) async fn save_new(
         cleanup_unattached(state, &form.media_ids).await;
         return Ok(Redirect::to(&format!("/drafts/{id}")).into_response());
     }
-    if !form.retained_media.is_empty() {
+    if !form.retained_media.is_empty() || !form.existing_descriptions.is_empty() {
         return Err(bad("new drafts cannot retain existing attachments"));
     }
     if form.is_nsfw {
@@ -240,6 +241,7 @@ pub(super) async fn update(
     if form
         .retained_media
         .iter()
+        .chain(form.existing_descriptions.keys())
         .any(|id| !previous.media.iter().any(|m| m.id == *id))
     {
         return Err(bad("attachment does not belong to this draft"));
@@ -573,7 +575,7 @@ pub(super) async fn admin_storage(
         }
     };
     let mut body = format!(
-        r#"<section class="panel"><h1>Storage</h1><p>Quotas count uploaded bytes per media record, including drafts and duplicate uploads. They are separate from free disk space. Active limits are shown below; restart after changing storage settings.</p><dl><dt>Logical uploaded bytes</dt><dd>{}</dd><dt>Uploads in progress</dt><dd>{}</dd><dt>Available filesystem space</dt><dd>{free}</dd><dt>Required free headroom</dt><dd>{}</dd><dt>Instance upload quota</dt><dd>{}</dd><dt>Per-account upload quota</dt><dd>{}</dd></dl><p><a href="/admin/deep-settings">Change storage settings</a></p><h2>Largest accounts</h2>"#,
+        r#"<section class="panel"><h1>Storage</h1><p>Quotas count uploaded bytes per media record, including drafts and duplicate uploads. They are separate from free disk space. Free-space checks do not reserve capacity: concurrent uploads, conversions, backup, or verification can consume the same headroom. Active limits are shown below; restart after changing storage settings.</p><dl><dt>Logical uploaded bytes</dt><dd>{}</dd><dt>Uploads in progress</dt><dd>{}</dd><dt>Available filesystem space</dt><dd>{free}</dd><dt>Free-space admission target</dt><dd>{}</dd><dt>Instance upload quota</dt><dd>{}</dd><dt>Per-account upload quota</dt><dd>{}</dd></dl><p><a href="/admin/deep-settings">Change storage settings</a></p><h2>Largest accounts</h2>"#,
         backups::format_bytes(used),
         backups::format_bytes(reserved),
         backups::format_bytes(state.settings.storage.min_free_bytes),

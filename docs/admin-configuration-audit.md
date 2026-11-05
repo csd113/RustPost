@@ -67,7 +67,7 @@ All entries below live in `settings.toml` under their canonical section/key. Non
 | `posts.allow_bookmarks` | `bool` | `true` | No | posts runtime | Restart required; Allow this feature. |
 | `posts.allow_hashtags` | `bool` | `true` | No | Reserved; hashtag extraction is unconditional | Restart required; Reserved: hashtag extraction currently operates regardless of this flag. |
 | `posts.allow_mentions` | `bool` | `true` | No | social | Restart required; Allow this feature. |
-| `storage.min_free_bytes` | `u64` | `536870912` | Yes | storage, upload, backup | Restart required; Filesystem free headroom in bytes. 0 disables probe. |
+| `storage.min_free_bytes` | `u64` | `536870912` | Yes | storage, upload, backup | Restart required; Free-space admission target in bytes, not a capacity reservation or guaranteed floor. Concurrent work can consume the same headroom. 0 disables probe. |
 | `storage.max_upload_bytes` | `u64` | `0` | Yes | upload, import | Restart required; Instance logical input-byte quota including reservations. 0 unlimited. |
 | `storage.max_user_upload_bytes` | `u64` | `0` | Yes | upload, import | Restart required; Per-account logical input-byte quota. 0 unlimited. |
 | `media.ffmpeg_path` | `String` | `"ffmpeg"` | No | ffmpeg | Deployment executable: arbitrary process selection with server privileges. |
