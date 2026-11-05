@@ -83,7 +83,8 @@ function activateYoutubePreview(link) {
   iframe.src = src;
   iframe.title = link.getAttribute("data-youtube-title") || "YouTube video";
   iframe.loading = "lazy";
-  iframe.referrerPolicy = "no-referrer";
+  // YouTube requires client identity; send only our origin, never the post URL.
+  iframe.referrerPolicy = "strict-origin-when-cross-origin";
   iframe.allow = "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share";
   iframe.setAttribute("allowfullscreen", "");
   iframe.setAttribute("sandbox", "allow-scripts allow-same-origin allow-presentation");
