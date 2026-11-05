@@ -46,9 +46,15 @@ pub fn layout_with_context(
                 icon_svg("log-out")
             )
         });
+        let saved = format!(
+            "{}{}{}",
+            nav_link("/drafts", "Drafts", "edit"),
+            nav_link("/media/processing", "Media processing", "paperclip"),
+            nav_link("/settings/deleted-posts", "Recently deleted", "trash")
+        );
         let profile = nav_link(&format!("/users/{}", user.username), "Profile", "profile");
         format!(
-            "{}{}{}{notifications}{requests}{}{}{admin}{logout}",
+            "{}{}{}{notifications}{requests}{}{}{saved}{admin}{logout}",
             nav_link("/home", "Home Feed", "home"),
             nav_link("/following", "Following", "users"),
             nav_link("/search", "Search", "search"),
@@ -78,7 +84,7 @@ pub fn layout_with_context(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https://i.ytimg.com; media-src 'self'; frame-src https://www.youtube-nocookie.com; style-src 'self' 'unsafe-inline'; form-action 'self'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' blob: data: https://i.ytimg.com; media-src 'self'; frame-src https://www.youtube-nocookie.com; style-src 'self' 'unsafe-inline'; form-action 'self'">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta name="referrer" content="same-origin">
 <link rel="icon" href="/favicon.ico" type="{}">

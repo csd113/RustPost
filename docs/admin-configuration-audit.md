@@ -6,7 +6,7 @@ Most site settings can be changed in **Admin → Deep server settings**. Change 
 
 ## Choose where to change a setting
 
-The model contains **65 TOML options**: 61 appear in the web editor, and four remain deployment-managed. The admin overview also manages four database values (announcement text/enabled and maintenance message/enabled) plus the favicon file. Account preferences are managed from each account's Settings page.
+The model contains **69 TOML options**: 65 appear in the web editor, and four remain deployment-managed. The admin overview also manages four database values (announcement text/enabled and maintenance message/enabled) plus the favicon file. Account preferences are managed from each account's Settings page.
 
 The four file-only fields are `media.ffmpeg_path`, `tor.data_dir`, `backup.backup_dir`, and `tor.include_tor_keys_in_backups_by_default`. Executable selection and moving private storage require access to the host; the last field must remain false because manual key inclusion requires explicit consent.
 
@@ -56,6 +56,7 @@ All entries below live in `settings.toml` under their canonical section/key. Non
 | `accounts.max_archive_expanded_bytes` | `u64` | `1073741824` | Yes | portability, server | Restart required; MiB of decompressed media; 0.0625–16384 MiB. |
 | `accounts.max_archive_entries` | `usize` | `10000` | Yes | portability | Restart required; Tar entries per import, 1–100000. |
 | `posts.max_text_chars` | `usize` | `280` | No | portability, social, server | Restart required; Characters. |
+| `posts.post_delete_recovery_seconds` | `u64` | `30` | Yes | social, background | Restart required; Own-post undo window, 0–300 seconds. Admin removals are final. |
 | `posts.post_edit_window_seconds` | `u64` | `15` | Yes | social, server | Restart required; Seconds, 0–300. Set 0 to disable editing. |
 | `posts.max_images_per_post` | `usize` | `4` | No | social, server | Restart required; Attachments per post. |
 | `posts.max_videos_per_post` | `usize` | `1` | No | social, server | Restart required; Attachments per post. |
@@ -66,6 +67,9 @@ All entries below live in `settings.toml` under their canonical section/key. Non
 | `posts.allow_bookmarks` | `bool` | `true` | No | posts runtime | Restart required; Allow this feature. |
 | `posts.allow_hashtags` | `bool` | `true` | No | Reserved; hashtag extraction is unconditional | Restart required; Reserved: hashtag extraction currently operates regardless of this flag. |
 | `posts.allow_mentions` | `bool` | `true` | No | social | Restart required; Allow this feature. |
+| `storage.min_free_bytes` | `u64` | `536870912` | Yes | storage, upload, backup | Restart required; Filesystem free headroom in bytes. 0 disables probe. |
+| `storage.max_upload_bytes` | `u64` | `0` | Yes | upload, import | Restart required; Instance logical input-byte quota including reservations. 0 unlimited. |
+| `storage.max_user_upload_bytes` | `u64` | `0` | Yes | upload, import | Restart required; Per-account logical input-byte quota. 0 unlimited. |
 | `media.ffmpeg_path` | `String` | `"ffmpeg"` | No | ffmpeg | Deployment executable: arbitrary process selection with server privileges. |
 | `media.convert_images_to_webp` | `bool` | `true` | No | media | Restart required; Convert accepted images using the existing image processor. |
 | `media.convert_videos_to_webm` | `bool` | `true` | No | media runtime | Restart required; Convert accepted videos using FFmpeg. |

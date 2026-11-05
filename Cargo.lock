@@ -3674,7 +3674,7 @@ dependencies = [
 
 [[package]]
 name = "rustpost"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3702,6 +3702,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "subtle",
+ "sysinfo",
  "tar",
  "tempfile",
  "thiserror 2.0.21",

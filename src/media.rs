@@ -66,9 +66,11 @@ struct UploadContext<'a> {
     settings: &'a Settings,
     paths: &'a RuntimePaths,
     ffmpeg: &'a FfmpegStatus,
+    background: bool,
 }
 
 struct StagedUpload {
+    reservation: crate::storage_limits::Reservation,
     owner_user_id: Option<i64>,
     original_filename: String,
     staging: StagedUploadGuard,
@@ -76,6 +78,7 @@ struct StagedUpload {
 }
 
 struct PreparedUpload {
+    reservation: crate::storage_limits::Reservation,
     owner_user_id: Option<i64>,
     original_filename: String,
     staging: StagedUploadGuard,
@@ -129,6 +132,7 @@ impl Drop for StagedUploadGuard {
 }
 
 struct NewMediaRecord {
+    reservation_id: String,
     cleanup: Vec<StagedUploadGuard>,
     owner_user_id: Option<i64>,
     original_filename: String,
@@ -271,3 +275,5 @@ impl PendingMedia {
         self.id
     }
 }
+
+pub mod jobs;

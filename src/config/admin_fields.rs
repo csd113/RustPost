@@ -49,7 +49,7 @@ macro_rules! admin_fields {
         #[derive(Debug, Clone, PartialEq, Eq)]
         pub struct DeepSettingsValues { $(pub $name: $ty,)* }
         impl DeepSettingsField {
-            pub const ALL: [Self; 61] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 65] = [$(Self::$variant,)*];
             #[must_use]
             pub const fn toml_section(self) -> &'static str { match self { $(Self::$variant => stringify!($section),)* } }
             #[must_use]
@@ -102,6 +102,9 @@ macro_rules! admin_fields {
 }
 
 admin_fields! {
+    StorageMinFreeBytes, storage_min_free_bytes: u64, storage.min_free_bytes, "Minimum free disk space", "Bytes reserved as free headroom; 0 disables filesystem checks.", Number, [];
+    StorageMaxUploadBytes, storage_max_upload_bytes: u64, storage.max_upload_bytes, "Instance upload quota", "Logical bytes across all media including drafts and duplicates; 0 is unlimited.", Number, [];
+    StorageMaxUserUploadBytes, storage_max_user_upload_bytes: u64, storage.max_user_upload_bytes, "Per-account upload quota", "Logical bytes owned by each account; 0 is unlimited.", Number, [];
     SiteName, site_name: String, site.name, "Site name", "Shown in page titles, the header, and the footer. Empty hides the display name.", Text, [];
     RegistrationEnabled, registration_enabled: bool, accounts.registration_enabled, "Registration enabled", "Allow this feature.", Boolean, [serde(default = "unchecked")];
     RegistrationCaptchaEnabled, registration_captcha_enabled: bool, accounts.registration_captcha_enabled, "Registration CAPTCHA enabled", "Allow this feature.", Boolean, [serde(default = "unchecked")];
@@ -117,6 +120,7 @@ admin_fields! {
     MaxArchiveExpandedBytes, max_archive_expanded_bytes: u64, accounts.max_archive_expanded_bytes, "Maximum expanded account archive", "MiB of decompressed media; 0.0625–16384 MiB.", Size, [];
     MaxArchiveEntries, max_archive_entries: usize, accounts.max_archive_entries, "Maximum archive entries", "Tar entries per import, 1–100000.", Number, [];
     MaxTextChars, max_text_chars: usize, posts.max_text_chars, "Maximum post text length", "Characters.", Number, [];
+    PostDeleteRecoverySeconds, post_delete_recovery_seconds: u64, posts.post_delete_recovery_seconds, "Post deletion recovery", "Seconds, 0–300. Applies only to an account deleting its own post; admin removals are final.", Number, [];
     PostEditWindowSeconds, post_edit_window_seconds: u64, posts.post_edit_window_seconds, "Post edit window", "Seconds, 0–300. Set 0 to disable editing.", Number, [];
     MaxImagesPerPost, max_images_per_post: usize, posts.max_images_per_post, "Maximum images per post", "Attachments per post.", Number, [];
     MaxVideosPerPost, max_videos_per_post: usize, posts.max_videos_per_post, "Maximum videos per post", "Attachments per post.", Number, [];
@@ -172,6 +176,7 @@ impl DeepSettingsField {
             b"site" => "Site",
             b"accounts" => "Accounts",
             b"posts" => "Posts",
+            b"storage" => "Storage",
             b"media" => "Media",
             b"server" => "Networking & cookies",
             b"moderation" => "Rate limiting",

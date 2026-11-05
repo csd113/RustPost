@@ -578,6 +578,33 @@ function updateComposerMedia(input) {
   if (nsfw && !hasMedia) {
     nsfw.checked = false;
   }
+  const descriptions = form.querySelector("[data-image-descriptions]");
+  if (descriptions) {
+    descriptions.querySelectorAll("img[data-preview-url]").forEach(img => URL.revokeObjectURL(img.dataset.previewUrl));
+    descriptions.replaceChildren();
+    Array.from(input.files || []).forEach((file, index) => {
+      if (file.type && !file.type.startsWith("image/")) return;
+      const field = document.createElement("fieldset");
+      const legend = document.createElement("legend");
+      legend.textContent = `Description for ${file.name}`;
+      const image = document.createElement("img");
+      image.src = URL.createObjectURL(file);
+      image.dataset.previewUrl = image.src;
+      image.alt = "Selected image preview";
+      image.addEventListener("error", () => { URL.revokeObjectURL(image.src); image.remove(); });
+      image.width = 200;
+      const label = document.createElement("label");
+      label.textContent = "Describe this image for people using screen readers";
+      const text = document.createElement("textarea");
+      text.name = `alt_${index}`;
+      text.maxLength = 1000;
+      text.rows = 2;
+      label.append(text);
+      field.append(legend, image, label);
+      descriptions.append(field);
+    });
+  }
+
 }
 
 document.querySelectorAll("input[type=file][data-composer-media]").forEach((input) => {
@@ -669,6 +696,7 @@ document.addEventListener("change", (event) => {
 function resetSubmittingForms() {
   document.querySelectorAll('form[data-submitting="true"]').forEach((form) => {
     delete form.dataset.submitting;
+    form.querySelectorAll("[data-submitter-value]").forEach(input => input.remove());
     form.querySelectorAll("button:disabled").forEach((button) => {
       button.disabled = false;
     });
@@ -730,6 +758,9 @@ function enhancedErrorMessage(status) {
 document.addEventListener("submit", async (event) => {
   const form = event.target.closest("form[data-enhance]");
   if (!form || !window.fetch) {
+    return;
+  }
+  if (form.dataset.enhance === "post-create" && ["draft", "schedule"].includes(event.submitter?.value)) {
     return;
   }
   event.preventDefault();
@@ -829,6 +860,10 @@ document.addEventListener("submit", async (event) => {
         window.history.pushState(null, "", data.redirect);
       }
       form.reset();
+      const key = form.elements.namedItem("post_key");
+      if (key && window.crypto?.getRandomValues) {
+        key.value = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
+      } else if (key) { window.location.reload(); }
       form.querySelectorAll("textarea[data-character-limit]").forEach(updateComposerCount);
       form.querySelectorAll("input[type=file][data-composer-media]").forEach(updateComposerMedia);
     }
@@ -863,6 +898,15 @@ document.addEventListener("submit", (event) => {
   form.dataset.submitting = "true";
   const submitter = event.submitter || form.querySelector("button[type=submit]");
   if (submitter) {
+    // A disabled named button is omitted by native form serialization.
+    if (submitter.name) {
+      const value = document.createElement("input");
+      value.type = "hidden";
+      value.name = submitter.name;
+      value.value = submitter.value;
+      value.dataset.submitterValue = "";
+      form.append(value);
+    }
     submitter.disabled = true;
   }
 });
@@ -923,3 +967,24 @@ document.addEventListener("click", async (event) => {
     delete button.dataset.copyTimer;
   }, 1600));
 });
+
+// This optional reminder is a local preference; descriptions themselves are saved on the server.
+document.querySelectorAll("[data-alt-reminder]").forEach(input => {
+  try { input.checked = localStorage.getItem("rustpost-alt-reminder") === "1"; } catch (_) {}
+  input.addEventListener("change", () => {
+    try { localStorage.setItem("rustpost-alt-reminder", input.checked ? "1" : "0"); } catch (_) {}
+  });
+});
+document.addEventListener("submit", event => {
+  const form = event.target;
+  if (!(form instanceof HTMLFormElement) || event.submitter?.value === "draft") return;
+  const reminder = form.querySelector("[data-alt-reminder]");
+  const input = form.querySelector("[data-composer-media]");
+  if (!reminder?.checked || !input?.files) return;
+  const missingNew = Array.from(input.files).some((file, index) => file.type.startsWith("image/") && !form.elements.namedItem(`alt_${index}`)?.value.trim());
+  const missingExisting = Array.from(form.querySelectorAll("[data-retained-image]")).some(field => field.querySelector('[name="retain_media"]')?.checked && !field.querySelector("textarea")?.value.trim());
+  if ((missingNew || missingExisting) && !window.confirm("An image has no description. Post or schedule it anyway?")) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }
+}, true);

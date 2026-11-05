@@ -194,34 +194,9 @@ pub async fn delete_post(
     post_id: i64,
     is_admin: bool,
 ) -> anyhow::Result<()> {
-    let owner: Option<i64> = pool
-        .call(move |conn| {
-            conn.query_row(
-                "SELECT user_id FROM posts WHERE id = ? AND is_deleted = 0",
-                [post_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
-        })
-        .await?;
-    if !is_admin && owner != Some(actor_id) {
-        anyhow::bail!("cannot delete this post");
-    }
-    pool.call(move |conn| {
-        let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE posts SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
-            [post_id],
-        )?;
-        tx.execute(
-            "UPDATE users SET pinned_post_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE pinned_post_id = ?",
-            [post_id],
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
-    .await
+    recovery::delete(pool, actor_id, post_id, is_admin, 0)
+        .await
+        .map(|_| ())
 }
 
 pub async fn set_post_media_nsfw(

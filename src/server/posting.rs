@@ -27,7 +27,13 @@ pub(super) async fn create_post(
             }
             Err(err) => return Err(err),
         };
-    let outcome = finish_post_create(&state, &headers, addr, user.as_ref(), &form).await;
+    let outcome = if matches!(form.intent.as_str(), "draft" | "schedule") {
+        drafts_routes::save_new(&state, &headers, user.as_ref(), &form).await
+    } else if !form.retained_media.is_empty() || !matches!(form.intent.as_str(), "" | "publish") {
+        Err(AppError::BadRequest("invalid posting action".to_owned()))
+    } else {
+        finish_post_create(&state, &headers, addr, user.as_ref(), &form).await
+    };
     if outcome.is_err() {
         cleanup_post_uploads(&state, &form.media_ids).await;
     }
@@ -44,11 +50,29 @@ pub(super) async fn finish_post_create(
     user: Option<&CurrentUser>,
     form: &ParsedPostCreate,
 ) -> AppResult<Response> {
-    if let Some(parent_id) = form.parent_post_id {
-        ensure_parent_post_exists(&state.pool, parent_id).await?;
-    }
+    let viewer_id = user.map(|u| u.id);
     if user.is_some() {
         validate_csrf(&state.pool, headers, &form.csrf_token).await?;
+    }
+    let request_actor = viewer_id.map_or_else(|| "anonymous".to_owned(), user_actor);
+    let request_key = if form.post_key.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        form.post_key.clone()
+    };
+    if let Some(post_id) = social::post_for_request(&state.pool, &request_actor, &request_key)
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?
+    {
+        drafts_routes::cleanup_unattached(state, &form.media_ids).await;
+        let redirect = format!("/posts/{post_id}");
+        if enhanced_request(headers) {
+            return enhanced_post_response(state, headers, user, post_id, redirect).await;
+        }
+        return Ok(Redirect::to(&redirect).into_response());
+    }
+    if let Some(parent) = form.parent_post_id {
+        ensure_parent_post_exists(&state.pool, parent).await?;
     }
     if form.is_nsfw {
         media::set_media_nsfw(&state.pool, &form.media_ids, true).await?;
@@ -76,53 +100,50 @@ pub(super) async fn finish_post_create(
             60,
         )
     };
-    rate_limit::check_and_record(&state.pool, scope, &actor, max_events, window_secs)
-        .await
-        .map_err(|err| AppError::RateLimited(err.to_string()))?;
-    let post_id = social::create_post(
+    let descriptions = form
+        .media_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, form.descriptions.get(&i).cloned().unwrap_or_default()))
+        .collect();
+    drafts_routes::set_new_descriptions(&state.pool, viewer_id, descriptions).await?;
+    let poll = drafts_routes::poll_spec(form)?;
+    if poll.is_some() && viewer_id.is_none() {
+        return Err(AppError::Forbidden);
+    }
+    let post_id = social::create_post_with_options(
         &state.pool,
         &state.settings,
         viewer_id,
         &form.text,
         form.parent_post_id,
         &form.media_ids,
+        social::PostOptions {
+            poll,
+            request: Some((request_actor, request_key)),
+            rate: Some(rate_limit::Limit {
+                scope,
+                actor,
+                max_events,
+                window_secs,
+            }),
+        },
     )
     .await
-    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    .map_err(|err| {
+        if err.is::<rate_limit::LimitExceeded>() {
+            AppError::RateLimited(err.to_string())
+        } else {
+            AppError::BadRequest(err.to_string())
+        }
+    })?;
+    drafts_routes::cleanup_unattached(state, &form.media_ids).await;
     let redirect = form.parent_post_id.map_or_else(
         || format!("/home#post-{post_id}"),
         |_| format!("/posts/{post_id}#reply-{post_id}"),
     );
     if enhanced_request(headers) {
-        let posts = social::post_thread(&state.pool, viewer_id, post_id).await?;
-        let post = posts
-            .iter()
-            .find(|post| post.id == post_id)
-            .ok_or(AppError::NotFound)?;
-        return Ok(Json(PostCreateResponse {
-            kind: "post-created",
-            post_id,
-            parent_post_id: form.parent_post_id,
-            redirect,
-            html: if form.parent_post_id.is_some() {
-                render::thread_post_card_with_controls(
-                    post,
-                    user,
-                    form_csrf(state, headers).await?.as_deref(),
-                    blur_nsfw_media(state, user),
-                    state.settings.posts.post_edit_window_seconds,
-                )
-            } else {
-                render::post_card_with_controls(
-                    post,
-                    user,
-                    form_csrf(state, headers).await?.as_deref(),
-                    blur_nsfw_media(state, user),
-                    state.settings.posts.post_edit_window_seconds,
-                )
-            },
-        })
-        .into_response());
+        return enhanced_post_response(state, headers, user, post_id, redirect).await;
     }
     Ok(Redirect::to(&redirect).into_response())
 }
@@ -154,6 +175,16 @@ pub(super) async fn parse_post_create(
         parent_post_id: None,
         media_ids: Vec::new(),
         is_nsfw: false,
+        intent: String::new(),
+        post_key: String::new(),
+        scheduled_at: String::new(),
+        poll_options: String::new(),
+        poll_multiple: false,
+        poll_closes_at: String::new(),
+        descriptions: std::collections::BTreeMap::new(),
+        retained_media: Vec::new(),
+        existing_descriptions: std::collections::BTreeMap::new(),
+        revision: None,
     };
     let outcome = fill_post_create_form(state, headers, user_id, multipart, &mut form).await;
     if outcome.is_err() {
@@ -162,6 +193,10 @@ pub(super) async fn parse_post_create(
     outcome.map(|()| form)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordered multipart parsing keeps CSRF-before-upload checks and cleanup ownership together"
+)]
 pub(super) async fn fill_post_create_form(
     state: &AppState,
     headers: &HeaderMap,
@@ -205,6 +240,65 @@ pub(super) async fn fill_post_create_form(
                         "reply target is invalid; open the post thread and try again".to_owned(),
                     )
                 })?);
+            }
+            "post_key" => form.post_key = read_form_text(field).await?,
+            "intent" => form.intent = read_form_text(field).await?,
+            "scheduled_at" => form.scheduled_at = read_form_text(field).await?,
+            "poll_options" => form.poll_options = read_form_text(field).await?,
+            "poll_multiple" => {
+                form.poll_multiple = true;
+                let _ignored = read_form_text(field).await?;
+            }
+            "poll_closes_at" => form.poll_closes_at = read_form_text(field).await?,
+            "revision" => {
+                form.revision = Some(
+                    read_form_text(field)
+                        .await?
+                        .parse()
+                        .map_err(|_| AppError::BadRequest("invalid draft revision".to_owned()))?,
+                );
+            }
+            "retain_media" => {
+                if form.retained_media.len() >= state.settings.posts.max_media_per_post {
+                    return Err(AppError::BadRequest(
+                        "too many retained attachments".to_owned(),
+                    ));
+                }
+                form.retained_media.push(
+                    read_form_text(field)
+                        .await?
+                        .parse()
+                        .map_err(|_| AppError::BadRequest("invalid attachment".to_owned()))?,
+                );
+            }
+            "alt_lines" => {
+                for (i, line) in read_form_text(field).await?.lines().enumerate() {
+                    if i < state.settings.posts.max_media_per_post {
+                        form.descriptions.insert(i, line.to_owned());
+                    }
+                }
+            }
+            name if name.starts_with("alt_") => {
+                let index: usize = name[4..]
+                    .parse()
+                    .map_err(|_| AppError::BadRequest("invalid description index".to_owned()))?;
+                let text = read_form_text(field).await?;
+                if index >= state.settings.posts.max_media_per_post || text.chars().count() > 1000 {
+                    return Err(AppError::BadRequest("invalid image description".to_owned()));
+                }
+                form.descriptions.insert(index, text);
+            }
+            name if name.starts_with("existing_alt_") => {
+                let id: i64 = name[13..].parse().map_err(|_| {
+                    AppError::BadRequest("invalid attachment description".to_owned())
+                })?;
+                let text = read_form_text(field).await?;
+                if text.chars().count() > 1000
+                    || form.existing_descriptions.len() >= state.settings.posts.max_media_per_post
+                {
+                    return Err(AppError::BadRequest("invalid image description".to_owned()));
+                }
+                form.existing_descriptions.insert(id, text);
             }
             "nsfw" => {
                 form.is_nsfw = true;
@@ -262,11 +356,42 @@ pub(super) async fn thread(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
+    Query(query): Query<ThreadQuery>,
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
-    let posts = social::post_thread(&state.pool, user.as_ref().map(|u| u.id), id).await?;
-    if posts.is_empty() {
-        return Err(AppError::NotFound);
+    let history = social::history::thread_page(
+        &state.pool,
+        user.as_ref().map(|u| u.id),
+        id,
+        query.before,
+        query.after,
+    )
+    .await
+    .map_err(|e| AppError::BadRequest(e.to_string()))?
+    .ok_or(AppError::NotFound)?;
+    let mut navigation = format!(
+        r#"<nav aria-label="Conversation history"><a href="/posts/{}">Conversation start</a> "#,
+        history.root
+    );
+    if let Some(parent) = history.requested.parent_post_id {
+        let _ = write!(navigation, r#"<a href="/posts/{parent}">Parent post</a> "#);
+    }
+    if let Some(before) = history.before {
+        let _ = write!(
+            navigation,
+            r#"<a class="button-link" href="/posts/{id}?before={before}">Earlier replies</a> "#
+        );
+    }
+    if let Some(after) = history.after {
+        let _ = write!(
+            navigation,
+            r#"<a class="button-link" href="/posts/{id}?after={after}">Later replies</a> "#
+        );
+    }
+    navigation.push_str("</nav>");
+    let mut posts = history.posts;
+    if !posts.iter().any(|p| p.id == id) {
+        posts.insert(0, history.requested);
     }
     let csrf = form_csrf(&state, &headers).await?;
     let composer = if (user.is_some() || state.settings.accounts.anonymous_mode_enabled)
@@ -281,7 +406,7 @@ pub(super) async fn thread(
         String::new()
     };
     let body = format!(
-        "{}{}{}",
+        "{}{navigation}{}{}",
         render::thread_back_control(),
         render::thread_posts_with_controls(
             &posts,
@@ -292,6 +417,7 @@ pub(super) async fn thread(
         ),
         composer
     );
+    let body = format!("{body}{navigation}");
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Thread", &body).await?,
     ))
@@ -417,7 +543,17 @@ pub(super) async fn delete_post(
         Err(err) => return Err(err),
     };
     media::validate_post_media_deletion(&state.pool, &state.paths, id).await?;
-    social::delete_post(&state.pool, user.id, id, user.is_admin).await?;
+    let recoverable = social::recovery::delete(
+        &state.pool,
+        user.id,
+        id,
+        user.is_admin,
+        state.settings.posts.post_delete_recovery_seconds,
+    )
+    .await?;
+    if recoverable {
+        return Ok(Redirect::to("/settings/deleted-posts").into_response());
+    }
     // The post is already deleted; a media cleanup failure should not turn a
     // successful deletion into an error page.
     if let Err(error) = media::delete_post_media(&state.pool, &state.paths, id).await {
@@ -586,4 +722,43 @@ pub(super) async fn quote_post(
 
 pub(super) async fn reply_redirect(Path(id): Path<i64>) -> Redirect {
     Redirect::to(&format!("/posts/{id}"))
+}
+
+async fn enhanced_post_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: Option<&CurrentUser>,
+    post_id: i64,
+    redirect: String,
+) -> AppResult<Response> {
+    let viewer_id = user.map(|u| u.id);
+    let posts = social::post_thread(&state.pool, viewer_id, post_id).await?;
+    let post = posts
+        .iter()
+        .find(|post| post.id == post_id)
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(PostCreateResponse {
+        kind: "post-created",
+        post_id,
+        parent_post_id: post.parent_post_id,
+        redirect,
+        html: if post.parent_post_id.is_some() {
+            render::thread_post_card_with_controls(
+                post,
+                user,
+                form_csrf(state, headers).await?.as_deref(),
+                blur_nsfw_media(state, user),
+                state.settings.posts.post_edit_window_seconds,
+            )
+        } else {
+            render::post_card_with_controls(
+                post,
+                user,
+                form_csrf(state, headers).await?.as_deref(),
+                blur_nsfw_media(state, user),
+                state.settings.posts.post_edit_window_seconds,
+            )
+        },
+    })
+    .into_response())
 }

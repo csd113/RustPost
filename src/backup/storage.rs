@@ -64,7 +64,7 @@ pub fn backup_path_for_download(paths: &RuntimePaths, filename: &str) -> anyhow:
 }
 
 pub fn operation_in_progress(paths: &RuntimePaths) -> bool {
-    paths.tmp_dir.join(LOCK_DIR).is_dir()
+    paths.tmp_dir.join(CAPTURE_DIR).is_dir()
 }
 
 pub(super) fn sync_directory(path: &Path) -> anyhow::Result<()> {

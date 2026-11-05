@@ -409,6 +409,7 @@ pub(super) async fn apply_import(
             Err(error) => return Err(error.into()),
         }
 
+        tx.execute("DELETE FROM storage_reservations WHERE id=?",[&plan.reservation_id])?;
         tx.commit()?;
         for guard in &mut plan.cleanup { guard.disarm(); }
         remove_files_best_effort(&unused_copies);

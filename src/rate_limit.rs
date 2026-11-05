@@ -2,6 +2,33 @@ use rusqlite::params;
 
 use crate::db::SqlitePool;
 
+#[derive(Debug, thiserror::Error)]
+#[error("rate limit exceeded; try again later")]
+pub struct LimitExceeded;
+
+pub struct Limit {
+    pub scope: Scope,
+    pub actor: String,
+    pub max_events: i64,
+    pub window_secs: i64,
+}
+
+/// Records an event in the same transaction as the content it admits.
+pub(crate) fn check_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    limit: &Limit,
+) -> anyhow::Result<()> {
+    let count:i64=tx.query_row("SELECT COUNT(*) FROM rate_limit_events WHERE scope=? AND actor=? AND created_at>=datetime('now',?)",params![limit.scope.as_str(),limit.actor,format!("-{} seconds",limit.window_secs)],|r|r.get(0))?;
+    if limit.max_events <= 0 || count >= limit.max_events {
+        return Err(LimitExceeded.into());
+    }
+    tx.execute(
+        "INSERT INTO rate_limit_events(scope,actor) VALUES(?,?)",
+        params![limit.scope.as_str(), limit.actor],
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     Post,

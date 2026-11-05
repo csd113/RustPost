@@ -310,6 +310,7 @@ pub(super) fn enrich_posts(
         .filter(|row| !row.original_unavailable)
         .map(|row| row.id)
         .collect::<Vec<_>>();
+    let polls = polls::for_posts(conn, &visible_ids, viewer_id)?;
     let media = media_for_posts(conn, &visible_ids)?;
     let embeds = youtube_embeds_for_posts(conn, &visible_ids)?;
     let viewer_likes = viewer_relation_ids(conn, viewer_id, ViewerRelation::Likes, &visible_ids)?;
@@ -375,6 +376,7 @@ pub(super) fn enrich_posts(
             quote,
             media: media.get(&id).cloned().unwrap_or_default(),
             youtube_embeds: embeds.get(&id).cloned().unwrap_or_default(),
+            poll: polls.get(&id).cloned(),
         });
     }
     Ok(posts)
@@ -407,7 +409,7 @@ pub(super) fn media_for_posts(
     }
     let sql = format!(
         r#"
-        SELECT pm.post_id, m.public_path, m.mime_type, m.media_kind, m.alt_text, m.is_nsfw
+        SELECT pm.post_id, m.public_path, m.mime_type, m.media_kind, m.alt_text, m.is_nsfw, m.id, m.conversion_state
         FROM post_media pm
         JOIN media m ON m.id = pm.media_id
         WHERE pm.post_id IN ({})
@@ -424,6 +426,8 @@ pub(super) fn media_for_posts(
                 mime_type: row.get(2)?,
                 media_kind: row.get(3)?,
                 alt_text: row.get(4)?,
+                id: row.get(6)?,
+                conversion_state: row.get(7)?,
                 is_nsfw: row.get::<_, i64>(5)? != 0,
             },
         ))

@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 /// Pre-1.0 schema version 1 (without the `YouTube` embed tables).
 const RELEASE_V1_SCHEMA_VERSION: i64 = 1;
@@ -159,6 +159,7 @@ impl SchemaReport {
 enum MigrationState {
     Empty,
     Baseline,
+    ReleaseVersion4,
     ReleaseVersion3,
     ReleaseVersion2,
     ReleaseVersion1,
@@ -202,7 +203,7 @@ mod migrations;
 pub use migrations::migrate;
 use migrations::{
     migrate_release_v1_to_current, migrate_release_v2_to_current, migrate_release_v3_to_current,
-    migration_state, reset_schema_migrations_to,
+    migrate_release_v4_to_current, migration_state, reset_schema_migrations_to,
 };
 mod inspect;
 pub use inspect::{
@@ -216,7 +217,7 @@ use inspect::{
 };
 mod schema;
 use schema::{
-    BASELINE_SCHEMA, FTS_SHADOW_TABLES, RELEASE_V3_INDEXES, RELEASE_V4_SCHEMA, REQUIRED_COLUMNS,
-    REQUIRED_INDEXES, REQUIRED_TABLES, REQUIRED_TRIGGERS, USER_COLUMNS_ADDED_IN_V4,
-    YOUTUBE_EMBEDS_SCHEMA,
+    BASELINE_SCHEMA, FTS_SHADOW_TABLES, RELEASE_V3_INDEXES, RELEASE_V4_SCHEMA, RELEASE_V5_SCHEMA,
+    REQUIRED_COLUMNS, REQUIRED_INDEXES, REQUIRED_TABLES, REQUIRED_TRIGGERS,
+    USER_COLUMNS_ADDED_IN_V4, YOUTUBE_EMBEDS_SCHEMA,
 };

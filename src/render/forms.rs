@@ -69,6 +69,7 @@ pub fn client_boot_script() -> &'static str {
 }
 
 pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) -> String {
+    let request_key = uuid::Uuid::new_v4().to_string();
     let parent_input = parent.map_or_else(String::new, |id| {
         format!(r#"<input type="hidden" name="parent_post_id" value="{id}">"#)
     });
@@ -84,7 +85,7 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
     };
     format!(
         r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted character-counter character-counter-normal" data-character-counter="{}" aria-live="polite">{} remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
-<input type="hidden" name="csrf" value="{}">{}
+<input type="hidden" name="csrf" value="{}">{}<input type="hidden" name="post_key" value="{request_key}">
 <label class="sr-only" for="{}">What is happening?</label>
 <div class="composer-surface">
 <textarea id="{}" name="text" rows="4" data-character-limit="{}" data-mention-autocomplete aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-controls="{}" placeholder="{}"></textarea>
@@ -92,7 +93,10 @@ pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) 
 <div class="composer-footer"><label class="composer-file-control" for="{}"><input class="composer-file-input" id="{}" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime" aria-label="Attach media" data-composer-media><span class="composer-file-button" aria-hidden="true">{}<span>Attach media</span></span></label></div>
 <div class="composer-media-selection" data-composer-media-selection hidden><span class="composer-media-summary" data-composer-media-summary></span><label class="check-row composer-nsfw" for="{}"><input id="{}" name="nsfw" type="checkbox" value="true" data-composer-nsfw> Mark media as NSFW</label><button class="composer-clear-media" type="button" data-composer-clear-media>Clear</button></div>
 </div>
-<div class="composer-tools"><span></span><button class="primary" type="submit">Post</button></div>
+<div data-image-descriptions></div><noscript><label>Attachment descriptions, one per line in selection order (leave a blank line for videos)<textarea name="alt_lines" rows="3"></textarea></label></noscript>
+<label class="check-row"><input type="checkbox" data-alt-reminder> Remind me if an image has no description</label>
+<details><summary>Drafts, scheduling and polls</summary><p><a href="/drafts">Your saved drafts and scheduled posts</a> (account required)</p><label>Publish at (UTC)<input type="datetime-local" name="scheduled_at"></label><label>Poll choices (2–6, one per line)<textarea name="poll_options" rows="3" maxlength="606"></textarea></label><label class="check-row"><input type="checkbox" name="poll_multiple" value="1"> Allow multiple choices</label><label>Poll closes at (UTC, optional)<input type="datetime-local" name="poll_closes_at"></label></details>
+<div class="composer-tools"><span><button type="submit" name="intent" value="draft">Save draft</button> <button type="submit" name="intent" value="schedule">Schedule</button></span><button class="primary" type="submit" name="intent" value="publish">Post</button></div>
 </form></section>"#,
         if parent.is_some() {
             "Reply"
@@ -334,7 +338,7 @@ pub fn search_page(
 
 pub(super) fn search_form(site_name: &str, query: &str) -> String {
     format!(
-        r#"<section class="panel search-panel"><h1>Search</h1><form method="get" action="/search" class="search-form"><label class="sr-only" for="q">Search {}</label><input id="q" name="q" type="search" value="{}" placeholder="Search posts, @users, or #tags" autocomplete="off"><button class="primary" type="submit">Search</button></form></section>"#,
+        r#"<section class="panel search-panel"><h1>Search</h1><form method="get" action="/search" class="search-form"><label class="sr-only" for="q">Search {}</label><input id="q" name="q" type="search" value="{}" placeholder="Search posts, @users, or #tags" autocomplete="off"><button class="primary" type="submit">Search</button></form><p class="field-help">Filters: <code>from:username</code>, <code>after:2026-01-01</code>, <code>before:2026-02-01</code> (UTC), <code>has:media</code>, <code>has:image</code>, <code>has:video</code>, <code>is:bookmarked</code>. Combine filters with words. After is inclusive; before is exclusive.</p></section>"#,
         html_escape::encode_text(site_name),
         html_escape::encode_double_quoted_attribute(query)
     )

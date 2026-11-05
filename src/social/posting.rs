@@ -10,77 +10,228 @@ pub async fn create_post(
     parent_post_id: Option<i64>,
     media_ids: &[i64],
 ) -> anyhow::Result<i64> {
+    create_post_with_options(
+        pool,
+        settings,
+        user_id,
+        text,
+        parent_post_id,
+        media_ids,
+        PostOptions::default(),
+    )
+    .await
+}
+
+pub async fn create_post_with_options(
+    pool: &SqlitePool,
+    settings: &Settings,
+    user_id: Option<i64>,
+    text: &str,
+    parent_post_id: Option<i64>,
+    media_ids: &[i64],
+    options: PostOptions,
+) -> anyhow::Result<i64> {
+    if let Some((actor, key)) = &options.request
+        && let Some(post) = post_for_request(pool, actor, key).await?
+    {
+        return Ok(post);
+    }
     if user_id.is_none() && !settings.accounts.anonymous_mode_enabled {
         anyhow::bail!("anonymous posting is disabled");
     }
     if media_ids.len() > settings.posts.max_media_per_post {
         anyhow::bail!("too many media attachments");
     }
-    let max_images_per_post = settings.posts.max_images_per_post;
-    let max_videos_per_post = settings.posts.max_videos_per_post;
     let text = clean_post_text(text, settings.posts.max_text_chars, media_ids.len())?;
     let youtube_embeds = crate::youtube::metadata_for_text(&text).await;
-    let allow_mentions = settings.posts.allow_mentions;
-    let media_ids = media_ids.to_vec();
+    let settings = settings.clone();
+    let input = PostInput {
+        user_id,
+        text,
+        parent_post_id,
+        media_ids: media_ids.to_vec(),
+        youtube_embeds,
+        poll: options.poll,
+        request: options.request,
+        rate: options.rate,
+    };
     pool.call(move |conn| {
         let tx = conn.transaction()?;
-        let root_post_id = if let Some(parent_id) = parent_post_id {
-            if let Some(actor_id) = user_id {
-                ensure_post_interaction_accessible_tx(&tx, actor_id, parent_id)?;
-            }
-            let root = tx
-                .query_row(
-                    "SELECT COALESCE(root_post_id, id) FROM posts WHERE id = ? AND is_deleted = 0",
-                    [parent_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?;
-            let Some(root) = root else {
-                anyhow::bail!("parent post not found");
-            };
-            Some(root)
-        } else {
-            None
-        };
-        let (image_count, video_count) = media_kind_counts_tx(&tx, user_id, &media_ids)?;
-        if image_count > max_images_per_post {
-            anyhow::bail!("too many image attachments");
-        }
-        if video_count > max_videos_per_post {
-            anyhow::bail!("too many video attachments");
-        }
-        let anonymous_label = user_id.is_none().then_some("Anonymous");
-        tx.execute(
-            "INSERT INTO posts (user_id, anonymous_label, text, parent_post_id, root_post_id) VALUES (?, ?, ?, ?, ?)",
-            params![user_id, anonymous_label, text, parent_post_id, root_post_id],
-        )?;
-        let post_id = tx.last_insert_rowid();
-        replace_youtube_embeds_tx(&tx, post_id, &youtube_embeds)?;
-        for (position, media_id) in media_ids.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO post_media (post_id, media_id, position) VALUES (?, ?, ?)",
-                params![post_id, media_id, i64::try_from(position)?],
-            )?;
-        }
-        let reply_owner = if let (Some(parent_id), Some(actor_id)) = (parent_post_id, user_id) {
-            notify_post_owner_tx(
-                &tx,
-                parent_id,
-                actor_id,
-                post_id,
-                "reply",
-                "replied to your post",
-            )?
-        } else {
-            None
-        };
-        if allow_mentions && let Some(actor_id) = user_id {
-            notify_mentioned_users_tx(&tx, &text, actor_id, post_id, reply_owner)?;
-        }
+        let post_id = insert_post_tx(&tx, &settings, &input)?;
         tx.commit()?;
         Ok(post_id)
     })
     .await
+}
+
+/// Request keys are scoped to the authenticated account (or an anonymous random form key).
+pub async fn post_for_request(
+    pool: &SqlitePool,
+    actor: &str,
+    key: &str,
+) -> anyhow::Result<Option<i64>> {
+    anyhow::ensure!(
+        !key.is_empty()
+            && key.len() <= 64
+            && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "invalid posting request key"
+    );
+    let actor = actor.to_owned();
+    let key = key.to_owned();
+    pool.call(move |conn| {
+        Ok(conn
+            .query_row(
+                "SELECT post_id FROM post_requests WHERE actor=? AND request_key=?",
+                params![actor, key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    })
+    .await
+}
+
+#[derive(Default)]
+pub struct PostOptions {
+    pub poll: Option<polls::PollSpec>,
+    pub request: Option<(String, String)>,
+    pub rate: Option<crate::rate_limit::Limit>,
+}
+
+pub(super) struct PostInput {
+    pub user_id: Option<i64>,
+    pub text: String,
+    pub parent_post_id: Option<i64>,
+    pub media_ids: Vec<i64>,
+    pub youtube_embeds: Vec<YoutubeEmbed>,
+    pub poll: Option<polls::PollSpec>,
+    pub request: Option<(String, String)>,
+    pub rate: Option<crate::rate_limit::Limit>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "post, poll, idempotency key, rate event and notifications must commit atomically"
+)]
+pub(super) fn insert_post_tx(
+    tx: &rusqlite::Transaction<'_>,
+    settings: &Settings,
+    input: &PostInput,
+) -> anyhow::Result<i64> {
+    let PostInput {
+        user_id,
+        text,
+        parent_post_id,
+        media_ids,
+        youtube_embeds,
+        poll,
+        request,
+        rate,
+    } = input;
+    let user_id = *user_id;
+    let parent_post_id = *parent_post_id;
+    if let Some(id) = user_id {
+        let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=? AND is_deleted=0 AND is_suspended=0 AND deletion_requested_at IS NULL AND must_change_password=0)", [id], |r| r.get(0))?;
+        anyhow::ensure!(active, "account cannot publish");
+    }
+    if let Some((actor, key)) = request {
+        anyhow::ensure!(
+            key.len() <= 64
+                && !key.is_empty()
+                && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "invalid posting request key"
+        );
+        if let Some(id) = tx
+            .query_row(
+                "SELECT post_id FROM post_requests WHERE actor=? AND request_key=?",
+                params![actor, key],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            return Ok(id);
+        }
+    }
+    if let Some(rate) = rate {
+        crate::rate_limit::check_in_transaction(tx, rate)?;
+    }
+    anyhow::ensure!(
+        media_ids.len() <= settings.posts.max_media_per_post,
+        "too many media attachments"
+    );
+    clean_post_text(text, settings.posts.max_text_chars, media_ids.len())?;
+    anyhow::ensure!(
+        parent_post_id.is_none() || settings.posts.allow_replies,
+        "replies are disabled"
+    );
+    anyhow::ensure!(
+        poll.is_none() || user_id.is_some(),
+        "polls require an account"
+    );
+    let root_post_id = if let Some(parent_id) = parent_post_id {
+        if let Some(actor_id) = user_id {
+            ensure_post_interaction_accessible_tx(tx, actor_id, parent_id)?;
+        }
+        let root = tx
+            .query_row(
+                "SELECT COALESCE(root_post_id, id) FROM posts WHERE id = ? AND is_deleted = 0",
+                [parent_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(root) = root else {
+            anyhow::bail!("parent post not found");
+        };
+        Some(root)
+    } else {
+        None
+    };
+    let (image_count, video_count) = media_kind_counts_tx(tx, user_id, media_ids)?;
+    if image_count > settings.posts.max_images_per_post {
+        anyhow::bail!("too many image attachments");
+    }
+    if video_count > settings.posts.max_videos_per_post {
+        anyhow::bail!("too many video attachments");
+    }
+    let anonymous_label = user_id.is_none().then_some("Anonymous");
+    tx.execute(
+            "INSERT INTO posts (user_id, anonymous_label, text, parent_post_id, root_post_id) VALUES (?, ?, ?, ?, ?)",
+            params![user_id, anonymous_label, text, parent_post_id, root_post_id],
+        )?;
+    let post_id = tx.last_insert_rowid();
+    replace_youtube_embeds_tx(tx, post_id, youtube_embeds)?;
+    for (position, media_id) in media_ids.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO post_media (post_id, media_id, position) VALUES (?, ?, ?)",
+            params![post_id, media_id, i64::try_from(position)?],
+        )?;
+    }
+    let reply_owner = if let (Some(parent_id), Some(actor_id)) = (parent_post_id, user_id) {
+        notify_post_owner_tx(
+            tx,
+            parent_id,
+            actor_id,
+            post_id,
+            "reply",
+            "replied to your post",
+        )?
+    } else {
+        None
+    };
+    if settings.posts.allow_mentions
+        && let Some(actor_id) = user_id
+    {
+        notify_mentioned_users_tx(tx, text, actor_id, post_id, reply_owner)?;
+    }
+    if let Some(spec) = poll {
+        polls::insert_tx(tx, post_id, spec)?;
+    }
+    if let Some((actor, key)) = request {
+        tx.execute(
+            "INSERT INTO post_requests(actor,request_key,post_id) VALUES(?,?,?)",
+            params![actor, key, post_id],
+        )?;
+    }
+    Ok(post_id)
 }
 
 pub(super) fn media_kind_counts_tx(
@@ -339,39 +490,9 @@ pub async fn post_thread(
     viewer_id: Option<i64>,
     post_id: i64,
 ) -> anyhow::Result<Vec<PostView>> {
-    let root = pool
-        .call(move |conn| {
-            conn.query_row(
-                "SELECT COALESCE(root_post_id, id) FROM posts WHERE id = ? AND is_deleted = 0",
-                [post_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(Into::into)
-        })
-        .await?;
-    let Some(root) = root else {
-        return Ok(Vec::new());
-    };
-    let root_id = root;
-    let mut sql = base_post_query();
-    sql.push_str(" AND (p.id = ? OR p.root_post_id = ?)");
-    append_viewer_filters(&mut sql, "p.user_id", "p.text", viewer_id);
-    sql.push_str(" ORDER BY p.id ASC LIMIT 200");
-    let mut bindings = vec![root_id, root_id];
-    push_viewer_filter_bindings(&mut bindings, viewer_id);
-    let rows = pool
-        .call(move |conn| query_post_rows(conn, &sql, params_from_iter(bindings)))
-        .await?;
-    let posts = rows_to_posts(pool, rows, viewer_id).await?;
-    // The requested post can be hidden by a block, mute, suspension, or
-    // deletion while visible replies remain. Treat that as "not found" rather
-    // than rendering an orphaned reply branch.
-    if posts.iter().any(|post| post.id == post_id) {
-        Ok(posts)
-    } else {
-        Ok(Vec::new())
-    }
+    Ok(history::thread_page(pool, viewer_id, post_id, None, None)
+        .await?
+        .map_or_else(Vec::new, |page| page.posts))
 }
 
 pub async fn repost(pool: &SqlitePool, user_id: i64, post_id: i64) -> anyhow::Result<bool> {

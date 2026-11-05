@@ -247,11 +247,11 @@ pub(super) async fn backups_page_submission(
         notice_html,
         render::page_header(
             "Backups",
-            "Create, download, schedule, and restore full-site runtime backups."
+            "Create, download, schedule, and verify full-site backups. Restore requires the server to be stopped."
         ),
         render_manual_backup_panel(csrf, &settings),
         render_automatic_backup_panel(csrf, &settings, submitted),
-        render_backup_history(&archives, backup::operation_in_progress(&state.paths)),
+        render_backup_history(&archives, backup::operation_in_progress(&state.paths), csrf),
         render_restore_panel(csrf),
     );
     Ok(Html(
@@ -319,6 +319,7 @@ pub(super) fn bool_checkbox(id: &str, name: &str, value: bool) -> String {
 pub(super) fn render_backup_history(
     archives: &[backup::BackupArchiveInfo],
     operation_running: bool,
+    csrf: &str,
 ) -> String {
     let status = if archives.is_empty() {
         r#"<p class="muted">No backups have been created yet.</p>"#.to_owned()
@@ -332,9 +333,9 @@ pub(super) fn render_backup_history(
                     .tor_keys_included
                     .map_or("unknown", |included| if included { "included" } else { "excluded" });
                 let kind = if archive.automatic { "automatic" } else { "manual" };
-                let manifest = if archive.manifest_valid { "valid" } else { "unreadable" };
+                let manifest = if archive.manifest_valid { "readable" } else { "unreadable" };
                 format!(
-                    r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a class="button-link" href="/admin/backups/download/{}">Download</a></td></tr>"#,
+                    r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a class="button-link" href="/admin/backups/download/{}">Download</a><form method="post" action="/admin/backups/verify"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="filename" value="{filename}"><label><input type="checkbox" name="include_tor_keys" value="true"> Allow verification of included Tor keys</label><button>Verify backup</button></form></td></tr>"#,
                     html_escape::encode_text(&archive.filename),
                     html_escape::encode_text(kind),
                     html_escape::encode_text(created),
@@ -342,12 +343,14 @@ pub(super) fn render_backup_history(
                     html_escape::encode_text(tor_keys),
                     html_escape::encode_text(manifest),
                     html_escape::encode_double_quoted_attribute(&archive.filename),
+                    csrf=html_escape::encode_double_quoted_attribute(csrf),
+                    filename=html_escape::encode_double_quoted_attribute(&archive.filename),
                 )
             })
             .collect::<Vec<_>>()
             .join("");
         format!(
-            r#"<table><thead><tr><th>Archive</th><th>Kind</th><th>Created</th><th>Size</th><th>Tor keys</th><th>Manifest</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table>"#
+            r#"<table><thead><tr><th>Archive</th><th>Kind</th><th>Created</th><th>Size</th><th>Tor keys</th><th>Manifest metadata</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table>"#
         )
     };
     let running = if operation_running {
@@ -395,4 +398,46 @@ pub(super) fn format_bytes(bytes: u64) -> String {
 pub(super) fn format_scaled_bytes(bytes: u64, unit: u64, suffix: &str) -> String {
     let tenths = u128::from(bytes) * 10 / u128::from(unit);
     format!("{}.{:01} {suffix}", tenths / 10, tenths % 10)
+}
+
+#[derive(Deserialize)]
+pub(super) struct VerifyBackupForm {
+    csrf: String,
+    filename: String,
+    include_tor_keys: Option<String>,
+}
+
+pub(super) async fn admin_verify_backup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<VerifyBackupForm>,
+) -> AppResult<Html<String>> {
+    let user = require_admin(&state, &headers).await?;
+    validate_csrf(&state.pool, &headers, &form.csrf).await?;
+    let csrf = form_csrf(&state, &headers)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let archive = backup::backup_path_for_download(&state.paths, &form.filename)
+        .map_err(|_| AppError::NotFound)?;
+    let paths = state.paths.clone();
+    let include = form.include_tor_keys.is_some();
+    let result =
+        tokio::task::spawn_blocking(move || backup::verify_backup(&paths, &archive, include))
+            .await
+            .map_err(|_| AppError::BadRequest("backup verification task failed".to_owned()))?;
+    match result {
+        Ok(report) => {
+            admin::audit(&state.pool, user.id, "verify_backup", &form.filename).await?;
+            let message = format!(
+                "Backup verified: {} files, {} bytes; migrations and media paths rehearsed through schema {}. Live data was not replaced.",
+                report.files, report.bytes, report.schema_version
+            );
+            backups_page(&state, &user, &csrf, Some(("success", &message))).await
+        }
+        Err(error) => {
+            tracing::warn!(error=%error,"backup verification failed");
+            let message = public_backup_error("Backup verification failed", &error);
+            backups_page(&state, &user, &csrf, Some(("error", &message))).await
+        }
+    }
 }

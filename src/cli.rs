@@ -99,6 +99,13 @@ enum Command {
         include_tor_keys: bool,
     },
 
+    /// Fully verify a backup and rehearse migrations in temporary storage; live data is untouched.
+    VerifyBackup {
+        archive: PathBuf,
+        #[arg(long)]
+        include_tor_keys: bool,
+    },
+
     /// Restore a backup tar archive into the runtime data directory.
     #[command(about = "Restore a backup tar archive into the data directory")]
     Restore {
@@ -121,7 +128,7 @@ pub async fn run() -> anyhow::Result<()> {
     let command = cli.command.unwrap_or(Command::Serve);
     let explicit_data_dir = cli.data_dir.clone();
     let mut paths = runtime::RuntimePaths::discover(cli.data_dir.as_deref())?;
-    let check_only = matches!(command, Command::Check);
+    let check_only = matches!(command, Command::Check | Command::VerifyBackup { .. });
     if !check_only {
         paths.ensure()?;
     }
@@ -266,6 +273,17 @@ async fn run_command(
             Ok(())
         }
         Command::Backup { include_tor_keys } => backup_command(&paths, include_tor_keys),
+        Command::VerifyBackup {
+            archive,
+            include_tor_keys,
+        } => {
+            let report = backup::verify_backup(&paths, &archive, include_tor_keys)?;
+            stdout_line(format_args!(
+                "Backup verified without replacing live data: {} files, {} bytes, rehearsed schema {}",
+                report.files, report.bytes, report.schema_version
+            ))?;
+            Ok(())
+        }
         Command::Restore {
             archive,
             include_tor_keys,
@@ -526,6 +544,10 @@ async fn serve(
     result
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "owns startup, listeners and worker handles through graceful shutdown"
+)]
 async fn serve_runtime(
     context: &console::Context,
     pool: &db::SqlitePool,
@@ -548,7 +570,7 @@ async fn serve_runtime(
         pool.clone(),
         settings.clone(),
         paths.clone(),
-        ffmpeg,
+        ffmpeg.clone(),
         tor_status.clone(),
     );
     let app = server::router(state).layer(axum::middleware::from_fn_with_state(
@@ -570,6 +592,14 @@ async fn serve_runtime(
     {
         state.clearnet = Some(listener.local_addr()?);
     }
+    crate::media::jobs::recover(pool).await?;
+    let background = crate::background::spawn(
+        pool.clone(),
+        settings.clone(),
+        paths.clone(),
+        ffmpeg,
+        stop.clone(),
+    );
     console::phase(live, console::Phase::Listening);
     let backup = backup::spawn_automatic_scheduler_observed(
         paths.clone(),
@@ -621,8 +651,9 @@ async fn serve_runtime(
     console::phase(live, console::Phase::Stopping);
     shutdown.send_replace(true);
     let drained = drain_workers(backup, maintenance, onion, operations).await;
+    let background_result = background.await.map_err(anyhow::Error::from);
     tor_status.stop();
-    result.and(drained)
+    result.and(drained).and(background_result)
 }
 
 async fn initialize_tor(

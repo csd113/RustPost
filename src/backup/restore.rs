@@ -22,7 +22,7 @@ pub fn restore_backup(
     validate_staged_backup(staging.path(), &staged, include_tor_keys)?;
     rewrite_restored_media_paths(&staging.path().join("db/rustpost.sqlite3"), paths)?;
     let pre_restore_backup =
-        create_backup_inner(paths, include_tor_keys, BackupKind::PreRestore, false)
+        create_backup_inner(paths, include_tor_keys, BackupKind::PreRestore, false, None)
             .with_context(|| "failed to create pre-restore safety backup")?;
     swap_staged_runtime(paths, staging.path(), include_tor_keys)
         .with_context(|| "failed to install restored runtime state")?;

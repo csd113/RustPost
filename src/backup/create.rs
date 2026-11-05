@@ -4,8 +4,14 @@ use super::*;
 
 pub fn create_backup(paths: &RuntimePaths, include_tor_keys: bool) -> anyhow::Result<PathBuf> {
     let _temp_operation = crate::runtime::begin_temp_operation();
-    let _lock = OperationLock::acquire(paths)?;
-    create_backup_inner(paths, include_tor_keys, BackupKind::Manual, true)
+    let mut lock = OperationLock::acquire(paths)?;
+    create_backup_inner(
+        paths,
+        include_tor_keys,
+        BackupKind::Manual,
+        true,
+        Some(&mut lock),
+    )
 }
 
 #[expect(
@@ -17,6 +23,7 @@ pub(super) fn create_backup_inner(
     include_tor_keys: bool,
     kind: BackupKind,
     require_database: bool,
+    capture: Option<&mut OperationLock>,
 ) -> anyhow::Result<PathBuf> {
     fs::create_dir_all(&paths.backups_dir)?;
     fs::create_dir_all(&paths.tmp_dir)?;
@@ -25,6 +32,19 @@ pub(super) fn create_backup_inner(
         .tempdir_in(&paths.tmp_dir)
         .with_context(|| "failed to create backup staging directory")?;
 
+    let settings = if paths.settings_path.is_file() {
+        Settings::load(&paths.settings_path)?
+    } else {
+        Settings::default()
+    };
+    crate::storage_limits::ensure_headroom(
+        &paths.tmp_dir,
+        settings.storage.min_free_bytes,
+        paths
+            .database_path
+            .metadata()
+            .map_or(0, |m| m.len().saturating_mul(2)),
+    )?;
     let staged_db = staging.path().join("rustpost.sqlite3");
     let db_schema_version = if paths.database_path.is_file() {
         snapshot_database(&paths.database_path, &staged_db)?;
@@ -121,7 +141,28 @@ pub(super) fn create_backup_inner(
             <= 100_000,
         "backup contains too many entries for restore"
     );
+    if staging.path().join("rustpost.sqlite3").is_file() {
+        let referenced =
+            database::referenced_media_paths(&staging.path().join("rustpost.sqlite3"))?;
+        // Ignore uncommitted conversion output; only database-referenced media is durable snapshot content.
+        files.retain(|file| file.component != "media" || referenced.contains(&file.archive_path));
+    }
     files.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
+    freeze_sources(staging.path(), &mut files, settings.storage.min_free_bytes)?;
+    let needed = files
+        .iter()
+        .map(|file| file.size)
+        .fold(MANIFEST_MAX_BYTES, u64::saturating_add);
+    crate::storage_limits::ensure_headroom(
+        &paths.backups_dir,
+        settings.storage.min_free_bytes,
+        needed,
+    )?;
+    // The DB and each referenced file now have stable private sources. Requests may resume while tar/hash IO continues.
+    if let Some(capture) = capture {
+        capture.release_capture()?;
+    }
+
     // Publish only a complete, flushed archive. Scratch files have no .tar
     // suffix, so listing, retention and interrupted-backup recovery ignore them.
     let mut pending = tempfile::Builder::new()
@@ -315,4 +356,76 @@ pub(super) fn deterministic_header(
     header.set_mtime(0);
     header.set_cksum();
     Ok(header)
+}
+
+fn freeze_sources(staging: &Path, files: &mut [ArchiveFile], minimum: u64) -> anyhow::Result<()> {
+    for file in files {
+        if file.component == "database" {
+            continue;
+        }
+        let frozen = staging.join("frozen").join(&file.archive_path);
+        if let Some(parent) = frozen.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let linked = file.component == "media" && fs::hard_link(&file.source, &frozen).is_ok();
+        if !linked {
+            crate::storage_limits::ensure_headroom(staging, minimum, file.size)?;
+            fs::copy(&file.source, &frozen)?;
+        }
+        anyhow::ensure!(
+            fs::metadata(&frozen)?.len() == file.size,
+            "backup source changed during capture"
+        );
+        file.source = frozen;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{archive_file, freeze_sources};
+    use crate::{
+        backup::{OperationLock, backup_coordination_lock, operation_in_progress},
+        runtime::{RuntimePaths, snapshot_lease},
+    };
+    use std::fs;
+
+    #[test]
+    fn frozen_media_survives_live_deletion_and_settings_are_independent() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.png");
+        fs::write(&source, b"stable media")?;
+        let settings = directory.path().join("settings.toml");
+        fs::write(&settings, b"original settings")?;
+        let staging = directory.path().join("stage");
+        fs::create_dir(&staging)?;
+        let mut files = vec![
+            archive_file(source.clone(), "uploads/images/source.png", "media", 0o600)?,
+            archive_file(settings.clone(), "settings.toml", "settings", 0o600)?,
+        ];
+        freeze_sources(&staging, &mut files, 0)?;
+        fs::remove_file(source)?;
+        fs::write(settings, b"new settings")?;
+        assert_eq!(fs::read(&files[0].source)?, b"stable media");
+        assert_eq!(fs::read(&files[1].source)?, b"original settings");
+        Ok(())
+    }
+
+    #[test]
+    fn archive_io_releases_request_pause_but_keeps_backup_serialization() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_data_dir(directory.path().join("data"));
+        paths.ensure()?;
+        let mut lock = OperationLock::acquire(&paths)?;
+        assert!(operation_in_progress(&paths));
+        assert!(snapshot_lease(&paths, false).is_err());
+        lock.release_capture()?;
+        assert!(!operation_in_progress(&paths));
+        let shared = snapshot_lease(&paths, false)?;
+        assert!(backup_coordination_lock(&paths).is_err());
+        drop(shared);
+        drop(lock);
+        assert!(!operation_in_progress(&paths));
+        Ok(())
+    }
 }

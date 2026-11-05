@@ -46,3 +46,10 @@ pub mod validation;
 pub mod youtube;
 
 pub mod updates;
+
+pub mod background;
+
+pub mod storage_limits;
+
+#[cfg(test)]
+mod features_regressions;

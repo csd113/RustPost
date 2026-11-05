@@ -547,6 +547,7 @@ struct CanonicalMedia {
 // ---------------------------------------------------------------------------
 
 struct ImportPlan {
+    reservation_id: String,
     cleanup: Vec<TempOutputGuard>,
     archive_id: String,
     archive_username: String,

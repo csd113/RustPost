@@ -139,7 +139,7 @@ pub(super) fn rewrite_restored_media_paths(
     Ok(())
 }
 
-fn managed_media_relative_path(path: &str) -> anyhow::Result<String> {
+pub(super) fn managed_media_relative_path(path: &str) -> anyhow::Result<String> {
     let normalized = path.replace('\\', "/");
     for marker in [
         "uploads/originals/",
@@ -163,6 +163,22 @@ fn managed_media_relative_path(path: &str) -> anyhow::Result<String> {
         }
     }
     anyhow::bail!("media path is outside managed upload roots")
+}
+
+pub(super) fn referenced_media_paths(database: &Path) -> anyhow::Result<BTreeSet<String>> {
+    let conn = Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut statement =
+        conn.prepare("SELECT original_path,stored_path,thumbnail_path FROM media")?;
+    let mut rows = statement.query([])?;
+    let mut paths = BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        for i in 0..3 {
+            if let Some(path) = row.get::<_, Option<String>>(i)? {
+                paths.insert(managed_media_relative_path(&path)?);
+            }
+        }
+    }
+    Ok(paths)
 }
 
 fn remap_media_path(

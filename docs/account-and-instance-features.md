@@ -14,6 +14,8 @@ You can edit your own post text for 15 seconds after publishing by default. The 
 
 Search finds posts and accounts; notifications collect activity involving you. Core forms work without JavaScript, though enhancements such as mention suggestions require it.
 
+See [community tools](community-tools.md) for drafts, UTC scheduling, per-image descriptions, polls, search filters, history navigation, media processing, and short deletion undo.
+
 ## Set up your profile
 
 Open **Settings** to change your display name, bio, location, website, picture, banner, theme, and media-blur preferences. A username is your account handle; a display name is the name shown beside your posts.
@@ -40,7 +42,7 @@ Use the account export/import controls in **Settings**. An export is a `.tar.gz`
 
 To import, first create or log in to the destination RustPost account, then open its import page and select your archive. Imports add content to that account; they do not create accounts or change the destination username. Non-empty destination profile fields are kept, and the result reports skipped items. Importing the same archive into the same account again is rejected.
 
-Follows can only reconnect to accounts that exist on the destination site. Protected accounts still require approval. Passwords, sessions, administrator access, notifications, likes, bookmarks, and reposts are not transferred. References to other people's posts may not survive a transfer.
+Follows can only reconnect to accounts that exist on the destination site. Protected accounts still require approval. Passwords, sessions, administrator access, notifications, likes, bookmarks, and reposts are not transferred. References to other people's posts may not survive a transfer. Drafts, schedules, poll definitions/votes, and deletion recovery are not part of account archive format 1; full-site backups preserve them.
 
 The default compressed archive limit is 300 MiB; the owner can change it. See the [archive format and import rules](account-reference.md#account-export-and-import-29) for the full inclusion list, independent expansion limits, and validation behavior.
 

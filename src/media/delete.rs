@@ -15,12 +15,13 @@ pub async fn delete_media(
                 r#"
                 SELECT EXISTS(
                     SELECT 1 FROM post_media WHERE media_id = ?
+                    UNION ALL SELECT 1 FROM draft_media WHERE media_id = ?
                     UNION ALL
                     SELECT 1 FROM users
                     WHERE profile_picture_media_id = ? OR banner_media_id = ?
                 )
                 "#,
-                params![media_id, media_id, media_id],
+                params![media_id, media_id, media_id, media_id],
                 |row| row.get(0),
             )?;
             if referenced {
@@ -162,12 +163,13 @@ pub async fn delete_post_media(
                     r#"
                     SELECT EXISTS(
                         SELECT 1 FROM post_media WHERE media_id = ?
+                    UNION ALL SELECT 1 FROM draft_media WHERE media_id = ?
                         UNION ALL
                         SELECT 1 FROM users
                         WHERE profile_picture_media_id = ? OR banner_media_id = ?
                     )
                     "#,
-                    params![media_id, media_id, media_id],
+                    params![media_id, media_id, media_id, media_id],
                     |row| row.get(0),
                 )?;
                 if referenced {
@@ -278,5 +280,11 @@ pub(super) fn promote_canonical_references(
         "UPDATE media SET canonical_media_id = ? WHERE canonical_media_id = ?",
         params![replacement, media_id],
     )?;
+    tx.execute("UPDATE media_work SET media_id=?,status=CASE WHEN status='running' THEN CASE WHEN attempts<9 THEN 'queued' ELSE 'failed' END ELSE status END,lease_token='' WHERE media_id=?",params![replacement,media_id])?;
+    tx.execute(
+        "UPDATE media_jobs SET media_id=? WHERE media_id=?",
+        params![replacement, media_id],
+    )?;
+    tx.execute("UPDATE media SET conversion_state=(SELECT CASE WHEN status='queued' THEN 'queued' WHEN status='failed' THEN 'failed' ELSE conversion_state END FROM media_work WHERE media_id=?) WHERE id=? AND EXISTS(SELECT 1 FROM media_work WHERE media_id=?)",params![replacement,replacement,replacement])?;
     Ok(())
 }

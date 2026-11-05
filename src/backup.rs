@@ -22,6 +22,7 @@ const FORMAT_VERSION: u16 = 1;
 const MANIFEST_PATH: &str = "manifest.toml";
 const MANIFEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const LOCK_DIR: &str = "backup-restore.lock";
+const CAPTURE_DIR: &str = "backup-capture.lock";
 const AUTOMATIC_CHECK_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +164,7 @@ struct OperationLock {
     path: PathBuf,
     _coordination: File,
     snapshot: Option<File>,
+    capture_path: PathBuf,
 }
 
 impl OperationLock {
@@ -179,10 +181,16 @@ impl OperationLock {
             }
             Err(error) => return Err(error).context("failed to create backup operation lock"),
         }
+        let capture_path = paths.tmp_dir.join(CAPTURE_DIR);
+        if capture_path.exists() {
+            fs::remove_dir(&capture_path)?;
+        }
+        fs::create_dir(&capture_path)?;
         let mut lock = Self {
             path,
             _coordination: coordination,
             snapshot: None,
+            capture_path,
         };
         // Announce intent before draining admitted requests, preventing a busy
         // site from starving automatic backups through new shared leases.
@@ -203,8 +211,19 @@ impl OperationLock {
     }
 }
 
+impl OperationLock {
+    fn release_capture(&mut self) -> anyhow::Result<()> {
+        drop(self.snapshot.take());
+        if self.capture_path.exists() {
+            fs::remove_dir(&self.capture_path)?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for OperationLock {
     fn drop(&mut self) {
+        let _capture_result = fs::remove_dir(&self.capture_path);
         let _remove_result = fs::remove_dir(&self.path);
     }
 }
@@ -238,3 +257,6 @@ mod storage;
 pub(crate) use storage::backup_coordination_lock;
 pub use storage::{backup_path_for_download, list_backups, operation_in_progress};
 use storage::{sync_directory, unique_archive_path};
+
+mod verify;
+pub use verify::{VerificationReport, verify_backup};

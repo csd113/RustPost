@@ -138,13 +138,39 @@ pub(super) async fn profile(
     } else {
         None
     };
-    let mut posts = if !activity_visible
+    let history = if !activity_visible
         || (active_tab == social::ProfileTimelineTab::Likes && !likes_visible)
     {
-        Vec::new()
+        social::history::Page {
+            posts: Vec::new(),
+            older: None,
+            newer: None,
+        }
     } else {
-        social::profile_tab_timeline(&state.pool, viewer_id, profile_id, active_tab).await?
+        social::history::page(
+            &state.pool,
+            viewer_id,
+            social::history::Surface::Profile {
+                i: profile_id,
+                tab: active_tab,
+            },
+            query.older.as_deref(),
+            query.newer.as_deref(),
+        )
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?
     };
+    let tab_name = match active_tab {
+        social::ProfileTimelineTab::Posts => "posts",
+        social::ProfileTimelineTab::Replies => "replies",
+        social::ProfileTimelineTab::Media => "media",
+        social::ProfileTimelineTab::Likes => "likes",
+    };
+    let navigation = timelines::history_navigation(
+        &format!("/users/{profile_username}?tab={tab_name}"),
+        &history,
+    );
+    let mut posts = history.posts;
     if let Some(pinned) = pinned_post.as_ref() {
         posts.retain(|post| {
             !(post.event_kind == social::TimelineEventKind::Post && post.id == pinned.id)
@@ -237,6 +263,7 @@ pub(super) async fn profile(
             profile_tab_empty_state(active_tab),
         )
     };
+    let timeline = format!("{timeline}{navigation}");
     let body = format!(
         r#"<section class="panel profile">{}<div class="profile-heading">{}<div class="profile-main"><div class="profile-title-row"><div><h1>{}</h1><p class="muted">@{}</p></div>{}</div>{}{}{}{}{}</div></div></section>{}{}{}"#,
         banner,

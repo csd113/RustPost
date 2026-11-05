@@ -44,6 +44,25 @@ pub struct Settings {
     pub admin: AdminSettings,
     #[serde(default)]
     pub backup: BackupSettings,
+    #[serde(default)]
+    pub storage: StorageSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageSettings {
+    pub min_free_bytes: u64,
+    pub max_upload_bytes: u64,
+    pub max_user_upload_bytes: u64,
+}
+impl Default for StorageSettings {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: 512 * 1024 * 1024,
+            max_upload_bytes: 0,
+            max_user_upload_bytes: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +121,8 @@ pub struct PostSettings {
     pub max_text_chars: usize,
     #[serde(default = "default_post_edit_window_seconds")]
     pub post_edit_window_seconds: u64,
+    #[serde(default = "default_post_delete_recovery_seconds")]
+    pub post_delete_recovery_seconds: u64,
     pub max_images_per_post: usize,
     pub max_videos_per_post: usize,
     pub max_media_per_post: usize,
@@ -217,9 +238,11 @@ impl Default for Settings {
                 max_archive_expanded_bytes: DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES,
                 max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
             },
+            storage: StorageSettings::default(),
             posts: PostSettings {
                 max_text_chars: 280,
                 post_edit_window_seconds: DEFAULT_POST_EDIT_WINDOW_SECONDS,
+                post_delete_recovery_seconds: 30,
                 max_images_per_post: 4,
                 max_videos_per_post: 1,
                 max_media_per_post: 4,
@@ -319,7 +342,17 @@ impl Settings {
         }
         validate_onion_service_name(&self.tor.onion_service_name)?;
         validate_display_onion_address(&self.tor.display_onion_address)?;
+        anyhow::ensure!(
+            self.storage.min_free_bytes <= i64::MAX.unsigned_abs()
+                && self.storage.max_upload_bytes <= i64::MAX.unsigned_abs()
+                && self.storage.max_user_upload_bytes <= i64::MAX.unsigned_abs(),
+            "storage limits must fit in a signed 64-bit byte count"
+        );
         validate_post_edit_window(self.posts.post_edit_window_seconds)?;
+        anyhow::ensure!(
+            self.posts.post_delete_recovery_seconds <= 300,
+            "posts.post_delete_recovery_seconds must be 300 or less"
+        );
         if self.accounts.deletion_grace_period_days > MAX_DELETION_GRACE_PERIOD_DAYS {
             anyhow::bail!(
                 "accounts.deletion_grace_period_days must be {MAX_DELETION_GRACE_PERIOD_DAYS} days or less"
@@ -562,6 +595,9 @@ max_text_chars = {max_text_chars}
 # Seconds after creation that a user may edit their own post. Set to 0 to disable editing.
 post_edit_window_seconds = {post_edit_window_seconds}
 
+# Seconds to undo your own post deletion (0 disables, maximum 300). Admin removals are final.
+post_delete_recovery_seconds = {post_delete_recovery_seconds}
+
 # Maximum image attachments allowed on one post.
 max_images_per_post = {max_images_per_post}
 
@@ -695,6 +731,14 @@ anonymous_posts_per_ip_per_hour = {anonymous_posts_per_ip_per_hour}
 create_admin_on_first_boot = {create_admin_on_first_boot}
 
 
+# Storage guardrails. Quotas count logical uploaded bytes, including drafts and duplicate uploads.
+[storage]
+# Required available disk headroom. 0 disables the filesystem check.
+min_free_bytes = {storage_min_free_bytes}
+# Instance and per-account upload quotas. 0 means unlimited.
+max_upload_bytes = {storage_max_upload_bytes}
+max_user_upload_bytes = {storage_max_user_upload_bytes}
+
 # Backups
 
 [backup]
@@ -721,6 +765,9 @@ retention_max_age_days = {backup_retention_max_age_days}
 # Keep false unless automatic backup storage is encrypted and access-controlled.
 automatic_include_tor_keys = {backup_automatic_include_tor_keys}
 "#,
+        storage_min_free_bytes = settings.storage.min_free_bytes,
+        storage_max_upload_bytes = settings.storage.max_upload_bytes,
+        storage_max_user_upload_bytes = settings.storage.max_user_upload_bytes,
         site_name = toml_string(&settings.site.name),
         server_host = toml_string(&settings.server.host),
         server_port = settings.server.port,
@@ -742,6 +789,7 @@ automatic_include_tor_keys = {backup_automatic_include_tor_keys}
         max_archive_entries = settings.accounts.max_archive_entries,
         max_text_chars = settings.posts.max_text_chars,
         post_edit_window_seconds = settings.posts.post_edit_window_seconds,
+        post_delete_recovery_seconds = settings.posts.post_delete_recovery_seconds,
         max_images_per_post = settings.posts.max_images_per_post,
         max_videos_per_post = settings.posts.max_videos_per_post,
         max_media_per_post = settings.posts.max_media_per_post,
@@ -908,4 +956,8 @@ impl ServerSettings {
             .map_err(|_| anyhow::anyhow!("server.host must be an IP address"))?;
         Ok(std::net::SocketAddr::new(ip, self.port))
     }
+}
+
+const fn default_post_delete_recovery_seconds() -> u64 {
+    30
 }

@@ -66,6 +66,13 @@ pub(super) fn validate_or_normalize_restorable_schema(
 ) -> anyhow::Result<()> {
     match migration_state(conn)? {
         MigrationState::Baseline => validate_schema(conn),
+        MigrationState::ReleaseVersion4 => {
+            if !normalize {
+                anyhow::bail!("database schema version 4 requires migration before use");
+            }
+            migrate_release_v4_to_current(conn)?;
+            validate_schema(conn)
+        }
         MigrationState::ReleaseVersion3 => {
             if !normalize {
                 anyhow::bail!(
@@ -197,7 +204,10 @@ pub(super) fn inspect_alpha_schema_objects(conn: &Connection) -> anyhow::Result<
                     | "missing table instance_settings"
                     | "missing table account_imports"
                     | "missing index idx_account_imports_user"
-            ) && !issue.starts_with("table users columns differ")
+            ) && !schema::V5_ADDITIONS.iter().any(|object| {
+                issue == &format!("missing table {object}")
+                    || issue == &format!("missing index {object}")
+            }) && !issue.starts_with("table users columns differ")
                 && !USER_COLUMNS_ADDED_IN_V4
                     .iter()
                     .any(|(column, _definition)| issue == &format!("missing column users.{column}"))

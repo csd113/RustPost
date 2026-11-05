@@ -9,6 +9,9 @@ pub(super) async fn snapshot_guard(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
+    if matches!(request.uri().path(), "/health/live" | "/health/ready") {
+        return next.run(request).await;
+    }
     if request.method() == axum::http::Method::POST
         && request.uri().path() == "/admin/backups/create"
     {
@@ -92,6 +95,9 @@ pub(super) async fn account_state_guard(
     next: middleware::Next,
 ) -> Response {
     let guarded_path = request.uri().path();
+    if matches!(guarded_path, "/health/live" | "/health/ready") {
+        return next.run(request).await;
+    }
     if guarded_path.starts_with("/assets/")
         || guarded_path.starts_with("/uploads/")
         || guarded_path == "/favicon.ico"
@@ -145,10 +151,14 @@ pub(super) fn maintenance_policy(method: &axum::http::Method, path: &str) -> Mai
     match path {
         "/register" => MaintenancePolicy::Blocked,
         "/posts" | "/settings/import" => MaintenancePolicy::BlockedUnlessAdmin,
+        _ if path.starts_with("/drafts/") && path.trim_matches('/').split('/').count() == 2 => {
+            MaintenancePolicy::BlockedUnlessAdmin
+        }
         _ if path.starts_with("/posts/")
             && (path.ends_with("/quote")
                 || path.ends_with("/repost")
-                || path.ends_with("/edit")) =>
+                || path.ends_with("/edit")
+                || path.ends_with("/restore")) =>
         {
             MaintenancePolicy::BlockedUnlessAdmin
         }

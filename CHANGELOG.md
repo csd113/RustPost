@@ -2,6 +2,20 @@
 
 For installation, start with [Getting started](docs/getting-started.md). Entries below record changes for their own versions; use the [current guides](docs/README.md) for current behavior.
 
+## v1.2.0 - Community tools and reliable operations (unreleased)
+
+- Add private server-saved drafts, attachment descriptions, optimistic edits, UTC schedules, cancellation, and transactional restart-safe publication. Add optional browser-local description reminders and image previews.
+- Deduplicate posting retries with submission keys and atomically charge posting rates. Preserve committed attachments if response rendering fails.
+- Add single/multiple-choice polls with optional closing times, account-bound votes, and aggregate results. Votes remain visible to the database operator.
+- Add Everyone/Following feed controls, stable older/newer navigation for feeds/profiles/bookmarks/search, and paginated long conversations/deep reply links. Add author/date/media/bookmark search filters using SQLite.
+- Process post media through a durable single-worker queue with bounded admission, automatic/manual retries, restart recovery, safe shared-file handling, and usable originals. Keep FFmpeg optional and profile upload behavior intact.
+- Add logical instance/account upload quotas, atomic reservations, native filesystem headroom checks, and storage usage pages. Apply guardrails to uploads, imports, backup and verification staging.
+- Add owner-only deletion undo (default 30 seconds, configurable 0–300) and retained-media privacy/cleanup. Administrative removals revoke recovery and remain final.
+- Freeze consistent backup snapshots/files before resuming requests for bulk archive work. Add full non-destructive backup verification and disposable migration/path-rewrite rehearsal in Admin and CLI.
+- Add minimal uncached liveness/readiness endpoints, and fix YouTube error 153 with origin-only iframe referrers while preserving page-wide privacy policy.
+- Bump package/container/current guide versions to **1.2.0** and migrate supported databases transactionally to **schema 5**. Backup/account archive formats remain **1**; personal account archives do not include the new drafts, polls/votes, or recovery state. See [usage, limits, and upgrade notes](docs/community-tools.md).
+- Retain a single binary, embedded SQLite/Arti, native Windows/Unix support, and no mandatory external service. No moderator role or notification-control changes are included.
+
 ## v1.1.0 - Operations, safety, and easier setup
 
 ### Running and updating your site

@@ -4,7 +4,7 @@ Start RustPost, sign in as your administrator, and open **Admin**. You can manag
 
 [All guides](README.md) · [Settings](#configuration) · [Backups](#backup-and-restore) · [Commands](#cli-reference) · [Public deployment](deployment.md) · [Updates](software-updates.md)
 
-This guide describes **v1.1.0**. Older v1.0.0 differs in some operational behavior; in particular, v1.1.0 requires restoring with the server stopped.
+This guide describes **v1.2.0**. Older v1.0.0 differs in some operational behavior; in particular, v1.1.0 requires restoring with the server stopped.
 
 ## Everyday administration
 
@@ -105,7 +105,17 @@ To create one from the terminal:
 ./rustpost-cli --data-dir ./rustpost-data backup
 ```
 
-The command reports the archive path under `backups/`. Backup creation can run while the site is serving; it uses an online SQLite snapshot and coordinates application writes. Tor private keys are excluded unless you explicitly include them.
+The command reports the archive path under `backups/`. Backup creation can run while the site is serving; it freezes an online SQLite snapshot and its referenced files while briefly coordinating application writes, then resumes requests before hashing and archiving. Immutable media use hard links where supported; a copy fallback can lengthen the capture pause. Tor private keys are excluded unless you explicitly include them.
+
+### Verify a backup without restoring it
+
+Use **Verify** beside an archive in Admin → Backups, or run:
+
+```sh
+./rustpost-cli --data-dir ./rustpost-data verify-backup /path/to/ARCHIVE_NAME.tar
+```
+
+This checks every file hash, archive paths/types, settings, database integrity and foreign keys, then rehearses migrations and media-path rewriting in disposable storage. It does not replace live data or exercise a replacement machine's permissions, hardware, or Tor connectivity. Archives containing Tor identity keys require explicit `--include-tor-keys`. Allow staging space; verification is serialized with other backup operations while the site continues serving.
 
 ### Restore with the server stopped
 
@@ -143,9 +153,9 @@ Retention applies to `rustpost-auto-*.tar` archives only. It protects the config
 
 RustPost runs without `ffmpeg`. When available and enabled, it converts accepted images to WebP, videos to WebM/VP9, and can generate video thumbnails. The default accepted types are JPEG, PNG, GIF, WebP, MP4, WebM, and QuickTime. Profile pictures and banners use the media pipeline too.
 
-Conversion happens during upload, with bounded concurrent work. Image conversions have a 120-second timeout; videos have a 300-second timeout. Converted videos use `yuv420p` and BT.709 color metadata. An allowed original upload is used when conversion is unavailable or fails; that does not ensure every browser can play its codec.
+Post attachments enter a durable background queue; the original is available immediately. One worker handles at most 128 queued/running conversions, with three automatic attempts and owner-requested retries bounded at nine total attempts. Startup recovers interrupted jobs. Profile media still converts during upload with bounded concurrent work. Image conversions have a 120-second timeout; videos have a 300-second timeout. Converted videos use `yuv420p` and BT.709 color metadata. An allowed original upload is used when conversion is unavailable or fails; that does not ensure every browser can play its codec.
 
-Check **Health** for executable/encoder availability and **Media jobs** for outcomes. `media.keep_original_uploads` controls retention alongside successful conversions and is false by default. Upload limits and encoding quality are listed in the [configuration reference](admin-configuration-audit.md).
+Check **Health** for executable/encoder availability, **Media processing** for your uploads and retries, and the admin **Media jobs** page for outcomes. `media.keep_original_uploads` controls retention alongside successful conversions and is false by default. Upload limits and encoding quality are listed in the [configuration reference](admin-configuration-audit.md).
 
 ## Tor / Arti
 
@@ -189,6 +199,7 @@ Prefix each command with the executable and your data directory, for example `./
 | `create-admin USERNAME --password-stdin` | Create an admin from protected redirected input |
 | `reset-admin-password USERNAME --password-stdin` | Reset an admin from protected redirected input |
 | `backup [--include-tor-keys]` | Create an archive |
+| `verify-backup ARCHIVE.tar [--include-tor-keys]` | Validate/rehearse in temporary storage without replacing live data |
 | `restore ARCHIVE.tar [--include-tor-keys]` | Restore with the server stopped |
 | `seed-demo` | Seed an explicit disposable demo directory; see [demo guide](demo-preview.md) |
 

@@ -22,7 +22,7 @@ RUN apt-get update \
 COPY --from=build /usr/src/rustpost/target/release/rustpost-cli /usr/local/bin/rustpost-cli
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-ARG RUSTPOST_VERSION=1.1.0
+ARG RUSTPOST_VERSION=1.2.0
 LABEL org.opencontainers.image.source="https://github.com/csd113/RustPost" \
       org.opencontainers.image.title="RustPost" \
       org.opencontainers.image.version="${RUSTPOST_VERSION}"
