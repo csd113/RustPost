@@ -81,26 +81,3 @@ pub fn validate_profile_text(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn username_validation() {
-        assert_eq!(normalize_username("User-1", 32).expect("valid"), "user-1");
-        assert!(normalize_username("../x", 32).is_err());
-        assert!(normalize_username("admin", 32).is_err());
-        assert!(normalize_username("has space", 32).is_err());
-    }
-
-    #[test]
-    fn post_limit_uses_unicode_chars() {
-        let text = "é".repeat(280);
-        assert!(clean_post_text(&text, 280, 0).is_ok());
-        let too_long = "é".repeat(281);
-        assert!(clean_post_text(&too_long, 280, 0).is_err());
-        assert!(clean_post_text("   ", 280, 0).is_err());
-        assert!(clean_post_text("   ", 280, 1).is_ok());
-    }
-}

@@ -1,15 +1,32 @@
 name: Container
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Published source tag to build (for example v1.1.0)
+        required: true
+        type: string
+
+env:
+  RUSTPOST_RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: container-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: Build ${{ matrix.arch }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -20,42 +37,52 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Verify v1.0.0 application source
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RUSTPOST_RELEASE_TAG }}
+      - name: Resolve and validate version
+        id: version
         run: |
-          git fetch --depth=1 origin tag v1.0.0
-          git diff --quiet v1.0.0 -- Cargo.toml Cargo.lock src
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+          version="${RUSTPOST_RELEASE_TAG#v}"
+          test "$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')" = "$version"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
           push: true
-          tags: ghcr.io/csd113/rustpost:1.0.0-${{ matrix.arch }}
+          tags: ghcr.io/csd113/rustpost:${{ steps.version.outputs.value }}-${{ matrix.arch }}
+          build-args: RUSTPOST_VERSION=${{ steps.version.outputs.value }}
           provenance: false
 
   publish:
     name: Publish version and latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create multi-platform tags
         run: |
-          docker buildx imagetools create \
-            --tag ghcr.io/csd113/rustpost:1.0.0 \
-            --tag ghcr.io/csd113/rustpost:latest \
-            ghcr.io/csd113/rustpost:1.0.0-amd64 \
-            ghcr.io/csd113/rustpost:1.0.0-arm64
+          version="${RUSTPOST_RELEASE_TAG#v}"
+          tags=(--tag "ghcr.io/csd113/rustpost:$version")
+          if [[ "$version" != *-* ]]; then tags+=(--tag ghcr.io/csd113/rustpost:latest); fi
+          docker buildx imagetools create "${tags[@]}" \
+            "ghcr.io/csd113/rustpost:$version-amd64" \
+            "ghcr.io/csd113/rustpost:$version-arm64"
       - name: Inspect published image
-        run: docker buildx imagetools inspect ghcr.io/csd113/rustpost:1.0.0
+        run: docker buildx imagetools inspect "ghcr.io/csd113/rustpost:${RUSTPOST_RELEASE_TAG#v}"

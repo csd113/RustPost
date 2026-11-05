@@ -1,5 +1,39 @@
 # Changelog
 
+For installation, start with [Getting started](docs/getting-started.md). Entries below record changes for their own versions; use the [current guides](docs/README.md) for current behavior.
+
+## v1.1.0 - Operations, safety, and easier setup
+
+### Running and updating your site
+
+- Add a live terminal console with six scrollable views: Overview, Tasks, Content, Logs, System, and Configuration. Plain/off modes, ASCII output, freshness indicators, and graceful shutdown controls support different terminals.
+- Protect interactive administrator passwords with hidden entry and confirmation. Add bounded `--password-stdin` input for administrator creation and password resets.
+- Rewrite the guides around download, first run, everyday use, and administration, with separate configuration/developer references and preserved screenshots and licensing.
+- Replace automatic installation with a manual, read-only **Admin → Software updates** check that links to a newer published stable GitHub release. Installation remains a backup/stop/replace/start operation; remove the former updater service, IPC, signing/package tools, and deployment permissions.
+- Prepare five versioned native CLI ZIPs for Linux x86_64/ARM64, Intel/Apple silicon Mac, and Windows x86_64, with a shared `SHA256SUMS.txt` and a draft GitHub release. ZIPs contain the executable, README, LICENSE, and CHANGELOG; native downloads do not bundle `ffmpeg` or the full online guides. The separate tagged container workflow remains available.
+
+### Backups, requests, and account safety
+
+- Publish backups atomically with streaming checksums, online SQLite snapshots, bounded archive validation, and safe retention. Restore requires the server to be stopped, validates staged content before installation, and preserves recovery data when rollback cannot complete.
+- Keep session-bound CSRF tokens stable, validate origins/proxy metadata/cookies consistently, and delay multipart asset publication until validation succeeds.
+- Charge account-import quota only after complete multipart CSRF validation, with an atomic quota check/record. Submissions rejected for missing or invalid form tokens no longer consume the account's import quota; staged uploads retain bounded streaming and cleanup guards.
+- Require a CSRF-protected POST to prepare account deletion. GET/HEAD confirmation navigation cannot create or replace a deletion intent; the no-JavaScript warning/confirmation flow and final confirmation checks remain available.
+- Bound media processing, uploads, password work, database queues, and Tor forwarding. Fix cancellation cleanup, make profile/onboarding updates atomic, and preserve access to original video downloads. Drain admitted HTTP requests on SIGTERM.
+
+### Build and compatibility
+
+- Upgrade the compiler/minimum supported Rust version to **1.99.1** and current dependencies, including **Arti 0.48.0**, retaining **rusqlite 0.40.2** for a single compatible SQLite linkage.
+- Split large source files into subsystem modules and extract embedded assets. Remove the former broad application/Playwright suites and runners; retain the current terminal/CLI and focused CSRF route regressions.
+- Simplify CI and issue forms, validate native builds/tests on all five platforms, and remove the unused systemd service example.
+- Bump the package, lockfile entry, container version metadata, and current usage examples to **1.1.0**. CLI output, console display, update comparison/user agent, and backup manifests derive the app version from Cargo. Database schema **4**, account archive format **1**, and backup format **1** are unchanged.
+
+### Known limits and upgrade notes
+
+- Dependency Audit is report-only: success means a valid advisory report was produced, not that dependencies are free of advisories. Upstream **RUSTSEC-2023-0071** (`rsa 0.9.10`) and **RUSTSEC-2026-0387** (`crypto-bigint 0.5.5`) remain open, with maintenance warnings for transitive `bincode 2.0.1` and `paste 1.0.15`; inspect the current report before deployment.
+- Keep a full-site backup before upgrading from v1.0.0. Browser/live restore and automatic installation are no longer available; use [offline restore](docs/operator-guide.md#restore-with-the-server-stopped) and [manual updates](docs/software-updates.md).
+- RustPost remains a single-community service without federation. Search/reporting are basic, broader accessibility review is outstanding, and synchronous media conversion can delay uploads. Optional `ffmpeg` improves conversion/thumbnail support; original-format playback depends on the browser.
+- Console/log retention is bounded and best effort. Counts can be stale or unavailable, filesystem calls have no hard deadline, and there is no hard whole-process shutdown deadline for stuck filesystem operations. Displayed onion status does not prove external Tor reachability; native interactive Windows and SSH/tmux behavior still need separate validation.
+
 ## v1.0.0 - First Release
 
 - Published a Linux amd64/arm64 container image as `ghcr.io/csd113/rustpost:1.0.0` and `ghcr.io/csd113/rustpost:latest`, with persistent state under `/data` and bundled `ffmpeg`.

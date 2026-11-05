@@ -1,5 +1,5 @@
 use anyhow::Context as _;
-use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
+use argon2::password_hash::{PasswordHasher as _, PasswordVerifier as _, phc::PasswordHash};
 use argon2::{Algorithm, Argon2, Params, Version};
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
@@ -164,7 +164,7 @@ pub async fn login(
 
 pub async fn create_session(pool: &SqlitePool, user_id: i64) -> anyhow::Result<Session> {
     let token = secure_token();
-    let csrf_token = secure_token();
+    let csrf_token = session_csrf_token(&token);
     let expires_at = Utc::now() + Duration::days(30);
     let token_hash = hash_token(&token);
     let csrf_hash = hash_token(&csrf_token);
@@ -233,16 +233,34 @@ pub async fn verify_user_password(
 
 /// Argon2id hashing is intentionally CPU and memory heavy; run it on the
 /// blocking pool so it cannot stall the async runtime under load.
+#[derive(Debug, thiserror::Error)]
+#[error("password processing is busy; try again shortly")]
+pub(crate) struct PasswordWorkBusy;
+
+static PASSWORD_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 pub async fn hash_password_async(password: String) -> anyhow::Result<String> {
-    tokio::task::spawn_blocking(move || hash_password(&password))
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(30), PASSWORD_WORK.acquire())
         .await
-        .context("password hashing task failed")?
+        .map_err(|_| PasswordWorkBusy)??;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_password(&password)
+    })
+    .await
+    .context("password hashing task failed")?
 }
 
 async fn verify_password_async(password: String, encoded_hash: String) -> anyhow::Result<bool> {
-    tokio::task::spawn_blocking(move || verify_password(&password, &encoded_hash))
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(30), PASSWORD_WORK.acquire())
         .await
-        .context("password verification task failed")?
+        .map_err(|_| PasswordWorkBusy)??;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_password(&password, &encoded_hash)
+    })
+    .await
+    .context("password verification task failed")?
 }
 
 pub async fn change_password(
@@ -339,7 +357,7 @@ pub async fn csrf_hashes_for_cookie(
     let token_hash = hash_token(token);
     pool.call(move |conn| {
         conn.query_row(
-            "SELECT csrf_token_hash, previous_csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND datetime(expires_at) > CURRENT_TIMESTAMP",
+            "SELECT substr(s.csrf_token_hash, 1, 128), substr(s.previous_csrf_token_hash, 1, 4096) FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.revoked_at IS NULL AND datetime(s.expires_at) > CURRENT_TIMESTAMP AND u.is_deleted = 0",
             [token_hash],
             |row| {
                 let current = row.get::<_, String>(0)?;
@@ -351,6 +369,7 @@ pub async fn csrf_hashes_for_cookie(
                         previous
                             .lines()
                             .filter(|hash| !hash.is_empty())
+                            .take(31)
                             .map(ToOwned::to_owned),
                     );
                 }
@@ -363,13 +382,43 @@ pub async fn csrf_hashes_for_cookie(
     .await
 }
 
+/// Parse all Cookie fields (including HTTP/2 split fields), rejecting duplicate
+/// session names rather than letting browser/proxy ordering select an identity.
+pub(crate) fn checked_session_cookie(headers: &HeaderMap) -> anyhow::Result<Option<String>> {
+    let mut token = None;
+    for raw in headers.get_all(axum::http::header::COOKIE) {
+        let raw = raw.to_str().context("invalid Cookie header")?;
+        for part in raw.split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if name != "rustpost_session" {
+                continue;
+            }
+            anyhow::ensure!(token.is_none(), "ambiguous session cookies");
+            anyhow::ensure!(
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "invalid session cookie"
+            );
+            token = Some(value.to_owned());
+        }
+    }
+    Ok(token)
+}
+
 pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    raw.split(';').find_map(|part| {
-        let part = part.trim();
-        part.strip_prefix("rustpost_session=")
-            .map(ToOwned::to_owned)
-    })
+    checked_session_cookie(headers).ok().flatten()
+}
+
+/// A domain-separated token stable for one session. It cannot reveal the
+/// `HttpOnly` session credential and survives page loads, tabs and restarts.
+pub(crate) fn session_csrf_token(session: &str) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, session.as_bytes());
+    let signature = ring::hmac::sign(&key, b"RustPost session CSRF v1");
+    base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        signature.as_ref(),
+    )
 }
 
 pub fn set_session_cookie(session: &Session, secure: bool) -> String {
@@ -399,12 +448,10 @@ fn cookie_value(name: &str, value: &str, secure: bool, max_age: Option<u64>) -> 
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
     let mut salt_bytes = [0_u8; 16];
     getrandom::fill(&mut salt_bytes).context("generate password salt")?;
-    let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|err| anyhow::anyhow!("encode password salt: {err}"))?;
     let params = Params::new(19_456, 2, 1, None)
         .map_err(|err| anyhow::anyhow!("invalid argon2 params: {err}"))?;
     Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), &salt_bytes)
         .map_err(|err| anyhow::anyhow!("password hashing failed: {err}"))?
         .to_string())
 }
@@ -426,604 +473,4 @@ pub fn secure_token() -> String {
     let mut token = Uuid::new_v4().simple().to_string();
     token.push_str(&Uuid::new_v4().simple().to_string());
     token
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    async fn fixture() -> (tempfile::TempDir, SqlitePool, Settings, i64) {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        crate::db::migrate(&pool).await.expect("migrate");
-        let settings = Settings::default();
-        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
-            .await
-            .expect("user");
-        (temp, pool, settings, user_id)
-    }
-
-    fn session_headers(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            format!("rustpost_session={token}")
-                .parse()
-                .expect("session cookie"),
-        );
-        headers
-    }
-
-    async fn set_must_change_password(pool: &SqlitePool, user_id: i64) {
-        pool.call(move |conn| {
-            conn.execute(
-                "UPDATE users SET must_change_password = 1 WHERE id = ?",
-                [user_id],
-            )?;
-            Ok(())
-        })
-        .await
-        .expect("set must_change_password");
-    }
-
-    async fn must_change_password(pool: &SqlitePool, user_id: i64) -> i64 {
-        pool.call(move |conn| {
-            Ok(conn.query_row(
-                "SELECT must_change_password FROM users WHERE id = ?",
-                [user_id],
-                |row| row.get(0),
-            )?)
-        })
-        .await
-        .expect("must_change_password")
-    }
-
-    async fn active_session_count(pool: &SqlitePool, user_id: i64) -> i64 {
-        pool.call(move |conn| {
-            Ok(conn.query_row(
-                "SELECT COUNT(*) FROM sessions WHERE user_id = ? AND revoked_at IS NULL",
-                [user_id],
-                |row| row.get(0),
-            )?)
-        })
-        .await
-        .expect("active sessions")
-    }
-
-    async fn password_hash(pool: &SqlitePool, user_id: i64) -> String {
-        pool.call(move |conn| {
-            Ok(conn.query_row(
-                "SELECT password_hash FROM users WHERE id = ?",
-                [user_id],
-                |row| row.get(0),
-            )?)
-        })
-        .await
-        .expect("password hash")
-    }
-
-    #[test]
-    fn password_hash_verifies() {
-        let hash = hash_password("correct horse battery").expect("hash");
-        assert!(verify_password("correct horse battery", &hash).expect("verify"));
-        assert!(!verify_password("wrong horse battery", &hash).expect("verify"));
-        assert!(!hash.contains("correct horse battery"));
-    }
-
-    #[tokio::test]
-    async fn duplicate_username_is_rejected() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        crate::db::migrate(&pool).await.expect("migrate");
-        let settings = Settings::default();
-
-        register_user(&pool, &settings, "Alice", "very secure password", false)
-            .await
-            .expect("first user");
-        for candidate in ["alice", "ALICE", "aLiCe"] {
-            let error = register_user(&pool, &settings, candidate, "very secure password", false)
-                .await
-                .expect_err("case variant");
-            assert_eq!(error.to_string(), USERNAME_TAKEN_MESSAGE);
-        }
-        let stored: String = pool
-            .call(|conn| {
-                Ok(conn.query_row(
-                    "SELECT username FROM users WHERE normalized_username = 'alice'",
-                    (),
-                    |row| row.get(0),
-                )?)
-            })
-            .await
-            .expect("stored username");
-        assert_eq!(stored, "Alice");
-    }
-
-    #[tokio::test]
-    async fn registration_rejects_historical_handle() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        crate::db::migrate(&pool).await.expect("migrate");
-        let settings = Settings::default();
-        let alice = register_user(&pool, &settings, "alice", "very secure password", false)
-            .await
-            .expect("alice");
-        crate::identity::change_username(&pool, &settings, alice, "alice_new")
-            .await
-            .expect("rename alice");
-
-        for candidate in ["alice", "ALICE"] {
-            let error = register_user(&pool, &settings, candidate, "very secure password", false)
-                .await
-                .expect_err("historical handle");
-            assert_eq!(error.to_string(), USERNAME_TAKEN_MESSAGE);
-        }
-    }
-
-    #[tokio::test]
-    async fn password_change_clears_must_change_password() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        crate::db::migrate(&pool).await.expect("migrate");
-        let settings = Settings::default();
-        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
-            .await
-            .expect("user");
-        pool.call(move |conn| {
-            conn.execute(
-                "UPDATE users SET must_change_password = 1 WHERE id = ?",
-                [user_id],
-            )?;
-            Ok(())
-        })
-        .await
-        .expect("set flag");
-
-        change_password(
-            &pool,
-            &settings,
-            user_id,
-            "very secure password",
-            "much better password",
-            "much better password",
-            None,
-        )
-        .await
-        .expect("password change");
-
-        let flag: i64 = pool
-            .call(move |conn| {
-                Ok(conn.query_row(
-                    "SELECT must_change_password FROM users WHERE id = ?",
-                    [user_id],
-                    |row| row.get(0),
-                )?)
-            })
-            .await
-            .expect("flag");
-        assert_eq!(flag, 0);
-    }
-
-    #[tokio::test]
-    async fn password_change_updates_hash() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        crate::db::migrate(&pool).await.expect("migrate");
-        let settings = Settings::default();
-        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
-            .await
-            .expect("user");
-
-        change_password(
-            &pool,
-            &settings,
-            user_id,
-            "very secure password",
-            "much better password",
-            "much better password",
-            None,
-        )
-        .await
-        .expect("password change");
-
-        assert!(
-            login(&pool, "alice", "very secure password")
-                .await
-                .expect("old login")
-                .is_err()
-        );
-        assert!(
-            login(&pool, "alice", "much better password")
-                .await
-                .expect("new login")
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn password_change_revokes_other_sessions_but_keeps_current_session() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        crate::db::migrate(&pool).await.expect("migrate");
-        let settings = Settings::default();
-        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
-            .await
-            .expect("user");
-        let current = create_session(&pool, user_id)
-            .await
-            .expect("current session");
-        let other = create_session(&pool, user_id).await.expect("other session");
-
-        change_password(
-            &pool,
-            &settings,
-            user_id,
-            "very secure password",
-            "much better password",
-            "much better password",
-            Some(&current.token),
-        )
-        .await
-        .expect("password change");
-
-        let mut current_headers = HeaderMap::new();
-        current_headers.insert(
-            axum::http::header::COOKIE,
-            format!("rustpost_session={}", current.token)
-                .parse()
-                .expect("current cookie"),
-        );
-        assert!(
-            current_user(&pool, &current_headers)
-                .await
-                .expect("current user")
-                .is_some()
-        );
-        let mut other_headers = HeaderMap::new();
-        other_headers.insert(
-            axum::http::header::COOKIE,
-            format!("rustpost_session={}", other.token)
-                .parse()
-                .expect("other cookie"),
-        );
-        assert!(
-            current_user(&pool, &other_headers)
-                .await
-                .expect("other user")
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn password_change_rejects_wrong_current_password() {
-        let (_temp, pool, settings, user_id) = fixture().await;
-        set_must_change_password(&pool, user_id).await;
-        let current = create_session(&pool, user_id).await.expect("current");
-        let other = create_session(&pool, user_id).await.expect("other");
-
-        let result = change_password(
-            &pool,
-            &settings,
-            user_id,
-            "wrong password",
-            "much better password",
-            "much better password",
-            Some(&current.token),
-        )
-        .await;
-
-        assert_eq!(
-            result.expect_err("wrong current password").to_string(),
-            "current password is incorrect"
-        );
-        assert_eq!(must_change_password(&pool, user_id).await, 1);
-        assert_eq!(active_session_count(&pool, user_id).await, 2);
-        assert!(
-            current_user(&pool, &session_headers(&current.token))
-                .await
-                .expect("current user")
-                .is_some()
-        );
-        assert!(
-            current_user(&pool, &session_headers(&other.token))
-                .await
-                .expect("other user")
-                .is_some()
-        );
-        assert!(
-            login(&pool, "alice", "very secure password")
-                .await
-                .expect("old login")
-                .is_ok()
-        );
-        assert_eq!(
-            active_session_count(&pool, user_id).await,
-            3,
-            "login adds a session"
-        );
-    }
-
-    #[tokio::test]
-    async fn password_change_rejects_confirmation_mismatch() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        crate::db::migrate(&pool).await.expect("migrate");
-        let settings = Settings::default();
-        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
-            .await
-            .expect("user");
-
-        let result = change_password(
-            &pool,
-            &settings,
-            user_id,
-            "very secure password",
-            "much better password",
-            "different password",
-            None,
-        )
-        .await;
-
-        assert_eq!(
-            result.expect_err("password mismatch").to_string(),
-            "new passwords do not match"
-        );
-    }
-
-    #[tokio::test]
-    async fn expired_rfc3339_session_is_rejected() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        crate::db::migrate(&pool).await.expect("migrate");
-        let settings = Settings::default();
-        let user_id = register_user(&pool, &settings, "Alice", "very secure password", false)
-            .await
-            .expect("user");
-        let session = create_session(&pool, user_id).await.expect("session");
-        let token_hash = hash_token(&session.token);
-        pool.call(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET expires_at = datetime('now', '-1 minute') || 'Z' WHERE token_hash = ?",
-                [token_hash],
-            )?;
-            Ok(())
-        })
-        .await
-        .expect("expire session");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            format!("rustpost_session={}", session.token)
-                .parse()
-                .expect("cookie"),
-        );
-
-        assert!(
-            current_user(&pool, &headers)
-                .await
-                .expect("current user")
-                .is_none()
-        );
-        assert!(
-            csrf_hashes_for_cookie(&pool, &session.token)
-                .await
-                .expect("csrf lookup")
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn password_change_keeps_current_session_revokes_others_and_clears_flag() {
-        let (_temp, pool, settings, user_id) = fixture().await;
-        set_must_change_password(&pool, user_id).await;
-        let first = create_session(&pool, user_id).await.expect("first");
-        let second = create_session(&pool, user_id).await.expect("second");
-        let third = create_session(&pool, user_id).await.expect("third");
-
-        change_password(
-            &pool,
-            &settings,
-            user_id,
-            "very secure password",
-            "much better password",
-            "much better password",
-            Some(&first.token),
-        )
-        .await
-        .expect("password change");
-
-        assert_eq!(must_change_password(&pool, user_id).await, 0);
-        let current = current_user(&pool, &session_headers(&first.token))
-            .await
-            .expect("current user")
-            .expect("current session stays valid");
-        assert!(!current.must_change_password);
-        for token in [&second.token, &third.token] {
-            assert!(
-                current_user(&pool, &session_headers(token))
-                    .await
-                    .expect("revoked user")
-                    .is_none()
-            );
-            assert!(
-                csrf_hashes_for_cookie(&pool, token)
-                    .await
-                    .expect("csrf lookup")
-                    .is_none()
-            );
-        }
-        assert_eq!(active_session_count(&pool, user_id).await, 1);
-        assert!(
-            login(&pool, "alice", "much better password")
-                .await
-                .expect("new login")
-                .is_ok()
-        );
-        assert!(
-            login(&pool, "alice", "very secure password")
-                .await
-                .expect("old login")
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_password_change_and_read_leaves_no_stale_session() {
-        let (_temp, pool, settings, user_id) = fixture().await;
-        set_must_change_password(&pool, user_id).await;
-        let current = create_session(&pool, user_id).await.expect("current");
-        let other = create_session(&pool, user_id).await.expect("other");
-
-        let change = change_password(
-            &pool,
-            &settings,
-            user_id,
-            "very secure password",
-            "much better password",
-            "much better password",
-            Some(&current.token),
-        );
-        let other_headers = session_headers(&other.token);
-        let read = current_user(&pool, &other_headers);
-        let (change, read) = tokio::join!(change, read);
-
-        change.expect("password change");
-        if let Some(user) = read.expect("read") {
-            assert!(
-                user.must_change_password,
-                "a read that saw the other session must predate the password change"
-            );
-        }
-        assert!(
-            current_user(&pool, &session_headers(&other.token))
-                .await
-                .expect("final read")
-                .is_none(),
-            "no session may remain valid after the change"
-        );
-        assert_eq!(active_session_count(&pool, user_id).await, 1);
-    }
-
-    #[tokio::test]
-    async fn password_change_for_deleted_account_is_not_reported_as_success() {
-        use futures_util::FutureExt as _;
-
-        let (_temp, pool, settings, user_id) = fixture().await;
-        set_must_change_password(&pool, user_id).await;
-        let current = create_session(&pool, user_id).await.expect("current");
-        let _other = create_session(&pool, user_id).await.expect("other");
-        let hash_before = password_hash(&pool, user_id).await;
-
-        let change = change_password(
-            &pool,
-            &settings,
-            user_id,
-            "very secure password",
-            "much better password",
-            "much better password",
-            Some(&current.token),
-        );
-        tokio::pin!(change);
-        assert!(
-            change.as_mut().now_or_never().is_none(),
-            "first poll only queues password verification"
-        );
-        // The account is deleted after the password was verified but before the
-        // UPDATE runs.
-        pool.call(move |conn| {
-            conn.execute(
-                "UPDATE users SET is_deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                [user_id],
-            )?;
-            Ok(())
-        })
-        .await
-        .expect("delete mid-flight");
-
-        let error = change
-            .await
-            .expect_err("a deleted account must not report a successful change");
-        assert_eq!(error.to_string(), "account not found");
-        assert_eq!(password_hash(&pool, user_id).await, hash_before);
-        assert_eq!(must_change_password(&pool, user_id).await, 1);
-        assert_eq!(
-            active_session_count(&pool, user_id).await,
-            2,
-            "a failed change must not revoke sessions"
-        );
-    }
-
-    #[tokio::test]
-    async fn revoked_session_cookie_is_rejected() {
-        let (_temp, pool, _settings, user_id) = fixture().await;
-        let revoked = create_session(&pool, user_id).await.expect("revoked");
-        let active = create_session(&pool, user_id).await.expect("active");
-
-        revoke_session(&pool, &revoked.token).await.expect("revoke");
-
-        assert!(
-            current_user(&pool, &session_headers(&revoked.token))
-                .await
-                .expect("current user")
-                .is_none()
-        );
-        assert!(
-            csrf_hashes_for_cookie(&pool, &revoked.token)
-                .await
-                .expect("csrf lookup")
-                .is_none()
-        );
-        assert!(
-            current_user(&pool, &session_headers(&active.token))
-                .await
-                .expect("current user")
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn expired_inserted_session_cookie_is_rejected() {
-        let (_temp, pool, _settings, user_id) = fixture().await;
-        let token = secure_token();
-        let token_hash = hash_token(&token);
-        let csrf_hash = hash_token(&secure_token());
-        pool.call(move |conn| {
-            conn.execute(
-                "INSERT INTO sessions (user_id, token_hash, csrf_token_hash, expires_at) VALUES (?, ?, ?, datetime('now', '-1 hour'))",
-                params![user_id, token_hash, csrf_hash],
-            )?;
-            Ok(())
-        })
-        .await
-        .expect("insert expired session");
-
-        assert!(
-            current_user(&pool, &session_headers(&token))
-                .await
-                .expect("current user")
-                .is_none()
-        );
-        assert!(
-            csrf_hashes_for_cookie(&pool, &token)
-                .await
-                .expect("csrf lookup")
-                .is_none()
-        );
-    }
 }

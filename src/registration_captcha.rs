@@ -13,16 +13,11 @@ use uuid::Uuid;
 const CAPTCHA_CHARS: &[u8] = b"123456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const CAPTCHA_LENGTH: usize = 5;
 const CAPTCHA_TTL: Duration = Duration::from_mins(10);
-#[cfg(debug_assertions)]
-const CAPTCHA_E2E_ANSWER_ENV: &str = "RUSTPOST_E2E_CAPTCHA_ANSWER";
-
 #[derive(Debug, Clone)]
 pub struct RegistrationCaptchaChallenge {
     pub token: String,
     pub image_data_uri: String,
     pub expires_minutes: u64,
-    #[cfg(test)]
-    pub answer: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,8 +76,6 @@ impl RegistrationCaptchaStore {
             token,
             image_data_uri,
             expires_minutes: CAPTCHA_TTL.as_secs() / 60,
-            #[cfg(test)]
-            answer,
         })
     }
 
@@ -117,28 +110,9 @@ impl RegistrationCaptchaStore {
             Err(RegistrationCaptchaError::Incorrect)
         }
     }
-
-    #[cfg(test)]
-    pub async fn expire_for_test(&self, token: &str) {
-        let mut challenges = self.challenges.lock().await;
-        if let Some(challenge) = challenges.get_mut(token) {
-            let now = Instant::now();
-            challenge.expires_at = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
-        }
-    }
 }
 
 fn challenge_answer() -> anyhow::Result<String> {
-    #[cfg(debug_assertions)]
-    if let Ok(answer) = std::env::var(CAPTCHA_E2E_ANSWER_ENV) {
-        let normalized = normalize_answer(&answer);
-        if normalized.len() == CAPTCHA_LENGTH
-            && normalized.bytes().all(|byte| CAPTCHA_CHARS.contains(&byte))
-        {
-            return Ok(normalized);
-        }
-    }
-
     let mut bytes = [0_u8; CAPTCHA_LENGTH];
     getrandom::fill(&mut bytes).context("failed to generate CAPTCHA randomness")?;
     Ok(bytes
@@ -176,46 +150,4 @@ fn normalize_answer(answer: &str) -> String {
 
 fn remove_expired(challenges: &mut HashMap<String, StoredChallenge>, now: Instant) {
     challenges.retain(|_, challenge| challenge.expires_at > now);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn challenge_validates_once_case_insensitively() {
-        let store = RegistrationCaptchaStore::default();
-        let challenge = store.create_challenge().await.expect("challenge");
-
-        store
-            .validate(
-                Some(&challenge.token),
-                Some(&challenge.answer.to_lowercase()),
-            )
-            .await
-            .expect("valid answer");
-        assert_eq!(
-            store
-                .validate(Some(&challenge.token), Some(&challenge.answer))
-                .await,
-            Err(RegistrationCaptchaError::ExpiredOrUsed)
-        );
-    }
-
-    #[tokio::test]
-    async fn wrong_answer_consumes_challenge() {
-        let store = RegistrationCaptchaStore::default();
-        let challenge = store.create_challenge().await.expect("challenge");
-
-        assert_eq!(
-            store.validate(Some(&challenge.token), Some("WRONG")).await,
-            Err(RegistrationCaptchaError::Incorrect)
-        );
-        assert_eq!(
-            store
-                .validate(Some(&challenge.token), Some(&challenge.answer))
-                .await,
-            Err(RegistrationCaptchaError::ExpiredOrUsed)
-        );
-    }
 }

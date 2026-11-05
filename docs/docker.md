@@ -1,8 +1,48 @@
-# Running RustPost with Docker
+# Run RustPost with Docker
 
-Docker runs RustPost in a container: a packaged copy of the app and the tools it needs. The released image is `ghcr.io/csd113/rustpost:1.0.0`, with Linux amd64 and arm64 support and `ffmpeg` included for media conversion.
+Docker runs a packaged copy of RustPost with `ffmpeg` included for media conversion. Use this if you already have Docker installed and running, or prefer containers to a downloaded executable.
 
-Start with the [three-step setup in the README](../README.md#run-the-container). This guide covers the next steps. The commands assume your container is named `rustpost` and uses the `rustpost-data` volume from that setup.
+[All guides](README.md) · [Download an app instead](getting-started.md) · [Public deployment](deployment.md)
+
+For v1.1.0, use `ghcr.io/csd113/rustpost:1.1.0` once that image is published, with Linux amd64 and arm64 support. Docker Desktop can run the appropriate Linux image on compatible macOS and Windows computers. If v1.1.0 is not available yet, the older published `1.0.0` image predates features described here; see [version scope](README.md#which-version-do-these-guides-describe).
+
+## Start RustPost
+
+### 1. Start the container
+
+Run these commands in a terminal (the multiline examples use a POSIX shell; in PowerShell put the `docker run` arguments on one line):
+
+```sh
+docker volume create rustpost-data
+docker run -d --name rustpost \
+  -p 127.0.0.1:8080:8080 \
+  -v rustpost-data:/data \
+  --restart unless-stopped \
+  ghcr.io/csd113/rustpost:1.1.0
+```
+
+Docker downloads the image if necessary. The volume is the storage area for your site; retain it when replacing the container. The port mapping makes the site reachable only from the Docker host.
+
+### 2. Create your administrator
+
+```sh
+docker exec -it rustpost rustpost-cli --data-dir /data create-admin-interactive
+```
+
+Choose a username and a unique password of at least 10 characters. Hidden password prompts show no characters as you type. There is no default password.
+
+### 3. Open your site
+
+Visit **[http://127.0.0.1:8080](http://127.0.0.1:8080)** on the Docker host, log in, and finish any profile setup shown. Try writing a post. Use **Admin** to manage the site.
+
+```sh
+docker logs rustpost       # Read startup messages or errors
+docker stop rustpost       # Stop the site
+docker start rustpost      # Start it again
+docker restart rustpost    # Reload startup settings
+```
+
+For a public site, follow [Deployment](deployment.md) after finishing setup. The rest of this guide assumes the container is named `rustpost` and uses the `rustpost-data` volume above.
 
 ## Where your data lives
 
@@ -22,7 +62,7 @@ sudo chown 10001:10001 /srv/rustpost
 sudo chmod 700 /srv/rustpost
 ```
 
-In the README's `docker run` command, replace `-v rustpost-data:/data` with `-v /srv/rustpost:/data`. Use a named volume if you do not need a specific host folder.
+In the `docker run` command above, replace `-v rustpost-data:/data` with `-v /srv/rustpost:/data`. Use a named volume if you do not need a specific host folder.
 
 For a new data directory, the container creates `settings.toml` and sets `server.host` to `0.0.0.0` so Docker can forward traffic. Existing settings are preserved. If you bring an existing RustPost data directory, edit its `[server]` section to use `host = "0.0.0.0"` before starting it in Docker.
 
@@ -38,9 +78,9 @@ docker exec rustpost rustpost-cli --data-dir /data check
 docker restart rustpost
 ```
 
-Only restart if `check` succeeds. If it reports an error, fix the file and copy it back first. Keep the file private: it describes your deployment. The [operator guide](operator-guide.md#configuration) explains the available settings.
+If Docker copies the file as root, restore ownership with `docker exec --user 0 rustpost chown 10001:10001 /data/settings.toml` so the web editor can continue saving it. Only restart if `check` succeeds. If it reports an error, fix the file and copy it back first. Keep the file private: it describes your deployment. The [operator guide](operator-guide.md#configuration) explains the available settings.
 
-The quick start publishes port 8080 on `127.0.0.1`, so only the host computer can connect directly. For a public site, configure HTTPS through a reverse proxy and the corresponding settings described in the [README](../README.md#making-your-site-public).
+The quick start publishes port 8080 on `127.0.0.1`, so only the host computer can connect directly. For a public site, configure HTTPS through a reverse proxy and the corresponding settings described in the [deployment guide](deployment.md).
 
 ## Backing up and restoring
 
@@ -58,9 +98,7 @@ docker cp rustpost:/data/backups/ARCHIVE_NAME.tar ./ARCHIVE_NAME.tar
 
 Tor private keys are excluded by default. Include them only when needed, and protect any archive containing them.
 
-For a browser restore, use **Admin → Backups**, follow the restore confirmation, then run `docker restart rustpost` so the app loads the restored database and settings.
-
-For a terminal restore, stop the server and use a temporary container with the same volume. First copy the backup into the volume while the original container still exists:
+Restore with the server stopped. Version 1.1.0 disables browser restore; use the offline procedure below, which also avoids replacing a live database on older releases. First copy the backup into the volume while the original container is running:
 
 ```sh
 docker cp ./ARCHIVE_NAME.tar rustpost:/data/backups/restore-input.tar
@@ -69,7 +107,7 @@ docker exec --user 0 rustpost chmod 600 /data/backups/restore-input.tar
 docker stop rustpost
 docker run --rm \
   -v rustpost-data:/data \
-  ghcr.io/csd113/rustpost:1.0.0 \
+  ghcr.io/csd113/rustpost:1.1.0 \
   restore /data/backups/restore-input.tar
 ```
 
@@ -77,25 +115,25 @@ The ownership commands let the app's non-root user read the copied archive while
 
 ## Replacing or upgrading the container
 
-Create and download a backup first, and read the target release notes. The example below recreates the container using v1.0.0; substitute the published version you intend to install when upgrading.
+Create and download a backup first, and read the target release notes. The example below recreates the container using v1.1.0; substitute the published version you intend to install when upgrading.
 
 Download the image before stopping the app:
 
 ```sh
-docker pull ghcr.io/csd113/rustpost:1.0.0
+docker pull ghcr.io/csd113/rustpost:1.1.0
 docker stop rustpost
 docker rm rustpost
 docker run -d --name rustpost \
   -p 127.0.0.1:8080:8080 \
   -v rustpost-data:/data \
   --restart unless-stopped \
-  ghcr.io/csd113/rustpost:1.0.0
+  ghcr.io/csd113/rustpost:1.1.0
 docker logs rustpost
 ```
 
 Reuse the same volume or bind mount and any custom port or network settings from your original container. You do not need to create the administrator account again. Open the site and confirm your accounts, posts, and media are still there.
 
-The `latest` tag currently points to v1.0.0. A version tag makes the release you are running explicit; restarting an existing container does not download a newer image.
+The `latest` tag can move as releases are published. A version tag makes the release you intend to run explicit; restarting an existing container does not download a newer image.
 
 ## Troubleshooting
 
@@ -104,5 +142,9 @@ The `latest` tag currently points to v1.0.0. A version tag makes the release you
 | The browser cannot reach the site | Run `docker ps -a` and `docker logs rustpost`. Confirm port 8080 is available and you are browsing on the Docker host. |
 | An existing data directory will not serve through Docker | Check that `server.host` is `0.0.0.0` inside the container's settings. |
 | Permission errors under `/data` | For bind mounts, confirm the dedicated folder is writable by UID/GID `10001`. |
-| You cannot log in as administrator | Run the interactive administrator creation command from the README if no administrator exists. See the [CLI reference](operator-guide.md#cli-reference) for password reset commands. |
+| You cannot log in as administrator | Run the interactive administrator creation command above if no administrator exists. See the [CLI reference](operator-guide.md#cli-reference) for password reset commands. |
 | Settings changes have no effect | Validate with `rustpost-cli --data-dir /data check` inside the container, then restart it. |
+
+## Admin update checks
+
+Version 1.1.0 provides a manual GitHub release check in **Admin → Software updates**. It does not replace containers. Use the [update guide](software-updates.md) and retain the persistent `/data` volume.

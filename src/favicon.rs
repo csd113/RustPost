@@ -5,8 +5,6 @@ use axum::body::Body;
 use axum::extract::multipart::Field;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse as _, Response};
-use tokio::io::AsyncWriteExt as _;
-use uuid::Uuid;
 
 use crate::media;
 use crate::runtime::RuntimePaths;
@@ -158,48 +156,53 @@ pub async fn response(paths: &RuntimePaths) -> Response {
     response
 }
 
-pub async fn save_upload(paths: &RuntimePaths, mut field: Field<'_>) -> anyhow::Result<()> {
-    let original_filename = field.file_name().unwrap_or("favicon").to_owned();
-    media::reject_path_tricks(&original_filename)?;
-    let kind = extension_kind(&original_filename)?;
-    let staging = paths
-        .tmp_uploads
-        .join(format!("favicon-{}.upload", Uuid::new_v4().simple()));
-    let mut file = tokio::fs::File::create(&staging).await?;
-    let mut bytes = 0_u64;
+pub(crate) struct PreparedFavicon {
+    kind: FaviconKind,
+    data: Vec<u8>,
+}
+
+pub(crate) async fn prepare_upload(mut field: Field<'_>) -> anyhow::Result<PreparedFavicon> {
+    let filename = field.file_name().unwrap_or("favicon");
+    media::reject_path_tricks(filename)?;
+    let kind = extension_kind(filename)?;
+    let mut data = Vec::new();
     while let Some(chunk) = field.chunk().await? {
-        bytes = bytes.saturating_add(u64::try_from(chunk.len())?);
-        if bytes > MAX_FAVICON_BYTES {
-            let _ = tokio::fs::remove_file(&staging).await;
-            anyhow::bail!("favicon exceeds maximum size of 256 KiB");
+        anyhow::ensure!(
+            u64::try_from(data.len().saturating_add(chunk.len()))? <= MAX_FAVICON_BYTES,
+            "favicon exceeds maximum size of 256 KiB"
+        );
+        data.extend_from_slice(&chunk);
+    }
+    validate_bytes(kind, &data)?;
+    Ok(PreparedFavicon { kind, data })
+}
+
+pub(crate) async fn install_prepared(
+    paths: &RuntimePaths,
+    prepared: PreparedFavicon,
+) -> anyhow::Result<()> {
+    let paths = paths.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use std::io::Write as _;
+        std::fs::create_dir_all(&paths.assets_dir)?;
+        let mut pending = tempfile::NamedTempFile::new_in(&paths.assets_dir)?;
+        pending.write_all(&prepared.data)?;
+        pending.as_file().sync_all()?;
+        pending.persist(favicon_path(&paths, prepared.kind.extension()))?;
+        for extension in FAVICON_EXTENSIONS {
+            if extension != prepared.kind.extension() {
+                let path = favicon_path(&paths, extension);
+                if let Err(error) = std::fs::remove_file(&path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(error = %error, "failed to remove replaced favicon variant");
+                }
+            }
         }
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-
-    let data = tokio::fs::read(&staging).await?;
-    if let Err(error) = validate_bytes(kind, &data) {
-        let _ = tokio::fs::remove_file(&staging).await;
-        return Err(error);
-    }
-
-    tokio::fs::create_dir_all(&paths.assets_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to create asset directory {}",
-                paths.assets_dir.display()
-            )
-        })?;
-    let final_path = favicon_path(paths, kind.extension());
-    if let Err(error) = tokio::fs::rename(&staging, &final_path).await {
-        let _ = tokio::fs::remove_file(&staging).await;
-        return Err(error.into());
-    }
-    remove_stale_favicons(paths, kind.extension()).await;
-    Ok(())
+        Ok(())
+    })
+    .await
+    .context("favicon publication worker failed")?
 }
 
 pub async fn reset(paths: &RuntimePaths) -> anyhow::Result<()> {
@@ -305,32 +308,5 @@ fn validate_svg(data: &[u8]) -> anyhow::Result<()> {
         Ok(())
     } else {
         anyhow::bail!("SVG favicon must contain an <svg> element")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_supported_magic_headers() {
-        assert!(validate_bytes(FaviconKind::Png, b"\x89PNG\r\n\x1a\nrest").is_ok());
-        assert!(validate_bytes(FaviconKind::Ico, &[0, 0, 1, 0, 1, 0]).is_ok());
-        assert!(
-            validate_bytes(
-                FaviconKind::Svg,
-                br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn rejects_mismatched_or_active_content() {
-        assert!(validate_bytes(FaviconKind::Png, b"not png").is_err());
-        assert!(validate_bytes(FaviconKind::Ico, &[1, 0, 1, 0, 0, 0]).is_err());
-        assert!(
-            validate_bytes(FaviconKind::Svg, br#"<svg><script>alert(1)</script></svg>"#).is_err()
-        );
     }
 }

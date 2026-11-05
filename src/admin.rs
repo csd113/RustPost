@@ -1,4 +1,6 @@
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::Write as _;
 use std::path::Path;
 
@@ -7,103 +9,13 @@ use rusqlite::{Row, params, params_from_iter};
 use serde::Deserialize;
 
 use crate::auth;
-use crate::config::{BackupSettings, MAX_POST_EDIT_WINDOW_SECONDS, Settings};
+use crate::config::{BackupSettings, Settings};
 use crate::db::SqlitePool;
 
-const MIB: u64 = 1024 * 1024;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeepSettingsForm {
-    pub csrf: String,
-    pub intent: Option<String>,
-    pub site_name: String,
-    pub max_text_chars: String,
-    pub post_edit_window_seconds: String,
-    pub max_images_per_post: String,
-    pub max_videos_per_post: String,
-    pub max_media_per_post: String,
-    pub allow_reposts: String,
-    pub allow_replies: String,
-    pub allow_likes: String,
-    pub allow_bookmarks: String,
-    pub allow_hashtags: String,
-    pub allow_mentions: String,
-    pub registration_enabled: String,
-    pub registration_captcha_enabled: String,
-    pub anonymous_mode_enabled: String,
-    pub min_password_length: String,
-    pub max_username_len: String,
-    pub max_display_name_len: String,
-    pub max_bio_len: String,
-    pub allow_profile_banners: String,
-    pub allow_profile_pictures: String,
-    pub nsfw_blur_enabled: String,
-    pub max_image_size_mb: String,
-    pub max_video_size_mb: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeepSettingsField {
-    SiteName,
-    MaxTextChars,
-    PostEditWindowSeconds,
-    MaxImagesPerPost,
-    MaxVideosPerPost,
-    MaxMediaPerPost,
-    AllowReposts,
-    AllowReplies,
-    AllowLikes,
-    AllowBookmarks,
-    AllowHashtags,
-    AllowMentions,
-    RegistrationEnabled,
-    RegistrationCaptchaEnabled,
-    AnonymousModeEnabled,
-    MinPasswordLength,
-    MaxUsernameLen,
-    MaxDisplayNameLen,
-    MaxBioLen,
-    AllowProfileBanners,
-    AllowProfilePictures,
-    NsfwBlurEnabled,
-    MaxImageSizeMb,
-    MaxVideoSizeMb,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeepSettingsInputKind {
-    Text,
-    Number,
-    Boolean,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeepSettingsValues {
-    pub site_name: String,
-    pub max_text_chars: usize,
-    pub post_edit_window_seconds: u64,
-    pub max_images_per_post: usize,
-    pub max_videos_per_post: usize,
-    pub max_media_per_post: usize,
-    pub allow_reposts: bool,
-    pub allow_replies: bool,
-    pub allow_likes: bool,
-    pub allow_bookmarks: bool,
-    pub allow_hashtags: bool,
-    pub allow_mentions: bool,
-    pub registration_enabled: bool,
-    pub registration_captcha_enabled: bool,
-    pub anonymous_mode_enabled: bool,
-    pub min_password_length: usize,
-    pub max_username_len: usize,
-    pub max_display_name_len: usize,
-    pub max_bio_len: usize,
-    pub allow_profile_banners: bool,
-    pub allow_profile_pictures: bool,
-    pub nsfw_blur_enabled: bool,
-    pub max_image_size_mb: u64,
-    pub max_video_size_mb: u64,
-}
+pub use crate::config::admin_fields::{
+    DeepSettingsField, DeepSettingsForm, DeepSettingsInputKind, DeepSettingsValues,
+    parse_deep_settings_form,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeepSettingsChange {
@@ -113,14 +25,22 @@ pub struct DeepSettingsChange {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupSettingsForm {
     pub csrf: String,
+    #[serde(default = "unchecked_backup")]
     pub enabled: String,
+    #[serde(default = "unchecked_backup")]
     pub automatic_enabled: String,
     pub automatic_interval_minutes: String,
     pub retention_keep_last: String,
     pub retention_max_age_days: String,
+    #[serde(default = "unchecked_backup")]
     pub automatic_include_tor_keys: String,
+}
+
+fn unchecked_backup() -> String {
+    "false".to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,336 +51,6 @@ pub struct BackupSettingsValues {
     pub retention_keep_last: usize,
     pub retention_max_age_days: u64,
     pub automatic_include_tor_keys: bool,
-}
-
-impl DeepSettingsField {
-    pub const ALL: [Self; 24] = [
-        Self::SiteName,
-        Self::MaxTextChars,
-        Self::PostEditWindowSeconds,
-        Self::MaxImagesPerPost,
-        Self::MaxVideosPerPost,
-        Self::MaxMediaPerPost,
-        Self::AllowReposts,
-        Self::AllowReplies,
-        Self::AllowLikes,
-        Self::AllowBookmarks,
-        Self::AllowHashtags,
-        Self::AllowMentions,
-        Self::RegistrationEnabled,
-        Self::RegistrationCaptchaEnabled,
-        Self::AnonymousModeEnabled,
-        Self::MinPasswordLength,
-        Self::MaxUsernameLen,
-        Self::MaxDisplayNameLen,
-        Self::MaxBioLen,
-        Self::AllowProfileBanners,
-        Self::AllowProfilePictures,
-        Self::NsfwBlurEnabled,
-        Self::MaxImageSizeMb,
-        Self::MaxVideoSizeMb,
-    ];
-
-    #[must_use]
-    pub const fn section(self) -> &'static str {
-        match self {
-            Self::SiteName => "Site",
-            Self::MaxTextChars
-            | Self::PostEditWindowSeconds
-            | Self::MaxImagesPerPost
-            | Self::MaxVideosPerPost
-            | Self::MaxMediaPerPost
-            | Self::AllowReposts
-            | Self::AllowReplies
-            | Self::AllowLikes
-            | Self::AllowBookmarks
-            | Self::AllowHashtags
-            | Self::AllowMentions => "Posts",
-            Self::RegistrationEnabled
-            | Self::RegistrationCaptchaEnabled
-            | Self::AnonymousModeEnabled
-            | Self::MinPasswordLength
-            | Self::MaxUsernameLen
-            | Self::MaxDisplayNameLen
-            | Self::MaxBioLen
-            | Self::AllowProfileBanners
-            | Self::AllowProfilePictures => "Accounts",
-            Self::NsfwBlurEnabled | Self::MaxImageSizeMb | Self::MaxVideoSizeMb => "Media",
-        }
-    }
-
-    #[must_use]
-    pub const fn toml_section(self) -> &'static str {
-        match self {
-            Self::SiteName => "site",
-            Self::MaxTextChars
-            | Self::PostEditWindowSeconds
-            | Self::MaxImagesPerPost
-            | Self::MaxVideosPerPost
-            | Self::MaxMediaPerPost
-            | Self::AllowReposts
-            | Self::AllowReplies
-            | Self::AllowLikes
-            | Self::AllowBookmarks
-            | Self::AllowHashtags
-            | Self::AllowMentions => "posts",
-            Self::RegistrationEnabled
-            | Self::RegistrationCaptchaEnabled
-            | Self::AnonymousModeEnabled
-            | Self::MinPasswordLength
-            | Self::MaxUsernameLen
-            | Self::MaxDisplayNameLen
-            | Self::MaxBioLen
-            | Self::AllowProfileBanners
-            | Self::AllowProfilePictures => "accounts",
-            Self::NsfwBlurEnabled | Self::MaxImageSizeMb | Self::MaxVideoSizeMb => "media",
-        }
-    }
-
-    #[must_use]
-    pub const fn toml_key(self) -> &'static str {
-        match self {
-            Self::SiteName => "name",
-            Self::MaxTextChars => "max_text_chars",
-            Self::PostEditWindowSeconds => "post_edit_window_seconds",
-            Self::MaxImagesPerPost => "max_images_per_post",
-            Self::MaxVideosPerPost => "max_videos_per_post",
-            Self::MaxMediaPerPost => "max_media_per_post",
-            Self::AllowReposts => "allow_reposts",
-            Self::AllowReplies => "allow_replies",
-            Self::AllowLikes => "allow_likes",
-            Self::AllowBookmarks => "allow_bookmarks",
-            Self::AllowHashtags => "allow_hashtags",
-            Self::AllowMentions => "allow_mentions",
-            Self::RegistrationEnabled => "registration_enabled",
-            Self::RegistrationCaptchaEnabled => "registration_captcha_enabled",
-            Self::AnonymousModeEnabled => "anonymous_mode_enabled",
-            Self::MinPasswordLength => "min_password_length",
-            Self::MaxUsernameLen => "max_username_len",
-            Self::MaxDisplayNameLen => "max_display_name_len",
-            Self::MaxBioLen => "max_bio_len",
-            Self::AllowProfileBanners => "allow_profile_banners",
-            Self::AllowProfilePictures => "allow_profile_pictures",
-            Self::NsfwBlurEnabled => "nsfw_blur_enabled",
-            Self::MaxImageSizeMb => "max_image_size",
-            Self::MaxVideoSizeMb => "max_video_size",
-        }
-    }
-
-    #[must_use]
-    pub const fn form_name(self) -> &'static str {
-        match self {
-            Self::SiteName => "site_name",
-            Self::MaxTextChars => "max_text_chars",
-            Self::PostEditWindowSeconds => "post_edit_window_seconds",
-            Self::MaxImagesPerPost => "max_images_per_post",
-            Self::MaxVideosPerPost => "max_videos_per_post",
-            Self::MaxMediaPerPost => "max_media_per_post",
-            Self::AllowReposts => "allow_reposts",
-            Self::AllowReplies => "allow_replies",
-            Self::AllowLikes => "allow_likes",
-            Self::AllowBookmarks => "allow_bookmarks",
-            Self::AllowHashtags => "allow_hashtags",
-            Self::AllowMentions => "allow_mentions",
-            Self::RegistrationEnabled => "registration_enabled",
-            Self::RegistrationCaptchaEnabled => "registration_captcha_enabled",
-            Self::AnonymousModeEnabled => "anonymous_mode_enabled",
-            Self::MinPasswordLength => "min_password_length",
-            Self::MaxUsernameLen => "max_username_len",
-            Self::MaxDisplayNameLen => "max_display_name_len",
-            Self::MaxBioLen => "max_bio_len",
-            Self::AllowProfileBanners => "allow_profile_banners",
-            Self::AllowProfilePictures => "allow_profile_pictures",
-            Self::NsfwBlurEnabled => "nsfw_blur_enabled",
-            Self::MaxImageSizeMb => "max_image_size_mb",
-            Self::MaxVideoSizeMb => "max_video_size_mb",
-        }
-    }
-
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::SiteName => "Site name",
-            Self::MaxTextChars => "Maximum post text length",
-            Self::PostEditWindowSeconds => "Post edit window",
-            Self::MaxImagesPerPost => "Maximum images per post",
-            Self::MaxVideosPerPost => "Maximum videos per post",
-            Self::MaxMediaPerPost => "Maximum total media per post",
-            Self::AllowReposts => "Allow reposts",
-            Self::AllowReplies => "Allow replies",
-            Self::AllowLikes => "Allow likes",
-            Self::AllowBookmarks => "Allow bookmarks",
-            Self::AllowHashtags => "Allow hashtags",
-            Self::AllowMentions => "Allow mentions",
-            Self::RegistrationEnabled => "Registration enabled",
-            Self::RegistrationCaptchaEnabled => "Registration CAPTCHA enabled",
-            Self::AnonymousModeEnabled => "Anonymous posting enabled",
-            Self::MinPasswordLength => "Minimum password length",
-            Self::MaxUsernameLen => "Maximum username length",
-            Self::MaxDisplayNameLen => "Maximum display name length",
-            Self::MaxBioLen => "Maximum bio length",
-            Self::AllowProfileBanners => "Allow profile banners",
-            Self::AllowProfilePictures => "Allow profile pictures",
-            Self::NsfwBlurEnabled => "Blur NSFW media",
-            Self::MaxImageSizeMb => "Maximum image size",
-            Self::MaxVideoSizeMb => "Maximum video size",
-        }
-    }
-
-    #[must_use]
-    pub const fn helper(self) -> Option<&'static str> {
-        match self {
-            Self::SiteName => Some("Shown in page titles, the header, and the footer."),
-            Self::MaxTextChars
-            | Self::MaxUsernameLen
-            | Self::MaxDisplayNameLen
-            | Self::MaxBioLen => Some("Characters."),
-            Self::PostEditWindowSeconds => {
-                Some("Seconds. Default is 15; valid range is 0 to 300. Set 0 to disable.")
-            }
-            Self::MaxImagesPerPost | Self::MaxVideosPerPost | Self::MaxMediaPerPost => {
-                Some("Attachments per post.")
-            }
-            Self::MinPasswordLength => Some("Characters. Recommended default is 10."),
-            Self::RegistrationCaptchaEnabled => Some("Requires a CAPTCHA on registration only."),
-            Self::NsfwBlurEnabled => Some(
-                "When true, flagged media is blurred unless a user disables their own blur setting.",
-            ),
-            Self::MaxImageSizeMb | Self::MaxVideoSizeMb => Some("MB."),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn input_kind(self) -> DeepSettingsInputKind {
-        match self {
-            Self::SiteName => DeepSettingsInputKind::Text,
-            Self::AllowReposts
-            | Self::AllowReplies
-            | Self::AllowLikes
-            | Self::AllowBookmarks
-            | Self::AllowHashtags
-            | Self::AllowMentions
-            | Self::RegistrationEnabled
-            | Self::RegistrationCaptchaEnabled
-            | Self::AnonymousModeEnabled
-            | Self::AllowProfileBanners
-            | Self::AllowProfilePictures
-            | Self::NsfwBlurEnabled => DeepSettingsInputKind::Boolean,
-            _ => DeepSettingsInputKind::Number,
-        }
-    }
-}
-
-impl DeepSettingsValues {
-    #[must_use]
-    pub fn from_settings(settings: &Settings) -> Self {
-        Self {
-            site_name: settings.site.name.clone(),
-            max_text_chars: settings.posts.max_text_chars,
-            post_edit_window_seconds: settings.posts.post_edit_window_seconds,
-            max_images_per_post: settings.posts.max_images_per_post,
-            max_videos_per_post: settings.posts.max_videos_per_post,
-            max_media_per_post: settings.posts.max_media_per_post,
-            allow_reposts: settings.posts.allow_reposts,
-            allow_replies: settings.posts.allow_replies,
-            allow_likes: settings.posts.allow_likes,
-            allow_bookmarks: settings.posts.allow_bookmarks,
-            allow_hashtags: settings.posts.allow_hashtags,
-            allow_mentions: settings.posts.allow_mentions,
-            registration_enabled: settings.accounts.registration_enabled,
-            registration_captcha_enabled: settings.accounts.registration_captcha_enabled,
-            anonymous_mode_enabled: settings.accounts.anonymous_mode_enabled,
-            min_password_length: settings.accounts.min_password_length,
-            max_username_len: settings.accounts.max_username_len,
-            max_display_name_len: settings.accounts.max_display_name_len,
-            max_bio_len: settings.accounts.max_bio_len,
-            allow_profile_banners: settings.accounts.allow_profile_banners,
-            allow_profile_pictures: settings.accounts.allow_profile_pictures,
-            nsfw_blur_enabled: settings.media.nsfw_blur_enabled,
-            max_image_size_mb: bytes_to_mb(settings.media.max_image_size),
-            max_video_size_mb: bytes_to_mb(settings.media.max_video_size),
-        }
-    }
-
-    #[must_use]
-    pub fn form_value(&self, field: DeepSettingsField) -> String {
-        match field {
-            DeepSettingsField::SiteName => self.site_name.clone(),
-            DeepSettingsField::MaxTextChars => self.max_text_chars.to_string(),
-            DeepSettingsField::PostEditWindowSeconds => self.post_edit_window_seconds.to_string(),
-            DeepSettingsField::MaxImagesPerPost => self.max_images_per_post.to_string(),
-            DeepSettingsField::MaxVideosPerPost => self.max_videos_per_post.to_string(),
-            DeepSettingsField::MaxMediaPerPost => self.max_media_per_post.to_string(),
-            DeepSettingsField::AllowReposts => self.allow_reposts.to_string(),
-            DeepSettingsField::AllowReplies => self.allow_replies.to_string(),
-            DeepSettingsField::AllowLikes => self.allow_likes.to_string(),
-            DeepSettingsField::AllowBookmarks => self.allow_bookmarks.to_string(),
-            DeepSettingsField::AllowHashtags => self.allow_hashtags.to_string(),
-            DeepSettingsField::AllowMentions => self.allow_mentions.to_string(),
-            DeepSettingsField::RegistrationEnabled => self.registration_enabled.to_string(),
-            DeepSettingsField::RegistrationCaptchaEnabled => {
-                self.registration_captcha_enabled.to_string()
-            }
-            DeepSettingsField::AnonymousModeEnabled => self.anonymous_mode_enabled.to_string(),
-            DeepSettingsField::MinPasswordLength => self.min_password_length.to_string(),
-            DeepSettingsField::MaxUsernameLen => self.max_username_len.to_string(),
-            DeepSettingsField::MaxDisplayNameLen => self.max_display_name_len.to_string(),
-            DeepSettingsField::MaxBioLen => self.max_bio_len.to_string(),
-            DeepSettingsField::AllowProfileBanners => self.allow_profile_banners.to_string(),
-            DeepSettingsField::AllowProfilePictures => self.allow_profile_pictures.to_string(),
-            DeepSettingsField::NsfwBlurEnabled => self.nsfw_blur_enabled.to_string(),
-            DeepSettingsField::MaxImageSizeMb => self.max_image_size_mb.to_string(),
-            DeepSettingsField::MaxVideoSizeMb => self.max_video_size_mb.to_string(),
-        }
-    }
-
-    #[must_use]
-    pub fn display_value(&self, field: DeepSettingsField) -> String {
-        let value = self.form_value(field);
-        match field {
-            DeepSettingsField::MaxTextChars
-            | DeepSettingsField::MinPasswordLength
-            | DeepSettingsField::MaxUsernameLen
-            | DeepSettingsField::MaxDisplayNameLen
-            | DeepSettingsField::MaxBioLen => format!("{value} characters"),
-            DeepSettingsField::PostEditWindowSeconds => format!("{value} seconds"),
-            DeepSettingsField::MaxImageSizeMb | DeepSettingsField::MaxVideoSizeMb => {
-                format!("{value} MB")
-            }
-            _ => value,
-        }
-    }
-
-    #[must_use]
-    pub fn apply_to(&self, current: &Settings) -> Settings {
-        let mut updated = current.clone();
-        updated.site.name.clone_from(&self.site_name);
-        updated.posts.max_text_chars = self.max_text_chars;
-        updated.posts.post_edit_window_seconds = self.post_edit_window_seconds;
-        updated.posts.max_images_per_post = self.max_images_per_post;
-        updated.posts.max_videos_per_post = self.max_videos_per_post;
-        updated.posts.max_media_per_post = self.max_media_per_post;
-        updated.posts.allow_reposts = self.allow_reposts;
-        updated.posts.allow_replies = self.allow_replies;
-        updated.posts.allow_likes = self.allow_likes;
-        updated.posts.allow_bookmarks = self.allow_bookmarks;
-        updated.posts.allow_hashtags = self.allow_hashtags;
-        updated.posts.allow_mentions = self.allow_mentions;
-        updated.accounts.registration_enabled = self.registration_enabled;
-        updated.accounts.registration_captcha_enabled = self.registration_captcha_enabled;
-        updated.accounts.anonymous_mode_enabled = self.anonymous_mode_enabled;
-        updated.accounts.min_password_length = self.min_password_length;
-        updated.accounts.max_username_len = self.max_username_len;
-        updated.accounts.max_display_name_len = self.max_display_name_len;
-        updated.accounts.max_bio_len = self.max_bio_len;
-        updated.accounts.allow_profile_banners = self.allow_profile_banners;
-        updated.accounts.allow_profile_pictures = self.allow_profile_pictures;
-        updated.media.nsfw_blur_enabled = self.nsfw_blur_enabled;
-        updated.media.max_image_size = self.max_image_size_mb * MIB;
-        updated.media.max_video_size = self.max_video_size_mb * MIB;
-        updated
-    }
 }
 
 impl BackupSettingsValues {
@@ -496,89 +86,25 @@ pub fn parse_backup_settings_form(
     form: &BackupSettingsForm,
     current: &Settings,
 ) -> anyhow::Result<BackupSettingsValues> {
-    let values = BackupSettingsValues {
-        enabled: parse_named_bool(&form.enabled, "Backups enabled")?,
-        automatic_enabled: parse_named_bool(&form.automatic_enabled, "Automatic backups enabled")?,
-        automatic_interval_minutes: parse_named_u64(
-            &form.automatic_interval_minutes,
-            "Automatic backup interval",
-        )?,
-        retention_keep_last: parse_named_usize(&form.retention_keep_last, "Backups to keep")?,
-        retention_max_age_days: parse_named_u64(
-            &form.retention_max_age_days,
-            "Maximum automatic backup age",
-        )?,
-        automatic_include_tor_keys: parse_named_bool(
-            &form.automatic_include_tor_keys,
-            "Automatic Tor key backup",
-        )?,
-    };
-    values.apply_to(current).validate()?;
-    Ok(values)
-}
-
-pub fn parse_deep_settings_form(
-    form: &DeepSettingsForm,
-    current: &Settings,
-) -> anyhow::Result<DeepSettingsValues> {
-    let values = DeepSettingsValues {
-        site_name: form.site_name.clone(),
-        max_text_chars: parse_usize(&form.max_text_chars, DeepSettingsField::MaxTextChars)?,
-        post_edit_window_seconds: parse_post_edit_window_seconds(&form.post_edit_window_seconds)?,
-        max_images_per_post: parse_usize(
-            &form.max_images_per_post,
-            DeepSettingsField::MaxImagesPerPost,
-        )?,
-        max_videos_per_post: parse_usize(
-            &form.max_videos_per_post,
-            DeepSettingsField::MaxVideosPerPost,
-        )?,
-        max_media_per_post: parse_usize(
-            &form.max_media_per_post,
-            DeepSettingsField::MaxMediaPerPost,
-        )?,
-        allow_reposts: parse_bool(&form.allow_reposts, DeepSettingsField::AllowReposts)?,
-        allow_replies: parse_bool(&form.allow_replies, DeepSettingsField::AllowReplies)?,
-        allow_likes: parse_bool(&form.allow_likes, DeepSettingsField::AllowLikes)?,
-        allow_bookmarks: parse_bool(&form.allow_bookmarks, DeepSettingsField::AllowBookmarks)?,
-        allow_hashtags: parse_bool(&form.allow_hashtags, DeepSettingsField::AllowHashtags)?,
-        allow_mentions: parse_bool(&form.allow_mentions, DeepSettingsField::AllowMentions)?,
-        registration_enabled: parse_bool(
-            &form.registration_enabled,
-            DeepSettingsField::RegistrationEnabled,
-        )?,
-        registration_captcha_enabled: parse_bool(
-            &form.registration_captcha_enabled,
-            DeepSettingsField::RegistrationCaptchaEnabled,
-        )?,
-        anonymous_mode_enabled: parse_bool(
-            &form.anonymous_mode_enabled,
-            DeepSettingsField::AnonymousModeEnabled,
-        )?,
-        min_password_length: parse_usize(
-            &form.min_password_length,
-            DeepSettingsField::MinPasswordLength,
-        )?,
-        max_username_len: parse_usize(&form.max_username_len, DeepSettingsField::MaxUsernameLen)?,
-        max_display_name_len: parse_usize(
-            &form.max_display_name_len,
-            DeepSettingsField::MaxDisplayNameLen,
-        )?,
-        max_bio_len: parse_usize(&form.max_bio_len, DeepSettingsField::MaxBioLen)?,
-        allow_profile_banners: parse_bool(
-            &form.allow_profile_banners,
-            DeepSettingsField::AllowProfileBanners,
-        )?,
-        allow_profile_pictures: parse_bool(
-            &form.allow_profile_pictures,
-            DeepSettingsField::AllowProfilePictures,
-        )?,
-        nsfw_blur_enabled: parse_bool(&form.nsfw_blur_enabled, DeepSettingsField::NsfwBlurEnabled)?,
-        max_image_size_mb: parse_mb(&form.max_image_size_mb, DeepSettingsField::MaxImageSizeMb)?,
-        max_video_size_mb: parse_mb(&form.max_video_size_mb, DeepSettingsField::MaxVideoSizeMb)?,
-    };
-    values.apply_to(current).validate()?;
-    Ok(values)
+    let mut shared = DeepSettingsForm::from_settings(current);
+    shared.backup_enabled.clone_from(&form.enabled);
+    shared.automatic_enabled.clone_from(&form.automatic_enabled);
+    shared
+        .automatic_interval_minutes
+        .clone_from(&form.automatic_interval_minutes);
+    shared
+        .retention_keep_last
+        .clone_from(&form.retention_keep_last);
+    shared
+        .retention_max_age_days
+        .clone_from(&form.retention_max_age_days);
+    shared
+        .automatic_include_tor_keys
+        .clone_from(&form.automatic_include_tor_keys);
+    let values = parse_deep_settings_form(&shared, current)?;
+    Ok(BackupSettingsValues::from_settings(
+        &values.apply_to(current),
+    ))
 }
 
 #[must_use]
@@ -603,7 +129,7 @@ pub fn write_deep_settings(path: &Path, updated: &Settings) -> anyhow::Result<()
     updated.validate()?;
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read settings file {}", path.display()))?;
-    let rewritten = rewrite_deep_settings_toml(&raw, updated);
+    let rewritten = rewrite_settings_toml(&raw, updated, DeepSettingsField::ALL.into_iter())?;
     let parsed: Settings = toml::from_str(&rewritten)
         .with_context(|| "rewritten settings.toml did not parse as settings")?;
     parsed.validate()?;
@@ -614,363 +140,147 @@ pub fn write_backup_settings(path: &Path, updated: &Settings) -> anyhow::Result<
     updated.validate()?;
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read settings file {}", path.display()))?;
-    let rewritten = rewrite_backup_settings_toml(&raw, &updated.backup);
+    let rewritten = rewrite_settings_toml(
+        &raw,
+        updated,
+        DeepSettingsField::ALL
+            .into_iter()
+            .filter(|field| field.toml_section() == "backup"),
+    )?;
     let parsed: Settings = toml::from_str(&rewritten)
         .with_context(|| "rewritten settings.toml did not parse as settings")?;
     parsed.validate()?;
     write_atomic(path, rewritten.as_bytes())
 }
 
-fn parse_bool(value: &str, field: DeepSettingsField) -> anyhow::Result<bool> {
-    match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => anyhow::bail!("{} must be true or false", field.label()),
-    }
+type SpannedFields = std::collections::BTreeMap<String, toml::Spanned<toml::Value>>;
+
+// Deserialize only known tables so unrelated scalar or nested extension values
+// do not constrain the writer. Unknown data stays untouched in the raw TOML.
+#[derive(Deserialize)]
+struct ConfigurationSpans {
+    site: Option<toml::Spanned<SpannedFields>>,
+    server: Option<toml::Spanned<SpannedFields>>,
+    accounts: Option<toml::Spanned<SpannedFields>>,
+    posts: Option<toml::Spanned<SpannedFields>>,
+    media: Option<toml::Spanned<SpannedFields>>,
+    tor: Option<toml::Spanned<SpannedFields>>,
+    moderation: Option<toml::Spanned<SpannedFields>>,
+    admin: Option<toml::Spanned<SpannedFields>>,
+    backup: Option<toml::Spanned<SpannedFields>>,
 }
-
-fn parse_usize(value: &str, field: DeepSettingsField) -> anyhow::Result<usize> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("{} is required", field.label());
-    }
-    if trimmed.starts_with('-') {
-        anyhow::bail!("{} must not be negative", field.label());
-    }
-    trimmed
-        .parse::<usize>()
-        .with_context(|| format!("{} must be a whole number", field.label()))
-}
-
-fn parse_post_edit_window_seconds(value: &str) -> anyhow::Result<u64> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("Post edit window is required");
-    }
-    if trimmed.starts_with('-') {
-        anyhow::bail!("Post edit window must not be negative");
-    }
-    let seconds = trimmed
-        .parse::<u64>()
-        .with_context(|| "Post edit window must be a whole number of seconds")?;
-    if seconds > MAX_POST_EDIT_WINDOW_SECONDS {
-        anyhow::bail!("Post edit window must be {MAX_POST_EDIT_WINDOW_SECONDS} seconds or less");
-    }
-    Ok(seconds)
-}
-
-fn parse_mb(value: &str, field: DeepSettingsField) -> anyhow::Result<u64> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("{} is required and must be entered in MB", field.label());
-    }
-    if trimmed.starts_with('-') {
-        anyhow::bail!("{} must not be negative", field.label());
-    }
-    let mb = trimmed
-        .parse::<u64>()
-        .with_context(|| format!("{} must be a whole number of MB", field.label()))?;
-    mb.checked_mul(MIB)
-        .with_context(|| format!("{} is too large to convert from MB", field.label()))?;
-    Ok(mb)
-}
-
-fn parse_named_bool(value: &str, label: &str) -> anyhow::Result<bool> {
-    match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => anyhow::bail!("{label} must be true or false"),
-    }
-}
-
-fn parse_named_u64(value: &str, label: &str) -> anyhow::Result<u64> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("{label} is required");
-    }
-    if trimmed.starts_with('-') {
-        anyhow::bail!("{label} must not be negative");
-    }
-    trimmed
-        .parse::<u64>()
-        .with_context(|| format!("{label} must be a whole number"))
-}
-
-fn parse_named_usize(value: &str, label: &str) -> anyhow::Result<usize> {
-    let parsed = parse_named_u64(value, label)?;
-    usize::try_from(parsed).with_context(|| format!("{label} is too large"))
-}
-
-fn bytes_to_mb(bytes: u64) -> u64 {
-    bytes / MIB
-}
-
-fn rewrite_deep_settings_toml(raw: &str, settings: &Settings) -> String {
-    let mut output = Vec::new();
-    let mut current_section: Option<&str> = None;
-    let mut found = vec![false; DeepSettingsField::ALL.len()];
-    let mut section_seen = Vec::new();
-
-    for line in raw.lines() {
-        if let Some(section) = parse_section_header(line) {
-            append_missing_for_section(&mut output, current_section, &mut found, settings);
-            if DeepSettingsField::ALL
-                .iter()
-                .any(|field| field.toml_section() == section)
-            {
-                section_seen.push(section.to_owned());
-            }
-            current_section = Some(section);
-            output.push(line.to_owned());
-            continue;
-        }
-
-        if let Some(section) = current_section
-            && let Some((index, field)) =
-                DeepSettingsField::ALL
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .find(|(_, field)| {
-                        field.toml_section() == section && line_assigns_key(line, field.toml_key())
-                    })
-        {
-            found[index] = true;
-            output.push(format!(
-                "{}{} = {}",
-                leading_whitespace(line),
-                field.toml_key(),
-                toml_value(field, settings)
-            ));
-            continue;
-        }
-
-        output.push(line.to_owned());
-    }
-
-    append_missing_for_section(&mut output, current_section, &mut found, settings);
-    for section in ["site", "posts", "accounts", "media"] {
-        if !section_seen.iter().any(|seen| seen == section) {
-            output.push(String::new());
-            output.push(format!("[{section}]"));
-            append_missing_for_section(&mut output, Some(section), &mut found, settings);
-        }
-    }
-
-    let mut rewritten = output.join("\n");
-    if raw.ends_with('\n') {
-        rewritten.push('\n');
-    }
-    rewritten
-}
-
-fn rewrite_backup_settings_toml(raw: &str, settings: &BackupSettings) -> String {
-    let mut output = Vec::new();
-    let mut current_section: Option<&str> = None;
-    let mut found = vec![false; BACKUP_SETTING_KEYS.len()];
-    let mut backup_section_seen = false;
-
-    for line in raw.lines() {
-        if let Some(section) = parse_section_header(line) {
-            append_missing_backup_settings(&mut output, current_section, &mut found, settings);
-            if section == "backup" {
-                backup_section_seen = true;
-            }
-            current_section = Some(section);
-            output.push(line.to_owned());
-            continue;
-        }
-
-        if current_section == Some("backup")
-            && let Some((index, key)) = BACKUP_SETTING_KEYS
-                .iter()
-                .copied()
-                .enumerate()
-                .find(|(_, key)| line_assigns_key(line, key))
-        {
-            found[index] = true;
-            output.push(format!(
-                "{}{} = {}",
-                leading_whitespace(line),
-                key,
-                backup_toml_value(key, settings)
-            ));
-            continue;
-        }
-
-        output.push(line.to_owned());
-    }
-
-    append_missing_backup_settings(&mut output, current_section, &mut found, settings);
-    if !backup_section_seen {
-        output.push(String::new());
-        output.push("[backup]".to_owned());
-        append_missing_backup_settings(&mut output, Some("backup"), &mut found, settings);
-    }
-
-    let mut rewritten = output.join("\n");
-    if raw.ends_with('\n') {
-        rewritten.push('\n');
-    }
-    rewritten
-}
-
-const BACKUP_SETTING_KEYS: [&str; 6] = [
-    "enabled",
-    "automatic_enabled",
-    "automatic_interval_minutes",
-    "retention_keep_last",
-    "retention_max_age_days",
-    "automatic_include_tor_keys",
-];
-
-fn append_missing_backup_settings(
-    output: &mut Vec<String>,
-    section: Option<&str>,
-    found: &mut [bool],
-    settings: &BackupSettings,
-) {
-    if section != Some("backup") {
-        return;
-    }
-    for (index, key) in BACKUP_SETTING_KEYS.iter().copied().enumerate() {
-        if !found[index] {
-            found[index] = true;
-            output.push(format!("{key} = {}", backup_toml_value(key, settings)));
+impl ConfigurationSpans {
+    fn get(&self, section: &str) -> Option<&toml::Spanned<SpannedFields>> {
+        match section {
+            "site" => self.site.as_ref(),
+            "server" => self.server.as_ref(),
+            "accounts" => self.accounts.as_ref(),
+            "posts" => self.posts.as_ref(),
+            "media" => self.media.as_ref(),
+            "tor" => self.tor.as_ref(),
+            "moderation" => self.moderation.as_ref(),
+            "admin" => self.admin.as_ref(),
+            "backup" => self.backup.as_ref(),
+            _ => None,
         }
     }
 }
 
-fn backup_toml_value(key: &str, settings: &BackupSettings) -> String {
-    match key {
-        "enabled" => settings.enabled.to_string(),
-        "automatic_enabled" => settings.automatic_enabled.to_string(),
-        "automatic_interval_minutes" => settings.automatic_interval_minutes.to_string(),
-        "retention_keep_last" => settings.retention_keep_last.to_string(),
-        "retention_max_age_days" => settings.retention_max_age_days.to_string(),
-        "automatic_include_tor_keys" => settings.automatic_include_tor_keys.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn append_missing_for_section(
-    output: &mut Vec<String>,
-    section: Option<&str>,
-    found: &mut [bool],
+/// Replace only typed, approved settings. TOML value spans handle multiline
+/// strings/arrays, quoted keys and inline tables without touching adjacent text.
+fn rewrite_settings_toml(
+    raw: &str,
     settings: &Settings,
-) {
-    let Some(section) = section else {
-        return;
-    };
-    for (index, field) in DeepSettingsField::ALL.iter().copied().enumerate() {
-        if field.toml_section() == section && !found[index] {
-            found[index] = true;
-            output.push(format!(
-                "{} = {}",
-                field.toml_key(),
-                toml_value(field, settings)
+    fields: impl Iterator<Item = DeepSettingsField>,
+) -> anyhow::Result<String> {
+    use std::collections::BTreeMap;
+    let spans: ConfigurationSpans = toml::from_str(raw)?;
+    let raw_values: toml::Value = toml::from_str(raw)?;
+    let fields = fields.collect::<Vec<_>>();
+    let mut inline_sections = std::collections::BTreeSet::new();
+    let before: Settings = toml::from_str(raw)?;
+    let before_values = toml::Value::try_from(&before)?;
+    let after_values = toml::Value::try_from(settings)?;
+    let mut edits = Vec::new();
+    let mut missing: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for field in &fields {
+        let section = field.toml_section();
+        let key = field.toml_key();
+        let value = &after_values[section][key];
+        if value == &before_values[section][key] {
+            continue;
+        }
+        if let Some(table) = spans.get(section)
+            && raw[table.span()].trim_start().starts_with('{')
+        {
+            if inline_sections.insert(section) {
+                let mut replacement = raw_values[section].clone();
+                for field in &fields {
+                    if field.toml_section() == section {
+                        replacement[field.toml_key()] =
+                            after_values[section][field.toml_key()].clone();
+                    }
+                }
+                edits.push((table.span(), replacement.to_string()));
+            }
+            continue;
+        }
+        if let Some(existing) = spans
+            .get(section)
+            .and_then(|table| table.get_ref().get(key))
+        {
+            edits.push((existing.span(), value.to_string()));
+        } else {
+            missing
+                .entry(section)
+                .or_default()
+                .push(format!("{key} = {value}\n"));
+        }
+    }
+    for (section, lines) in missing {
+        if let Some(table) = spans.get(section) {
+            let end = table.span().end;
+            // Missing fields can only be inserted in a normal table. Refuse
+            // unsupported shapes instead of silently producing corrupt TOML.
+            if raw[..end].trim_end().ends_with('}') {
+                anyhow::bail!(
+                    "Missing setting in inline {section} table; expand the table before editing"
+                );
+            }
+            edits.push((end..end, format!("\n{}", lines.join(""))));
+        } else {
+            edits.push((
+                raw.len()..raw.len(),
+                format!("\n[{section}]\n{}", lines.join("")),
             ));
         }
     }
-}
-
-fn parse_section_header(line: &str) -> Option<&str> {
-    let trimmed = line.trim();
-    trimmed.strip_prefix('[')?.strip_suffix(']')
-}
-
-fn line_assigns_key(line: &str, key: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return false;
+    edits.sort_by_key(|(left, _)| std::cmp::Reverse(left.start));
+    let mut rewritten = raw.to_owned();
+    for (span, value) in edits {
+        rewritten.replace_range(span, &value);
     }
-    let Some(rest) = trimmed.strip_prefix(key) else {
-        return false;
-    };
-    rest.trim_start().starts_with('=')
-}
-
-fn leading_whitespace(line: &str) -> &str {
-    let end = line
-        .char_indices()
-        .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
-        .unwrap_or(line.len());
-    &line[..end]
-}
-
-fn toml_value(field: DeepSettingsField, settings: &Settings) -> String {
-    match field {
-        DeepSettingsField::SiteName => toml::Value::String(settings.site.name.clone()).to_string(),
-        DeepSettingsField::MaxTextChars => settings.posts.max_text_chars.to_string(),
-        DeepSettingsField::PostEditWindowSeconds => {
-            settings.posts.post_edit_window_seconds.to_string()
-        }
-        DeepSettingsField::MaxImagesPerPost => settings.posts.max_images_per_post.to_string(),
-        DeepSettingsField::MaxVideosPerPost => settings.posts.max_videos_per_post.to_string(),
-        DeepSettingsField::MaxMediaPerPost => settings.posts.max_media_per_post.to_string(),
-        DeepSettingsField::AllowReposts => settings.posts.allow_reposts.to_string(),
-        DeepSettingsField::AllowReplies => settings.posts.allow_replies.to_string(),
-        DeepSettingsField::AllowLikes => settings.posts.allow_likes.to_string(),
-        DeepSettingsField::AllowBookmarks => settings.posts.allow_bookmarks.to_string(),
-        DeepSettingsField::AllowHashtags => settings.posts.allow_hashtags.to_string(),
-        DeepSettingsField::AllowMentions => settings.posts.allow_mentions.to_string(),
-        DeepSettingsField::RegistrationEnabled => {
-            settings.accounts.registration_enabled.to_string()
-        }
-        DeepSettingsField::RegistrationCaptchaEnabled => {
-            settings.accounts.registration_captcha_enabled.to_string()
-        }
-        DeepSettingsField::AnonymousModeEnabled => {
-            settings.accounts.anonymous_mode_enabled.to_string()
-        }
-        DeepSettingsField::MinPasswordLength => settings.accounts.min_password_length.to_string(),
-        DeepSettingsField::MaxUsernameLen => settings.accounts.max_username_len.to_string(),
-        DeepSettingsField::MaxDisplayNameLen => settings.accounts.max_display_name_len.to_string(),
-        DeepSettingsField::MaxBioLen => settings.accounts.max_bio_len.to_string(),
-        DeepSettingsField::AllowProfileBanners => {
-            settings.accounts.allow_profile_banners.to_string()
-        }
-        DeepSettingsField::AllowProfilePictures => {
-            settings.accounts.allow_profile_pictures.to_string()
-        }
-        DeepSettingsField::NsfwBlurEnabled => settings.media.nsfw_blur_enabled.to_string(),
-        DeepSettingsField::MaxImageSizeMb => settings.media.max_image_size.to_string(),
-        DeepSettingsField::MaxVideoSizeMb => settings.media.max_video_size.to_string(),
-    }
+    let parsed: Settings =
+        toml::from_str(&rewritten).context("Updated TOML could not be parsed")?;
+    parsed.validate()?;
+    Ok(rewritten)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("settings path must have a valid file name")?;
-    let tmp_path = parent.join(format!(".{file_name}.tmp"));
-    {
-        let mut tmp = File::create(&tmp_path).with_context(|| {
-            format!(
-                "failed to create temporary settings file {}",
-                tmp_path.display()
-            )
-        })?;
-        tmp.write_all(bytes).with_context(|| {
-            format!(
-                "failed to write temporary settings file {}",
-                tmp_path.display()
-            )
-        })?;
-        tmp.sync_all().with_context(|| {
-            format!(
-                "failed to sync temporary settings file {}",
-                tmp_path.display()
-            )
-        })?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("Settings must be a regular file, not a symbolic link");
     }
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("failed to replace settings file {}", path.display()))?;
-    if let Ok(parent_dir) = File::open(parent) {
-        let _sync_result = parent_dir.sync_all();
-    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary
+        .as_file()
+        .set_permissions(metadata.permissions())?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -1499,329 +809,4 @@ pub async fn media_jobs_report(pool: &SqlitePool) -> anyhow::Result<MediaJobsRep
         })
     })
     .await
-}
-
-#[cfg(test)]
-mod tests {
-    use tempfile::tempdir;
-
-    use super::*;
-
-    async fn test_pool() -> (tempfile::TempDir, SqlitePool, Settings) {
-        let temp = tempdir().expect("temp dir");
-        let pool = crate::db::connect(&temp.path().join("test.sqlite3"))
-            .await
-            .expect("connect");
-        crate::db::migrate(&pool).await.expect("migrate");
-        (temp, pool, Settings::default())
-    }
-
-    async fn register(pool: &SqlitePool, settings: &Settings, username: &str) -> i64 {
-        auth::register_user(pool, settings, username, "very secure password", false)
-            .await
-            .expect("register user")
-    }
-
-    async fn create_post(pool: &SqlitePool, settings: &Settings, user_id: i64, text: &str) -> i64 {
-        crate::social::create_post(pool, settings, Some(user_id), text, None, &[])
-            .await
-            .expect("create post")
-    }
-
-    fn usernames(rows: &[AdminUserInvestigation]) -> Vec<&str> {
-        rows.iter().map(|row| row.username.as_str()).collect()
-    }
-
-    fn form_from_settings(settings: &Settings) -> DeepSettingsForm {
-        let values = DeepSettingsValues::from_settings(settings);
-        DeepSettingsForm {
-            csrf: "csrf".to_owned(),
-            intent: Some("preview".to_owned()),
-            site_name: values.site_name,
-            max_text_chars: values.max_text_chars.to_string(),
-            post_edit_window_seconds: values.post_edit_window_seconds.to_string(),
-            max_images_per_post: values.max_images_per_post.to_string(),
-            max_videos_per_post: values.max_videos_per_post.to_string(),
-            max_media_per_post: values.max_media_per_post.to_string(),
-            allow_reposts: values.allow_reposts.to_string(),
-            allow_replies: values.allow_replies.to_string(),
-            allow_likes: values.allow_likes.to_string(),
-            allow_bookmarks: values.allow_bookmarks.to_string(),
-            allow_hashtags: values.allow_hashtags.to_string(),
-            allow_mentions: values.allow_mentions.to_string(),
-            registration_enabled: values.registration_enabled.to_string(),
-            registration_captcha_enabled: values.registration_captcha_enabled.to_string(),
-            anonymous_mode_enabled: values.anonymous_mode_enabled.to_string(),
-            min_password_length: values.min_password_length.to_string(),
-            max_username_len: values.max_username_len.to_string(),
-            max_display_name_len: values.max_display_name_len.to_string(),
-            max_bio_len: values.max_bio_len.to_string(),
-            allow_profile_banners: values.allow_profile_banners.to_string(),
-            allow_profile_pictures: values.allow_profile_pictures.to_string(),
-            nsfw_blur_enabled: values.nsfw_blur_enabled.to_string(),
-            max_image_size_mb: values.max_image_size_mb.to_string(),
-            max_video_size_mb: values.max_video_size_mb.to_string(),
-        }
-    }
-
-    #[test]
-    fn admin_post_search_parses_keywords_quotes_and_malformed_quotes() {
-        assert_eq!(
-            parse_admin_post_search("rust admin"),
-            ParsedAdminPostSearch {
-                mode: Some(AdminPostSearchMode::Keywords(vec![
-                    "rust".to_owned(),
-                    "admin".to_owned()
-                ])),
-                malformed_quotes: false,
-            }
-        );
-        assert_eq!(
-            parse_admin_post_search(r#""hello world""#),
-            ParsedAdminPostSearch {
-                mode: Some(AdminPostSearchMode::ExactPhrase("hello world".to_owned())),
-                malformed_quotes: false,
-            }
-        );
-        assert_eq!(
-            parse_admin_post_search(r#""hello world"#),
-            ParsedAdminPostSearch {
-                mode: Some(AdminPostSearchMode::Keywords(vec![
-                    "hello".to_owned(),
-                    "world".to_owned()
-                ])),
-                malformed_quotes: true,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn admin_username_search_matches_username_handle_and_display_name() {
-        let (_temp, pool, settings) = test_pool().await;
-        let alice = register(&pool, &settings, "alice").await;
-        register(&pool, &settings, "bob").await;
-        pool.call(move |conn| {
-            conn.execute(
-                "UPDATE users SET display_name = 'Ada Admin' WHERE id = ?",
-                [alice],
-            )?;
-            Ok(())
-        })
-        .await
-        .expect("display name");
-
-        let by_handle = users(&pool, AdminUserSearch::new("@ali", ""))
-            .await
-            .expect("search by handle");
-        let by_display = users(&pool, AdminUserSearch::new("ada", ""))
-            .await
-            .expect("search by display");
-
-        assert_eq!(usernames(&by_handle), vec!["alice"]);
-        assert!(by_handle[0].matched_name);
-        assert_eq!(usernames(&by_display), vec!["alice"]);
-    }
-
-    #[tokio::test]
-    async fn admin_plain_post_keyword_search_matches_accounts_with_all_terms() {
-        let (_temp, pool, settings) = test_pool().await;
-        let alice = register(&pool, &settings, "alice").await;
-        let bob = register(&pool, &settings, "bob").await;
-        create_post(&pool, &settings, alice, "Rust admin investigation notes").await;
-        create_post(&pool, &settings, bob, "Rust release notes").await;
-
-        let rows = users(&pool, AdminUserSearch::new("", "rust investigation"))
-            .await
-            .expect("post search");
-
-        assert_eq!(usernames(&rows), vec!["alice"]);
-        assert_eq!(rows[0].matching_post_count, 1);
-        assert_eq!(
-            rows[0].post_match_preview.as_deref(),
-            Some("Rust admin investigation notes")
-        );
-    }
-
-    #[tokio::test]
-    async fn admin_quoted_post_search_matches_exact_substring_phrase() {
-        let (_temp, pool, settings) = test_pool().await;
-        let alice = register(&pool, &settings, "alice").await;
-        let bob = register(&pool, &settings, "bob").await;
-        create_post(&pool, &settings, alice, "hello world from alice").await;
-        create_post(&pool, &settings, bob, "hello careful world from bob").await;
-
-        let rows = users(&pool, AdminUserSearch::new("", r#""hello world""#))
-            .await
-            .expect("phrase search");
-
-        assert_eq!(usernames(&rows), vec!["alice"]);
-    }
-
-    #[tokio::test]
-    async fn admin_post_search_escapes_like_special_characters() {
-        let (_temp, pool, settings) = test_pool().await;
-        let alice = register(&pool, &settings, "alice").await;
-        let bob = register(&pool, &settings, "bob").await;
-        create_post(&pool, &settings, alice, "token 100%_safe").await;
-        create_post(&pool, &settings, bob, "token 1000 safe").await;
-
-        let rows = users(&pool, AdminUserSearch::new("", "100%_safe"))
-            .await
-            .expect("escaped search");
-
-        assert_eq!(usernames(&rows), vec!["alice"]);
-    }
-
-    #[test]
-    fn deep_settings_form_parsing_accepts_valid_values() {
-        let settings = Settings::default();
-        let mut form = form_from_settings(&settings);
-        form.site_name = "Custom Site".to_owned();
-        form.max_bio_len = "300".to_owned();
-        form.allow_profile_pictures = "false".to_owned();
-        form.nsfw_blur_enabled = "false".to_owned();
-
-        let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
-
-        assert_eq!(parsed.site_name, "Custom Site");
-        assert_eq!(parsed.max_bio_len, 300);
-        assert!(!parsed.allow_profile_pictures);
-        assert!(!parsed.nsfw_blur_enabled);
-    }
-
-    #[test]
-    fn deep_settings_form_parsing_rejects_invalid_numbers() {
-        let settings = Settings::default();
-        let mut form = form_from_settings(&settings);
-        form.max_bio_len.clear();
-        assert!(parse_deep_settings_form(&form, &settings).is_err());
-
-        let mut form = form_from_settings(&settings);
-        form.max_bio_len = "nope".to_owned();
-        assert!(parse_deep_settings_form(&form, &settings).is_err());
-
-        let mut form = form_from_settings(&settings);
-        form.max_bio_len = "-1".to_owned();
-        assert!(parse_deep_settings_form(&form, &settings).is_err());
-    }
-
-    #[test]
-    fn deep_settings_form_parsing_rejects_invalid_boolean_values() {
-        let settings = Settings::default();
-        let mut form = form_from_settings(&settings);
-        form.allow_likes = "yes".to_owned();
-
-        let err = parse_deep_settings_form(&form, &settings).expect_err("invalid bool");
-
-        assert!(
-            err.to_string()
-                .contains("Allow likes must be true or false")
-        );
-    }
-
-    #[test]
-    fn unchanged_deep_settings_form_has_no_diff() {
-        let settings = Settings::default();
-        let form = form_from_settings(&settings);
-        let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
-
-        assert!(diff_deep_settings(&settings, &parsed).is_empty());
-    }
-
-    #[test]
-    fn changed_deep_settings_diff_uses_friendly_labels_and_units() {
-        let settings = Settings::default();
-        let mut form = form_from_settings(&settings);
-        form.max_bio_len = "300".to_owned();
-        form.allow_profile_pictures = "false".to_owned();
-        form.nsfw_blur_enabled = "false".to_owned();
-        let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
-
-        let diff = diff_deep_settings(&settings, &parsed);
-
-        assert_eq!(
-            diff,
-            vec![
-                DeepSettingsChange {
-                    label: "Maximum bio length",
-                    old_value: "240 characters".to_owned(),
-                    new_value: "300 characters".to_owned(),
-                },
-                DeepSettingsChange {
-                    label: "Allow profile pictures",
-                    old_value: "true".to_owned(),
-                    new_value: "false".to_owned(),
-                },
-                DeepSettingsChange {
-                    label: "Blur NSFW media",
-                    old_value: "true".to_owned(),
-                    new_value: "false".to_owned(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn deep_settings_media_mb_values_convert_to_bytes() {
-        let settings = Settings::default();
-        let mut form = form_from_settings(&settings);
-        form.max_image_size_mb = "8".to_owned();
-        form.max_video_size_mb = "50".to_owned();
-        let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
-        let updated = parsed.apply_to(&settings);
-
-        assert_eq!(updated.media.max_image_size, 8 * MIB);
-        assert_eq!(updated.media.max_video_size, 50 * MIB);
-    }
-
-    #[test]
-    fn deep_settings_accepts_operator_chosen_minimum_password_length() {
-        let settings = Settings::default();
-        let mut form = form_from_settings(&settings);
-        form.min_password_length = "5".to_owned();
-
-        let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
-        let updated = parsed.apply_to(&settings);
-
-        assert_eq!(updated.accounts.min_password_length, 5);
-    }
-
-    #[test]
-    fn deep_settings_accepts_zero_post_edit_window_as_disabled() {
-        let settings = Settings::default();
-        let mut form = form_from_settings(&settings);
-        form.post_edit_window_seconds = "0".to_owned();
-
-        let parsed = parse_deep_settings_form(&form, &settings).expect("valid form");
-        let updated = parsed.apply_to(&settings);
-
-        assert_eq!(updated.posts.post_edit_window_seconds, 0);
-    }
-
-    #[test]
-    fn deep_settings_writeback_preserves_unrelated_values_and_comments() {
-        let temp = tempdir().expect("temp dir");
-        let path = temp.path().join("settings.toml");
-        crate::config::write_default_if_missing(&path).expect("default settings");
-        let mut settings = Settings::load(&path).expect("load settings");
-        settings.site.name = "Written Site".to_owned();
-        settings.accounts.max_bio_len = 300;
-        settings.media.nsfw_blur_enabled = false;
-        settings.media.max_image_size = 8 * MIB;
-
-        write_deep_settings(&path, &settings).expect("write settings");
-
-        let raw = fs::read_to_string(&path).expect("settings raw");
-        let parsed = Settings::load(&path).expect("reload settings");
-        assert!(raw.contains("# RustPost settings"));
-        assert_eq!(parsed.site.name, "Written Site");
-        assert_eq!(parsed.accounts.max_bio_len, 300);
-        assert!(!parsed.media.nsfw_blur_enabled);
-        assert_eq!(parsed.media.max_image_size, 8 * MIB);
-        assert_eq!(parsed.server.port, Settings::default().server.port);
-        assert_eq!(
-            parsed.media.ffmpeg_path,
-            Settings::default().media.ffmpeg_path
-        );
-    }
 }

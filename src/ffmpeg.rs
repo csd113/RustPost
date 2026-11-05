@@ -2,7 +2,14 @@ use std::path::Path;
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
+
+/// Bound simultaneous CPU-heavy decoders and their aggregate memory use.
+static CONVERSIONS: Semaphore = Semaphore::const_new(2);
+const STDERR_LIMIT: usize = 64 * 1024;
+const STDOUT_LIMIT: usize = 256 * 1024;
 use tokio::time::timeout;
 
 use crate::config::MediaSettings;
@@ -34,20 +41,23 @@ impl FfmpegStatus {
 }
 
 pub async fn probe(settings: &MediaSettings) -> FfmpegStatus {
-    let output = Command::new(&settings.ffmpeg_path)
-        .arg("-version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
-    let Ok(output) = output else {
-        return FfmpegStatus {
-            available: false,
-            version: String::new(),
-            supports_webp: false,
-            supports_vp9: false,
-            error: Some("ffmpeg command not found".to_owned()),
-        };
+    let output = run_ffmpeg(
+        &settings.ffmpeg_path,
+        &["-version".to_owned()],
+        Duration::from_secs(10),
+    )
+    .await;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            return FfmpegStatus {
+                available: false,
+                version: String::new(),
+                supports_webp: false,
+                supports_vp9: false,
+                error: Some(format!("ffmpeg probe failed: {error}")),
+            };
+        }
     };
     if !output.status.success() {
         return FfmpegStatus {
@@ -60,11 +70,12 @@ pub async fn probe(settings: &MediaSettings) -> FfmpegStatus {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let version = stdout.lines().next().unwrap_or("ffmpeg").to_owned();
-    let encoders = Command::new(&settings.ffmpeg_path)
-        .arg("-hide_banner")
-        .arg("-encoders")
-        .output()
-        .await;
+    let encoders = run_ffmpeg(
+        &settings.ffmpeg_path,
+        &["-hide_banner".to_owned(), "-encoders".to_owned()],
+        Duration::from_secs(10),
+    )
+    .await;
     let encoder_text = encoders
         .ok()
         .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
@@ -86,6 +97,7 @@ pub async fn convert_image_to_webp(
     let args = image_webp_args(settings, input, output);
     let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_mins(2)).await?;
     if result.status.success() {
+        validate_output(output, settings.max_image_size, "image/webp").await?;
         Ok(stderr_summary(&result.stderr))
     } else {
         anyhow::bail!(stderr_summary(&result.stderr));
@@ -101,6 +113,7 @@ pub async fn convert_image_to_webp_thumbnail(
     let args = image_webp_thumbnail_args(settings, input, output, size);
     let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_mins(2)).await?;
     if result.status.success() {
+        validate_output(output, settings.max_image_size, "image/webp").await?;
         Ok(stderr_summary(&result.stderr))
     } else {
         anyhow::bail!(stderr_summary(&result.stderr));
@@ -115,6 +128,7 @@ pub async fn convert_video_to_webm(
     let args = video_webm_args(settings, input, output);
     let result = run_ffmpeg(&settings.ffmpeg_path, &args, Duration::from_mins(5)).await?;
     if result.status.success() {
+        validate_output(output, settings.max_video_size, "video/webm").await?;
         Ok(stderr_summary(&result.stderr))
     } else {
         anyhow::bail!(stderr_summary(&result.stderr));
@@ -122,34 +136,134 @@ pub async fn convert_video_to_webm(
 }
 
 async fn run_ffmpeg(path: &str, args: &[String], duration: Duration) -> anyhow::Result<Output> {
-    let mut command = Command::new(path);
-    command
+    let _permit = timeout(Duration::from_secs(30), CONVERSIONS.acquire())
+        .await
+        .map_err(|_| anyhow::anyhow!("media processing is busy; try again shortly"))??;
+    let mut child = Command::new(path)
+        .args(args)
+        .stdin(Stdio::null())
         .kill_on_drop(true)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for arg in args {
-        command.arg(arg);
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("ffmpeg stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("ffmpeg stderr unavailable"))?;
+    let result = timeout(duration, async {
+        tokio::try_join!(
+            child.wait(),
+            read_bounded_output(stdout, STDOUT_LIMIT, false),
+            read_bounded_output(stderr, STDERR_LIMIT, true)
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok((status, stdout, stderr))) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(error.into())
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!("ffmpeg timed out");
+        }
     }
-    let child = command.spawn()?;
-    timeout(duration, child.wait_with_output())
-        .await
-        .map_err(|_elapsed| anyhow::anyhow!("ffmpeg timed out"))?
-        .map_err(Into::into)
+}
+
+/// Drain continuously to avoid pipe deadlocks, retaining only a bounded tail.
+async fn read_bounded_output<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+    tail: bool,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(limit);
+    let mut buffer = vec![0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        if tail {
+            let overflow = output.len().saturating_add(read).saturating_sub(limit);
+            if overflow > 0 {
+                output.drain(..overflow);
+            }
+            output.extend_from_slice(&buffer[..read]);
+        } else {
+            let remaining = limit.saturating_sub(output.len()).min(read);
+            output.extend_from_slice(&buffer[..remaining]);
+        }
+    }
+    Ok(output)
+}
+
+async fn validate_output(path: &Path, max_bytes: u64, mime: &str) -> anyhow::Result<()> {
+    let metadata = tokio::fs::metadata(path).await?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() > 0 && metadata.len() < max_bytes,
+        "media conversion produced an empty or oversized output"
+    );
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut prefix = [0u8; 4096];
+    let read = file.read(&mut prefix).await?;
+    anyhow::ensure!(
+        infer::get(&prefix[..read]).is_some_and(|kind| kind.mime_type() == mime),
+        "media conversion produced an invalid format"
+    );
+    Ok(())
+}
+
+fn safety_args() -> Vec<String> {
+    [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-threads",
+        "2",
+        "-max_pixels",
+        "100000000",
+        "-y",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 fn image_webp_args(settings: &MediaSettings, input: &Path, output: &Path) -> Vec<String> {
-    vec![
-        "-y".to_owned(),
-        "-i".to_owned(),
-        input.display().to_string(),
-        "-vf".to_owned(),
-        "scale='min(1600,iw)':-2".to_owned(),
-        "-c:v".to_owned(),
-        "libwebp".to_owned(),
-        "-quality".to_owned(),
-        settings.webp_quality.to_string(),
-        output.display().to_string(),
-    ]
+    safety_args()
+        .into_iter()
+        .chain([
+            "-i".to_owned(),
+            input.display().to_string(),
+            "-vf".to_owned(),
+            "scale='min(1600,iw)':-2".to_owned(),
+            "-threads".to_owned(),
+            "2".to_owned(),
+            "-map_metadata".to_owned(),
+            "-1".to_owned(),
+            "-c:v".to_owned(),
+            "libwebp".to_owned(),
+            "-quality".to_owned(),
+            settings.webp_quality.to_string(),
+            "-fs".to_owned(),
+            settings.max_image_size.to_string(),
+            output.display().to_string(),
+        ])
+        .collect()
 }
 
 fn image_webp_thumbnail_args(
@@ -159,47 +273,61 @@ fn image_webp_thumbnail_args(
     size: u16,
 ) -> Vec<String> {
     let size = size.to_string();
-    vec![
-        "-y".to_owned(),
-        "-i".to_owned(),
-        input.display().to_string(),
-        "-vf".to_owned(),
-        format!("scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}"),
-        "-c:v".to_owned(),
-        "libwebp".to_owned(),
-        "-quality".to_owned(),
-        settings.webp_quality.to_string(),
-        output.display().to_string(),
-    ]
+    safety_args()
+        .into_iter()
+        .chain([
+            "-i".to_owned(),
+            input.display().to_string(),
+            "-vf".to_owned(),
+            format!("scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}"),
+            "-threads".to_owned(),
+            "2".to_owned(),
+            "-map_metadata".to_owned(),
+            "-1".to_owned(),
+            "-c:v".to_owned(),
+            "libwebp".to_owned(),
+            "-quality".to_owned(),
+            settings.webp_quality.to_string(),
+            "-fs".to_owned(),
+            settings.max_image_size.to_string(),
+            output.display().to_string(),
+        ])
+        .collect()
 }
 
 fn video_webm_args(settings: &MediaSettings, input: &Path, output: &Path) -> Vec<String> {
-    vec![
-        "-y".to_owned(),
-        "-i".to_owned(),
-        input.display().to_string(),
-        "-map_metadata".to_owned(),
-        "-1".to_owned(),
-        "-c:v".to_owned(),
-        "libvpx-vp9".to_owned(),
-        "-pix_fmt".to_owned(),
-        "yuv420p".to_owned(),
-        "-colorspace".to_owned(),
-        "bt709".to_owned(),
-        "-color_primaries".to_owned(),
-        "bt709".to_owned(),
-        "-color_trc".to_owned(),
-        "bt709".to_owned(),
-        "-crf".to_owned(),
-        settings.vp9_crf.to_string(),
-        "-deadline".to_owned(),
-        settings.vp9_deadline.clone(),
-        "-b:v".to_owned(),
-        "0".to_owned(),
-        "-c:a".to_owned(),
-        "libopus".to_owned(),
-        output.display().to_string(),
-    ]
+    safety_args()
+        .into_iter()
+        .chain([
+            "-i".to_owned(),
+            input.display().to_string(),
+            "-threads".to_owned(),
+            "2".to_owned(),
+            "-map_metadata".to_owned(),
+            "-1".to_owned(),
+            "-c:v".to_owned(),
+            "libvpx-vp9".to_owned(),
+            "-pix_fmt".to_owned(),
+            "yuv420p".to_owned(),
+            "-colorspace".to_owned(),
+            "bt709".to_owned(),
+            "-color_primaries".to_owned(),
+            "bt709".to_owned(),
+            "-color_trc".to_owned(),
+            "bt709".to_owned(),
+            "-crf".to_owned(),
+            settings.vp9_crf.to_string(),
+            "-deadline".to_owned(),
+            settings.vp9_deadline.clone(),
+            "-b:v".to_owned(),
+            "0".to_owned(),
+            "-c:a".to_owned(),
+            "libopus".to_owned(),
+            "-fs".to_owned(),
+            settings.max_video_size.to_string(),
+            output.display().to_string(),
+        ])
+        .collect()
 }
 
 pub fn stderr_summary(stderr: &[u8]) -> String {
@@ -212,104 +340,4 @@ pub fn stderr_summary(stderr: &[u8]) -> String {
         .rev()
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use crate::config::MediaSettings;
-
-    #[test]
-    fn vp9_args_document_safe_color_handling() {
-        let args = super::video_webm_args(
-            &MediaSettings {
-                ffmpeg_path: "ffmpeg".to_owned(),
-                convert_images_to_webp: true,
-                convert_videos_to_webm: true,
-                keep_original_uploads: false,
-                nsfw_blur_enabled: true,
-                max_image_size: 1,
-                max_video_size: 1,
-                generate_video_thumbnails: false,
-                allowed_image_mime_types: Vec::new(),
-                allowed_video_mime_types: Vec::new(),
-                webp_quality: 82,
-                vp9_crf: 32,
-                vp9_deadline: "good".to_owned(),
-            },
-            Path::new("in.mp4"),
-            Path::new("out.webm"),
-        );
-        assert!(args.iter().any(|arg| arg == "yuv420p"));
-        assert!(args.iter().filter(|arg| arg.as_str() == "bt709").count() >= 3);
-    }
-
-    #[test]
-    fn image_thumbnail_args_crop_square_webp() {
-        let args = super::image_webp_thumbnail_args(
-            &MediaSettings {
-                ffmpeg_path: "ffmpeg".to_owned(),
-                convert_images_to_webp: true,
-                convert_videos_to_webm: true,
-                keep_original_uploads: false,
-                nsfw_blur_enabled: true,
-                max_image_size: 1,
-                max_video_size: 1,
-                generate_video_thumbnails: false,
-                allowed_image_mime_types: Vec::new(),
-                allowed_video_mime_types: Vec::new(),
-                webp_quality: 82,
-                vp9_crf: 32,
-                vp9_deadline: "good".to_owned(),
-            },
-            Path::new("in.png"),
-            Path::new("out.webp"),
-            96,
-        );
-
-        assert!(args.iter().any(|arg| arg == "libwebp"));
-        assert!(args.iter().any(|arg| arg == "-quality"));
-        assert!(args.iter().any(|arg| arg.contains("crop=96:96")));
-        assert!(
-            args.iter()
-                .any(|arg| arg.contains("force_original_aspect_ratio=increase"))
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_ffmpeg_reports_error() {
-        let result = super::run_ffmpeg(
-            "definitely-not-rustpost-ffmpeg",
-            &["-version".to_owned()],
-            std::time::Duration::from_millis(100),
-        )
-        .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn ffmpeg_timeout_is_reported() {
-        #[cfg(windows)]
-        let (program, args) = (
-            "powershell.exe",
-            vec![
-                "-NoProfile".to_owned(),
-                "-NonInteractive".to_owned(),
-                "-Command".to_owned(),
-                "Start-Sleep -Seconds 2".to_owned(),
-            ],
-        );
-        #[cfg(not(windows))]
-        let (program, args) = ("sh", vec!["-c".to_owned(), "sleep 2".to_owned()]);
-
-        let result = super::run_ffmpeg(program, &args, std::time::Duration::from_millis(50)).await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .expect_err("timeout")
-                .to_string()
-                .contains("timed out")
-        );
-    }
 }

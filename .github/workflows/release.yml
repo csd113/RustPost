@@ -1,103 +1,210 @@
 name: Release
-
 on:
   push:
-    tags:
-      - 'v*'
-
+    tags: ["v*"]
 permissions:
-  contents: write
-
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 env:
   CARGO_TERM_COLOR: always
-
+  CARGO_INCREMENTAL: 0
 jobs:
-  build-unix:
-    name: Build ${{ matrix.name }}
+  release-validation:
+    name: Release validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
+          components: clippy, rustfmt
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: false
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run strict Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::all -D clippy::pedantic -D clippy::nursery -D clippy::cargo
+      - name: Build API documentation
+        run: cargo doc --locked --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Verify release tag matches package version
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "rustpost") | .version')"
+          test "$GITHUB_REF_NAME" = "v$version"
+  build:
+    name: Build (${{ matrix.asset_suffix }})
+    needs: release-validation
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: macos-aarch64
-            os: macos-14
-            target: aarch64-apple-darwin
-            archive: rustpost-macos-aarch64.tar.gz
-          - name: linux-x86_64
-            os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            archive: rustpost-linux-x86_64.tar.gz
-          - name: linux-aarch64
-            os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            archive: rustpost-linux-aarch64.tar.gz
-    runs-on: ${{ matrix.os }}
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            binary_suffix: ""
+            asset_suffix: macos-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            binary_suffix: ""
+            asset_suffix: macos-apple-silicon
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            binary_suffix: ""
+            asset_suffix: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            binary_suffix: ""
+            asset_suffix: linux-arm64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            binary_suffix: ".exe"
+            asset_suffix: windows-x86_64
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install Linux build tools
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config
-      - name: Install Rust 1.91
-        uses: dtolnay/rust-toolchain@1.91.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          key: ${{ matrix.target }}
           cache-bin: false
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin rustpost-cli
-      - name: Package archive
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin rustpost-cli
+      - name: Verify native executable and architecture
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          SUFFIX: ${{ matrix.binary_suffix }}
         run: |
           set -euo pipefail
-          staging="dist/${{ matrix.name }}/rustpost"
-          mkdir -p "$staging"
-          cp "target/${{ matrix.target }}/release/rustpost-cli" "$staging/"
-          cp README.md "$staging/"
-          if [ -f LICENSE ]; then cp LICENSE "$staging/"; fi
-          if [ -f NOTICE ]; then cp NOTICE "$staging/"; fi
-          if [ -f NOTICES ]; then cp NOTICES "$staging/"; fi
-          tar -czf "dist/${{ matrix.archive }}" -C "dist/${{ matrix.name }}" rustpost
-          (cd dist && shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256")
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/${{ matrix.archive }}
-            dist/${{ matrix.archive }}.sha256
-
-  build-windows:
-    name: Build windows-x86_64
-    runs-on: windows-2022
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install Rust 1.91
-        uses: dtolnay/rust-toolchain@1.91.0
-        with:
-          targets: x86_64-pc-windows-msvc
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-      - name: Build release binary
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc --bin rustpost-cli
-      - name: Package archive
-        shell: pwsh
+          binary="target/${TARGET}/release/rustpost-cli${SUFFIX}"
+          "$binary" --version
+          if [[ "$TARGET" == *apple-darwin ]]; then
+            if [[ "$TARGET" == x86_64-* ]]; then arch=x86_64; else arch=arm64; fi
+            lipo "$binary" -verify_arch "$arch"
+          fi
+      - name: Package release archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY_SUFFIX: ${{ matrix.binary_suffix }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $staging = "dist/windows-x86_64/rustpost"
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "target/x86_64-pc-windows-msvc/release/rustpost-cli.exe" $staging
-          Copy-Item "README.md" $staging
-          if (Test-Path "LICENSE") { Copy-Item "LICENSE" $staging }
-          if (Test-Path "NOTICE") { Copy-Item "NOTICE" $staging }
-          if (Test-Path "NOTICES") { Copy-Item "NOTICES" $staging }
-          Compress-Archive -Path $staging -DestinationPath "dist/rustpost-windows-x86_64.zip" -Force
-          (Get-FileHash "dist/rustpost-windows-x86_64.zip" -Algorithm SHA256).Hash.ToLower() + "  rustpost-windows-x86_64.zip" | Out-File -Encoding ascii "dist/rustpost-windows-x86_64.zip.sha256"
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+          python3 - <<'PYTHON'
+          import os, pathlib, re, shutil, subprocess, zipfile
+          tag = os.environ["GITHUB_REF_NAME"]
+          suffix = os.environ["ASSET_SUFFIX"]
+          if not re.fullmatch(r"v[0-9A-Za-z._-]+", tag) or not re.fullmatch(r"[0-9A-Za-z._-]+", suffix):
+              raise SystemExit("unsafe release archive name")
+          executable = "rustpost-cli" + os.environ["BINARY_SUFFIX"]
+          binary = pathlib.Path("target") / os.environ["TARGET"] / "release" / executable
+          if subprocess.check_output([str(binary), "--version"], text=True).strip() != "rustpost-cli " + tag[1:]:
+              raise SystemExit("release executable version mismatch")
+          basename = f"rustpost-cli-{tag}-{suffix}"
+          package = pathlib.Path("dist/package") / basename
+          package.mkdir(parents=True)
+          for source in [binary, pathlib.Path("README.md"), pathlib.Path("LICENSE"), pathlib.Path("CHANGELOG.md")]:
+              shutil.copy2(source, package / source.name)
+          if os.name != "nt":
+              (package / executable).chmod(0o755)
+          with zipfile.ZipFile(pathlib.Path("dist") / (basename + ".zip"), "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for source in sorted(package.iterdir()):
+                  archive.write(source, source.relative_to(package.parent))
+          PYTHON
+      - name: Upload archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          files: |
-            dist/rustpost-windows-x86_64.zip
-            dist/rustpost-windows-x86_64.zip.sha256
+          name: rustpost-cli-${{ matrix.asset_suffix }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+  release:
+    name: Prepare GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout changelog
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download all platform archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rustpost-cli-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify complete assets and checksum manifest
+        run: |
+          set -euo pipefail
+          cd release-assets
+          shopt -s nullglob
+          archives=( *.zip )
+          expected=(linux-arm64 linux-x86_64 macos-apple-silicon macos-intel windows-x86_64)
+          test "${#archives[@]}" -eq "${#expected[@]}"
+          for suffix in "${expected[@]}"; do
+            test -s "rustpost-cli-${GITHUB_REF_NAME}-${suffix}.zip"
+          done
+          sha256sum --binary "${archives[@]}" > SHA256SUMS.txt
+          sha256sum --check --strict SHA256SUMS.txt
+      - name: Prepare release notes
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib
+          version = os.environ["GITHUB_REF_NAME"]
+          sections = pathlib.Path("CHANGELOG.md").read_text().split("\n## ")[1:]
+          matching = [section for section in sections if section.splitlines()[0].split(" - ")[0].split(" — ")[0] == version]
+          if not matching:
+              matching = [section for section in sections if section.splitlines()[0] == "Unreleased"]
+          if len(matching) != 1:
+              raise SystemExit("expected one changelog entry")
+          notes = matching[0].split("\n", 1)[1].strip()
+          if not notes:
+              raise SystemExit("release notes are empty")
+          pathlib.Path("RELEASE_NOTES.md").write_text(notes + "\n")
+          PYTHON
+      - name: Prepare draft release without changing published releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import json, os, urllib.error, urllib.parse, urllib.request
+          tag = urllib.parse.quote(os.environ["GITHUB_REF_NAME"], safe="")
+          url = "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/releases/tags/" + tag
+          request = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json"})
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  release = json.load(response)
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise SystemExit("cannot verify existing release") from None
+          else:
+              if release.get("draft") is not True:
+                  raise SystemExit("refusing to modify a published release")
+          PYTHON
+          if ! gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft > /dev/null; then
+            flags=()
+            if [[ "$GITHUB_REF_NAME" == *-* ]]; then flags+=(--prerelease); fi
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md "${flags[@]}"
+          fi
+          gh release upload "$GITHUB_REF_NAME" release-assets/*.zip release-assets/SHA256SUMS.txt --clobber

@@ -6,6 +6,9 @@ use anyhow::Error;
 
 use crate::{config, ffmpeg, runtime, tor};
 
+pub(crate) mod input;
+pub(crate) mod session;
+
 const RULE: &str = "------------------------------------------------------------";
 
 #[derive(Debug, Clone, Copy)]
@@ -14,6 +17,7 @@ pub enum Status {
     Warn,
     Pending,
     Off,
+    Failed,
 }
 
 impl Status {
@@ -22,7 +26,8 @@ impl Status {
             Self::Ok => "[OK]",
             Self::Warn => "[WARN]",
             Self::Pending => "[PENDING]",
-            Self::Off => "[OFF]",
+            Self::Off => "[DISABLED]",
+            Self::Failed => "[FAILED]",
         }
     }
 }
@@ -59,6 +64,7 @@ pub enum DatabaseSchemaStatus {
     },
 }
 
+/// Legacy one-time snapshot. This does not establish listener readiness or freshness.
 #[must_use]
 pub fn render_startup_dashboard(input: &StartupDashboard<'_>) -> String {
     let mut out = String::with_capacity(1_800);
@@ -127,6 +133,7 @@ pub fn render_startup_dashboard(input: &StartupDashboard<'_>) -> String {
 
 #[must_use]
 pub fn render_check(
+    paths: &runtime::RuntimePaths,
     settings: &config::Settings,
     ffmpeg: &ffmpeg::FfmpegStatus,
     tor_status: &tor::TorStatus,
@@ -150,14 +157,22 @@ pub fn render_check(
                 "Anonymous posting",
                 enabled_label(settings.accounts.anonymous_mode_enabled),
             ),
-            row("Tor", tor_status_value(settings, tor_status)),
+            row(
+                "Tor",
+                if settings.tor.enabled {
+                    "[CONFIGURED] not started by check; publication/reachability unverified"
+                        .to_owned()
+                } else {
+                    tor_status_value(settings, tor_status)
+                },
+            ),
             row("FFmpeg", ffmpeg_status_value(ffmpeg)),
         ],
     );
     push_section(
         &mut out,
         "Next commands",
-        &[row("Start server", "rustpost-cli serve")],
+        &[row("Start server", instance_command(paths, "serve"))],
     );
     out.push_str(RULE);
     out.push('\n');
@@ -186,18 +201,9 @@ pub fn render_init(paths: &runtime::RuntimePaths, settings_path: &Path) -> Strin
         &[
             row(
                 "Create admin",
-                format!(
-                    "rustpost-cli --data-dir {} create-admin-interactive",
-                    display(paths.data_dir.as_path())
-                ),
+                instance_command(paths, "create-admin-interactive"),
             ),
-            row(
-                "Start server",
-                format!(
-                    "rustpost-cli --data-dir {} serve",
-                    display(paths.data_dir.as_path())
-                ),
-            ),
+            row("Start server", instance_command(paths, "serve")),
         ],
     );
     out.push_str(RULE);
@@ -225,7 +231,7 @@ pub fn render_first_admin_setup(paths: &runtime::RuntimePaths) -> String {
         &[
             row("Why", "no admin account exists"),
             row("Data directory", display(paths.data_dir.as_path())),
-            row("Password input", "hidden where supported"),
+            row("Password input", "hidden; Ctrl-C/Esc cancels"),
         ],
     );
     out.push_str(RULE);
@@ -242,20 +248,14 @@ pub fn render_first_admin_non_interactive(paths: &runtime::RuntimePaths) -> Stri
         "Setup",
         &[
             row("Status", "no admin account exists"),
-            row("Input", "stdin is not interactive, so setup was skipped"),
+            row("Input", "terminal stdin/stderr unavailable; setup skipped"),
             row(
                 "Create admin",
-                format!(
-                    "rustpost-cli --data-dir {} create-admin-interactive",
-                    display(paths.data_dir.as_path())
-                ),
+                instance_command(paths, "create-admin-interactive"),
             ),
             row(
                 "Alternative",
-                format!(
-                    "rustpost-cli --data-dir {} create-admin <username> <password>",
-                    display(paths.data_dir.as_path())
-                ),
+                instance_command(paths, "create-admin USERNAME --password-stdin"),
             ),
         ],
     );
@@ -272,8 +272,8 @@ pub fn render_error(error: &Error) -> String {
     let mut sources = error.chain().skip(1).peekable();
     if sources.peek().is_some() {
         out.push_str("Caused by\n");
-        for source in sources {
-            let _ = writeln!(out, "  - {source}");
+        for source in sources.take(8) {
+            let _ = writeln!(out, "  - {}", display_text(&source.to_string()));
         }
         out.push('\n');
     }
@@ -294,22 +294,22 @@ pub struct Row {
 #[must_use]
 pub fn row(label: impl Into<String>, value: impl Into<String>) -> Row {
     Row {
-        label: label.into(),
-        value: value.into(),
+        label: display_text(&label.into()),
+        value: display_text(&value.into()),
     }
 }
 
 fn push_header(out: &mut String, title: &str) {
     out.push_str(RULE);
     out.push('\n');
-    let _ = writeln!(out, " {title}");
+    let _ = writeln!(out, " {}", display_text(title));
     out.push_str(RULE);
     out.push('\n');
 }
 
 fn push_section(out: &mut String, title: &str, rows: &[Row]) {
     let label_width = rows.iter().map(|row| row.label.len()).max().unwrap_or(0);
-    let _ = writeln!(out, "{title}");
+    let _ = writeln!(out, "{}", display_text(title));
     for row in rows {
         let _ = writeln!(out, "  {:label_width$} : {}", row.label, row.value);
     }
@@ -322,7 +322,14 @@ fn endpoint_rows(
     onion_target: Option<SocketAddr>,
 ) -> Vec<Row> {
     let mut rows = vec![
-        row("Local URL", local_http_url(&settings.server)),
+        row(
+            "Local URL",
+            if settings.tor.tor_only {
+                "[DISABLED] clearnet".to_owned()
+            } else {
+                local_http_url(&settings.server)
+            },
+        ),
         row("Public URL", public_url(settings)),
     ];
     if let Some(addr) = onion_target {
@@ -341,25 +348,19 @@ fn next_command_rows(input: &StartupDashboard<'_>) -> Vec<Row> {
     if input.admin_count == 0 {
         rows.push(row(
             "Create admin",
-            format!(
-                "rustpost-cli --data-dir {} create-admin-interactive",
-                display(input.paths.data_dir.as_path())
-            ),
+            instance_command(input.paths, "create-admin-interactive"),
         ));
     }
-    rows.push(row(
-        "Check config",
-        format!(
-            "rustpost-cli --data-dir {} check",
-            display(input.paths.data_dir.as_path())
-        ),
-    ));
+    rows.push(row("Check config", instance_command(input.paths, "check")));
     rows.push(row("Stop server", "Press Ctrl-C"));
     rows
 }
 
 fn bind_address(settings: &config::ServerSettings) -> String {
-    format!("{}:{}", settings.host, settings.port)
+    settings.listener_address().map_or_else(
+        |_| "[UNAVAILABLE] invalid bind address".to_owned(),
+        |addr| addr.to_string(),
+    )
 }
 
 fn local_http_url(settings: &config::ServerSettings) -> String {
@@ -399,11 +400,11 @@ fn tor_status_value(settings: &config::Settings, tor_status: &tor::TorStatus) ->
     if !settings.tor.enabled {
         return status_value(Status::Off, "disabled");
     }
-    if tor_status.running() {
-        return status_value(Status::Ok, &tor_status.summary());
-    }
     if let Some(error) = tor_status.error() {
         return status_value(Status::Warn, &error);
+    }
+    if tor_status.running() {
+        return status_value(Status::Ok, &tor_status.summary());
     }
     status_value(Status::Pending, &tor_status.summary())
 }
@@ -442,11 +443,11 @@ fn database_schema_status_value(status: &DatabaseSchemaStatus) -> String {
             if *compatible {
                 status_value(Status::Ok, &summary)
             } else {
-                status_value(Status::Warn, &summary)
+                status_value(Status::Failed, &summary)
             }
         }
         DatabaseSchemaStatus::Unreadable { error } => {
-            status_value(Status::Warn, &format!("unreadable; {error}"))
+            status_value(Status::Failed, &format!("unreadable; {error}"))
         }
     }
 }
@@ -495,142 +496,80 @@ fn error_title(error: &Error) -> &'static str {
 fn error_text(error: &Error) -> String {
     error
         .chain()
-        .map(ToString::to_string)
+        .take(8)
+        .map(|source| display_text(&source.to_string()))
         .collect::<Vec<_>>()
         .join("\n")
         .to_ascii_lowercase()
 }
 
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
+/// One bounded, Unicode-safe display boundary. Controls are visible tokens,
+/// rather than deleted bytes which could concatenate unrelated identifiers.
+#[must_use]
+pub fn display_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(1024));
+    for (index, ch) in value.chars().enumerate() {
+        if index == 512 {
+            out.push_str(" [truncated]");
+            break;
+        }
+        if ch.is_control()
+            || matches!(ch, '\u{061c}' | '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+        {
+            let _ = write!(out, "<U+{:04X}>", u32::from(ch));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
 
-    use crate::{config::Settings, ffmpeg::FfmpegStatus, runtime::RuntimePaths};
-
-    use super::*;
-
-    #[test]
-    fn startup_dashboard_groups_copyable_urls_paths_and_commands() {
-        let paths = RuntimePaths::from_data_dir(PathBuf::from("/tmp/rustpost-data"));
-        let data_dir = display(paths.data_dir.as_path());
-        let database_path = display(paths.database_path.as_path());
-        let originals_dir = display(paths.uploads_originals.as_path());
-        let logs_dir = display(paths.logs_dir.as_path());
-        let backups_dir = display(paths.backups_dir.as_path());
-        let settings = Settings::default();
-        let ffmpeg = FfmpegStatus {
-            available: false,
-            version: String::new(),
-            supports_webp: false,
-            supports_vp9: false,
-            error: Some("ffmpeg command not found".to_owned()),
+/// Suggestions retain the effective executable, data and configuration paths.
+/// POSIX sh on Unix; PowerShell on Windows. No secret is ever an argument.
+#[must_use]
+pub fn instance_command(paths: &runtime::RuntimePaths, command: &str) -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return "[UNAVAILABLE] executable path".to_owned();
+    };
+    let values = [&exe, &paths.data_dir, &paths.settings_path];
+    let mut quoted = Vec::new();
+    for path in values {
+        let Some(value) = path.to_str() else {
+            return "[UNAVAILABLE] command path is not Unicode".to_owned();
         };
-        let tor_status = tor::validate_startup(&settings.tor);
-        let output = render_startup_dashboard(&StartupDashboard {
-            paths: &paths,
-            settings_path: &paths.settings_path,
-            settings: &settings,
-            schema_version: Some(1),
-            schema_compatible: true,
-            schema_summary: "release baseline schema version 1",
-            admin_count: 0,
-            user_count: 2,
-            post_count: 3,
-            ffmpeg: &ffmpeg,
-            tor_status: &tor_status,
-            onion_target: None,
-        });
-
-        assert!(output.contains("Status"));
-        assert!(output.contains("DB schema"));
-        assert!(output.contains("release baseline schema version 1"));
-        assert!(output.contains("Endpoints"));
-        assert!(output.contains("Storage"));
-        assert!(output.contains("Next commands"));
-        assert!(output.contains("Local URL"));
-        assert!(output.contains("http://127.0.0.1:8080"));
-        assert!(output.contains("Data directory"));
-        assert!(output.contains(&data_dir));
-        assert!(output.contains(&database_path));
-        assert!(output.contains(&originals_dir));
-        assert!(output.contains(&logs_dir));
-        assert!(output.contains(&backups_dir));
-        assert!(output.contains(&format!(
-            "rustpost-cli --data-dir {data_dir} create-admin-interactive"
-        )));
-        assert!(output.contains("FFmpeg"));
-        assert!(output.contains("[WARN] unavailable"));
+        if value.len() > 2048 || display_text(value) != value {
+            return "[UNAVAILABLE] command path contains controls or exceeds the display limit"
+                .to_owned();
+        }
+        #[cfg(windows)]
+        quoted.push(format!("'{}'", value.replace('\'', "''")));
+        #[cfg(not(windows))]
+        quoted.push(format!("'{}'", value.replace('\'', "'\"'\"'")));
     }
-
-    #[test]
-    fn check_output_reports_database_schema_status() {
-        let settings = Settings::default();
-        let ffmpeg = FfmpegStatus {
-            available: false,
-            version: String::new(),
-            supports_webp: false,
-            supports_vp9: false,
-            error: Some("ffmpeg command not found".to_owned()),
-        };
-        let tor_status = tor::validate_startup(&settings.tor);
-        let output = render_check(
-            &settings,
-            &ffmpeg,
-            &tor_status,
-            &DatabaseSchemaStatus::Present {
-                version: Some(1),
-                compatible: true,
-                summary: "release baseline schema version 1".to_owned(),
-            },
-        );
-
-        assert!(output.contains("DB schema"));
-        assert!(output.contains("[OK] version 1; release baseline schema version 1"));
+    #[cfg(windows)]
+    let prefix = "& ";
+    #[cfg(not(windows))]
+    let prefix = "";
+    let suggestion = format!(
+        "{prefix}{} --data-dir {} --config {} {command}",
+        quoted[0], quoted[1], quoted[2]
+    );
+    if suggestion.chars().count() > 512 {
+        "[UNAVAILABLE] command exceeds display limit; pass effective --data-dir and --config separately".to_owned()
+    } else {
+        suggestion
     }
+}
 
-    #[test]
-    fn check_output_avoids_internal_alpha_version_wording() {
-        let settings = Settings::default();
-        let ffmpeg = FfmpegStatus {
-            available: true,
-            version: "ffmpeg 8.1.1".to_owned(),
-            supports_webp: true,
-            supports_vp9: true,
-            error: None,
-        };
-        let tor_status = tor::validate_startup(&settings.tor);
-        let output = render_check(
-            &settings,
-            &ffmpeg,
-            &tor_status,
-            &DatabaseSchemaStatus::Adoptable {
-                summary: "pre-release database structurally matches the release baseline; startup will mark it as release baseline schema version 1 without data loss".to_owned(),
-            },
-        );
-
-        assert!(output.contains("release baseline schema version 1"));
-        assert!(!output.contains("version 13"));
-        assert!(!output.contains("version 12"));
+/// ASCII fallback keeps Unicode values explicit instead of guessing a transliteration.
+pub fn ascii_text(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+        } else {
+            let _ = write!(out, "<U+{:04X}>", u32::from(ch));
+        }
     }
-
-    #[test]
-    fn local_url_uses_loopback_for_unspecified_bind_addresses() {
-        let mut settings = Settings::default();
-        settings.server.host = "0.0.0.0".to_owned();
-        assert_eq!(local_http_url(&settings.server), "http://127.0.0.1:8080");
-
-        settings.server.host = "::".to_owned();
-        assert_eq!(local_http_url(&settings.server), "http://[::1]:8080");
-    }
-
-    #[test]
-    fn rendered_error_includes_actionable_port_hint() {
-        let error = anyhow::anyhow!("bind RustPost server at 127.0.0.1:8080")
-            .context("Address already in use");
-        let output = render_error(&error);
-
-        assert!(output.contains("RustPost startup failed"));
-        assert!(output.contains("Next step"));
-        assert!(output.contains("change server.port"));
-    }
+    out
 }

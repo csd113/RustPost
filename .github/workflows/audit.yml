@@ -1,0 +1,57 @@
+name: Dependency Audit
+on:
+  pull_request:
+    branches: [main, dev]
+    paths: [Cargo.toml, Cargo.lock, .github/workflows/audit.yml]
+  push:
+    branches: [main, dev]
+    paths: [Cargo.toml, Cargo.lock, .github/workflows/audit.yml]
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: audit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  audit:
+    name: Dependency advisory report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+      - name: Report all dependency advisories
+        id: audit
+        # Report-only policy: keep upstream blockers visible, without an ignore list.
+        continue-on-error: true
+        run: cargo audit --file Cargo.lock --format json > audit.json
+      - name: Verify report and summarize findings
+        env:
+          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
+        run: |
+          jq -e '.lockfile["dependency-count"] > 0' audit.json > /dev/null
+          echo "Dependency audit: $(jq -r '.vulnerabilities.count' audit.json) vulnerability findings; full report attached." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$AUDIT_OUTCOME" != success ]; then
+            echo "::warning::Dependency advisories require review; see the full audit report."
+          fi
+      - name: Preserve full advisory report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dependency-advisories
+          path: audit.json
+          if-no-files-found: error
+          retention-days: 7

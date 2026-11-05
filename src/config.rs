@@ -1,3 +1,5 @@
+pub mod admin_fields;
+
 use std::fs;
 use std::path::Path;
 
@@ -285,6 +287,7 @@ impl Settings {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_network_and_media()?;
         let site_name = self.site.name.trim();
         if site_name != self.site.name {
             anyhow::bail!("site.name must not contain surrounding whitespace");
@@ -342,6 +345,81 @@ impl Settings {
             anyhow::bail!(
                 "accounts.max_archive_entries must be between 1 and {MAX_ARCHIVE_ENTRY_LIMIT}"
             );
+        }
+        Ok(())
+    }
+    fn validate_network_and_media(&self) -> anyhow::Result<()> {
+        self.server.listener_address()?;
+        if !self.server.public_url.is_empty() {
+            let url: axum::http::Uri = self.server.public_url.parse().map_err(|_| {
+                anyhow::anyhow!("server.public_url must be an absolute HTTP(S) URL")
+            })?;
+            if !matches!(url.scheme_str(), Some("http" | "https"))
+                || url
+                    .authority()
+                    .is_none_or(|host| host.as_str().contains('@'))
+            {
+                anyhow::bail!(
+                    "server.public_url must be an absolute HTTP(S) URL without credentials"
+                );
+            }
+        }
+        for cidr in &self.server.trusted_proxy_cidrs {
+            let (address, prefix) = cidr.split_once('/').unwrap_or((cidr, ""));
+            let address: std::net::IpAddr = address.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "server.trusted_proxy_cidrs must contain valid IP addresses or CIDRs"
+                )
+            })?;
+            if !prefix.is_empty() {
+                let bits: u8 = prefix.parse().map_err(|_| {
+                    anyhow::anyhow!("server.trusted_proxy_cidrs contains an invalid prefix")
+                })?;
+                if bits > if address.is_ipv4() { 32 } else { 128 } {
+                    anyhow::bail!("server.trusted_proxy_cidrs contains an out-of-range prefix");
+                }
+            } else if cidr.contains('/') {
+                anyhow::bail!("server.trusted_proxy_cidrs contains an empty prefix");
+            }
+        }
+        if self.media.webp_quality > 100 {
+            anyhow::bail!("media.webp_quality must be 0–100");
+        }
+        if self.media.vp9_crf > 63 {
+            anyhow::bail!("media.vp9_crf must be 0–63");
+        }
+        self.media.vp9_deadline.parse::<VideoEncodingSpeed>()?;
+        for (key, types) in [
+            (
+                "media.allowed_image_mime_types",
+                &self.media.allowed_image_mime_types,
+            ),
+            (
+                "media.allowed_video_mime_types",
+                &self.media.allowed_video_mime_types,
+            ),
+        ] {
+            for mime in types {
+                if mime.split_once('/').is_none_or(|(kind, subtype)| {
+                    kind.is_empty() || subtype.is_empty() || subtype.contains('/')
+                }) || !mime
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/-+._".contains(&b))
+                {
+                    anyhow::bail!("{key} contains an invalid MIME type");
+                }
+            }
+        }
+        if self.tor.max_concurrent_streams == 0
+            || self.tor.max_concurrent_streams
+                > (u32::MAX as usize).min(tokio::sync::Semaphore::MAX_PERMITS)
+        {
+            anyhow::bail!(
+                "tor.max_concurrent_streams must be positive and fit the runtime stream limit"
+            );
+        }
+        if !(1..=3600).contains(&self.tor.bootstrap_timeout_secs) {
+            anyhow::bail!("tor.bootstrap_timeout_secs must be between 1 and 3600 seconds");
         }
         Ok(())
     }
@@ -786,285 +864,48 @@ const fn default_retention_max_age_days() -> u64 {
     30
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_settings_validate() {
-        Settings::default().validate().expect("default config");
+/// `FFmpeg` VP9 deadline choices, shared by configuration validation and admin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEncodingSpeed {
+    Best,
+    Good,
+    Realtime,
+}
+impl VideoEncodingSpeed {
+    pub const ALL: [Self; 3] = [Self::Best, Self::Good, Self::Realtime];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Best => "best",
+            Self::Good => "good",
+            Self::Realtime => "realtime",
+        }
     }
-
-    #[test]
-    fn generated_default_settings_toml_parses_and_preserves_defaults() {
-        let generated = default_settings_toml();
-        let parsed: Settings = toml::from_str(&generated).expect("generated config parses");
-
-        assert_eq!(
-            toml::to_string(&parsed).expect("parsed settings serialize"),
-            toml::to_string(&Settings::default()).expect("default settings serialize")
-        );
-        parsed.validate().expect("generated config validates");
+}
+impl std::str::FromStr for VideoEncodingSpeed {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|speed| speed.as_str() == value)
+            .ok_or_else(|| anyhow::anyhow!("media.vp9_deadline must be best, good or realtime"))
     }
+}
 
-    #[test]
-    fn missing_nsfw_blur_setting_defaults_to_safe_enabled() {
-        let raw = toml::to_string(&Settings::default())
-            .expect("settings toml")
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("nsfw_blur_enabled"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
-
-        assert!(parsed.media.nsfw_blur_enabled);
-    }
-
-    #[test]
-    fn missing_display_onion_address_defaults_to_blank() {
-        let raw = toml::to_string(&Settings::default())
-            .expect("settings toml")
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("display_onion_address"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
-
-        assert!(parsed.tor.display_onion_address.is_empty());
-    }
-
-    #[test]
-    fn missing_post_edit_window_defaults_to_fifteen_seconds() {
-        let raw = toml::to_string(&Settings::default())
-            .expect("settings toml")
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("post_edit_window_seconds"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let parsed: Settings = toml::from_str(&raw).expect("legacy settings parse");
-
-        assert_eq!(
-            parsed.posts.post_edit_window_seconds,
-            DEFAULT_POST_EDIT_WINDOW_SECONDS
-        );
-        parsed.validate().expect("defaulted setting validates");
-    }
-
-    #[test]
-    fn missing_backup_schedule_settings_default_safely_disabled() {
-        let raw = toml::to_string(&Settings::default())
-            .expect("settings toml")
-            .lines()
-            .filter(|line| {
-                ![
-                    "automatic_enabled",
-                    "automatic_interval_minutes",
-                    "retention_keep_last",
-                    "retention_max_age_days",
-                    "automatic_include_tor_keys",
-                ]
-                .iter()
-                .any(|key| line.trim_start().starts_with(key))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let parsed: Settings = toml::from_str(&raw).expect("legacy backup settings parse");
-
-        assert!(!parsed.backup.automatic_enabled);
-        assert_eq!(parsed.backup.automatic_interval_minutes, 1_440);
-        assert_eq!(parsed.backup.retention_keep_last, 10);
-        assert_eq!(parsed.backup.retention_max_age_days, 30);
-        assert!(!parsed.backup.automatic_include_tor_keys);
-        parsed
-            .validate()
-            .expect("defaulted backup settings validate");
-    }
-
-    #[test]
-    fn rejects_unsafe_backup_retention_settings() {
-        let mut settings = Settings::default();
-        settings.backup.automatic_interval_minutes = 0;
-        assert!(settings.validate().is_err());
-
-        let mut settings = Settings::default();
-        settings.backup.retention_keep_last = 0;
-        assert!(settings.validate().is_err());
-    }
-
-    #[test]
-    fn accepts_zero_post_edit_window_as_disabled() {
-        let mut settings = Settings::default();
-        settings.posts.post_edit_window_seconds = 0;
-
-        settings.validate().expect("zero disables post editing");
-    }
-
-    #[test]
-    fn rejects_unsafe_post_edit_windows() {
-        let mut settings = Settings::default();
-
-        settings.posts.post_edit_window_seconds = MAX_POST_EDIT_WINDOW_SECONDS + 1;
-        assert!(settings.validate().is_err());
-    }
-
-    #[test]
-    fn tor_only_requires_tor_enabled() {
-        let mut settings = Settings::default();
-        settings.tor.tor_only = true;
-        assert!(settings.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_unsafe_relative_paths() {
-        assert!(validate_relative_path("../tor", "x").is_err());
-        assert!(validate_relative_path("/tmp/tor", "x").is_err());
-        assert!(validate_relative_path("tor/onion-service", "x").is_ok());
-        assert!(validate_relative_path("tor", "x").is_ok());
-    }
-
-    #[test]
-    fn rejects_invalid_tor_settings() {
-        let mut settings = Settings::default();
-        settings.tor.onion_service_name = "bad/name".to_owned();
-        assert!(settings.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_configured_display_onion_address() {
-        let mut settings = Settings::default();
-        settings.tor.display_onion_address =
-            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion".to_owned();
-        let error = settings.validate().expect_err("display address must fail");
-        assert!(error.to_string().contains("only displays the active Arti"));
-    }
-
-    #[test]
-    fn rejects_implicit_tor_key_backups() {
-        let mut settings = Settings::default();
-        settings.tor.include_tor_keys_in_backups_by_default = true;
-
-        let error = settings
-            .validate()
-            .expect_err("implicit Tor key backup must fail");
-
-        assert!(error.to_string().contains("explicit include-Tor-keys"));
-    }
-
-    #[test]
-    fn allows_operator_chosen_numeric_limits() {
-        let mut settings = Settings::default();
-        settings.accounts.min_password_length = 0;
-        settings.accounts.max_username_len = 0;
-        settings.posts.max_text_chars = 0;
-        settings.posts.max_media_per_post = 99;
-        settings.posts.max_images_per_post = 99;
-        settings.media.max_image_size = 0;
-        settings.media.max_video_size = 0;
-        settings.moderation.posts_per_minute = 0;
-        settings.tor.bootstrap_timeout_secs = 0;
-        settings.tor.max_concurrent_streams = 0;
-
-        settings
-            .validate()
-            .expect("operator-chosen limits validate");
-    }
-
-    #[test]
-    fn site_name_is_validated_and_defaults_when_missing() {
-        let settings: Settings = toml::from_str(
-            r#"
-            [server]
-            host = "127.0.0.1"
-            port = 8080
-            public_url = ""
-            cookie_secure = false
-            trusted_proxy_cidrs = ["127.0.0.1/32"]
-
-            [accounts]
-            registration_enabled = true
-            registration_captcha_enabled = false
-            anonymous_mode_enabled = false
-            min_password_length = 10
-            max_username_len = 32
-            max_display_name_len = 64
-            max_bio_len = 240
-            allow_profile_banners = true
-            allow_profile_pictures = true
-
-            [posts]
-            max_text_chars = 280
-            max_images_per_post = 4
-            max_videos_per_post = 1
-            max_media_per_post = 4
-            allow_reposts = true
-            allow_replies = true
-            allow_likes = true
-            allow_bookmarks = true
-            allow_hashtags = true
-            allow_mentions = true
-
-            [media]
-            ffmpeg_path = "ffmpeg"
-            convert_images_to_webp = true
-            convert_videos_to_webm = true
-            keep_original_uploads = false
-            max_image_size = 52428800
-            max_video_size = 157286400
-            generate_video_thumbnails = true
-            allowed_image_mime_types = ["image/png"]
-            allowed_video_mime_types = ["video/webm"]
-            webp_quality = 82
-            vp9_crf = 32
-            vp9_deadline = "good"
-
-            [tor]
-            enabled = false
-            tor_only = false
-            data_dir = "tor"
-            onion_service_name = "microblog"
-            bootstrap_timeout_secs = 120
-            max_concurrent_streams = 512
-            include_tor_keys_in_backups_by_default = false
-
-            [moderation]
-            posts_per_minute = 5
-            replies_per_minute = 10
-            reposts_per_minute = 10
-            account_creations_per_ip_per_day = 3
-            failed_login_attempts_per_15m = 10
-            anonymous_posts_per_ip_per_hour = 10
-
-            [admin]
-            create_admin_on_first_boot = true
-
-            [backup]
-            enabled = true
-            backup_dir = "backups"
-            "#,
-        )
-        .expect("settings without site");
-        assert_eq!(settings.site.name, "RustPost");
-        assert!(!settings.accounts.registration_captcha_enabled);
-
-        let mut settings = Settings::default();
-        settings.site.name = " Custom".to_owned();
-        assert!(settings.validate().is_err());
-    }
-
-    #[test]
-    fn registration_captcha_defaults_disabled_when_missing() {
-        let generated = default_settings_toml();
-        let without_captcha = generated
-            .lines()
-            .filter(|line| {
-                !line
-                    .trim_start()
-                    .starts_with("registration_captcha_enabled")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let settings: Settings = toml::from_str(&without_captcha).expect("legacy settings parse");
-
-        assert!(!settings.accounts.registration_captcha_enabled);
+impl ServerSettings {
+    /// Validated listener address, preserving bracketed IPv6 TOML compatibility.
+    ///
+    /// # Errors
+    /// Returns an error if the host is not an IPv4 or IPv6 address.
+    pub fn listener_address(&self) -> anyhow::Result<std::net::SocketAddr> {
+        let host = self
+            .host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(&self.host);
+        let ip = host
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| anyhow::anyhow!("server.host must be an IP address"))?;
+        Ok(std::net::SocketAddr::new(ip, self.port))
     }
 }

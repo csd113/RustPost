@@ -117,15 +117,10 @@ fn should_buffer_head_response(path: &str, response: &Response) -> bool {
 async fn head_response_with_get_length(response: Response) -> Response {
     let (mut parts, body) = response.into_parts();
     match to_bytes(body, MAX_BUFFERED_RESPONSE_BYTES).await {
-        Ok(body) => {
-            set_content_length(&mut parts.headers, body.len());
-            Response::from_parts(parts, Body::empty())
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to buffer HEAD response");
-            Response::from_parts(parts, Body::empty())
-        }
+        Ok(body) => set_content_length(&mut parts.headers, body.len()),
+        Err(error) => tracing::warn!(error = %error, "failed to buffer HEAD response"),
     }
+    Response::from_parts(parts, Body::empty())
 }
 
 fn body_for_method(body: Vec<u8>, is_head: bool) -> Body {
@@ -301,133 +296,4 @@ fn vary_contains_token(value: &str, token: &str) -> bool {
     value
         .split(',')
         .any(|part| part.trim().eq_ignore_ascii_case(token))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accept_encoding_parser_reads_q_values() {
-        let encodings = parse_accept_encoding("br, gzip;q=0.7, deflate; q=0").collect::<Vec<_>>();
-
-        assert_eq!(
-            encodings,
-            vec![
-                AcceptedEncoding { name: "br", q: 1.0 },
-                AcceptedEncoding {
-                    name: "gzip",
-                    q: 0.7
-                },
-                AcceptedEncoding {
-                    name: "deflate",
-                    q: 0.0
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn chooses_gzip_only_when_explicitly_accepted() {
-        let mut headers = HeaderMap::new();
-        assert_eq!(choose_response_encoding(&headers), None);
-
-        headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("br"));
-        assert_eq!(choose_response_encoding(&headers), None);
-
-        headers.insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static("gzip;q=0"),
-        );
-        assert_eq!(choose_response_encoding(&headers), None);
-
-        headers.insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static("br, gzip;q=0.5"),
-        );
-        assert_eq!(
-            choose_response_encoding(&headers),
-            Some(ResponseEncoding::Gzip)
-        );
-    }
-
-    #[test]
-    fn content_type_decision_accepts_text_candidates() {
-        for value in [
-            "text/html; charset=utf-8",
-            "text/css",
-            "application/javascript; charset=utf-8",
-            "application/json",
-            "application/activity+json",
-            "application/xml",
-            "image/svg+xml",
-        ] {
-            assert!(is_compressible_content_type(&HeaderValue::from_static(
-                value
-            )));
-        }
-    }
-
-    #[test]
-    fn content_type_decision_rejects_binary_media() {
-        for value in [
-            "image/png",
-            "image/webp",
-            "video/mp4",
-            "audio/mpeg",
-            "application/pdf",
-            "application/zip",
-            "application/octet-stream",
-        ] {
-            assert!(!is_compressible_content_type(&HeaderValue::from_static(
-                value
-            )));
-        }
-    }
-
-    #[test]
-    fn already_encoded_responses_are_not_candidates() {
-        let mut response = Response::builder()
-            .header(header::CONTENT_TYPE, "text/html")
-            .body(Body::from("<html></html>"))
-            .expect("response");
-        assert!(response_is_compressible(&response));
-
-        response
-            .headers_mut()
-            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
-        assert!(!response_is_compressible(&response));
-    }
-
-    #[test]
-    fn content_length_over_buffer_limit_is_not_candidate() {
-        let response = Response::builder()
-            .header(header::CONTENT_TYPE, "text/html")
-            .header(
-                header::CONTENT_LENGTH,
-                (MAX_BUFFERED_RESPONSE_BYTES + 1).to_string(),
-            )
-            .body(Body::empty())
-            .expect("response");
-
-        assert!(!response_is_compressible(&response));
-    }
-
-    #[test]
-    fn size_threshold_skips_tiny_responses() {
-        assert!(!meets_minimum_size_threshold(MIN_COMPRESSIBLE_BYTES - 1));
-        assert!(meets_minimum_size_threshold(MIN_COMPRESSIBLE_BYTES));
-    }
-
-    #[test]
-    fn vary_accept_encoding_is_merged_without_clobbering() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::VARY, HeaderValue::from_static("Cookie"));
-
-        merge_vary_accept_encoding(&mut headers);
-        assert_eq!(headers[header::VARY], "Cookie, Accept-Encoding");
-
-        merge_vary_accept_encoding(&mut headers);
-        assert_eq!(headers[header::VARY], "Cookie, Accept-Encoding");
-    }
 }

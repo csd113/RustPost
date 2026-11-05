@@ -1,0 +1,23 @@
+name: Report an issue
+description: Tell us what went wrong.
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "1.1.0"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "macOS Intel, Linux ARM64, Windows"
+    validations:
+      required: true
+  - type: textarea
+    id: issue
+    attributes:
+      label: What is the issue?
+    validations:
+      required: true
