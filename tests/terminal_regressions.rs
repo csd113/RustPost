@@ -63,6 +63,48 @@ fn corrupt_check_is_failure_and_missing_database_is_read_only() -> anyhow::Resul
 }
 
 #[test]
+fn check_and_migration_identify_the_shared_release_format() -> anyhow::Result<()> {
+    let (_dir, paths) = fixture()?;
+    let open = || rusqlite::Connection::open(&paths.database_path);
+    open()?.execute_batch(include_str!("fixtures/schema-v4.sql"))?;
+    let before = std::fs::read(&paths.database_path)?;
+    let release = concat!("v", env!("CARGO_PKG_VERSION"));
+
+    let pending = cli(&paths.data_dir).arg("check").output()?;
+    let summary = String::from_utf8_lossy(&pending.stdout);
+    assert!(pending.status.success(), "{summary}");
+    assert!(summary.contains("[PENDING] RustPost v1.0.0/v1.1.0 database format"));
+    assert!(summary.contains(&format!("migration to RustPost {release}")));
+    assert_eq!(std::fs::read(&paths.database_path)?, before);
+
+    let migrated = cli(&paths.data_dir)
+        .args(["create-admin", "auditadmin", "fixture-only-password"])
+        .output()?;
+    let diagnostics = String::from_utf8_lossy(&migrated.stderr);
+    assert!(migrated.status.success(), "{diagnostics}");
+    assert!(diagnostics.contains(&format!(
+        "Migrated database from RustPost v1.0.0/v1.1.0 database format to RustPost {release}."
+    )));
+
+    let current = cli(&paths.data_dir).arg("check").output()?;
+    assert!(current.status.success());
+    assert!(
+        String::from_utf8_lossy(&current.stdout)
+            .contains(&format!("[OK] compatible with RustPost {release}"))
+    );
+    assert_eq!(
+        rustpost::db::schema_version_from_connection(&open()?)?,
+        rustpost::db::CURRENT_SCHEMA_VERSION
+    );
+
+    // An older ledger with newer tables is inconsistent, not a pending migration.
+    open()?.execute("UPDATE schema_migrations SET version = 4", [])?;
+    let inconsistent = cli(&paths.data_dir).arg("check").output()?;
+    assert!(!inconsistent.status.success());
+    Ok(())
+}
+
+#[test]
 fn piped_secret_creates_admin_without_echo_or_argv_secret() -> anyhow::Result<()> {
     let (_dir, paths) = fixture()?;
     let secret = "audit-only-secret-382717";
@@ -126,6 +168,40 @@ fn exact_suggestion_executes_with_custom_config_and_shell_metacharacters() -> an
     );
     let command = command.replacen(&harness, &executable, 1);
     let output = Command::new("/bin/sh").args(["-c", &command]).output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.stdout.contains(&0x1b));
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_suggestion_executes_with_typographic_quotes() -> anyhow::Result<()> {
+    use base64::Engine as _;
+
+    let (dir, fixture_paths) = fixture()?;
+    let paths = RuntimePaths::from_data_dir(dir.path().join("data ’ ‘ ‚ ‛ ' $ ` ; 終"));
+    std::fs::rename(&fixture_paths.data_dir, &paths.data_dir)?;
+    let command = terminal::instance_command(&paths, "check");
+    // Keep the exact suggested arguments and swap the harness executable for the CLI.
+    let (_, arguments) = command
+        .split_once(" --data-dir ")
+        .ok_or_else(|| anyhow::anyhow!("missing PowerShell suggestion: {command}"))?;
+    let exe = env!("CARGO_BIN_EXE_rustpost-cli");
+    let command = format!("& $env:RUSTPOST_TEST_EXE --data-dir {arguments}; exit $LASTEXITCODE");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(
+        command
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
+        .env("RUSTPOST_TEST_EXE", exe)
+        .output()?;
     assert!(
         output.status.success(),
         "{}",

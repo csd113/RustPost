@@ -196,6 +196,7 @@ pub(super) fn create_backup_inner(
     pending.as_file().sync_all()?;
     let archive_path = unique_archive_path(&paths.backups_dir, kind);
     pending.persist_noclobber(&archive_path)?;
+    #[cfg(unix)]
     sync_directory(&paths.backups_dir)?;
     Ok(archive_path)
 }

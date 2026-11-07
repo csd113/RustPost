@@ -55,8 +55,11 @@ pub(super) fn swap_staged_runtime(
             .write(true)
             .open(rollback.join("recovery-paths.txt"))?
             .sync_all()?;
-        sync_directory(&rollback)?;
-        sync_directory(&paths.data_dir)?;
+        #[cfg(unix)]
+        {
+            sync_directory(&rollback)?;
+            sync_directory(&paths.data_dir)?;
+        }
         for root in roots {
             if root.live.try_exists()? {
                 let rollback_path = rollback.join(root.relative);
@@ -80,10 +83,12 @@ pub(super) fn swap_staged_runtime(
             }
             installed.push(root.live);
         }
+        #[cfg(unix)]
         apply_restored_permissions(paths, include_tor_keys)?;
         for path in &installed {
             sync_restored_tree(path)?;
         }
+        #[cfg(unix)]
         sync_directory(&paths.data_dir)?;
         Ok(())
     })();
@@ -99,6 +104,7 @@ pub(super) fn swap_staged_runtime(
     }
     // If cleanup fails, keep recovery evidence and require operator attention.
     fs::remove_dir_all(&rollback)?;
+    #[cfg(unix)]
     sync_directory(&paths.data_dir)?;
     Ok(())
 }
@@ -111,7 +117,9 @@ pub(super) fn sync_restored_tree(path: &Path) -> anyhow::Result<()> {
                 .write(true)
                 .open(entry.path())?
                 .sync_all()?;
-        } else if entry.file_type().is_dir() {
+        }
+        #[cfg(unix)]
+        if entry.file_type().is_dir() {
             sync_directory(entry.path())?;
         }
     }
@@ -139,6 +147,7 @@ pub(super) fn rollback_restore(
     Ok(())
 }
 
+#[cfg(unix)]
 pub(super) fn apply_restored_permissions(
     paths: &RuntimePaths,
     include_tor_keys: bool,
@@ -163,11 +172,6 @@ pub(super) fn restrict_tor_permissions(path: &Path) -> anyhow::Result<()> {
         };
         fs::set_permissions(entry.path(), fs::Permissions::from_mode(mode))?;
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub(super) fn restrict_tor_permissions(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 

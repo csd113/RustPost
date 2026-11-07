@@ -69,12 +69,16 @@ uuid = { version = "1.29.0", features = ["v4", "serde"] }
 walkdir = "2.5"
 zeroize = "1.9.1"
 unicode-segmentation = "1.13.3"
-# Already in the Arti dependency graph; safe cross-platform disk headroom checks.
+
+[target.'cfg(not(windows))'.dependencies]
+# Already in the Arti dependency graph; used for disk headroom on Unix.
 sysinfo = { version = "0.38.4", default-features = false, features = ["disk", "linux-tmpfs", "linux-netdevs"] }
 
 [target.'cfg(windows)'.dependencies]
 # Crossterm's Windows raw-mode reset does not preserve initially disabled flags.
 crossterm_winapi = "0.9.1"
+# Query the data filesystem directly, including UNC shares and user quotas.
+winsafe = { version = "0.0.29", features = ["kernel"] }
 
 [[test]]
 name = "terminal_regressions"

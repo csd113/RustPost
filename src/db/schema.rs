@@ -5,8 +5,20 @@ use super::{RequiredColumn, RequiredIndex, RequiredTrigger};
 /// Schema additions introduced with schema version 3. Applied on top of a
 /// version 2 database; every statement is idempotent.
 pub(super) const RELEASE_V3_INDEXES: &str = include_str!("schema/release-v3.sql");
+pub(super) const V3_ADDITIONS: &[&str] = &[
+    "idx_posts_root",
+    "idx_media_owner",
+    "idx_sessions_user",
+    "idx_post_media_media",
+    "idx_rate_limit_created",
+];
 
 pub(super) const YOUTUBE_EMBEDS_SCHEMA: &str = include_str!("schema/youtube.sql");
+pub(super) const V2_ADDITIONS: &[&str] = &[
+    "post_embeds",
+    "idx_post_embeds_post",
+    "idx_post_embeds_video",
+];
 
 /// Columns appended to `users` by schema version 4. The order is part of the
 /// schema contract: fresh baselines and migrated databases must match it.
@@ -20,6 +32,15 @@ pub(super) const USER_COLUMNS_ADDED_IN_V4: &[(&str, &str)] = &[
 /// Tables and indexes introduced with schema version 4. Applied on top of a
 /// version 3 database; every statement is idempotent.
 pub(super) const RELEASE_V4_SCHEMA: &str = include_str!("schema/release-v4.sql");
+pub(super) const V4_ADDITIONS: &[&str] = &[
+    "follow_requests",
+    "idx_follow_requests_target",
+    "username_history",
+    "idx_username_history_normalized",
+    "instance_settings",
+    "account_imports",
+    "idx_account_imports_user",
+];
 
 pub(super) const RELEASE_V5_SCHEMA: &str = include_str!("schema/release-v5.sql");
 pub(super) const V5_ADDITIONS: &[&str] = &[

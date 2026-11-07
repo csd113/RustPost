@@ -8,15 +8,35 @@ use crate::{
 use rusqlite::params;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(windows))]
 pub fn available_space(path: &Path) -> anyhow::Result<u64> {
     let path = path.canonicalize()?;
-    #[cfg(windows)]
-    let path = {
-        let text = path.to_string_lossy();
-        PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
-    };
     let disks = sysinfo::Disks::new_with_refreshed_list();
-    disks.iter().filter(|d|path.starts_with(d.mount_point())).max_by_key(|d|d.mount_point().components().count()).map(sysinfo::Disk::available_space).ok_or_else(||anyhow::anyhow!("cannot inspect storage headroom; check the data filesystem or storage.min_free_bytes"))
+    disks
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().components().count())
+        .map(sysinfo::Disk::available_space)
+        .ok_or_else(|| anyhow::anyhow!(
+            "cannot inspect storage headroom; check the data filesystem or storage.min_free_bytes"
+        ))
+}
+
+#[cfg(windows)]
+pub fn available_space(path: &Path) -> anyhow::Result<u64> {
+    use anyhow::Context as _;
+
+    // Query the directory itself so UNC shares, mount points and user quotas
+    // are handled by Windows. UNC roots require a trailing backslash.
+    let directory = path.canonicalize()?.join("");
+    let directory = directory
+        .to_str()
+        .filter(|text| !text.contains('\0'))
+        .context("storage directory path is invalid")?;
+    let mut available = 0;
+    winsafe::GetDiskFreeSpaceEx(Some(directory), Some(&mut available), None, None)
+        .with_context(|| format!("cannot inspect storage headroom for {directory}"))?;
+    Ok(available)
 }
 
 /// Best-effort admission probe only: it does not reserve physical disk capacity.

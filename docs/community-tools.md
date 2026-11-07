@@ -54,7 +54,9 @@ After expiry, cleanup runs in the background. Operator downtime can delay physic
 
 ## Operator controls and upgrade
 
-Back up the complete site before upgrading. Startup migrates supported older SQLite schemas to **schema 5** in one transaction, preserving existing posts/media. Existing settings receive safe defaults for new fields. Downgrading requires the matching older binary and a pre-upgrade full-site backup; an older binary cannot use schema 5. Backup format **1** and account archive format **1** are unchanged.
+Back up the complete site before upgrading. Startup migrates supported older databases to the **RustPost v1.2.0** format in one transaction, preserving existing posts and media. RustPost v1.0.0 and v1.1.0 share a database format, so migration messages name both releases. Supported pre-release databases use a legacy label. Existing settings receive safe defaults for new fields.
+
+The internal migration ledger uses schema 4 for the shared v1.0.0/v1.1.0 format and schema 5 for v1.2.0. Downgrading requires the matching older binary and a pre-upgrade full-site backup. Backup format **1** and account archive format **1** are unchanged.
 
 Full-site backups include drafts, schedules, polls/votes, media work, and recovery state. Account export/import remains a selected-content format: it does **not** transfer drafts, schedules, poll definitions/votes, or deletion recovery. Exported poll post text/media can transfer without its poll. Use a full-site backup to preserve these features.
 

@@ -7,6 +7,7 @@ use anyhow::Context as _;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub(crate) const CURRENT_RELEASE: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// Pre-1.0 schema version 1 (without the `YouTube` embed tables).
 const RELEASE_V1_SCHEMA_VERSION: i64 = 1;
@@ -14,6 +15,7 @@ const RELEASE_V1_SCHEMA_VERSION: i64 = 1;
 const RELEASE_V2_SCHEMA_VERSION: i64 = 2;
 /// Pre-1.0 schema version 3 (with the release indexes).
 const RELEASE_V3_SCHEMA_VERSION: i64 = 3;
+const RELEASE_V4_SCHEMA_VERSION: i64 = 4;
 const OLD_ALPHA_SCHEMA_VERSION: i64 = 13;
 const INCOMPATIBLE_DATABASE_HINT: &str = "back up or export the instance, recreate a fresh RustPost data directory, and restore from a known-good backup instead of attempting a blind migration";
 
@@ -149,7 +151,7 @@ impl SchemaReport {
     #[must_use]
     pub fn summary(&self) -> String {
         if self.is_compatible() {
-            return format!("release baseline schema version {CURRENT_SCHEMA_VERSION}");
+            return format!("compatible with RustPost {CURRENT_RELEASE}");
         }
         summarize_issues(&self.issues)
     }
@@ -165,6 +167,19 @@ enum MigrationState {
     ReleaseVersion1,
     AlphaLatest,
     Incompatible(String),
+}
+
+impl MigrationState {
+    const fn source_format(&self) -> Option<&'static str> {
+        match self {
+            Self::ReleaseVersion4 => Some("RustPost v1.0.0/v1.1.0 database format"),
+            Self::ReleaseVersion1 | Self::ReleaseVersion2 | Self::ReleaseVersion3 => {
+                Some("legacy pre-release database format")
+            }
+            Self::AlphaLatest => Some("legacy alpha database format"),
+            Self::Empty | Self::Baseline | Self::Incompatible(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -201,6 +216,7 @@ struct ColumnInfo {
 
 mod migrations;
 pub use migrations::migrate;
+pub(crate) use migrations::migrate_from;
 use migrations::{
     migrate_release_v1_to_current, migrate_release_v2_to_current, migrate_release_v3_to_current,
     migrate_release_v4_to_current, migration_state, reset_schema_migrations_to,

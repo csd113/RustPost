@@ -255,8 +255,10 @@ pub use scheduler::{
 };
 mod storage;
 pub(crate) use storage::backup_coordination_lock;
+#[cfg(unix)]
+use storage::sync_directory;
+use storage::unique_archive_path;
 pub use storage::{backup_path_for_download, list_backups, operation_in_progress};
-use storage::{sync_directory, unique_archive_path};
 
 mod verify;
 pub use verify::{VerificationReport, verify_backup};

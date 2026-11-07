@@ -267,7 +267,7 @@ async fn run_command(
                 anyhow::bail!("seed-demo requires an explicit --data-dir under target/debug");
             }
             let pool = db::connect(&paths.database_path).await?;
-            db::migrate(&pool).await?;
+            migrate_database(&pool).await?;
             let report = demo_seed::seed(&pool, &paths, &settings, &settings_path).await?;
             stdout_line(format_args!("{report}"))?;
             Ok(())
@@ -279,8 +279,10 @@ async fn run_command(
         } => {
             let report = backup::verify_backup(&paths, &archive, include_tor_keys)?;
             stdout_line(format_args!(
-                "Backup verified without replacing live data: {} files, {} bytes, rehearsed schema {}",
-                report.files, report.bytes, report.schema_version
+                "Backup verified without replacing live data: {} files, {} bytes, database and media paths rehearsed for RustPost {}",
+                report.files,
+                report.bytes,
+                db::CURRENT_RELEASE
             ))?;
             Ok(())
         }
@@ -378,13 +380,23 @@ struct AdminDatabase<'a> {
     settings: &'a config::Settings,
 }
 
+async fn migrate_database(pool: &db::Db) -> anyhow::Result<()> {
+    if let Some(source) = db::migrate_from(pool).await? {
+        stderr_raw(format_args!(
+            "Migrated database from {source} to RustPost {}.\n",
+            db::CURRENT_RELEASE
+        ));
+    }
+    Ok(())
+}
+
 async fn create_admin_command(
     database: &AdminDatabase<'_>,
     username: String,
     password: Zeroizing<String>,
 ) -> anyhow::Result<()> {
     let pool = db::connect(&database.paths.database_path).await?;
-    db::migrate(&pool).await?;
+    migrate_database(&pool).await?;
     admin::create_admin(&pool, database.settings, &username, &password).await?;
     stdout_raw(format_args!(
         "{}",
@@ -408,7 +420,7 @@ async fn reset_admin_password_command(
     password: Zeroizing<String>,
 ) -> anyhow::Result<()> {
     let pool = db::connect(&database.paths.database_path).await?;
-    db::migrate(&pool).await?;
+    migrate_database(&pool).await?;
     admin::reset_admin_password(&pool, database.settings, &username, &password).await?;
     stdout_raw(format_args!(
         "{}",
@@ -459,6 +471,10 @@ fn restore_command(
                 terminal::row("Archive", archive.display().to_string()),
                 terminal::row("Data directory", paths.data_dir.display().to_string()),
                 terminal::row(
+                    "Database",
+                    format!("compatible with RustPost {}", db::CURRENT_RELEASE)
+                ),
+                terminal::row(
                     "Pre-restore safety backup",
                     report.pre_restore_backup.map_or_else(
                         || "not created".to_owned(),
@@ -491,7 +507,7 @@ async fn serve(
         "[STARTING] opening database and validating schema\n"
     ));
     let pool = db::connect(&paths.database_path).await?;
-    db::migrate(&pool).await?;
+    migrate_database(&pool).await?;
     ensure_first_admin_interactive(&pool, &settings, &paths, options.shutdown.subscribe()).await?;
     if *options.shutdown.borrow() {
         anyhow::bail!("startup cancelled");

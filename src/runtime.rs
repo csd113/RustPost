@@ -134,10 +134,13 @@ impl RuntimePaths {
             })?;
         }
         self.migrate_legacy_database_layout()?;
-        restrict_dir(&self.data_dir)?;
-        restrict_dir(&self.backups_dir)?;
-        restrict_dir(&self.tor_dir)?;
-        restrict_dir(&self.tor_onion_service_dir)?;
+        #[cfg(unix)]
+        {
+            restrict_dir(&self.data_dir)?;
+            restrict_dir(&self.backups_dir)?;
+            restrict_dir(&self.tor_dir)?;
+            restrict_dir(&self.tor_onion_service_dir)?;
+        }
         Ok(())
     }
 
@@ -329,11 +332,6 @@ fn restrict_dir(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_dir(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 

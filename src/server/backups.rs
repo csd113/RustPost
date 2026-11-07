@@ -429,8 +429,10 @@ pub(super) async fn admin_verify_backup(
         Ok(report) => {
             admin::audit(&state.pool, user.id, "verify_backup", &form.filename).await?;
             let message = format!(
-                "Backup verified: {} files, {} bytes; migrations and media paths rehearsed through schema {}. Live data was not replaced.",
-                report.files, report.bytes, report.schema_version
+                "Backup verified: {} files, {} bytes. Database and media paths rehearsed for RustPost {}. Live data was not replaced.",
+                report.files,
+                report.bytes,
+                crate::db::CURRENT_RELEASE
             );
             backups_page(&state, &user, &csrf, Some(("success", &message))).await
         }

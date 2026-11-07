@@ -205,7 +205,7 @@ Prefix each command with the executable and your data directory, for example `./
 
 Global console options are `--console auto|tui|plain|off` and `--ascii`. `--config PATH` selects a settings file; `--data-dir PATH` selects site storage. Put both path options before the subcommand. They do not override individual settings. See the [terminal guide](terminal-console.md) for controls and measurement limits.
 
-`check` reports missing fresh databases, adoptable legacy schemas, and optional FFmpeg absence without treating them as corruption. It exits nonzero for incompatible/unreadable databases or layout conflicts. A legacy database is inspected in place.
+`check` reports missing fresh databases, pending migrations from recognized older database formats, and optional FFmpeg absence without treating them as corruption. It describes database compatibility using RustPost release names. It exits nonzero for incompatible or unreadable databases and layout conflicts. A legacy database is inspected in place.
 
 ## Further reference
 

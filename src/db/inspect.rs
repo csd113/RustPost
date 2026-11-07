@@ -13,17 +13,22 @@ pub fn schema_report_from_path(path: &Path) -> anyhow::Result<SchemaReport> {
 
 pub fn adoptable_schema_summary_from_path(path: &Path) -> anyhow::Result<Option<String>> {
     let conn = open_read_only_connection(path)?;
-    if !matches!(migration_state(&conn)?, MigrationState::AlphaLatest) {
+    let state = migration_state(&conn)?;
+    let Some(source) = state.source_format() else {
+        return Ok(None);
+    };
+
+    // The current migration creates these objects without IF NOT EXISTS.
+    if user_schema_objects(&conn)?
+        .iter()
+        .any(|object| schema::V5_ADDITIONS.contains(&object.as_str()))
+        || !inspect_migration_candidate(&conn, &state)?.is_empty()
+    {
         return Ok(None);
     }
-
-    let issues = inspect_alpha_schema_objects(&conn)?;
-    if issues.is_empty() {
-        return Ok(Some(format!(
-            "pre-release database structurally matches the release baseline; startup will mark it as release baseline schema version {CURRENT_SCHEMA_VERSION} without data loss"
-        )));
-    }
-    Ok(None)
+    Ok(Some(format!(
+        "{source} detected. Startup will attempt migration to RustPost {CURRENT_RELEASE}."
+    )))
 }
 
 pub fn validate_schema(conn: &Connection) -> anyhow::Result<()> {
@@ -64,39 +69,28 @@ pub(super) fn validate_or_normalize_restorable_schema(
     conn: &Connection,
     normalize: bool,
 ) -> anyhow::Result<()> {
-    match migration_state(conn)? {
+    let state = migration_state(conn)?;
+    if !normalize
+        && !matches!(state, MigrationState::AlphaLatest)
+        && let Some(source) = state.source_format()
+    {
+        anyhow::bail!("{source} requires migration to RustPost {CURRENT_RELEASE}");
+    }
+    match state {
         MigrationState::Baseline => validate_schema(conn),
         MigrationState::ReleaseVersion4 => {
-            if !normalize {
-                anyhow::bail!("database schema version 4 requires migration before use");
-            }
             migrate_release_v4_to_current(conn)?;
             validate_schema(conn)
         }
         MigrationState::ReleaseVersion3 => {
-            if !normalize {
-                anyhow::bail!(
-                    "database schema version {RELEASE_V3_SCHEMA_VERSION} requires migration before use"
-                );
-            }
             migrate_release_v3_to_current(conn)?;
             validate_schema(conn)
         }
         MigrationState::ReleaseVersion2 => {
-            if !normalize {
-                anyhow::bail!(
-                    "database schema version {RELEASE_V2_SCHEMA_VERSION} requires migration before use"
-                );
-            }
             migrate_release_v2_to_current(conn)?;
             validate_schema(conn)
         }
         MigrationState::ReleaseVersion1 => {
-            if !normalize {
-                anyhow::bail!(
-                    "database schema version {RELEASE_V1_SCHEMA_VERSION} requires migration before use"
-                );
-            }
             migrate_release_v1_to_current(conn)?;
             validate_schema(conn)
         }
@@ -136,7 +130,7 @@ pub(super) fn inspect_schema(conn: &Connection) -> anyhow::Result<SchemaReport> 
         version = versions.iter().max().copied();
         if versions != [CURRENT_SCHEMA_VERSION] {
             issues.push(format!(
-                "schema_migrations metadata does not match the release baseline; expected only version {CURRENT_SCHEMA_VERSION}"
+                "migration metadata does not match the RustPost {CURRENT_RELEASE} database format"
             ));
         }
     } else {
@@ -180,37 +174,43 @@ pub(super) fn inspect_schema_objects(conn: &Connection) -> anyhow::Result<Vec<St
 }
 
 pub(super) fn inspect_alpha_schema_objects(conn: &Connection) -> anyhow::Result<Vec<String>> {
-    // Objects introduced after the alpha schema are reported as missing here
-    // but are created by the migration chain during adoption. The `users`
-    // column list may also differ because adoption appends the version 4
-    // account lifecycle columns.
+    inspect_migration_candidate(conn, &MigrationState::AlphaLatest)
+}
+
+fn inspect_migration_candidate(
+    conn: &Connection,
+    state: &MigrationState,
+) -> anyhow::Result<Vec<String>> {
+    let add_embeds = matches!(
+        state,
+        MigrationState::AlphaLatest | MigrationState::ReleaseVersion1
+    );
+    let add_release_indexes = add_embeds || matches!(state, MigrationState::ReleaseVersion2);
+    let add_account_lifecycle =
+        add_release_indexes || matches!(state, MigrationState::ReleaseVersion3);
+    // Ignore only the objects that the remaining migrations create.
     Ok(inspect_schema_objects(conn)?
         .into_iter()
         .filter(|issue| {
-            !matches!(
-                issue.as_str(),
-                "missing table post_embeds"
-                    | "missing index idx_post_embeds_post"
-                    | "missing index idx_post_embeds_video"
-                    | "missing index idx_posts_root"
-                    | "missing index idx_media_owner"
-                    | "missing index idx_sessions_user"
-                    | "missing index idx_post_media_media"
-                    | "missing index idx_rate_limit_created"
-                    | "missing table follow_requests"
-                    | "missing index idx_follow_requests_target"
-                    | "missing table username_history"
-                    | "missing index idx_username_history_normalized"
-                    | "missing table instance_settings"
-                    | "missing table account_imports"
-                    | "missing index idx_account_imports_user"
-            ) && !schema::V5_ADDITIONS.iter().any(|object| {
-                issue == &format!("missing table {object}")
-                    || issue == &format!("missing index {object}")
-            }) && !issue.starts_with("table users columns differ")
-                && !USER_COLUMNS_ADDED_IN_V4
-                    .iter()
-                    .any(|(column, _definition)| issue == &format!("missing column users.{column}"))
+            let new_object = issue
+                .strip_prefix("missing table ")
+                .or_else(|| issue.strip_prefix("missing index "))
+                .is_some_and(|name| {
+                    schema::V5_ADDITIONS.contains(&name)
+                        || (add_embeds && schema::V2_ADDITIONS.contains(&name))
+                        || (add_release_indexes && schema::V3_ADDITIONS.contains(&name))
+                        || (add_account_lifecycle && schema::V4_ADDITIONS.contains(&name))
+                });
+            let new_user_column = add_account_lifecycle
+                && (issue.starts_with("table users columns differ")
+                    || issue
+                        .strip_prefix("missing column users.")
+                        .is_some_and(|name| {
+                            USER_COLUMNS_ADDED_IN_V4
+                                .iter()
+                                .any(|(column, _)| name == *column)
+                        }));
+            !new_object && !new_user_column
         })
         .collect())
 }

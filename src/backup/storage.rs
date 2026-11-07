@@ -85,11 +85,9 @@ pub fn operation_in_progress(paths: &RuntimePaths) -> bool {
     }
 }
 
+#[cfg(unix)]
 pub(super) fn sync_directory(path: &Path) -> anyhow::Result<()> {
-    #[cfg(unix)]
     File::open(path)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = path;
     Ok(())
 }
 
