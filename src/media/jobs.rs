@@ -151,7 +151,7 @@ async fn process_claimed(
     Ok(())
 }
 
-async fn publication_lease(paths: &RuntimePaths) -> anyhow::Result<std::fs::File> {
+async fn publication_lease(paths: &RuntimePaths) -> anyhow::Result<crate::runtime::FileLease> {
     loop {
         match crate::runtime::snapshot_lease(paths, false) {
             Ok(lease) => return Ok(lease),

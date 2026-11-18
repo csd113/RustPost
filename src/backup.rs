@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 
 use crate::config::{BackupSettings, Settings};
 use crate::db;
-use crate::runtime::RuntimePaths;
+use crate::runtime::{FileLease, RuntimePaths};
 
 const FORMAT_VERSION: u16 = 1;
 const MANIFEST_PATH: &str = "manifest.toml";
@@ -162,15 +162,15 @@ fn copy_stream<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io:
 
 struct OperationLock {
     path: PathBuf,
-    _coordination: File,
-    snapshot: Option<File>,
+    _coordination: FileLease,
+    snapshot: Option<FileLease>,
     capture_path: PathBuf,
 }
 
 impl OperationLock {
     fn acquire(paths: &RuntimePaths) -> anyhow::Result<Self> {
         fs::create_dir_all(&paths.tmp_dir)?;
-        let coordination = backup_coordination_lock(paths)?;
+        let coordination = backup_coordination_lock(paths).map(FileLease::from_locked)?;
         let path = paths.tmp_dir.join(LOCK_DIR);
         match fs::create_dir(&path) {
             Ok(()) => {}

@@ -17,7 +17,7 @@ pub fn verify_backup(
 ) -> anyhow::Result<VerificationReport> {
     let _temporary = crate::runtime::begin_temp_operation();
     // Serialize against archive creation, retention and restore, without taking the live snapshot lock.
-    let _operation = backup_coordination_lock(paths)?;
+    let _operation = backup_coordination_lock(paths).map(FileLease::from_locked)?;
     let settings = Settings::load(&paths.settings_path)?;
     let size = fs::metadata(archive)?.len();
     crate::storage_limits::ensure_headroom(

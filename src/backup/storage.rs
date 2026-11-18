@@ -70,7 +70,7 @@ pub fn operation_in_progress(paths: &RuntimePaths) -> bool {
     if !capture.is_dir() {
         return false;
     }
-    let Ok(_ownership) = backup_coordination_lock(paths) else {
+    let Ok(_ownership) = backup_coordination_lock(paths).map(FileLease::from_locked) else {
         // A live owner or an IO failure must never allow an unsafe capture bypass.
         return true;
     };
