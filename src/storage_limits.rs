@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 
 #[cfg(not(windows))]
 pub fn available_space(path: &Path) -> anyhow::Result<u64> {
+    use anyhow::Context as _;
+
     let path = path.canonicalize()?;
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let disks =
+        sysinfo::Disks::new_with_refreshed_list().context("cannot list storage filesystems")?;
     disks
         .iter()
         .filter(|disk| path.starts_with(disk.mount_point()))

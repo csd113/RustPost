@@ -6,7 +6,7 @@ You only need the Rust toolchain if you want to build or change the app. To run 
 
 ## Build and run
 
-Install Git and [rustup](https://rustup.rs/), plus the native compiler/linker tools for your operating system. The repository pins **Rust 1.99.1** in `rust-toolchain.toml`; `Cargo.toml` also declares 1.99.1 as the minimum supported version. Rustup selects the pin inside the repository without changing your global default.
+Install Git and [rustup](https://rustup.rs/), plus the native compiler/linker tools for your operating system. The repository pins **Rust 1.100.0** in `rust-toolchain.toml`; `Cargo.toml` also declares 1.100.0 as the minimum supported version. Rustup selects the pin inside the repository without changing your global default.
 
 ```sh
 git clone --branch dev https://github.com/csd113/RustPost.git
@@ -92,7 +92,7 @@ Each ZIP contains a matching version/platform folder with the executable, README
 
 The release workflow checks that the tag matches the package version, validates code quality/rustdoc, verifies the native executable version and Mac architecture, and prepares a **draft** GitHub release. It refuses to modify an already-published release. Publishing a draft is a separate maintainer action.
 
-The container workflow builds Linux amd64/arm64 images from a source tag and publishes version tags, plus `latest` for stable versions. The image uses an unprivileged UID/GID 10001, persistent `/data`, and bundled `ffmpeg`. Its Dockerfile starts with `rust:1.98.1-bookworm` and installs the exact 1.99.1 compiler; that base-image tag is not the final build compiler version.
+The container workflow builds Linux amd64/arm64 images from a source tag and publishes version tags, plus `latest` for stable versions. The image uses an unprivileged UID/GID 10001, persistent `/data`, and bundled `ffmpeg`. Its Dockerfile uses `rust:1.100.0-bookworm` for the builder and `debian:bookworm-slim` for the runtime.
 
 ## Change the compiler or dependencies
 

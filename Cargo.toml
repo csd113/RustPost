@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 description = "A single-binary self-hosted microblogging app"
 repository = "https://github.com/csd113/RustPost"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 keywords = ["microblog", "self-hosted", "sqlite", "axum"]
 categories = ["web-programming::http-server"]
 autobins = false
@@ -31,12 +31,12 @@ axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.23.1"
 captcha = { version = "1.0", default-features = false }
 chrono = { version = "0.4.45", features = ["serde"] }
-clap = { version = "4.6.7", features = ["derive", "env"] }
+clap = { version = "4.6.8", features = ["derive", "env"] }
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 futures-util = "0.3.34"
-flate2 = "1.1.10"
-html-escape = "0.3.0"
+flate2 = "1.1.11"
+html-escape = "0.3.1"
 # Enforce a small streaming cap on URL-encoded forms independently of media.
 http-body-util = "0.1.5"
 infer = "0.22"
@@ -56,7 +56,7 @@ tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "fs", "process", "signal", "net", "time", "io-util", "sync"] }
-toml = "1.2.0"
+toml = "1.2.1"
 tor-cell = { version = "=0.48.0", default-features = false }
 tor-hsservice = { version = "=0.48.0", default-features = false }
 tor-proto = { version = "=0.48.0", default-features = false, features = ["tokio"] }
@@ -64,15 +64,15 @@ tor-rtcompat = { version = "=0.48.0", default-features = false, features = ["tok
 tower-http = { version = "0.7.1", features = ["fs", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
-uuid = { version = "1.29.0", features = ["v4", "serde"] }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+uuid = { version = "1.29.3", features = ["v4", "serde"] }
 walkdir = "2.5"
-zeroize = "1.9.1"
+zeroize = "1.9.2"
 unicode-segmentation = "1.13.3"
 
 [target.'cfg(not(windows))'.dependencies]
-# Already in the Arti dependency graph; used for disk headroom on Unix.
-sysinfo = { version = "0.38.4", default-features = false, features = ["disk", "linux-tmpfs", "linux-netdevs"] }
+# Used for disk headroom on Unix. Arti still requires sysinfo 0.38.
+sysinfo = { version = "0.40.4", default-features = false, features = ["disk", "linux-tmpfs", "linux-netdevs"] }
 
 [target.'cfg(windows)'.dependencies]
 # Crossterm's Windows raw-mode reset does not preserve initially disabled flags.

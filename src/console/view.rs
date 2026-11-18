@@ -218,11 +218,7 @@ fn help() -> Vec<String> {
 }
 
 fn content(context: &Context, tab: usize) -> Vec<String> {
-    let metrics = context
-        .metrics
-        .lock()
-        .map(|value| value.clone())
-        .unwrap_or_default();
+    let metrics = context.metrics.lock().map_or_default(|value| value.clone());
     match tab {
         0 => overview(context, &metrics),
         1 => task_rows(context, &metrics),
@@ -529,11 +525,7 @@ fn storage(metrics: &metrics::Metrics) -> Vec<String> {
 }
 
 pub(super) fn plain_status(context: &Context) -> String {
-    let metrics = context
-        .metrics
-        .lock()
-        .map(|value| value.clone())
-        .unwrap_or_default();
+    let metrics = context.metrics.lock().map_or_default(|value| value.clone());
     let lifecycle = context.live.lock().map_or_else(
         |_| "[UNAVAILABLE] lifecycle".to_owned(),
         |live| live.phase.label(),

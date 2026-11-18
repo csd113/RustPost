@@ -245,7 +245,7 @@ pub(super) async fn stage_account_import(
         .await
         .map_err(|err| AppError::BadRequest(err.to_string()))?
     {
-        let name = field.name().map(ToOwned::to_owned).unwrap_or_default();
+        let name = field.name().map_or_default(ToOwned::to_owned);
         if name == "csrf" {
             if csrf.is_some() {
                 return Err(AppError::Csrf);
