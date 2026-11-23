@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::auth::{self, CurrentUser, Theme};
 use crate::config::Settings;
 use crate::db::SqlitePool;
-use crate::errors::{AppError, AppResult};
+use crate::errors::{AppError, AppResult, ComposerField};
 use crate::ffmpeg::FfmpegStatus;
 use crate::registration_captcha::RegistrationCaptchaStore;
 use crate::runtime::RuntimePaths;
@@ -275,7 +275,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/users/{id}/follow/cancel", post(cancel_follow_request))
         .route("/users/{id}/unfollow", post(unfollow))
         .route("/follow-requests", get(follow_requests))
-        .route("/users/{id}/block", post(block))
+        .route("/users/{id}/block", get(block_confirm).post(block))
         .route("/users/{id}/unblock", post(unblock))
         .route("/users/{id}/mute", post(mute))
         .route("/users/{id}/unmute", post(unmute))
@@ -1038,9 +1038,9 @@ use posting::{
 };
 mod profiles;
 use profiles::{
-    account_list_next_link, approve_follow_request, block, cancel_follow_request, follow,
-    follow_requests, profile, profile_followers, profile_following, reject_follow_request, unblock,
-    unfollow,
+    account_list_next_link, approve_follow_request, block, block_confirm, cancel_follow_request,
+    follow, follow_requests, profile, profile_followers, profile_following, reject_follow_request,
+    unblock, unfollow,
 };
 mod settings;
 use settings::{

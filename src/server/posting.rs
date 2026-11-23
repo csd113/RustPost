@@ -40,7 +40,64 @@ pub(super) async fn create_post(
     if outcome.is_ok() {
         form.pending_uploads.commit();
     }
-    outcome
+    match outcome {
+        Err(AppError::InvalidComposerField(field, message)) if enhanced_request(&headers) => Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "field": field.name(), "message": message })),
+        )
+            .into_response()),
+        Err(AppError::InvalidComposerField(field, message)) => {
+            rejected_composer(&state, user.as_ref(), &form, Some(field), &message).await
+        }
+        Err(AppError::BadRequest(message)) if !enhanced_request(&headers) => {
+            rejected_composer(&state, user.as_ref(), &form, None, &message).await
+        }
+        result => result,
+    }
+}
+
+async fn rejected_composer(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    form: &ParsedPostCreate,
+    field: Option<ComposerField>,
+    message: &str,
+) -> AppResult<Response> {
+    let target = if let Some(id) = form.parent_post_id {
+        social::history::thread_page(&state.pool, user.map(|user| user.id), id, None, None)
+            .await?
+            .map(|thread| thread.requested)
+    } else {
+        None
+    };
+    let alt_lines = (0..form.media_ids.len())
+        .map(|index| form.descriptions.get(&index).map_or("", String::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let csrf = user.map(|_| form.csrf_token.as_str());
+    let body = render::composer_with_values(
+        csrf,
+        form.parent_post_id,
+        state.settings.posts.max_text_chars,
+        &render::ComposerValues {
+            target: target.as_ref(),
+            text: &form.text,
+            scheduled_at: &form.scheduled_at,
+            poll_options: &form.poll_options,
+            poll_multiple: form.poll_multiple,
+            poll_closes_at: &form.poll_closes_at,
+            alt_lines: &alt_lines,
+            nsfw: form.is_nsfw,
+            reselect_media: !form.media_ids.is_empty(),
+            error: Some((field, message)),
+        },
+    );
+    Ok((
+        StatusCode::BAD_REQUEST,
+        [(header::CACHE_CONTROL, "no-store")],
+        Html(page_layout(state, user, csrf, "Check the form", &body).await?),
+    )
+        .into_response())
 }
 
 pub(super) async fn finish_post_create(
@@ -67,7 +124,7 @@ pub(super) async fn finish_post_create(
         drafts_routes::cleanup_unattached(state, &form.media_ids).await;
         let redirect = format!("/posts/{post_id}");
         if enhanced_request(headers) {
-            return enhanced_post_response(state, headers, user, post_id, redirect).await;
+            return enhanced_post_response(state, headers, user, post_id).await;
         }
         return Ok(Redirect::to(&redirect).into_response());
     }
@@ -143,7 +200,7 @@ pub(super) async fn finish_post_create(
         |_| format!("/posts/{post_id}#reply-{post_id}"),
     );
     if enhanced_request(headers) {
-        return enhanced_post_response(state, headers, user, post_id, redirect).await;
+        return enhanced_post_response(state, headers, user, post_id).await;
     }
     Ok(Redirect::to(&redirect).into_response())
 }
@@ -215,7 +272,8 @@ pub(super) async fn fill_post_create_form(
         };
         match name.as_str() {
             "text" => {
-                form.text = read_form_text(field).await?;
+                // Multipart encodes a textarea line break as CRLF. Count it as one.
+                form.text = read_form_text(field).await?.replace("\r\n", "\n");
             }
             "csrf" => {
                 if csrf_seen {
@@ -389,22 +447,26 @@ pub(super) async fn thread(
         );
     }
     navigation.push_str("</nav>");
-    let mut posts = history.posts;
-    if !posts.iter().any(|p| p.id == id) {
-        posts.insert(0, history.requested);
-    }
     let csrf = form_csrf(&state, &headers).await?;
     let composer = if (user.is_some() || state.settings.accounts.anonymous_mode_enabled)
         && posting_enabled_for(&state, user.as_ref()).await?
     {
-        render::composer(
+        render::composer_with_values(
             csrf.as_deref(),
             Some(id),
             state.settings.posts.max_text_chars,
+            &render::ComposerValues {
+                target: Some(&history.requested),
+                ..render::ComposerValues::default()
+            },
         )
     } else {
         String::new()
     };
+    let mut posts = history.posts;
+    if !posts.iter().any(|p| p.id == id) {
+        posts.insert(0, history.requested);
+    }
     let body = format!(
         "{}{navigation}{}{}",
         render::thread_back_control(),
@@ -729,7 +791,6 @@ async fn enhanced_post_response(
     headers: &HeaderMap,
     user: Option<&CurrentUser>,
     post_id: i64,
-    redirect: String,
 ) -> AppResult<Response> {
     let viewer_id = user.map(|u| u.id);
     let posts = social::post_thread(&state.pool, viewer_id, post_id).await?;
@@ -741,7 +802,7 @@ async fn enhanced_post_response(
         kind: "post-created",
         post_id,
         parent_post_id: post.parent_post_id,
-        redirect,
+        redirect: format!("/posts/{post_id}"),
         html: if post.parent_post_id.is_some() {
             render::thread_post_card_with_controls(
                 post,

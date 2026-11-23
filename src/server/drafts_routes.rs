@@ -9,9 +9,55 @@ fn esc(value: &str) -> String {
     html_escape::encode_double_quoted_attribute(value).into_owned()
 }
 
+fn poll_close_time(form: &ParsedPostCreate) -> AppResult<Option<i64>> {
+    social::drafts::parse_utc(&form.poll_closes_at).map_err(|_| {
+        AppError::InvalidComposerField(
+            ComposerField::PollClosesAt,
+            "Enter a valid poll close time in UTC.".to_owned(),
+        )
+    })
+}
+
 pub(super) fn poll_spec(form: &ParsedPostCreate) -> AppResult<Option<social::polls::PollSpec>> {
-    let closes = social::drafts::parse_utc(&form.poll_closes_at).map_err(bad)?;
-    social::polls::PollSpec::parse(&form.poll_options, form.poll_multiple, closes).map_err(bad)
+    use social::polls::{PollInputError, PollSpec};
+
+    PollSpec::parse_input(
+        &form.poll_options,
+        form.poll_multiple,
+        poll_close_time(form)?,
+    )
+    .map_err(|error| {
+        let field = match error {
+            PollInputError::Choices(_) => ComposerField::PollOptions,
+            PollInputError::CloseTime => ComposerField::PollClosesAt,
+        };
+        AppError::InvalidComposerField(field, error.to_string())
+    })
+}
+
+fn schedule_time(form: &ParsedPostCreate) -> AppResult<i64> {
+    let invalid = |message: &str| {
+        AppError::InvalidComposerField(ComposerField::ScheduledAt, message.to_owned())
+    };
+    let at = social::drafts::parse_utc(&form.scheduled_at)
+        .map_err(|_| invalid("Enter a valid publication time in UTC."))?
+        .ok_or_else(|| invalid("Choose a publication time in UTC."))?;
+    let now = chrono::Utc::now().timestamp();
+    if at <= now {
+        return Err(invalid("Scheduled time must be in the future."));
+    }
+    if at > now + 366 * 86_400 {
+        return Err(invalid("Schedule must be within the next year."));
+    }
+    if let Some(close) = poll_spec(form)?.and_then(|poll| poll.closes_at)
+        && close <= at
+    {
+        return Err(AppError::InvalidComposerField(
+            ComposerField::PollClosesAt,
+            "Poll must close after publication.".to_owned(),
+        ));
+    }
+    Ok(at)
 }
 
 pub(super) async fn set_new_descriptions(
@@ -34,15 +80,7 @@ fn input(form: &ParsedPostCreate, id: Option<i64>) -> AppResult<social::drafts::
     let at = match form.intent.as_str() {
         "draft" => None,
         "publish" => Some(chrono::Utc::now().timestamp()),
-        "schedule" => {
-            let at = social::drafts::parse_utc(&form.scheduled_at)
-                .map_err(bad)?
-                .ok_or_else(|| bad("choose a publication time in UTC"))?;
-            if at <= chrono::Utc::now().timestamp() {
-                return Err(bad("scheduled time must be in the future"));
-            }
-            Some(at)
-        }
+        "schedule" => Some(schedule_time(form)?),
         _ => return Err(bad("invalid draft action")),
     };
     let mut media_ids = form.retained_media.clone();
@@ -70,7 +108,7 @@ fn input(form: &ParsedPostCreate, id: Option<i64>) -> AppResult<social::drafts::
         scheduled_at: at,
         poll_options: form.poll_options.clone(),
         poll_multiple: form.poll_multiple,
-        poll_closes_at: social::drafts::parse_utc(&form.poll_closes_at).map_err(bad)?,
+        poll_closes_at: poll_close_time(form)?,
     })
 }
 
@@ -88,7 +126,7 @@ pub(super) async fn save_new(
             .map_err(bad)?
     {
         cleanup_unattached(state, &form.media_ids).await;
-        return Ok(Redirect::to(&format!("/drafts/{id}")).into_response());
+        return Ok(draft_saved(headers, id));
     }
     if !form.retained_media.is_empty() || !form.existing_descriptions.is_empty() {
         return Err(bad("new drafts cannot retain existing attachments"));
@@ -100,7 +138,16 @@ pub(super) async fn save_new(
         .await
         .map_err(bad)?;
     cleanup_unattached(state, &form.media_ids).await;
-    Ok(Redirect::to(&format!("/drafts/{id}")).into_response())
+    Ok(draft_saved(headers, id))
+}
+
+fn draft_saved(headers: &HeaderMap, id: i64) -> Response {
+    let redirect = format!("/drafts/{id}");
+    if enhanced_request(headers) {
+        Json(serde_json::json!({ "kind": "draft-saved", "redirect": redirect })).into_response()
+    } else {
+        Redirect::to(&redirect).into_response()
+    }
 }
 
 pub(super) async fn index(

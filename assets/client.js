@@ -154,6 +154,22 @@ document.addEventListener("click", (event) => {
   button.setAttribute("aria-label", show ? "Hide password" : "Show password");
 });
 
+const mobileNavMore = document.querySelector(".mobile-nav-more");
+if (mobileNavMore) {
+  document.addEventListener("click", (event) => {
+    if (mobileNavMore.open && !mobileNavMore.contains(event.target)) {
+      mobileNavMore.open = false;
+    }
+  });
+  mobileNavMore.addEventListener("keydown", (event) => {
+    if (mobileNavMore.open && event.key === "Escape") {
+      event.preventDefault();
+      mobileNavMore.open = false;
+      mobileNavMore.querySelector("summary").focus();
+    }
+  });
+}
+
 function closeRepostMenus(except, restoreFocus) {
   document.querySelectorAll("[data-repost-menu]").forEach((menu) => {
     if (menu === except) {
@@ -254,11 +270,14 @@ function characterCounterClass(remaining) {
 
 function updateComposerSubmit(textarea, remaining) {
   const form = textarea.closest("form");
+  if (form?.dataset.enhance === "post-create") {
+    return;
+  }
   const submit = form ? form.querySelector('button[type="submit"]') : null;
   if (!submit) {
     return;
   }
-  submit.disabled = remaining < 0 || form.dataset.submitting === "true";
+  submit.disabled = remaining < 0;
 }
 
 function updateComposerCount(textarea) {
@@ -340,6 +359,7 @@ function closeMentionMenu(textarea) {
   if (!state) {
     return;
   }
+  state.requestId++;
   if (state.timer) {
     window.clearTimeout(state.timer);
     state.timer = 0;
@@ -464,12 +484,12 @@ function requestMentionSuggestions(textarea) {
       }
       const suggestions = await response.json();
       const current = mentionContext(textarea);
-      if (!current || current.atIndex !== context.atIndex || current.fragment !== context.fragment) {
+      if (requestId !== state.requestId || !current || current.atIndex !== context.atIndex || current.fragment !== context.fragment) {
         return;
       }
       renderMentionSuggestions(state, Array.isArray(suggestions) ? suggestions : []);
     } catch (error) {
-      if (!state.controller || error.name !== "AbortError") {
+      if (requestId === state.requestId && error.name !== "AbortError") {
         closeMentionMenu(textarea);
       }
     }
@@ -489,6 +509,10 @@ document.addEventListener("input", (event) => {
   const textarea = event.target.closest("textarea[data-character-limit]");
   if (textarea) {
     updateComposerCount(textarea);
+    const error = textarea.form?.querySelector('[data-field-error="text"]:not([hidden])');
+    if (error) {
+      clearFieldError(textarea, error);
+    }
   }
   const mentionTextarea = event.target.closest("textarea[data-mention-autocomplete]");
   if (mentionTextarea) {
@@ -514,12 +538,18 @@ document.addEventListener("keydown", (event) => {
   } else if (event.key === "ArrowUp") {
     event.preventDefault();
     setActiveMention(state, state.activeIndex - 1);
-  } else if (event.key === "Enter" || event.key === "Tab") {
+  } else if (event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) {
     event.preventDefault();
     selectMention(textarea, state.activeIndex);
   } else if (event.key === "Escape") {
     event.preventDefault();
     closeMentionMenu(textarea);
+  }
+});
+
+document.addEventListener("focusout", (event) => {
+  if (event.target.matches("textarea[data-mention-autocomplete]")) {
+    closeMentionMenu(event.target);
   }
 });
 
@@ -696,6 +726,8 @@ document.addEventListener("change", (event) => {
 function resetSubmittingForms() {
   document.querySelectorAll('form[data-submitting="true"]').forEach((form) => {
     delete form.dataset.submitting;
+    form.removeAttribute("aria-busy");
+    form.querySelectorAll('button[aria-disabled="true"]').forEach(button => button.removeAttribute("aria-disabled"));
     form.querySelectorAll("[data-submitter-value]").forEach(input => input.remove());
     form.querySelectorAll("button:disabled").forEach((button) => {
       button.disabled = false;
@@ -711,6 +743,20 @@ window.addEventListener("pageshow", (event) => {
   }
 });
 
+const blockDialog = document.querySelector("[data-block-dialog]");
+const blockTrigger = document.querySelector("[data-block-trigger]");
+if (blockTrigger && typeof blockDialog?.showModal === "function") {
+  blockTrigger.addEventListener("click", event => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return;
+    }
+    event.preventDefault();
+    blockDialog.showModal();
+  });
+  blockDialog.querySelector("[data-block-cancel]").addEventListener("click", () => blockDialog.close());
+  blockDialog.addEventListener("close", () => blockTrigger.focus());
+}
+
 function setButtonState(button, active, label) {
   button.classList.toggle("active", active);
   button.setAttribute("aria-pressed", active ? "true" : "false");
@@ -722,11 +768,41 @@ function setButtonState(button, active, label) {
   }
 }
 
+function clearFieldError(field, error) {
+  field.removeAttribute("aria-invalid");
+  field.removeAttribute("aria-describedby");
+  error.hidden = true;
+  error.textContent = "";
+}
+
 function clearFormError(form) {
   const existing = form.querySelector("[data-form-error]");
   if (existing) {
     existing.remove();
   }
+  form.querySelectorAll('[data-field-error]:not([hidden])').forEach((error) => {
+    const field = form.elements.namedItem(error.dataset.fieldError);
+    clearFieldError(field, error);
+  });
+}
+
+function showComposerFieldError(form, name, message) {
+  const field = form.elements.namedItem(name);
+  const error = [...form.querySelectorAll("[data-field-error]")].find(el => el.dataset.fieldError === name);
+  if (!(field instanceof HTMLElement) || !error || typeof message !== "string") {
+    return false;
+  }
+  const details = field.closest("details");
+  if (details) {
+    details.open = true;
+  }
+  field.setAttribute("aria-invalid", "true");
+  field.setAttribute("aria-describedby", error.id);
+  error.hidden = false;
+  error.textContent = message;
+  field.focus({ preventScroll: true });
+  field.scrollIntoView({ block: "center" });
+  return true;
 }
 
 function showFormError(form, message) {
@@ -737,6 +813,10 @@ function showFormError(form, message) {
   notice.setAttribute("data-form-error", "");
   notice.textContent = message;
   form.prepend(notice);
+  if (form.dataset.enhance === "post-create") {
+    notice.tabIndex = -1;
+    notice.focus();
+  }
 }
 
 function enhancedErrorMessage(status) {
@@ -755,26 +835,102 @@ function enhancedErrorMessage(status) {
   return "Something went wrong. Please try again.";
 }
 
+function removeUnsavedBookmark(form) {
+  const saved = form.closest("[data-bookmarks]");
+  const card = form.closest("[data-post-id]");
+  if (!saved || !card) {
+    return;
+  }
+  const timeline = card.parentElement;
+  const restoreFocus = card.contains(document.activeElement);
+  const neighbor = card.nextElementSibling || card.previousElementSibling;
+  card.remove();
+  if (neighbor) {
+    if (restoreFocus) {
+      neighbor.querySelector('[data-action-kind="bookmark"]')?.focus();
+    }
+    return;
+  }
+  const empty = saved.querySelector("[data-bookmarks-empty]").content.cloneNode(true);
+  const heading = empty.querySelector("h2");
+  timeline.replaceWith(empty);
+  if (restoreFocus) {
+    heading.tabIndex = -1;
+    heading.focus();
+  }
+}
+
+function showPublishedPost(form, data) {
+  const view = form.closest(".primary-column");
+  const query = new URLSearchParams(location.search);
+  const paged = ["older", "newer", "before", "after"].some(key => query.has(key));
+  if (view && !paged && !document.getElementById(`post-${data.post_id}`)) {
+    let timeline = view.querySelector(".timeline");
+    const empty = view.querySelector(".empty-state");
+    if (!timeline && empty) {
+      timeline = document.createElement("section");
+      timeline.className = "timeline";
+      timeline.setAttribute("aria-label", "Posts");
+      empty.replaceWith(timeline);
+    }
+    timeline?.insertAdjacentHTML(data.parent_post_id === null ? "afterbegin" : "beforeend", data.html);
+    if (data.parent_post_id !== null) {
+      view.querySelectorAll(`[data-post-id="${data.parent_post_id}"] [data-count="replies"]`).forEach((node) => {
+        const next = Number.parseInt(node.textContent, 10) + 1;
+        node.textContent = `${next} ${next === 1 ? "reply" : "replies"}`;
+      });
+    }
+  }
+  form.reset();
+  const key = form.elements.namedItem("post_key");
+  key.value = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
+  form.querySelectorAll("textarea[data-character-limit]").forEach(updateComposerCount);
+  form.querySelectorAll("input[type=file][data-composer-media]").forEach(updateComposerMedia);
+  const status = form.querySelector("[data-post-success]");
+  const link = document.createElement("a");
+  link.href = data.redirect;
+  const isReply = data.parent_post_id !== null;
+  link.textContent = isReply ? "View reply" : "View post";
+  status.hidden = false;
+  status.replaceChildren(isReply ? "Reply posted. " : "Post published. ", link);
+}
+
 document.addEventListener("submit", async (event) => {
   const form = event.target.closest("form[data-enhance]");
   if (!form || !window.fetch) {
-    return;
-  }
-  if (form.dataset.enhance === "post-create" && ["draft", "schedule"].includes(event.submitter?.value)) {
     return;
   }
   event.preventDefault();
   if (form.dataset.submitting === "true") {
     return;
   }
+  const submitter = event.submitter;
+  const composer = form.dataset.enhance === "post-create";
+  clearFormError(form);
+  if (composer) {
+    form.querySelector("[data-post-success]").hidden = true;
+    const text = form.elements.namedItem("text");
+    const limit = Number(text.dataset.characterLimit);
+    const savesDraft = submitter?.value === "draft" || submitter?.value === "schedule";
+    // Publishing trims Unicode whitespace on the server. Drafts keep it.
+    const submittedText = savesDraft ? text.value : text.value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
+    if (Array.from(submittedText).length > limit) {
+      showComposerFieldError(form, "text", `Use ${limit} characters or fewer.`);
+      return;
+    }
+    if (submitter?.value === "schedule" && !form.elements.namedItem("scheduled_at").value) {
+      showComposerFieldError(form, "scheduled_at", "Choose a publication time in UTC.");
+      return;
+    }
+  }
   form.dataset.submitting = "true";
   form.setAttribute("aria-busy", "true");
-  const submitter = event.submitter || form.querySelector("button[type=submit]");
-  if (submitter) {
-    submitter.disabled = true;
-  }
+  submitter?.setAttribute("aria-disabled", "true");
   try {
     const formData = new FormData(form);
+    if (submitter?.name) {
+      formData.set(submitter.name, submitter.value);
+    }
     const body = form.enctype === "multipart/form-data" ? formData : new URLSearchParams(formData);
     const response = await fetch(form.action, {
       method: form.method || "POST",
@@ -783,14 +939,18 @@ document.addEventListener("submit", async (event) => {
       credentials: "same-origin"
     });
     if (!response.ok) {
+      if (composer && response.status === 400 && response.headers.get("content-type")?.includes("application/json")) {
+        const error = await response.json();
+        if (showComposerFieldError(form, error.field, error.message)) {
+          return;
+        }
+      }
       showFormError(form, enhancedErrorMessage(response.status));
       return;
     }
-    clearFormError(form);
     const data = await response.json();
     if (data.kind === "follow") {
-      const followForm = document.querySelector(`[data-follow-user="${data.user_id}"]`);
-      if (followForm) {
+      document.querySelectorAll(`[data-follow-user="${data.user_id}"]`).forEach((followForm) => {
         followForm.action = data.action;
         const button = followForm.querySelector("button");
         if (button) {
@@ -802,7 +962,7 @@ document.addEventListener("submit", async (event) => {
           button.setAttribute("aria-label", aria);
           button.setAttribute("title", aria);
         }
-      }
+      });
       document.querySelectorAll(`[data-profile-followers="${data.user_id}"]`).forEach((node) => {
         node.textContent = `${data.followers} ${data.followers === 1 ? "follower" : "followers"}`;
       });
@@ -832,40 +992,13 @@ document.addEventListener("submit", async (event) => {
           setButtonState(reposted, data.reposted, data.reposted ? "Unrepost" : "Repost");
         }
       });
+      if (!data.bookmarked && submitter?.dataset.actionKind === "bookmark") {
+        removeUnsavedBookmark(form);
+      }
     } else if (data.kind === "post-created") {
-      let timeline = document.querySelector(".timeline");
-      const empty = document.querySelector(".empty-state");
-      if (!timeline && empty) {
-        empty.outerHTML = '<section class="timeline" aria-label="Posts"></section>';
-        timeline = document.querySelector(".timeline");
-      }
-      if (!timeline) {
-        window.location.assign(data.redirect);
-        return;
-      }
-      timeline.insertAdjacentHTML(data.parent_post_id === null ? "afterbegin" : "beforeend", data.html);
-      if (data.parent_post_id !== null) {
-        document.querySelectorAll(`[data-post-id="${data.parent_post_id}"] [data-count="replies"]`).forEach((node) => {
-          const current = Number.parseInt(node.textContent || "0", 10);
-          const next = Number.isFinite(current) ? current + 1 : 1;
-          node.textContent = `${next} ${next === 1 ? "reply" : "replies"}`;
-        });
-      }
-      const created = document.getElementById(`post-${data.post_id}`);
-      if (created) {
-        created.setAttribute("tabindex", "-1");
-        created.focus({ preventScroll: true });
-      }
-      if (window.history && data.redirect) {
-        window.history.pushState(null, "", data.redirect);
-      }
-      form.reset();
-      const key = form.elements.namedItem("post_key");
-      if (key && window.crypto?.getRandomValues) {
-        key.value = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
-      } else if (key) { window.location.reload(); }
-      form.querySelectorAll("textarea[data-character-limit]").forEach(updateComposerCount);
-      form.querySelectorAll("input[type=file][data-composer-media]").forEach(updateComposerMedia);
+      showPublishedPost(form, data);
+    } else if (data.kind === "draft-saved") {
+      window.location.assign(data.redirect);
     }
   } catch (_err) {
     // Do not silently re-POST: the first request may have been committed even
@@ -877,9 +1010,7 @@ document.addEventListener("submit", async (event) => {
   } finally {
     delete form.dataset.submitting;
     form.removeAttribute("aria-busy");
-    if (submitter) {
-      submitter.disabled = false;
-    }
+    submitter?.removeAttribute("aria-disabled");
   }
 });
 

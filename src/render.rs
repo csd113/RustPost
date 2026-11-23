@@ -239,6 +239,7 @@ mod layout;
 use layout::plural;
 pub use layout::{layout, layout_with_context, layout_with_csrf};
 mod forms;
+pub(crate) use forms::{ComposerValues, composer_with_values};
 pub use forms::{
     account_links, account_links_with_empty_state, accounts, client_boot_script, client_script,
     composer, edit_post_form, follow_form, login_form, onboarding_page, password_length_attrs,

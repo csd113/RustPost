@@ -1,10 +1,29 @@
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposerField {
+    ScheduledAt,
+    PollOptions,
+    PollClosesAt,
+}
+
+impl ComposerField {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::ScheduledAt => "scheduled_at",
+            Self::PollOptions => "poll_options",
+            Self::PollClosesAt => "poll_closes_at",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("{1}")]
+    InvalidComposerField(ComposerField, String),
     #[error("authentication required")]
     Unauthorized,
     #[error("forbidden")]
@@ -34,7 +53,7 @@ pub type AppResult<T> = Result<T, AppError>;
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            Self::BadRequest(message) | Self::InvalidComposerField(_, message) => (StatusCode::BAD_REQUEST, message),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "authentication required".to_owned(),

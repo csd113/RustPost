@@ -1,6 +1,6 @@
 //! Profiles for the server subsystem.
 
-use super::*;
+use super::{post_actions::user_profile_path, *};
 
 /// Renders the page for a handle no account currently owns.
 ///
@@ -177,7 +177,13 @@ pub(super) async fn profile(
         });
     }
     let (followers, following) = social::follow_counts(&state.pool, profile_id).await?;
-    let controls = profile_controls(user.as_ref(), csrf.as_deref(), profile_id, relationship);
+    let controls = profile_controls(
+        user.as_ref(),
+        csrf.as_deref(),
+        profile_id,
+        &profile_username,
+        relationship,
+    );
     let picture = picture_path.map_or_else(
         || r#"<div class="profile-picture" aria-hidden="true"></div>"#.to_owned(),
         |path| {
@@ -482,6 +488,7 @@ pub(super) fn profile_controls(
     user: Option<&CurrentUser>,
     csrf: Option<&str>,
     profile_id: i64,
+    username: &str,
     relationship: social::ProfileRelationship,
 ) -> String {
     let (Some(viewer), Some(csrf)) = (user, csrf) else {
@@ -526,17 +533,49 @@ pub(super) fn profile_controls(
             "Mute this account",
         )
     };
+    let confirmation = block_confirmation_form(profile_id, username, csrf, true);
     format!(
-        r#"<div class="actions profile-actions">{}<span class="actions profile-secondary">{}{}</span></div>"#,
-        follow_action,
-        small_form(
-            &format!("/users/{profile_id}/block"),
-            csrf,
-            "Block",
-            "Block this account"
-        ),
-        mute_action
+        r#"<div class="actions profile-actions">{follow_action}<span class="actions profile-secondary"><a class="button-link profile-block-trigger" href="/users/{profile_id}/block" data-block-trigger>Block</a>{mute_action}</span><dialog class="panel block-dialog" aria-labelledby="block-title" aria-describedby="block-consequences" data-block-dialog>{confirmation}</dialog></div>"#,
     )
+}
+
+fn block_confirmation_form(id: i64, username: &str, csrf: &str, dialog: bool) -> String {
+    let cancel = if dialog {
+        r#"<button type="button" data-block-cancel autofocus>Cancel</button>"#.to_owned()
+    } else {
+        format!(
+            r#"<a class="button-link" href="/users/{}" autofocus>Cancel</a>"#,
+            html_escape::encode_double_quoted_attribute(username),
+        )
+    };
+    let (heading, handle, csrf) = (
+        if dialog { "h2" } else { "h1" },
+        html_escape::encode_text(username),
+        html_escape::encode_double_quoted_attribute(csrf),
+    );
+    format!(
+        r#"<{heading} id="block-title">Block @{handle}?</{heading}><p id="block-consequences">Blocking removes existing follows in both directions. Unblocking does not restore them.</p><form class="actions" method="post" action="/users/{id}/block"><input type="hidden" name="csrf" value="{csrf}">{cancel}<button class="danger" type="submit">Block</button></form>"#,
+    )
+}
+
+pub(super) async fn block_confirm(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    let user = require_active_user(&state, &headers).await?;
+    let path = user_profile_path(&state.pool, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let username = path.strip_prefix("/users/").ok_or(AppError::NotFound)?;
+    let csrf = form_csrf(&state, &headers)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let form = block_confirmation_form(id, username, &csrf, false);
+    let body = format!(r#"<section class="panel">{form}</section>"#);
+    Ok(Html(
+        page_layout(&state, Some(&user), Some(&csrf), "Block account", &body).await?,
+    ))
 }
 
 pub(super) async fn follow(
@@ -646,7 +685,13 @@ pub(super) async fn block(
             tracing::warn!(blocker_id = user.id, blocked_id = id, error = %err, "block rejected");
             AppError::BadRequest(err.to_string())
         })?;
-    Ok(Redirect::to(&account_action_return(&state.pool, &headers, id).await?).into_response())
+    let mut target = account_action_return(&state.pool, &headers, id).await?;
+    if target.split('?').next() == Some(&format!("/users/{id}/block")) {
+        target = user_profile_path(&state.pool, id)
+            .await?
+            .unwrap_or_else(|| "/home".to_owned());
+    }
+    Ok(Redirect::to(&target).into_response())
 }
 
 pub(super) async fn unblock(
@@ -658,5 +703,5 @@ pub(super) async fn unblock(
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::unblock(&state.pool, user.id, id).await?;
-    Ok(Redirect::to("/settings?saved=profile").into_response())
+    Ok(super::settings::SettingsSave::Unblocked.redirect())
 }

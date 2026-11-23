@@ -734,3 +734,75 @@ async fn readiness_and_requests_recover_stale_capture_but_preserve_live_or_unexp
     assert!(!marker.exists());
     Ok(())
 }
+
+#[tokio::test]
+async fn composer_rejections_identify_fields_and_preserve_native_input() -> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let parent = social::create_post(
+        &f.state.pool,
+        &f.state.settings,
+        Some(f.user_id),
+        "Thread opener",
+        None,
+        &[],
+    )
+    .await?;
+    let fields = [
+        ("csrf", f.session.csrf_token.clone()),
+        ("parent_post_id", parent.to_string()),
+        ("text", "Keep <this> reply".into()),
+        ("poll_options", "Only one choice".into()),
+        ("poll_multiple", "1".into()),
+    ];
+    let enhanced = format!("{MULTIPART}Accept: application/json\r\nX-RustPost-Enhance: 1\r\n");
+    let (status, response) = f
+        .request("POST", "/posts", &multipart(&fields, None), &enhanced)
+        .await?;
+    assert_eq!(status, 400);
+    assert!(response.contains(r#""field":"poll_options""#));
+    assert!(response.contains("a poll needs 2 to 6 choices"));
+
+    let mut schedule = fields.to_vec();
+    schedule.push(("intent", "schedule".into()));
+    let (status, response) = f
+        .request("POST", "/posts", &multipart(&schedule, None), &enhanced)
+        .await?;
+    assert_eq!(status, 400);
+    assert!(response.contains(r#""field":"scheduled_at""#));
+
+    let (status, response) = f
+        .request("POST", "/posts", &multipart(&fields, None), MULTIPART)
+        .await?;
+    assert_eq!(status, 400);
+    assert!(response.contains("Keep &lt;this&gt; reply"));
+    assert!(response.contains("Only one choice"));
+    assert!(response.contains(r#"name="poll_multiple" value="1" checked"#));
+    assert!(response.contains("Replying to"));
+    assert!(response.contains(&format!(r#"name="parent_post_id" value="{parent}""#)));
+    assert_eq!(f.count("posts").await?, 1);
+    assert_eq!(f.count("drafts").await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn composer_publish_links_to_post_and_keeps_native_redirect() -> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let csrf = ("csrf", f.session.csrf_token.clone());
+    let enhanced = format!("{MULTIPART}Accept: application/json\r\nX-RustPost-Enhance: 1\r\n");
+    let first = multipart(&[csrf.clone(), ("text", "Enhanced post".into())], None);
+    let (status, response) = f.request("POST", "/posts", &first, &enhanced).await?;
+    assert_eq!(status, 200);
+    assert!(response.contains(r#""redirect":"/posts/1""#));
+    let second_line = "界".repeat(f.state.settings.posts.max_text_chars - 2);
+    let second = multipart(&[csrf, ("text", format!("🌿\r\n{second_line}"))], None);
+    let (status, response) = f.request("POST", "/posts", &second, MULTIPART).await?;
+    assert_eq!(status, 303);
+    assert!(response.contains("location: /home#post-2"));
+    let saved_text: String = f
+        .state
+        .pool
+        .call(|conn| Ok(conn.query_row("SELECT text FROM posts WHERE id=2", [], |r| r.get(0))?))
+        .await?;
+    assert_eq!(saved_text, format!("🌿\n{second_line}"));
+    Ok(())
+}

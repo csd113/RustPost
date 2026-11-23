@@ -31,7 +31,7 @@ pub fn layout_with_context(
     site_name: &str,
     context: &LayoutContext,
 ) -> String {
-    let auth_nav = if let Some(user) = user {
+    let (auth_nav, mobile_nav) = if let Some(user) = user {
         let admin = if user.is_admin {
             nav_link("/admin", "Admin", "admin")
         } else {
@@ -53,22 +53,27 @@ pub fn layout_with_context(
             nav_link("/settings/deleted-posts", "Recently deleted", "trash")
         );
         let profile = nav_link(&format!("/users/{}", user.username), "Profile", "profile");
-        format!(
-            "{}{}{}{notifications}{requests}{}{}{saved}{admin}{logout}",
+        let primary = format!(
+            "{}{}{}{notifications}{requests}{}{}",
             nav_link("/home", "Home Feed", "home"),
             nav_link("/following", "Following", "users"),
             nav_link("/search", "Search", "search"),
             nav_link("/bookmarks", "Bookmarks", "bookmark"),
             profile,
-        )
+        );
+        let mobile = format!(
+            r#"{primary}<details class="mobile-nav-more"><summary>More</summary><div class="mobile-nav-options"><a href="/settings">Settings</a>{saved}{admin}{logout}</div></details>"#,
+        );
+        (format!("{primary}{saved}{admin}{logout}"), mobile)
     } else {
-        format!(
+        let guest = format!(
             "{}{}{}{}",
             nav_link("/home", "Home Feed", "home"),
             nav_link("/search", "Search", "search"),
             nav_link("/login", "Log in", "log-in"),
             nav_link("/register", "Register", "user-plus")
-        )
+        );
+        (guest.clone(), guest)
     };
     let brand_mark = site_name.chars().next().unwrap_or('R');
     let left_rail = left_rail(user, &auth_nav);
@@ -110,7 +115,7 @@ pub fn layout_with_context(
         html_escape::encode_text(site_name),
         announcement,
         header_tor,
-        auth_nav,
+        mobile_nav,
         left_rail,
         body,
         side_panel,

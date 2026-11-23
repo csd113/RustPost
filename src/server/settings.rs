@@ -2,19 +2,61 @@
 
 use super::*;
 
-pub(super) fn settings_query_notice(saved: Option<&str>) -> Option<(&'static str, &'static str)> {
-    match saved {
-        Some("profile") => Some(("success", "Profile settings saved.")),
-        Some("muted-word") => Some(("success", "Muted word saved.")),
-        Some("muted-word-removed") => Some(("success", "Muted word removed.")),
-        Some("password") => Some(("success", "Password changed.")),
-        Some("username") => Some(("success", "Username changed.")),
-        Some("delete-requested") => Some((
-            "success",
-            "Account deletion requested. You can cancel it until the deadline.",
-        )),
-        Some("delete-cancelled") => Some(("success", "Account deletion cancelled.")),
-        _ => None,
+#[derive(Clone, Copy)]
+pub(super) enum SettingsSave {
+    Profile,
+    Unblocked,
+    Unmuted,
+    MutedWord,
+    MutedWordRemoved,
+    Password,
+    Username,
+    DeleteRequested,
+    DeleteCancelled,
+}
+
+impl SettingsSave {
+    fn details(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Profile => ("profile", "profile-save", "Profile settings saved."),
+            Self::Unblocked => ("unblocked", "blocked-users", "Account unblocked."),
+            Self::Unmuted => ("unmuted", "muted-users", "Account unmuted."),
+            Self::MutedWord => ("muted-word", "muted-words", "Muted word saved."),
+            Self::MutedWordRemoved => ("muted-word-removed", "muted-words", "Muted word removed."),
+            Self::Password => ("password", "password", "Password changed."),
+            Self::Username => ("username", "username", "Username changed."),
+            Self::DeleteRequested => (
+                "delete-requested",
+                "delete-account",
+                "Account deletion requested. You can cancel it until the deadline.",
+            ),
+            Self::DeleteCancelled => (
+                "delete-cancelled",
+                "delete-account",
+                "Account deletion cancelled.",
+            ),
+        }
+    }
+
+    fn from_query(key: Option<&str>) -> Option<Self> {
+        [
+            Self::Profile,
+            Self::Unblocked,
+            Self::Unmuted,
+            Self::MutedWord,
+            Self::MutedWordRemoved,
+            Self::Password,
+            Self::Username,
+            Self::DeleteRequested,
+            Self::DeleteCancelled,
+        ]
+        .into_iter()
+        .find(|save| Some(save.details().0) == key)
+    }
+
+    pub(super) fn redirect(self) -> Response {
+        let (key, section, _) = self.details();
+        Redirect::to(&format!("/settings?saved={key}#{section}")).into_response()
     }
 }
 
@@ -23,6 +65,7 @@ pub(super) fn settings_username_panel(
     username: &str,
     history: &[identity::UsernameHistoryEntry],
     csrf: &str,
+    confirmation: &str,
 ) -> String {
     let history_html = if history.is_empty() {
         r#"<p class="username-history">No previous usernames.</p>"#.to_owned()
@@ -43,7 +86,7 @@ pub(super) fn settings_username_panel(
         )
     };
     format!(
-        r#"<section class="panel settings-card" data-testid="settings-card"><h2>Username</h2><p class="settings-section-help">Your public @handle is used in profile links and mentions.</p><form method="post" action="/settings/username" class="settings-password-form"><input type="hidden" name="csrf" value="{csrf}"><label for="new_username">New username</label><input id="new_username" name="new_username" value="{username}" autocomplete="username" required><label for="username_password">Current password</label><div class="password-control"><input id="username_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="username_password" aria-label="Show password">Show</button></div><div class="settings-form-actions"><button type="submit">Change username</button></div></form>{history_html}</section>"#,
+        r#"<section class="panel settings-card" id="username" data-testid="settings-card"><h2>Username</h2>{confirmation}<p class="settings-section-help">Your public @handle is used in profile links and mentions.</p><form method="post" action="/settings/username" class="settings-password-form"><input type="hidden" name="csrf" value="{csrf}"><label for="new_username">New username</label><input id="new_username" name="new_username" value="{username}" autocomplete="username" required><label for="username_password">Current password</label><div class="password-control"><input id="username_password" name="password" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" data-password-toggle="username_password" aria-label="Show password">Show</button></div><div class="settings-form-actions"><button type="submit">Change username</button></div></form>{history_html}</section>"#,
         csrf = html_escape::encode_double_quoted_attribute(csrf),
         username = html_escape::encode_double_quoted_attribute(username),
     )
@@ -51,7 +94,7 @@ pub(super) fn settings_username_panel(
 
 /// Export and import entry points for portable account archives.
 pub(super) fn settings_account_data_panel() -> String {
-    r#"<section class="panel settings-card" data-testid="settings-card"><h2>Account data</h2><p class="settings-section-help">Export your posts, profile, media, follows, and settings as a portable archive, or import an archive exported from another RustPost instance.</p><p class="actions"><a class="button-link" href="/settings/export">Export account archive</a> <a class="button-link" href="/settings/import">Import account archive</a></p><p class="muted">Archives never include your password, sessions, tokens, or administrator access.</p></section>"#
+    r#"<section class="panel settings-card" id="account-data" data-testid="settings-card"><h2>Account data</h2><p class="settings-section-help">Export your posts, profile, media, follows, and settings as a portable archive, or import an archive exported from another RustPost instance.</p><p class="actions"><a class="button-link" href="/settings/export">Export account archive</a> <a class="button-link" href="/settings/import">Import account archive</a></p><p class="muted">Archives never include your password, sessions, tokens, or administrator access.</p></section>"#
         .to_owned()
 }
 
@@ -59,14 +102,15 @@ pub(super) fn settings_account_data_panel() -> String {
 pub(super) fn settings_delete_panel(
     deletion: Option<&account::DeletionRequest>,
     csrf: &str,
+    confirmation: &str,
 ) -> String {
     deletion.map_or_else(
         || {
-            r#"<section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p>Deleting your account starts a countdown before permanent removal.</p><p class="settings-danger-action"><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#.to_owned()
+            format!(r#"<section class="panel settings-card danger-panel" id="delete-account" data-testid="settings-card"><h2>Delete account</h2>{confirmation}<p>Deleting your account starts a countdown before permanent removal.</p><p class="settings-danger-action"><a class="button-link danger-link" href="/settings/delete">Start delete account flow</a></p></section>"#)
         },
         |deletion| {
             format!(
-                r#"<section class="panel settings-card danger-panel" data-testid="settings-card"><h2>Delete account</h2><p data-testid="deletion-deadline">This account is scheduled for permanent deletion on {}.</p><p>You can cancel the deletion until then. Until it completes, this account keeps your posts but cannot publish or change account data.</p><form method="post" action="/settings/delete/cancel"><input type="hidden" name="csrf" value="{}"><button type="submit">Cancel deletion</button></form></section>"#,
+                r#"<section class="panel settings-card danger-panel" id="delete-account" data-testid="settings-card"><h2>Delete account</h2>{confirmation}<p data-testid="deletion-deadline">This account is scheduled for permanent deletion on {}.</p><p>You can cancel the deletion until then. Until it completes, this account keeps your posts but cannot publish or change account data.</p><form method="post" action="/settings/delete/cancel"><input type="hidden" name="csrf" value="{}"><button type="submit">Cancel deletion</button></form></section>"#,
                 html_escape::encode_text(&deletion.scheduled_at),
                 html_escape::encode_double_quoted_attribute(csrf),
             )
@@ -352,7 +396,7 @@ pub(super) async fn unmute(
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::unmute(&state.pool, user.id, id).await?;
-    Ok(Redirect::to("/settings").into_response())
+    Ok(SettingsSave::Unmuted.redirect())
 }
 
 pub(super) async fn settings_form(
@@ -364,8 +408,10 @@ pub(super) async fn settings_form(
     let csrf = form_csrf(&state, &headers)
         .await?
         .ok_or(AppError::Unauthorized)?;
-    let notice = settings_query_notice(query.saved.as_deref());
-    Ok(Html(settings_page(&state, &user, &csrf, notice).await?))
+    let saved = SettingsSave::from_query(query.saved.as_deref());
+    Ok(Html(
+        settings_page(&state, &user, &csrf, saved, None).await?,
+    ))
 }
 
 #[expect(
@@ -376,6 +422,7 @@ pub(super) async fn settings_page(
     state: &AppState,
     user: &CurrentUser,
     csrf: &str,
+    saved: Option<SettingsSave>,
     notice: Option<(&str, &str)>,
 ) -> AppResult<String> {
     let profile = settings_profile(&state.pool, user.id).await?;
@@ -384,8 +431,29 @@ pub(super) async fn settings_page(
     let muted_words = social::muted_words(&state.pool, user.id).await?;
     let username_history = identity::username_history(&state.pool, user.id).await?;
     let deletion = account::deletion_status(&state.pool, user.id).await?;
-    let username_panel = settings_username_panel(&user.username, &username_history, csrf);
-    let delete_panel = settings_delete_panel(deletion.as_ref(), csrf);
+    let confirmation = |section| {
+        saved.map_or_else(String::new, |save| {
+            let (_, target, message) = save.details();
+            if target == section {
+                render::notice("success", message)
+            } else {
+                String::new()
+            }
+        })
+    };
+    let username_panel = settings_username_panel(
+        &user.username,
+        &username_history,
+        csrf,
+        &confirmation("username"),
+    );
+    let delete_panel =
+        settings_delete_panel(deletion.as_ref(), csrf, &confirmation("delete-account"));
+    let profile_confirmation = confirmation("profile-save");
+    let blocked_confirmation = confirmation("blocked-users");
+    let muted_confirmation = confirmation("muted-users");
+    let word_confirmation = confirmation("muted-words");
+    let password_confirmation = confirmation("password");
     let notice_html =
         notice.map_or_else(String::new, |(kind, message)| render::notice(kind, message));
     let password_hint = if state.settings.accounts.min_password_length == 0 {
@@ -444,8 +512,9 @@ pub(super) async fn settings_page(
         ),
     ]
     .join("");
+    let jump_links = r##"<nav class="settings-category-nav" aria-label="Settings sections"><a href="#profile-settings-form">Profile and privacy</a><a href="#muted-words">Muted words</a><a href="#blocked-users">Blocked and muted users</a><a href="#password">Password and username</a><a href="#account-data">Account data</a></nav>"##;
     let body = format!(
-        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, media, and account controls.</p></div></div><form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}"><div class="settings-section settings-section-media"><div class="settings-section-heading"><h2>Profile media</h2><p class="settings-section-help">Avatar and banner images for your profile header.</p></div>{}</div><div class="settings-section settings-section-profile"><div class="settings-section-heading"><h2>Profile</h2><p class="settings-section-help">Your name, bio, location, and link as shown on your profile.</p></div>{}</div><div class="settings-section settings-section-preferences"><div class="settings-section-heading"><h2>Preferences and privacy</h2><p class="settings-section-help">Control your display theme, NSFW media blur, and profile activity visibility.</p></div><div class="settings-switch-list">{}</div></div><div class="settings-form-actions"><button class="primary" type="submit">Save profile settings</button></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Blocked users</h2><p class="settings-section-help">Blocked accounts cannot follow or interact with you.</p>{}</section><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted users</h2><p class="settings-section-help">Muted accounts stay hidden from your views.</p>{}</section></div><section class="panel settings-card compact-panel settings-list-panel" data-testid="settings-card"><h2>Muted words</h2><p class="settings-section-help">Hide posts containing specific words or phrases.</p><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel settings-security-panel" data-testid="settings-card"><h2>Change password</h2><p class="settings-section-help">Update the password used to sign in to this account.</p><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form></section>{username_panel}{account_data_panel}{delete_panel}"#,
+        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, media, and account controls.</p></div></div>{jump_links}<form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}"><div class="settings-section settings-section-media"><div class="settings-section-heading"><h2>Profile media</h2><p class="settings-section-help">Avatar and banner images for your profile header.</p></div>{}</div><div class="settings-section settings-section-profile"><div class="settings-section-heading"><h2>Profile</h2><p class="settings-section-help">Your name, bio, location, and link as shown on your profile.</p></div>{}</div><div class="settings-section settings-section-preferences"><div class="settings-section-heading"><h2>Preferences and privacy</h2><p class="settings-section-help">Control your display theme, NSFW media blur, and profile activity visibility.</p></div><div class="settings-switch-list">{}</div></div><div id="profile-save">{profile_confirmation}<div class="settings-form-actions"><button class="primary" type="submit">Save profile settings</button></div></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel settings-list-panel" id="blocked-users" data-testid="settings-card"><h2>Blocked users</h2>{blocked_confirmation}<p class="settings-section-help">Blocked accounts cannot follow or interact with you.</p>{}</section><section class="panel settings-card compact-panel settings-list-panel" id="muted-users" data-testid="settings-card"><h2>Muted users</h2>{muted_confirmation}<p class="settings-section-help">Muted accounts stay hidden from your views.</p>{}</section></div><section class="panel settings-card compact-panel settings-list-panel" id="muted-words" data-testid="settings-card"><h2>Muted words</h2>{word_confirmation}<p class="settings-section-help">Hide posts containing specific words or phrases.</p><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel settings-security-panel" id="password" data-testid="settings-card"><h2>Change password</h2>{password_confirmation}<p class="settings-section-help">Update the password used to sign in to this account.</p><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form></section>{username_panel}{account_data_panel}{delete_panel}"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         profile_media,
         profile_fields,
@@ -567,7 +636,7 @@ pub(super) async fn apply_profile_update(
             Ok(previous)
         }).await?;
     media::cleanup_replaced_profile_media(&state.pool, &state.paths, previous).await;
-    Ok(Redirect::to("/settings?saved=profile").into_response())
+    Ok(SettingsSave::Profile.redirect())
 }
 
 pub(super) async fn add_muted_word(
@@ -578,7 +647,7 @@ pub(super) async fn add_muted_word(
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     match social::add_muted_word(&state.pool, user.id, &form.term).await {
-        Ok(()) => Ok(Redirect::to("/settings?saved=muted-word").into_response()),
+        Ok(()) => Ok(SettingsSave::MutedWord.redirect()),
         Err(err) => {
             settings_response(
                 &state,
@@ -602,7 +671,7 @@ pub(super) async fn remove_muted_word(
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     social::remove_muted_word(&state.pool, user.id, id).await?;
-    Ok(Redirect::to("/settings?saved=muted-word-removed").into_response())
+    Ok(SettingsSave::MutedWordRemoved.redirect())
 }
 
 pub(super) async fn change_password(
@@ -624,7 +693,7 @@ pub(super) async fn change_password(
     )
     .await
     {
-        Ok(()) => Ok(Redirect::to("/settings?saved=password").into_response()),
+        Ok(()) => Ok(SettingsSave::Password.redirect()),
         Err(err) => {
             password_response(
                 &state,
@@ -680,7 +749,7 @@ pub(super) async fn settings_response(
         .ok_or(AppError::Unauthorized)?;
     Ok((
         status,
-        Html(settings_page(state, user, &csrf, Some((kind, message))).await?),
+        Html(settings_page(state, user, &csrf, None, Some((kind, message))).await?),
     )
         .into_response())
 }
@@ -764,7 +833,7 @@ pub(super) async fn delete_account_final(
             .await;
         }
         return match account::request_deletion(&state.pool, &state.settings, user.id).await {
-            Ok(_request) => Ok(Redirect::to("/settings?saved=delete-requested").into_response()),
+            Ok(_request) => Ok(SettingsSave::DeleteRequested.redirect()),
             Err(err) => {
                 tracing::warn!(user_id = user.id, error = %err, "account deletion request failed");
                 delete_account_final_response(
@@ -976,7 +1045,7 @@ pub(super) async fn password_change_page(
             "You must change your password before using the rest of your account.",
         ))
     } else {
-        settings_query_notice(query.saved.as_deref())
+        SettingsSave::from_query(query.saved.as_deref()).map(|save| ("success", save.details().2))
     };
     Ok(Html(password_change_page_html(
         &state, &user, &csrf, notice,
@@ -1065,7 +1134,7 @@ pub(super) async fn change_username(
     }
     match identity::change_username(&state.pool, &state.settings, user.id, &form.new_username).await
     {
-        Ok(_change) => Ok(Redirect::to("/settings?saved=username").into_response()),
+        Ok(_change) => Ok(SettingsSave::Username.redirect()),
         Err(err) => {
             settings_response(
                 &state,
@@ -1088,5 +1157,5 @@ pub(super) async fn cancel_deletion(
     let user = require_active_user(&state, &headers).await?;
     validate_csrf(&state.pool, &headers, &form.csrf).await?;
     account::cancel_deletion(&state.pool, user.id).await?;
-    Ok(Redirect::to("/settings?saved=delete-cancelled").into_response())
+    Ok(SettingsSave::DeleteCancelled.redirect())
 }
