@@ -11,7 +11,7 @@ RustPost runs a small social website from one application. This guide takes you 
 3. Extract the archive into a folder you can write to. Open the extracted folder until you see `rustpost-cli` (Linux/macOS) or `rustpost-cli.exe` (Windows).
 4. Open a terminal there. On Windows, use **Open in Terminal** from that folder and select PowerShell. In a terminal, `cd` changes folders; quote paths that contain spaces.
 
-The v1.1.0 ZIPs contain a folder named for their version and platform, such as `rustpost-cli-v1.1.0-macos-apple-silicon`. Use them when v1.1.0 is published; older v1.0.0 archives contain a `rustpost` folder and use different archive/checksum names. Always work beside the executable. See [Release packaging](development.md#release-packaging) for the older names.
+The v1.2.0 ZIPs contain a folder named for their version and platform, such as `rustpost-cli-v1.2.0-macos-apple-silicon`. Use them when v1.2.0 is published; older v1.0.0 archives contain a `rustpost` folder and use different archive/checksum names. Always work beside the executable. See [Release packaging](development.md#release-packaging) for the older names.
 
 ## Start the app
 
@@ -57,7 +57,7 @@ Wait for startup to finish, then visit **[http://127.0.0.1:8080](http://127.0.0.
 
 Keep the app running while you browse. To stop it, press **Ctrl+C** in its terminal and wait for shutdown to finish. Start it again with the same command and data directory. Your accounts and content remain saved.
 
-Version 1.1.0 has a [live console](terminal-console.md): press **1–6** to switch views, **?** for help, or **Q** to confirm shutdown. Published older builds may have a different terminal display.
+Version 1.2.0 has a [live console](terminal-console.md): press **1–6** to switch views, **?** for help, or **Q** to confirm shutdown. Published older builds may have a different terminal display.
 
 ## Optional media conversion
 
@@ -67,26 +67,26 @@ You can post allowed images and videos without installing extra tools. Installin
 
 ## Verify a download
 
-A checksum helps detect a damaged or mismatched download. Get `SHA256SUMS.txt` from the same v1.1.0 GitHub release as the ZIP and check it before extracting. These examples assume the archive and manifest are in your terminal's current folder; substitute your platform's filename from the [download table](../README.md#1-download-the-app).
+A checksum helps detect a damaged or mismatched download. Get `SHA256SUMS.txt` from the same v1.2.0 GitHub release as the ZIP and check it before extracting. These examples assume the archive and manifest are in your terminal's current folder; substitute your platform's filename from the [download table](../README.md#1-download-the-app).
 
 Linux (one downloaded ZIP):
 
 ```sh
-sha256sum rustpost-cli-v1.1.0-linux-x86_64.zip
+sha256sum rustpost-cli-v1.2.0-linux-x86_64.zip
 cat SHA256SUMS.txt
 ```
 
 macOS (Apple silicon; Intel uses `macos-intel`):
 
 ```sh
-shasum -a 256 rustpost-cli-v1.1.0-macos-apple-silicon.zip
+shasum -a 256 rustpost-cli-v1.2.0-macos-apple-silicon.zip
 cat SHA256SUMS.txt
 ```
 
 Windows PowerShell:
 
 ```powershell
-Get-FileHash .\rustpost-cli-v1.1.0-windows-x86_64.zip -Algorithm SHA256
+Get-FileHash .\rustpost-cli-v1.2.0-windows-x86_64.zip -Algorithm SHA256
 Get-Content .\SHA256SUMS.txt
 ```
 

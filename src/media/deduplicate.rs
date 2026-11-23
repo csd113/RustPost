@@ -23,17 +23,9 @@ pub(super) async fn try_insert_duplicate(
             hash_kind = ?hash_kind,
             "reusing media by content hash"
         );
-        return insert_duplicate_media(
-            context.pool,
-            context.paths,
-            upload.owner_user_id,
-            upload.original_filename.clone(),
-            upload.bytes,
-            upload.original_sha256.clone(),
-            canonical,
-        )
-        .await
-        .map(Some);
+        return insert_duplicate_media(context, upload, canonical)
+            .await
+            .map(Some);
     }
     Ok(None)
 }
@@ -63,14 +55,17 @@ pub(super) async fn try_insert_duplicate_after_canonical_conflict(
 }
 
 pub(super) async fn insert_duplicate_media(
-    pool: &SqlitePool,
-    paths: &RuntimePaths,
-    owner_user_id: Option<i64>,
-    original_filename: String,
-    bytes: u64,
-    original_sha256: String,
+    context: &UploadContext<'_>,
+    upload: &PreparedUpload,
     canonical: StoredMedia,
 ) -> anyhow::Result<PendingMedia> {
+    let pool = context.pool;
+    let paths = context.paths;
+    let owner_user_id = upload.owner_user_id;
+    let original_filename = upload.original_filename.clone();
+    let bytes = upload.bytes;
+    let original_sha256 = upload.original_sha256.clone();
+    let reservation_id = upload.reservation.id().to_owned();
     let mut cleanup = PendingUploads::new(pool, paths);
     let byte_len = i64::try_from(bytes)?;
     let normalized_sha256 = canonical
@@ -78,8 +73,9 @@ pub(super) async fn insert_duplicate_media(
         .clone()
         .filter(|hash| !hash.is_empty());
     pool.call(move |conn| {
-        conn.execute(
-            "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, conversion_state, original_sha256, normalized_sha256, canonical_media_id, is_nsfw) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate', ?, ?, ?, ?)",
+        let tx=conn.transaction()?;
+        tx.execute(
+            "INSERT INTO media (owner_user_id, original_filename, stored_path, public_path, mime_type, media_kind, byte_len, conversion_state, original_sha256, normalized_sha256, canonical_media_id, is_nsfw) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT CASE status WHEN 'running' THEN 'processing' WHEN 'queued' THEN 'queued' WHEN 'failed' THEN 'failed' ELSE 'duplicate' END FROM media_work WHERE media_id=?),'duplicate'), ?, ?, ?, ?)",
             params![
                 owner_user_id,
                 original_filename,
@@ -88,13 +84,16 @@ pub(super) async fn insert_duplicate_media(
                 canonical.mime_type,
                 canonical.media_kind,
                 byte_len,
+                canonical.id,
                 original_sha256,
                 normalized_sha256,
                 canonical.id,
                 i64::from(canonical.is_nsfw),
             ],
         )?;
-        let id = conn.last_insert_rowid();
+        let id = tx.last_insert_rowid();
+        tx.execute("DELETE FROM storage_reservations WHERE id=?",[reservation_id])?;
+        tx.commit()?;
         cleanup.track(id);
         Ok(PendingMedia { id, cleanup })
     })

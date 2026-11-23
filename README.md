@@ -18,17 +18,17 @@ The app includes its own database. You do not need a separate database server, a
 
 Open the [latest published release](https://github.com/csd113/RustPost/releases/latest), expand **Assets**, and download the archive for your computer. Choose the app archive, not GitHub's **Source code** download.
 
-The **v1.1.0** release workflow prepares these downloads. Use them when v1.1.0 is published; if the latest release is still v1.0.0, follow its asset names and checksums instead. [Release packaging](docs/development.md#release-packaging) lists the older names.
+The **v1.2.0** release workflow prepares these downloads. Use them when v1.2.0 is published; if the latest release is still v1.0.0, follow its asset names and checksums instead. [Release packaging](docs/development.md#release-packaging) lists the older names.
 
-| Your computer | v1.1.0 download |
+| Your computer | v1.2.0 download |
 | --- | --- |
-| Linux, Intel or AMD 64-bit | `rustpost-cli-v1.1.0-linux-x86_64.zip` |
-| Linux, ARM64 | `rustpost-cli-v1.1.0-linux-arm64.zip` |
-| macOS, Intel | `rustpost-cli-v1.1.0-macos-intel.zip` |
-| macOS, Apple silicon | `rustpost-cli-v1.1.0-macos-apple-silicon.zip` |
-| Windows, Intel or AMD 64-bit | `rustpost-cli-v1.1.0-windows-x86_64.zip` |
+| Linux, Intel or AMD 64-bit | `rustpost-cli-v1.2.0-linux-x86_64.zip` |
+| Linux, ARM64 | `rustpost-cli-v1.2.0-linux-arm64.zip` |
+| macOS, Intel | `rustpost-cli-v1.2.0-macos-intel.zip` |
+| macOS, Apple silicon | `rustpost-cli-v1.2.0-macos-apple-silicon.zip` |
+| Windows, Intel or AMD 64-bit | `rustpost-cli-v1.2.0-windows-x86_64.zip` |
 
-Download `SHA256SUMS.txt` from the same v1.1.0 release to [verify your download](docs/getting-started.md#verify-a-download). Extract the ZIP, then open a terminal **inside its version/platform folder**, beside `rustpost-cli` (or `rustpost-cli.exe`). The archive includes the executable, README, LICENSE, and CHANGELOG. Media conversion tools such as `ffmpeg` are optional and installed separately for native downloads.
+Download `SHA256SUMS.txt` from the same v1.2.0 release to [verify your download](docs/getting-started.md#verify-a-download). Extract the ZIP, then open a terminal **inside its version/platform folder**, beside `rustpost-cli` (or `rustpost-cli.exe`). The archive includes the executable, README, LICENSE, and CHANGELOG. Media conversion tools such as `ffmpeg` are optional and installed separately for native downloads.
 
 ### 2. Run it
 
@@ -96,13 +96,15 @@ Images appear within posts, and the layout adapts to smaller screens.
 
 These screenshots use fictional accounts and locally generated sample media. You can [run the same demo](docs/demo-preview.md) without using real account data.
 
+The prepared **1.2.0** development build adds drafts/scheduling, image descriptions, polls, complete history/search, background media processing, deletion undo, and safer storage/backups. Read [how to use these features and upgrade](docs/community-tools.md). No release is published by preparing this branch.
+
 ## Manage your site
 
 Sign in as an administrator and open **Admin**. Use **Deep server settings** to review settings before saving, **Users** to manage accounts, and **Backups** to save a copy of the site. Most configuration changes need a restart; the settings page explains when each change takes effect.
 
 New registrations are enabled by default; anonymous posting and automatic backups are disabled. You can close registration, rename the site, and adjust post or upload limits. The [operator guide](docs/operator-guide.md) explains these tasks and where your data lives.
 
-**Admin → Software updates** in v1.1.0 checks GitHub and links to a newer stable release. Installation is manual. Follow the [update guide](docs/software-updates.md) to preserve your data.
+**Admin → Software updates** in v1.2.0 checks GitHub and links to a newer stable release. Installation is manual. Follow the [update guide](docs/software-updates.md) to preserve your data.
 
 ## Documentation
 
@@ -121,7 +123,7 @@ New registrations are enabled by default; anonymous posting and automatic backup
 
 Reading a README from an extracted app archive? The full guides and screenshots are available in the [online repository](https://github.com/csd113/RustPost/tree/dev).
 
-These guides describe **v1.1.0** and identify older-release differences where needed. A development build can report the same package version as a release while containing different commits; record the source commit with your build. Download availability is determined by the published release page.
+These guides describe **v1.2.0** and identify older-release differences where needed. A development build can report the same package version as a release while containing different commits; record the source commit with your build. Download availability is determined by the published release page.
 
 RustPost is designed for a single community. Search and reporting tools are basic, media conversion happens during upload, and broader accessibility review remains outstanding. For public deployments, read the [security and dependency notes](docs/deployment.md#security-and-dependency-review).
 

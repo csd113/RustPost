@@ -18,7 +18,7 @@ pub fn run_automatic_backup_if_due(
         return Ok(None);
     }
     let _temp_operation = crate::runtime::begin_temp_operation();
-    let _lock = OperationLock::acquire(&paths)?;
+    let mut lock = OperationLock::acquire(&paths)?;
     if !automatic_backup_due(&paths, &settings.backup)? {
         return Ok(None);
     }
@@ -27,6 +27,7 @@ pub fn run_automatic_backup_if_due(
         settings.backup.automatic_include_tor_keys,
         BackupKind::Automatic,
         true,
+        Some(&mut lock),
     )?;
     apply_retention(&paths, &settings.backup)?;
     Ok(Some(archive))

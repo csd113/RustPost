@@ -48,6 +48,7 @@ pub struct PostView {
     pub quote: Option<QuotePreview>,
     pub media: Vec<MediaView>,
     pub youtube_embeds: Vec<YoutubeEmbed>,
+    pub poll: Option<polls::PollView>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +87,8 @@ impl ProfileTimelineTab {
 
 #[derive(Debug, Clone)]
 pub struct MediaView {
+    pub id: i64,
+    pub conversion_state: String,
     pub public_path: String,
     pub mime_type: String,
     pub media_kind: String,
@@ -338,9 +341,9 @@ impl ViewerRelation {
 
 mod posting;
 pub use posting::{
-    create_post, create_quote_post, edit_post, post_thread, profile_activity_visible,
-    profile_pinned_post, profile_tab_timeline, profile_timeline, quote_target_preview, repost,
-    timeline, unrepost,
+    PostOptions, create_post, create_post_with_options, create_quote_post, edit_post,
+    post_for_request, post_thread, profile_activity_visible, profile_pinned_post,
+    profile_tab_timeline, profile_timeline, quote_target_preview, repost, timeline, unrepost,
 };
 mod relationships;
 pub(crate) use relationships::follow_in_transaction;
@@ -359,7 +362,7 @@ pub use interactions::{
     unpin_post,
 };
 mod search;
-pub use search::{mention_suggestions, search};
+pub use search::{mention_suggestions, search, search_history, search_page};
 mod notifications;
 pub use notifications::{
     mark_notification_group_read, mark_notification_ids_read, mark_notifications_read,
@@ -374,3 +377,10 @@ use query::{
     reply_events_for_user, repost_events, reuse_stored_youtube_metadata, rows_to_posts,
     youtube_embeds_for_post_conn,
 };
+
+pub mod drafts;
+pub mod polls;
+
+pub mod history;
+
+pub mod recovery;

@@ -5,15 +5,26 @@ use super::*;
 pub(super) async fn bookmarks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
 ) -> AppResult<Html<String>> {
     let user = require_user(&state, &headers).await?;
-    let posts = social::timeline(&state.pool, Some(user.id), "bookmarks", None).await?;
+    let history = social::history::page(
+        &state.pool,
+        Some(user.id),
+        social::history::Surface::Bookmarks,
+        query.older.as_deref(),
+        query.newer.as_deref(),
+    )
+    .await
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let posts = &history.posts;
+    let navigation = history_navigation("/bookmarks", &history);
     let csrf = form_csrf(&state, &headers).await?;
     let body = format!(
         "{}{}",
         render::page_header("Bookmarks", "Posts you saved for later."),
         render::posts_with_controls_empty_state(
-            &posts,
+            posts,
             Some(&user),
             csrf.as_deref(),
             blur_nsfw_media(&state, Some(&user)),
@@ -21,6 +32,7 @@ pub(super) async fn bookmarks(
             render::EmptyState::new("No bookmarks yet.", "Saved posts will appear here."),
         )
     );
+    let body = format!("{body}{navigation}");
     Ok(Html(
         page_layout(&state, Some(&user), csrf.as_deref(), "Bookmarks", &body).await?,
     ))
@@ -123,17 +135,24 @@ pub(super) async fn search(
 ) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
     let q = normalize_search_query(query.q.as_deref().unwrap_or_default());
-    let (users, posts) = if q.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        social::search(&state.pool, user.as_ref().map(|u| u.id), &q).await?
-    };
+    let result = social::search_history(
+        &state.pool,
+        user.as_ref().map(|u| u.id),
+        &q,
+        query.cursor,
+        query.user_after,
+        query.newer,
+    )
+    .await
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let users = &result.users;
+    let posts = &result.posts;
     let csrf = form_csrf(&state, &headers).await?;
-    let body = render::search_page(
+    let mut body = render::search_page(
         &state.settings.site.name,
         &q,
-        &users,
-        &posts,
+        users,
+        posts,
         user.as_ref(),
         csrf.as_deref(),
         render::SearchRenderOptions {
@@ -141,6 +160,25 @@ pub(super) async fn search(
             post_edit_window_seconds: state.settings.posts.post_edit_window_seconds,
         },
     );
+    let encoded = encode_query_component(&q);
+    if result.has_more_posts
+        && let Some(last) = posts.last()
+    {
+        let _ = write!(
+            body,
+            r#"<p><a class="button-link" href="/search?q={encoded}&amp;cursor={}">Older matching posts</a></p>"#,
+            last.id
+        );
+    }
+    if result.has_more_users
+        && let Some(last) = users.last()
+    {
+        let _ = write!(
+            body,
+            r#"<p><a class="button-link" href="/search?q={encoded}&amp;user_after={}">More matching accounts</a></p>"#,
+            encode_query_component(&last.username.to_ascii_lowercase())
+        );
+    }
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Search", &body).await?,
     ))
@@ -160,7 +198,50 @@ pub(super) async fn tag(
         headers,
         Query(SearchQuery {
             q: Some(format!("#{tag}")),
+            newer: None,
+            cursor: None,
+            user_after: None,
         }),
     )
     .await
+}
+
+fn encode_query_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+pub(super) fn history_navigation(base: &str, page: &social::history::Page) -> String {
+    let separator = if base.contains('?') { "&" } else { "?" };
+    let mut links = String::new();
+    for (label, kind, cursor) in [
+        ("Newer posts", "newer", &page.newer),
+        ("Older posts", "older", &page.older),
+    ] {
+        if let Some(cursor) = cursor {
+            let href = html_escape::encode_double_quoted_attribute(&format!(
+                "{base}{separator}{kind}={cursor}"
+            ))
+            .into_owned();
+            let _ = write!(
+                links,
+                r#"<a class="button-link" href="{href}">{label}</a> "#
+            );
+        }
+    }
+    if page.newer.is_some() || page.older.is_some() {
+        let _ = write!(
+            links,
+            r#"<a href="{}">Latest posts</a>"#,
+            html_escape::encode_double_quoted_attribute(base)
+        );
+    }
+    format!(r#"<nav class="history-navigation" aria-label="Post history">{links}</nav>"#)
 }

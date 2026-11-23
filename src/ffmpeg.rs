@@ -78,8 +78,7 @@ pub async fn probe(settings: &MediaSettings) -> FfmpegStatus {
     .await;
     let encoder_text = encoders
         .ok()
-        .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
-        .unwrap_or_default();
+        .map_or_default(|out| String::from_utf8_lossy(&out.stdout).to_string());
     FfmpegStatus {
         available: true,
         version,

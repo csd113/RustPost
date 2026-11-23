@@ -362,6 +362,7 @@ pub(super) fn post_card_with_options(
         .map(|(index, media)| render_media(media, post.id, index, options.blur_nsfw_media))
         .collect::<Vec<_>>()
         .join("");
+    let media = format!("{}{}", media, render_poll(post, user, csrf));
     let controls = if let (Some(user), Some(csrf)) = (user, csrf) {
         let delete = if post.user_id == Some(user.id) || user.is_admin {
             icon_link(&format!("/posts/{}/delete", post.id), "Delete", "trash")
@@ -722,6 +723,19 @@ pub(super) fn render_media(
     } else {
         format!(r#"<img src="{path}" alt="{alt}" loading="lazy">"#)
     };
+    let item = if matches!(
+        media.conversion_state.as_str(),
+        "queued" | "processing" | "failed"
+    ) {
+        let label = if media.conversion_state == "failed" {
+            "Conversion failed; original retained"
+        } else {
+            "Media processing; original available"
+        };
+        format!("{item}<p class=\"field-help\">{label}</p>")
+    } else {
+        item
+    };
     if !media.is_nsfw || !blur_nsfw_media {
         return item;
     }
@@ -844,4 +858,74 @@ pub(super) fn is_linkable_url(value: &str) -> bool {
     };
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     host.contains('.') && !host.starts_with('.') && !host.ends_with('.')
+}
+
+fn render_poll(post: &PostView, user: Option<&CurrentUser>, csrf: Option<&str>) -> String {
+    let Some(poll) = &post.poll else {
+        return String::new();
+    };
+    let voting = user.is_some() && csrf.is_some() && !poll.closed;
+    let mut choices = String::new();
+    for choice in &poll.choices {
+        let label = html_escape::encode_text(&choice.label);
+        let selected = if choice.selected { " checked" } else { "" };
+        let input = if voting {
+            format!(
+                r#"<input type="{}" name="choice" value="{}"{selected}> "#,
+                if poll.multiple { "checkbox" } else { "radio" },
+                choice.id
+            )
+        } else {
+            String::new()
+        };
+        let own = if choice.selected {
+            " · your choice"
+        } else {
+            ""
+        };
+        let _ = write!(
+            choices,
+            r#"<p><label>{input}{label} — {} votes{own}</label></p>"#,
+            choice.votes
+        );
+    }
+    let privacy = "Only totals and your own choices are shown. Votes are linked to accounts; the operator can access vote records.";
+    let status = if poll.closed {
+        "Poll closed"
+    } else if poll.multiple {
+        "Choose any options"
+    } else {
+        "Choose one option"
+    };
+    let close = poll
+        .closes_at
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map_or_else(String::new, |t| {
+            format!(" · closes {} UTC", t.format("%Y-%m-%d %H:%M"))
+        });
+    let content = if voting {
+        format!(
+            r#"<form method="post" action="/polls/{}/vote"><input type="hidden" name="csrf" value="{}"><fieldset><legend>{status}</legend>{choices}</fieldset><button type="submit">Save vote</button></form>"#,
+            post.id,
+            html_escape::encode_double_quoted_attribute(csrf.unwrap_or_default())
+        )
+    } else {
+        choices
+    };
+    let close_button = if !poll.closed
+        && user.is_some_and(|u| post.user_id == Some(u.id))
+        && csrf.is_some()
+    {
+        format!(
+            r#"<form method="post" action="/polls/{}/close"><input type="hidden" name="csrf" value="{}"><button>Close poll</button></form>"#,
+            post.id,
+            html_escape::encode_double_quoted_attribute(csrf.unwrap_or_default())
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<section class="poll" aria-label="Community poll"><p>{status}{close} · {} voters</p>{content}<p class="field-help">{privacy}</p>{close_button}</section>"#,
+        poll.voters
+    )
 }

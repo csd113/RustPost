@@ -21,22 +21,12 @@ impl Drop for Fixture {
 
 impl Fixture {
     async fn new(grace_days: u64, quota: i64) -> anyhow::Result<Self> {
-        let directory = tempfile::tempdir()?;
-        let paths = RuntimePaths::from_data_dir(directory.path().join("instance"));
-        paths.ensure()?;
         let mut settings = Settings::default();
         settings.accounts.deletion_grace_period_days = grace_days;
         settings.accounts.max_archive_upload_bytes = 64 * 1024;
         settings.moderation.posts_per_minute = quota;
-        let pool = crate::db::connect(&paths.database_path).await?;
-        crate::db::migrate(&pool).await?;
-        let user_id = auth::register_user(&pool, &settings, "csrfuser", PASSWORD, false).await?;
-        let session = auth::create_session(&pool, user_id).await?;
-        let tor = crate::tor::validate_startup(&settings.tor);
-        let state = AppState::new(
-            pool,
+        Self::configured(
             settings,
-            paths,
             FfmpegStatus {
                 available: false,
                 version: String::new(),
@@ -44,8 +34,21 @@ impl Fixture {
                 supports_vp9: false,
                 error: None,
             },
-            tor,
-        );
+        )
+        .await
+    }
+
+    async fn configured(settings: Settings, ffmpeg: FfmpegStatus) -> anyhow::Result<Self> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_data_dir(directory.path().join("instance"));
+        paths.ensure()?;
+        std::fs::write(&paths.settings_path, toml::to_string(&settings)?)?;
+        let pool = crate::db::connect(&paths.database_path).await?;
+        crate::db::migrate(&pool).await?;
+        let user_id = auth::register_user(&pool, &settings, "csrfuser", PASSWORD, false).await?;
+        let session = auth::create_session(&pool, user_id).await?;
+        let tor = crate::tor::validate_startup(&settings.tor);
+        let state = AppState::new(pool, settings, paths, ffmpeg, tor);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let app = router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
@@ -575,3 +578,5 @@ async fn restricted_accounts_keep_the_no_javascript_delete_flow() -> anyhow::Res
     }
     Ok(())
 }
+
+mod feature_http_regressions;

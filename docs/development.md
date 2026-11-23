@@ -6,7 +6,7 @@ You only need the Rust toolchain if you want to build or change the app. To run 
 
 ## Build and run
 
-Install Git and [rustup](https://rustup.rs/), plus the native compiler/linker tools for your operating system. The repository pins **Rust 1.99.1** in `rust-toolchain.toml`; `Cargo.toml` also declares 1.99.1 as the minimum supported version. Rustup selects the pin inside the repository without changing your global default.
+Install Git and [rustup](https://rustup.rs/), plus the native compiler/linker tools for your operating system. The repository pins **Rust 1.100.0** in `rust-toolchain.toml`; `Cargo.toml` also declares 1.100.0 as the minimum supported version. Rustup selects the pin inside the repository without changing your global default.
 
 ```sh
 git clone --branch dev https://github.com/csd113/RustPost.git
@@ -17,7 +17,7 @@ cargo build --locked --release --bin rustpost-cli
 
 On Windows, run `.\target\release\rustpost-cli.exe --data-dir .\rustpost-data serve`. Follow the terminal's administrator prompts and visit **[http://127.0.0.1:8080](http://127.0.0.1:8080)**. The [first-run guide](getting-started.md) applies after the build.
 
-`dev` is the current development branch. It can contain changes that are not in a published release, even when `--version` prints the same package version as a release (currently 1.1.0). Record `git rev-parse HEAD` with a build. To reproduce a release, check out that release's tag instead of assuming dev has the same content.
+`dev` is the current development branch. It can contain changes that are not in a published release, even when `--version` prints the same package version as a release (currently 1.2.0). Record `git rev-parse HEAD` with a build. To reproduce a release, check out that release's tag instead of assuming dev has the same content.
 
 RustPost uses SQLite and server-rendered HTML, CSS, and JavaScript. There is no separate database server or frontend build step. `ffmpeg` is optional for ordinary operation and required for the [demo's sample-video generation](demo-preview.md).
 
@@ -78,7 +78,7 @@ For setup changes, use a fresh disposable data directory to check `init`, `check
 
 **Older v1.0.0** uses `rustpost-linux-x86_64.tar.gz`, `rustpost-linux-aarch64.tar.gz`, `rustpost-macos-aarch64.tar.gz` (Apple silicon), and `rustpost-windows-x86_64.zip`, each with a matching `.sha256` file. These archives contain a `rustpost` folder. Those existing artifacts are not renamed by changing the workflow.
 
-The **v1.1.0 release workflow** prepares these five ZIP patterns for a `vVERSION` tag (`VERSION` is `1.1.0` for this release):
+The **v1.2.0 release workflow** prepares these five ZIP patterns for a `vVERSION` tag (`VERSION` is `1.2.0` for this release):
 
 | Platform | Archive pattern |
 | --- | --- |
@@ -92,7 +92,7 @@ Each ZIP contains a matching version/platform folder with the executable, README
 
 The release workflow checks that the tag matches the package version, validates code quality/rustdoc, verifies the native executable version and Mac architecture, and prepares a **draft** GitHub release. It refuses to modify an already-published release. Publishing a draft is a separate maintainer action.
 
-The container workflow builds Linux amd64/arm64 images from a source tag and publishes version tags, plus `latest` for stable versions. The image uses an unprivileged UID/GID 10001, persistent `/data`, and bundled `ffmpeg`. Its Dockerfile starts with `rust:1.98.1-bookworm` and installs the exact 1.99.1 compiler; that base-image tag is not the final build compiler version.
+The container workflow builds Linux amd64/arm64 images from a source tag and publishes version tags, plus `latest` for stable versions. The image uses an unprivileged UID/GID 10001, persistent `/data`, and bundled `ffmpeg`. Its Dockerfile starts with `rust:1.98.1-bookworm` and installs the exact 1.100.0 compiler; that base-image tag is not the final build compiler version.
 
 ## Change the compiler or dependencies
 

@@ -8,7 +8,7 @@ The screenshot refresh for v1.0.0 was captured on September 29, 2026. Desktop im
 
 ## What you need
 
-- Git and rustup, using the repository’s pinned Rust 1.99.1 compiler. Start from a current `dev` checkout; see [Build from source](development.md#build-and-run).
+- Git and rustup, using the repository’s pinned Rust 1.100.0 compiler. Start from a current `dev` checkout; see [Build from source](development.md#build-and-run).
 - `ffmpeg` with the `drawtext` filter and the `libvpx-vp9` encoder to generate the sample videos. These are needed for this demo even though `ffmpeg` is optional for normal RustPost use. Check your build with `ffmpeg -filters` and `ffmpeg -encoders`.
 
 ## 1. Build

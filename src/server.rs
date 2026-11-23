@@ -231,6 +231,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let upload_body_limit = upload_body_limit(&state.settings);
     let import_body_limit = import_upload_body_limit(&state.settings);
     Router::new()
+        .route("/health/live", get(health::live))
+        .route("/health/ready", get(health::ready))
         .route("/", get(home))
         .route("/assets/rustpost-boot.js", get(client_boot_script))
         .route("/assets/rustpost.js", get(client_script))
@@ -241,7 +243,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/register", get(register_form).post(register))
         .route("/onboarding", get(onboarding).post(onboarding_update))
         .route("/logout", post(logout))
+        .route("/drafts", get(drafts_routes::index))
+        .route(
+            "/drafts/{id}",
+            get(drafts_routes::edit).post(drafts_routes::update),
+        )
+        .route("/drafts/{id}/cancel", post(drafts_routes::cancel))
+        .route("/drafts/{id}/delete", post(drafts_routes::delete))
+        .route("/media/processing", get(drafts_routes::media_jobs))
+        .route("/media/{id}/retry", post(drafts_routes::retry_media))
+        .route("/polls/{id}/vote", post(drafts_routes::vote))
+        .route("/polls/{id}/close", post(drafts_routes::close_poll))
         .route("/posts", post(create_post))
+        .route("/settings/deleted-posts", get(drafts_routes::deleted_posts))
+        .route("/posts/{id}/restore", post(drafts_routes::restore_post))
         .route("/posts/{id}", get(thread))
         .route("/posts/{id}/edit", get(edit_post_form).post(edit_post))
         .route("/posts/{id}/delete", get(delete_confirm).post(delete_post))
@@ -316,6 +331,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/posts/{id}/nsfw", post(admin_toggle_post_nsfw))
         .route("/admin/health", get(admin_health))
         .route("/admin/media", get(admin_media))
+        .route("/admin/storage", get(drafts_routes::admin_storage))
         .route(
             "/admin/deep-settings",
             get(admin_deep_settings).post(admin_deep_settings_update),
@@ -324,6 +340,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/favicon/remove", post(admin_favicon_remove))
         .route("/admin/backups", get(admin_backups))
         .route("/admin/backups/create", post(admin_create_backup))
+        .route("/admin/backups/verify", post(backups::admin_verify_backup))
         .route(
             "/admin/backups/download/{filename}",
             get(admin_download_backup),
@@ -368,6 +385,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             snapshot_guard,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            drafts_routes::private_media_guard,
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -500,12 +521,30 @@ struct ReturnQuery {
 
 #[derive(Deserialize)]
 struct SearchQuery {
+    newer: Option<i64>,
     q: Option<String>,
+    cursor: Option<i64>,
+    user_after: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ProfileQuery {
     tab: Option<String>,
+    older: Option<String>,
+    newer: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct HistoryQuery {
+    feed: Option<String>,
+    older: Option<String>,
+    newer: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ThreadQuery {
+    before: Option<i64>,
+    after: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -591,6 +630,16 @@ struct ParsedPostCreate {
     parent_post_id: Option<i64>,
     media_ids: Vec<i64>,
     is_nsfw: bool,
+    intent: String,
+    post_key: String,
+    scheduled_at: String,
+    poll_options: String,
+    poll_multiple: bool,
+    poll_closes_at: String,
+    descriptions: std::collections::BTreeMap<usize, String>,
+    retained_media: Vec<i64>,
+    existing_descriptions: std::collections::BTreeMap<i64, String>,
+    revision: Option<i64>,
 }
 
 struct ParsedOnboardingUpdate {
@@ -669,9 +718,54 @@ async fn local_redirect() -> Redirect {
     Redirect::to("/home")
 }
 
-async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResult<Html<String>> {
+async fn home(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
+) -> AppResult<Html<String>> {
     let user = current(&state, &headers).await?;
-    let posts = social::timeline(&state.pool, user.as_ref().map(|u| u.id), "local", None).await?;
+    let following = match query.feed.as_deref() {
+        None | Some("everyone") => false,
+        Some("following") => true,
+        _ => {
+            return Err(AppError::BadRequest(
+                "choose Everyone or Following".to_owned(),
+            ));
+        }
+    };
+    if following && user.is_none() {
+        return Err(AppError::Unauthorized);
+    }
+    let history = social::history::page(
+        &state.pool,
+        user.as_ref().map(|u| u.id),
+        if following {
+            social::history::Surface::Following
+        } else {
+            social::history::Surface::Everyone
+        },
+        query.older.as_deref(),
+        query.newer.as_deref(),
+    )
+    .await
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let navigation = timelines::history_navigation(
+        if following {
+            "/home?feed=following"
+        } else {
+            "/home?feed=everyone"
+        },
+        &history,
+    );
+    let posts = &history.posts;
+    let selected = if following { "Following" } else { "Everyone" };
+    let feed_switch = if user.is_some() {
+        format!(
+            r#"<nav aria-label="Feed"><a class="button-link" href="/home?feed=everyone">Everyone</a> <a class="button-link" href="/home?feed=following">Following</a><p>Showing: {selected}</p></nav>"#
+        )
+    } else {
+        String::new()
+    };
     let csrf = form_csrf(&state, &headers).await?;
     let composer = if (user.is_some() || state.settings.accounts.anonymous_mode_enabled)
         && posting_enabled_for(&state, user.as_ref()).await?
@@ -681,17 +775,18 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResu
         String::new()
     };
     let body = format!(
-        "{}{}{}",
-        render::page_header("Home Feed", "All posts"),
+        "{}{feed_switch}{}{}",
+        render::page_header("Home Feed", selected),
         composer,
         render::posts_with_controls(
-            &posts,
+            posts,
             user.as_ref(),
             csrf.as_deref(),
             blur_nsfw_media(&state, user.as_ref()),
             state.settings.posts.post_edit_window_seconds,
         )
     );
+    let body = format!("{body}{navigation}");
     Ok(Html(
         page_layout(&state, user.as_ref(), csrf.as_deref(), "Home Feed", &body).await?,
     ))
@@ -748,6 +843,7 @@ async fn page_layout(
                 | "Site health"
                 | "Admin users"
                 | "Media jobs"
+                | "Storage"
                 | "Deep server settings"
                 | "Backups"
                 | "Software updates"
@@ -757,6 +853,7 @@ async fn page_layout(
             ("/admin/health", "Site health", "Site health"),
             ("/admin/users", "Users", "Admin users"),
             ("/admin/media", "Media jobs", "Media jobs"),
+            ("/admin/storage", "Storage", "Storage"),
             (
                 "/admin/deep-settings",
                 "Configuration",
@@ -990,3 +1087,7 @@ use backups::{
 async fn read_form_text(mut field: axum::extract::multipart::Field<'_>) -> AppResult<String> {
     portability_routes::read_limited_text_field(&mut field, 64 * 1024).await
 }
+
+mod drafts_routes;
+
+mod health;

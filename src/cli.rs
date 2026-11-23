@@ -99,6 +99,13 @@ enum Command {
         include_tor_keys: bool,
     },
 
+    /// Fully verify a backup and rehearse migrations in temporary storage; live data is untouched.
+    VerifyBackup {
+        archive: PathBuf,
+        #[arg(long)]
+        include_tor_keys: bool,
+    },
+
     /// Restore a backup tar archive into the runtime data directory.
     #[command(about = "Restore a backup tar archive into the data directory")]
     Restore {
@@ -121,7 +128,7 @@ pub async fn run() -> anyhow::Result<()> {
     let command = cli.command.unwrap_or(Command::Serve);
     let explicit_data_dir = cli.data_dir.clone();
     let mut paths = runtime::RuntimePaths::discover(cli.data_dir.as_deref())?;
-    let check_only = matches!(command, Command::Check);
+    let check_only = matches!(command, Command::Check | Command::VerifyBackup { .. });
     if !check_only {
         paths.ensure()?;
     }
@@ -260,12 +267,25 @@ async fn run_command(
                 anyhow::bail!("seed-demo requires an explicit --data-dir under target/debug");
             }
             let pool = db::connect(&paths.database_path).await?;
-            db::migrate(&pool).await?;
+            migrate_database(&pool).await?;
             let report = demo_seed::seed(&pool, &paths, &settings, &settings_path).await?;
             stdout_line(format_args!("{report}"))?;
             Ok(())
         }
         Command::Backup { include_tor_keys } => backup_command(&paths, include_tor_keys),
+        Command::VerifyBackup {
+            archive,
+            include_tor_keys,
+        } => {
+            let report = backup::verify_backup(&paths, &archive, include_tor_keys)?;
+            stdout_line(format_args!(
+                "Backup verified without replacing live data: {} files, {} bytes, database and media paths rehearsed for RustPost {}",
+                report.files,
+                report.bytes,
+                db::CURRENT_RELEASE
+            ))?;
+            Ok(())
+        }
         Command::Restore {
             archive,
             include_tor_keys,
@@ -360,13 +380,23 @@ struct AdminDatabase<'a> {
     settings: &'a config::Settings,
 }
 
+async fn migrate_database(pool: &db::Db) -> anyhow::Result<()> {
+    if let Some(source) = db::migrate_from(pool).await? {
+        stderr_raw(format_args!(
+            "Migrated database from {source} to RustPost {}.\n",
+            db::CURRENT_RELEASE
+        ));
+    }
+    Ok(())
+}
+
 async fn create_admin_command(
     database: &AdminDatabase<'_>,
     username: String,
     password: Zeroizing<String>,
 ) -> anyhow::Result<()> {
     let pool = db::connect(&database.paths.database_path).await?;
-    db::migrate(&pool).await?;
+    migrate_database(&pool).await?;
     admin::create_admin(&pool, database.settings, &username, &password).await?;
     stdout_raw(format_args!(
         "{}",
@@ -390,7 +420,7 @@ async fn reset_admin_password_command(
     password: Zeroizing<String>,
 ) -> anyhow::Result<()> {
     let pool = db::connect(&database.paths.database_path).await?;
-    db::migrate(&pool).await?;
+    migrate_database(&pool).await?;
     admin::reset_admin_password(&pool, database.settings, &username, &password).await?;
     stdout_raw(format_args!(
         "{}",
@@ -441,6 +471,10 @@ fn restore_command(
                 terminal::row("Archive", archive.display().to_string()),
                 terminal::row("Data directory", paths.data_dir.display().to_string()),
                 terminal::row(
+                    "Database",
+                    format!("compatible with RustPost {}", db::CURRENT_RELEASE)
+                ),
+                terminal::row(
                     "Pre-restore safety backup",
                     report.pre_restore_backup.map_or_else(
                         || "not created".to_owned(),
@@ -473,7 +507,7 @@ async fn serve(
         "[STARTING] opening database and validating schema\n"
     ));
     let pool = db::connect(&paths.database_path).await?;
-    db::migrate(&pool).await?;
+    migrate_database(&pool).await?;
     ensure_first_admin_interactive(&pool, &settings, &paths, options.shutdown.subscribe()).await?;
     if *options.shutdown.borrow() {
         anyhow::bail!("startup cancelled");
@@ -526,6 +560,10 @@ async fn serve(
     result
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "owns startup, listeners and worker handles through graceful shutdown"
+)]
 async fn serve_runtime(
     context: &console::Context,
     pool: &db::SqlitePool,
@@ -548,7 +586,7 @@ async fn serve_runtime(
         pool.clone(),
         settings.clone(),
         paths.clone(),
-        ffmpeg,
+        ffmpeg.clone(),
         tor_status.clone(),
     );
     let app = server::router(state).layer(axum::middleware::from_fn_with_state(
@@ -570,6 +608,14 @@ async fn serve_runtime(
     {
         state.clearnet = Some(listener.local_addr()?);
     }
+    crate::media::jobs::recover(pool).await?;
+    let background = crate::background::spawn(
+        pool.clone(),
+        settings.clone(),
+        paths.clone(),
+        ffmpeg,
+        stop.clone(),
+    );
     console::phase(live, console::Phase::Listening);
     let backup = backup::spawn_automatic_scheduler_observed(
         paths.clone(),
@@ -621,8 +667,9 @@ async fn serve_runtime(
     console::phase(live, console::Phase::Stopping);
     shutdown.send_replace(true);
     let drained = drain_workers(backup, maintenance, onion, operations).await;
+    let background_result = background.await.map_err(anyhow::Error::from);
     tor_status.stop();
-    result.and(drained)
+    result.and(drained).and(background_result)
 }
 
 async fn initialize_tor(

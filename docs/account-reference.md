@@ -81,6 +81,8 @@ RustPost account archives are separate from full-instance backups. Export is
 owner-only (`GET /settings/export`); import writes into the authenticated
 destination account (`GET`/`POST /settings/import`) and never creates accounts.
 
+Drafts, schedules, poll definitions/votes, and deletion recovery are outside account archive format 1. Full-site backups preserve them. Exported poll posts transfer as text/media without a poll.
+
 ### Archive format (version 1)
 
 A gzip-compressed tar archive (`.tar.gz`) containing:

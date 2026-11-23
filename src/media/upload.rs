@@ -43,16 +43,21 @@ pub(super) async fn save_upload_inner(
         .create_new(true)
         .open(&staging_path)?;
     let staging = StagedUploadGuard::new(staging_path);
-    let bytes = write_upload_to_staging(settings, staging.path(), &mut field, file).await?;
+    let reservation =
+        crate::storage_limits::Reservation::new(pool, settings, paths, owner_user_id).await?;
+    let bytes =
+        write_upload_to_staging(settings, staging.path(), &mut field, file, &reservation).await?;
     let context = UploadContext {
         pool,
         settings,
         paths,
         ffmpeg,
+        background: required_image_label.is_none(),
     };
     save_staged_upload(
         &context,
         StagedUpload {
+            reservation,
             owner_user_id,
             original_filename,
             staging,
@@ -115,6 +120,7 @@ pub(super) async fn prepare_staged_upload(
         }
     }
     Ok(PreparedUpload {
+        reservation: upload.reservation,
         owner_user_id: upload.owner_user_id,
         original_filename: upload.original_filename,
         staging: upload.staging,
@@ -141,16 +147,7 @@ pub(super) async fn store_new_upload(
     // cannot race a detached Tokio filesystem operation with guard cleanup.
     std::fs::rename(upload.staging.path(), &original_path)?;
     upload.staging.disarm();
-    let stored = convert_or_original(
-        context.settings,
-        context.paths,
-        context.ffmpeg,
-        &original_path,
-        &basename,
-        upload.media_kind,
-        &upload.mime,
-    )
-    .await;
+    let stored = initial_variant(context, &upload, &original_path, &basename).await;
     let normalized_sha256 = match hash_file(&stored.path).await {
         Ok(hash) => hash,
         Err(error) => {
@@ -188,6 +185,7 @@ pub(super) async fn store_new_upload(
         .as_ref()
         .map(|variant| variant.path.to_string_lossy().to_string());
     let record = NewMediaRecord {
+        reservation_id: upload.reservation.id().to_owned(),
         cleanup: vec![original_cleanup, stored.cleanup],
         owner_user_id: upload.owner_user_id,
         original_filename: upload.original_filename.clone(),
@@ -249,6 +247,7 @@ pub(super) async fn insert_new_media_record(
             ],
         )?;
         let media_id = tx.last_insert_rowid();
+        tx.execute("DELETE FROM storage_reservations WHERE id=?",[&record.reservation_id])?;
         record_media_job_in_tx(
             &tx,
             media_id,
@@ -271,6 +270,26 @@ pub(super) fn record_media_job_in_tx(
     state: &str,
     stderr: &str,
 ) -> anyhow::Result<()> {
+    if state == "queued" {
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM media_work WHERE status IN ('queued','running')",
+            [],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            count < jobs::QUEUE_LIMIT,
+            "media processing queue is full; try again later"
+        );
+        tx.execute(
+            "INSERT INTO media_work(media_id,status) VALUES(?,'queued')",
+            [media_id],
+        )?;
+        tx.execute(
+            "INSERT INTO media_jobs(media_id,status) VALUES(?,'queued')",
+            [media_id],
+        )?;
+        return Ok(());
+    }
     if state != "converted" && state != "fallback" {
         return Ok(());
     }
@@ -287,10 +306,11 @@ pub(super) async fn write_upload_to_staging(
     staging: &Path,
     field: &mut Field<'_>,
     file: std::fs::File,
+    reservation: &crate::storage_limits::Reservation,
 ) -> anyhow::Result<u64> {
     let result = tokio::time::timeout(
         std::time::Duration::from_hours(1),
-        write_upload_to_staging_inner(settings, file, field),
+        write_upload_to_staging_inner(settings, file, field, reservation),
     )
     .await
     .map_err(|_| anyhow::anyhow!("upload timed out"))?;
@@ -304,6 +324,7 @@ pub(super) async fn write_upload_to_staging_inner(
     settings: &Settings,
     file: std::fs::File,
     field: &mut Field<'_>,
+    reservation: &crate::storage_limits::Reservation,
 ) -> anyhow::Result<u64> {
     let mut file = tokio::fs::File::from_std(file);
     let mut bytes = 0_u64;
@@ -311,6 +332,7 @@ pub(super) async fn write_upload_to_staging_inner(
         .await
         .map_err(|_| anyhow::anyhow!("upload stalled; try again"))??
     {
+        let previous_bytes = bytes;
         bytes = bytes
             .checked_add(u64::try_from(chunk.len())?)
             .ok_or_else(|| anyhow::anyhow!("upload size overflow"))?;
@@ -322,6 +344,13 @@ pub(super) async fn write_upload_to_staging_inner(
         {
             anyhow::bail!("upload exceeds maximum size");
         }
+        reservation
+            .grow(
+                bytes,
+                previous_bytes == 0
+                    || bytes / (8 * 1024 * 1024) != previous_bytes / (8 * 1024 * 1024),
+            )
+            .await?;
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
@@ -375,5 +404,36 @@ pub(super) async fn cleanup_unreferenced_uploads<const N: usize>(
                 "failed to remove duplicate upload scratch file"
             );
         }
+    }
+}
+
+async fn initial_variant(
+    context: &UploadContext<'_>,
+    upload: &PreparedUpload,
+    original: &Path,
+    basename: &str,
+) -> StoredVariant {
+    if context.background
+        && jobs::conversion_requested(context.settings, context.ffmpeg, upload.media_kind)
+    {
+        convert::original_fallback(
+            original,
+            context.paths,
+            upload.media_kind,
+            &upload.mime,
+            "queued",
+            "",
+        )
+    } else {
+        convert_or_original(
+            context.settings,
+            context.paths,
+            context.ffmpeg,
+            original,
+            basename,
+            upload.media_kind,
+            &upload.mime,
+        )
+        .await
     }
 }

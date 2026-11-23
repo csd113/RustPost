@@ -74,7 +74,7 @@ pub fn render_startup_dashboard(input: &StartupDashboard<'_>) -> String {
         "Status",
         &[
             row("Version", env!("CARGO_PKG_VERSION")),
-            row("DB schema", schema_status_value(input)),
+            row("Database", schema_status_value(input)),
             row(
                 "Server",
                 status_value(Status::Pending, &bind_address(&input.settings.server)),
@@ -146,7 +146,7 @@ pub fn render_check(
         "Result",
         &[
             row("Configuration", status_value(Status::Ok, "valid")),
-            row("DB schema", database_schema_status_value(database_schema)),
+            row("Database", database_schema_status_value(database_schema)),
             row("Bind address", bind_address(&settings.server)),
             row("Public URL", public_url(settings)),
             row(
@@ -418,48 +418,32 @@ fn ffmpeg_status_value(ffmpeg: &ffmpeg::FfmpegStatus) -> String {
 }
 
 fn schema_status_value(input: &StartupDashboard<'_>) -> String {
-    let summary = schema_status_summary(
-        input.schema_version,
-        input.schema_compatible,
-        input.schema_summary,
-    );
     if input.schema_compatible {
-        status_value(Status::Ok, &summary)
+        status_value(Status::Ok, input.schema_summary)
     } else {
-        status_value(Status::Warn, &summary)
+        status_value(Status::Warn, input.schema_summary)
     }
 }
 
 fn database_schema_status_value(status: &DatabaseSchemaStatus) -> String {
     match status {
         DatabaseSchemaStatus::Missing => status_value(Status::Pending, "not created yet"),
-        DatabaseSchemaStatus::Adoptable { summary } => status_value(Status::Ok, summary),
+        DatabaseSchemaStatus::Adoptable { summary } => status_value(Status::Pending, summary),
         DatabaseSchemaStatus::Present {
-            version,
             compatible,
             summary,
+            ..
         } => {
-            let summary = schema_status_summary(*version, *compatible, summary);
             if *compatible {
-                status_value(Status::Ok, &summary)
+                status_value(Status::Ok, summary)
             } else {
-                status_value(Status::Failed, &summary)
+                status_value(Status::Failed, summary)
             }
         }
         DatabaseSchemaStatus::Unreadable { error } => {
             status_value(Status::Failed, &format!("unreadable; {error}"))
         }
     }
-}
-
-fn schema_status_summary(version: Option<i64>, compatible: bool, summary: &str) -> String {
-    if compatible {
-        return version.map_or_else(
-            || summary.to_owned(),
-            |version| format!("version {version}; {summary}"),
-        );
-    }
-    summary.to_owned()
 }
 
 fn status_value(status: Status, value: &str) -> String {
@@ -542,7 +526,19 @@ pub fn instance_command(paths: &runtime::RuntimePaths, command: &str) -> String 
                 .to_owned();
         }
         #[cfg(windows)]
-        quoted.push(format!("'{}'", value.replace('\'', "''")));
+        {
+            let mut literal = String::with_capacity(value.len() + 2);
+            literal.push('\'');
+            for ch in value.chars() {
+                // PowerShell treats the typographic single quotes as delimiters too.
+                if matches!(ch, '\'' | '\u{2018}'..='\u{201b}') {
+                    literal.push(ch);
+                }
+                literal.push(ch);
+            }
+            literal.push('\'');
+            quoted.push(literal);
+        }
         #[cfg(not(windows))]
         quoted.push(format!("'{}'", value.replace('\'', "'\"'\"'")));
     }

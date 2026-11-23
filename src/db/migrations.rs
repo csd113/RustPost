@@ -3,19 +3,26 @@
 use super::*;
 
 pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
+    migrate_from(pool).await.map(|_| ())
+}
+
+pub async fn migrate_from(pool: &Db) -> anyhow::Result<Option<&'static str>> {
     pool.call(|conn| {
         let tx = conn.transaction()?;
-        ensure_release_baseline(&tx)?;
+        let state = migration_state(&tx)?;
+        let source = state.source_format();
+        ensure_release_baseline(&tx, state)?;
         tx.commit()?;
-        Ok(())
+        Ok(source)
     })
     .await
 }
 
-pub(super) fn ensure_release_baseline(conn: &Connection) -> anyhow::Result<()> {
-    match migration_state(conn)? {
+fn ensure_release_baseline(conn: &Connection, state: MigrationState) -> anyhow::Result<()> {
+    match state {
         MigrationState::Empty => initialize_release_baseline(conn)?,
         MigrationState::Baseline => {}
+        MigrationState::ReleaseVersion4 => migrate_release_v4_to_current(conn)?,
         MigrationState::ReleaseVersion3 => migrate_release_v3_to_current(conn)?,
         MigrationState::ReleaseVersion2 => migrate_release_v2_to_current(conn)?,
         MigrationState::ReleaseVersion1 => migrate_release_v1_to_current(conn)?,
@@ -60,6 +67,9 @@ pub(super) fn migration_state(conn: &Connection) -> anyhow::Result<MigrationStat
     };
     if versions == [CURRENT_SCHEMA_VERSION] {
         return Ok(MigrationState::Baseline);
+    }
+    if versions == [RELEASE_V4_SCHEMA_VERSION] {
+        return Ok(MigrationState::ReleaseVersion4);
     }
     if versions == [RELEASE_V3_SCHEMA_VERSION] {
         return Ok(MigrationState::ReleaseVersion3);
@@ -145,7 +155,8 @@ pub(super) fn migrate_release_v3_to_current(conn: &Connection) -> anyhow::Result
         add_column_if_missing(conn, "users", column, definition)?;
     }
     conn.execute_batch(RELEASE_V4_SCHEMA)?;
-    reset_schema_migrations(conn)
+    reset_schema_migrations_to(conn, RELEASE_V4_SCHEMA_VERSION)?;
+    migrate_release_v4_to_current(conn)
 }
 
 /// `ALTER TABLE ... ADD COLUMN` is not idempotent, so the migration checks the
@@ -170,4 +181,10 @@ pub(super) fn add_column_if_missing(
         definition
     ))?;
     Ok(())
+}
+
+/// Adds durable drafts, polls and background media work without rewriting existing content.
+pub(super) fn migrate_release_v4_to_current(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(RELEASE_V5_SCHEMA)?;
+    reset_schema_migrations(conn)
 }

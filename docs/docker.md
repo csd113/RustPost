@@ -4,7 +4,7 @@ Docker runs a packaged copy of RustPost with `ffmpeg` included for media convers
 
 [All guides](README.md) · [Download an app instead](getting-started.md) · [Public deployment](deployment.md)
 
-For v1.1.0, use `ghcr.io/csd113/rustpost:1.1.0` once that image is published, with Linux amd64 and arm64 support. Docker Desktop can run the appropriate Linux image on compatible macOS and Windows computers. If v1.1.0 is not available yet, the older published `1.0.0` image predates features described here; see [version scope](README.md#which-version-do-these-guides-describe).
+For v1.2.0, use `ghcr.io/csd113/rustpost:1.2.0` once that image is published, with Linux amd64 and arm64 support. Docker Desktop can run the appropriate Linux image on compatible macOS and Windows computers. If v1.2.0 is not available yet, the older published `1.0.0` image predates features described here; see [version scope](README.md#which-version-do-these-guides-describe).
 
 ## Start RustPost
 
@@ -18,7 +18,7 @@ docker run -d --name rustpost \
   -p 127.0.0.1:8080:8080 \
   -v rustpost-data:/data \
   --restart unless-stopped \
-  ghcr.io/csd113/rustpost:1.1.0
+  ghcr.io/csd113/rustpost:1.2.0
 ```
 
 Docker downloads the image if necessary. The volume is the storage area for your site; retain it when replacing the container. The port mapping makes the site reachable only from the Docker host.
@@ -98,7 +98,7 @@ docker cp rustpost:/data/backups/ARCHIVE_NAME.tar ./ARCHIVE_NAME.tar
 
 Tor private keys are excluded by default. Include them only when needed, and protect any archive containing them.
 
-Restore with the server stopped. Version 1.1.0 disables browser restore; use the offline procedure below, which also avoids replacing a live database on older releases. First copy the backup into the volume while the original container is running:
+Restore with the server stopped. Version 1.2.0 disables browser restore; use the offline procedure below, which also avoids replacing a live database on older releases. First copy the backup into the volume while the original container is running:
 
 ```sh
 docker cp ./ARCHIVE_NAME.tar rustpost:/data/backups/restore-input.tar
@@ -107,7 +107,7 @@ docker exec --user 0 rustpost chmod 600 /data/backups/restore-input.tar
 docker stop rustpost
 docker run --rm \
   -v rustpost-data:/data \
-  ghcr.io/csd113/rustpost:1.1.0 \
+  ghcr.io/csd113/rustpost:1.2.0 \
   restore /data/backups/restore-input.tar
 ```
 
@@ -115,19 +115,19 @@ The ownership commands let the app's non-root user read the copied archive while
 
 ## Replacing or upgrading the container
 
-Create and download a backup first, and read the target release notes. The example below recreates the container using v1.1.0; substitute the published version you intend to install when upgrading.
+Create and download a backup first, and read the target release notes. The example below recreates the container using v1.2.0; substitute the published version you intend to install when upgrading.
 
 Download the image before stopping the app:
 
 ```sh
-docker pull ghcr.io/csd113/rustpost:1.1.0
+docker pull ghcr.io/csd113/rustpost:1.2.0
 docker stop rustpost
 docker rm rustpost
 docker run -d --name rustpost \
   -p 127.0.0.1:8080:8080 \
   -v rustpost-data:/data \
   --restart unless-stopped \
-  ghcr.io/csd113/rustpost:1.1.0
+  ghcr.io/csd113/rustpost:1.2.0
 docker logs rustpost
 ```
 
@@ -147,4 +147,4 @@ The `latest` tag can move as releases are published. A version tag makes the rel
 
 ## Admin update checks
 
-Version 1.1.0 provides a manual GitHub release check in **Admin → Software updates**. It does not replace containers. Use the [update guide](software-updates.md) and retain the persistent `/data` volume.
+Version 1.2.0 provides a manual GitHub release check in **Admin → Software updates**. It does not replace containers. Use the [update guide](software-updates.md) and retain the persistent `/data` volume.

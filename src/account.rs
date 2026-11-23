@@ -461,6 +461,8 @@ fn scrub_account_rows_in_tx(
                 "DELETE FROM reposts WHERE user_id = ? OR post_id IN (SELECT id FROM posts WHERE user_id = ?)",
                 params![user_id, user_id],
             )?;
+    tx.execute("DELETE FROM drafts WHERE user_id = ?", [user_id])?;
+    tx.execute("DELETE FROM poll_votes WHERE user_id = ?", [user_id])?;
     tx.execute("DELETE FROM posts WHERE user_id = ?", [user_id])?;
     for media_id in media_ids {
         promote_canonical_references(tx, media_id)?;
@@ -572,6 +574,12 @@ fn promote_canonical_references(
         "UPDATE media SET canonical_media_id = ? WHERE canonical_media_id = ?",
         params![replacement, media_id],
     )?;
+    tx.execute("UPDATE media_work SET media_id=?,status=CASE WHEN status='running' THEN CASE WHEN attempts<9 THEN 'queued' ELSE 'failed' END ELSE status END,lease_token='' WHERE media_id=?",params![replacement,media_id])?;
+    tx.execute(
+        "UPDATE media_jobs SET media_id=? WHERE media_id=?",
+        params![replacement, media_id],
+    )?;
+    tx.execute("UPDATE media SET conversion_state=(SELECT CASE WHEN status='queued' THEN 'queued' WHEN status='failed' THEN 'failed' ELSE conversion_state END FROM media_work WHERE media_id=?) WHERE id=? AND EXISTS(SELECT 1 FROM media_work WHERE media_id=?)",params![replacement,replacement,replacement])?;
     Ok(())
 }
 

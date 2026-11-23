@@ -134,10 +134,13 @@ impl RuntimePaths {
             })?;
         }
         self.migrate_legacy_database_layout()?;
-        restrict_dir(&self.data_dir)?;
-        restrict_dir(&self.backups_dir)?;
-        restrict_dir(&self.tor_dir)?;
-        restrict_dir(&self.tor_onion_service_dir)?;
+        #[cfg(unix)]
+        {
+            restrict_dir(&self.data_dir)?;
+            restrict_dir(&self.backups_dir)?;
+            restrict_dir(&self.tor_dir)?;
+            restrict_dir(&self.tor_onion_service_dir)?;
+        }
         Ok(())
     }
 
@@ -332,11 +335,6 @@ fn restrict_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn restrict_dir(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
 fn exe_dir() -> anyhow::Result<PathBuf> {
     let exe = env::current_exe()?;
     exe.parent()
@@ -376,8 +374,27 @@ pub(crate) fn check_restore_recovery(paths: &RuntimePaths) -> anyhow::Result<()>
     Ok(())
 }
 
+/// An acquired lock whose descriptor may briefly be inherited during a spawn.
+pub(crate) struct FileLease(fs::File);
+
+impl FileLease {
+    pub(crate) const fn from_locked(file: fs::File) -> Self {
+        Self(file)
+    }
+}
+
+impl Drop for FileLease {
+    fn drop(&mut self) {
+        // Explicit unlock releases Unix flock even if a child has inherited the
+        // descriptor and has yet to close it on exec.
+        if let Err(error) = self.0.unlock() {
+            warn!(%error, "could not release runtime file lock");
+        }
+    }
+}
+
 /// Shared request/maintenance lease; a snapshot holds the exclusive lease.
-pub(crate) fn snapshot_lease(paths: &RuntimePaths, exclusive: bool) -> anyhow::Result<fs::File> {
+pub(crate) fn snapshot_lease(paths: &RuntimePaths, exclusive: bool) -> anyhow::Result<FileLease> {
     let lease = fs::File::options()
         .read(true)
         .write(true)
@@ -389,5 +406,29 @@ pub(crate) fn snapshot_lease(paths: &RuntimePaths, exclusive: bool) -> anyhow::R
     } else {
         lease.try_lock_shared()?;
     }
-    Ok(lease)
+    Ok(FileLease::from_locked(lease))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::FileLease;
+
+    #[test]
+    fn lease_unlocks_while_a_duplicate_descriptor_is_open() -> anyhow::Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let owner = file.reopen()?;
+        owner.try_lock()?;
+        let inherited = owner.try_clone()?;
+        let lease = FileLease::from_locked(owner);
+        let contender = file.reopen()?;
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        drop(lease);
+        contender.try_lock()?;
+        drop(inherited);
+        Ok(())
+    }
 }

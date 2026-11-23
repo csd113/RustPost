@@ -144,8 +144,7 @@ impl Logs {
         let workers = self
             .workers
             .lock()
-            .map(|mut workers| std::mem::take(&mut *workers))
-            .unwrap_or_default();
+            .map_or_default(|mut workers| std::mem::take(&mut *workers));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         for worker in workers {
             while !worker.is_finished() && std::time::Instant::now() < deadline {

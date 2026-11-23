@@ -29,7 +29,12 @@ pub async fn import_account(
             .prefix(IMPORT_TMP_PREFIX)
             .tempdir_in(&worker_paths.tmp_dir)?;
         let limits = ArchiveLimits::from_settings(&worker_settings);
-        let extracted = extract_archive(&archive_path, staging.path(), limits)?;
+        let extracted = extract_archive(
+            &archive_path,
+            staging.path(),
+            limits,
+            worker_settings.storage.min_free_bytes,
+        )?;
         let staged = parse_archive(&worker_settings, &extracted, limits)?;
         Ok((staging, staged))
     })
@@ -42,12 +47,22 @@ pub async fn import_account(
         anyhow::bail!(ALREADY_IMPORTED_MESSAGE);
     }
 
+    let reservation =
+        crate::storage_limits::Reservation::new(pool, settings, paths, Some(user_id)).await?;
+    let logical = staged
+        .media
+        .iter()
+        .map(|media| media.byte_len)
+        .try_fold(0_u64, u64::checked_add)
+        .ok_or_else(|| anyhow::anyhow!("import size overflow"))?;
+    reservation.grow(logical, true).await?;
     // 3. Copy media bytes into the upload directories, claiming unique names.
     let installed = install_media_files(pool, paths, settings, &staged.media).await?;
 
     // 4. Apply every database row in one transaction. The transaction reads
     //    the installed file paths, so the files must exist before it starts.
     let plan = ImportPlan {
+        reservation_id: reservation.id().to_owned(),
         cleanup: installed.cleanup,
         archive_id: staged.manifest.archive_id,
         archive_username: staged.manifest.username,
@@ -77,6 +92,7 @@ pub(super) fn extract_archive(
     archive_path: &Path,
     staging: &Path,
     limits: ArchiveLimits,
+    minimum_free_bytes: u64,
 ) -> anyhow::Result<ExtractedArchive> {
     let metadata = fs::symlink_metadata(archive_path)
         .with_context(|| format!("account archive {} does not exist", archive_path.display()))?;
@@ -178,6 +194,7 @@ pub(super) fn extract_archive(
                 &target,
                 extracted_media_bytes,
                 limits.expanded_bytes,
+                minimum_free_bytes,
             )?;
             extracted_media_bytes = total;
             media_files.insert(
@@ -301,6 +318,7 @@ pub(super) fn extract_media_entry(
     target: &Path,
     already_extracted: u64,
     expanded_limit: u64,
+    minimum_free_bytes: u64,
 ) -> anyhow::Result<(u64, String, Vec<u8>, u64)> {
     let mut output = OpenOptions::new()
         .write(true)
@@ -338,6 +356,15 @@ pub(super) fn extract_media_entry(
             prefix.extend_from_slice(&chunk[..take]);
         }
         hasher.update(chunk);
+        if size == read || size / (8 * 1024 * 1024) != (size - read) / (8 * 1024 * 1024) {
+            crate::storage_limits::ensure_headroom(
+                target
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("missing staging parent"))?,
+                minimum_free_bytes,
+                read,
+            )?;
+        }
         output.write_all(chunk)?;
     }
     output
