@@ -92,7 +92,7 @@ Each ZIP contains a matching version/platform folder with the executable, README
 
 The release workflow checks that the tag matches the package version, validates code quality/rustdoc, verifies the native executable version and Mac architecture, and prepares a **draft** GitHub release. It refuses to modify an already-published release. Publishing a draft is a separate maintainer action.
 
-The container workflow builds Linux amd64/arm64 images from a source tag and publishes version tags, plus `latest` for stable versions. The image uses an unprivileged UID/GID 10001, persistent `/data`, and bundled `ffmpeg`. Its Dockerfile uses `rust:1.100.0-bookworm` for the builder and `debian:bookworm-slim` for the runtime.
+The container workflow builds Linux amd64/arm64 images from a source tag and publishes version tags, plus `latest` for stable versions. The image uses an unprivileged UID/GID 10001, persistent `/data`, and bundled `ffmpeg`. Its Dockerfile starts with `rust:1.98.1-bookworm` and installs the exact 1.100.0 compiler; that base-image tag is not the final build compiler version.
 
 ## Change the compiler or dependencies
 
