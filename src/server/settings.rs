@@ -126,7 +126,7 @@ pub(super) async fn settings_profile(
         Ok(conn
             .query_row(
                 r#"
-        SELECT u.display_name, u.bio, u.location, u.website, u.theme, u.nsfw_blur_enabled,
+        SELECT u.display_name, u.bio, u.location, u.website, u.nsfw_blur_enabled,
           u.liked_posts_public, u.follow_approval_required,
           pic.public_path AS profile_picture_path,
           banner.public_path AS banner_path
@@ -142,12 +142,11 @@ pub(super) async fn settings_profile(
                         bio: row.get(1)?,
                         location: row.get(2)?,
                         website: row.get(3)?,
-                        theme: row.get(4)?,
-                        nsfw_blur_enabled: row.get::<_, i64>(5)? != 0,
-                        liked_posts_public: row.get::<_, i64>(6)? != 0,
-                        follow_approval_required: row.get::<_, i64>(7)? != 0,
-                        picture_path: row.get(8)?,
-                        banner_path: row.get(9)?,
+                        nsfw_blur_enabled: row.get::<_, i64>(4)? != 0,
+                        liked_posts_public: row.get::<_, i64>(5)? != 0,
+                        follow_approval_required: row.get::<_, i64>(6)? != 0,
+                        picture_path: row.get(7)?,
+                        banner_path: row.get(8)?,
                     })
                 },
             )
@@ -487,12 +486,6 @@ pub(super) async fn settings_page(
     );
     let preference_switches = [
         settings_switch(
-            "dark_mode",
-            Theme::from(profile.theme.as_str()) == Theme::Dark,
-            "Dark mode",
-            "Use the darker color theme for your signed-in session.",
-        ),
-        settings_switch(
             "nsfw_blur_enabled",
             profile.nsfw_blur_enabled,
             "Blur NSFW media",
@@ -514,7 +507,7 @@ pub(super) async fn settings_page(
     .join("");
     let jump_links = r##"<nav class="settings-category-nav" aria-label="Settings sections"><a href="#profile-settings-form">Profile and privacy</a><a href="#muted-words">Muted words</a><a href="#blocked-users">Blocked and muted users</a><a href="#password">Password and username</a><a href="#account-data">Account data</a></nav>"##;
     let body = format!(
-        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, media, and account controls.</p></div></div>{jump_links}<form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}"><div class="settings-section settings-section-media"><div class="settings-section-heading"><h2>Profile media</h2><p class="settings-section-help">Avatar and banner images for your profile header.</p></div>{}</div><div class="settings-section settings-section-profile"><div class="settings-section-heading"><h2>Profile</h2><p class="settings-section-help">Your name, bio, location, and link as shown on your profile.</p></div>{}</div><div class="settings-section settings-section-preferences"><div class="settings-section-heading"><h2>Preferences and privacy</h2><p class="settings-section-help">Control your display theme, NSFW media blur, and profile activity visibility.</p></div><div class="settings-switch-list">{}</div></div><div id="profile-save">{profile_confirmation}<div class="settings-form-actions"><button class="primary" type="submit">Save profile settings</button></div></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel settings-list-panel" id="blocked-users" data-testid="settings-card"><h2>Blocked users</h2>{blocked_confirmation}<p class="settings-section-help">Blocked accounts cannot follow or interact with you.</p>{}</section><section class="panel settings-card compact-panel settings-list-panel" id="muted-users" data-testid="settings-card"><h2>Muted users</h2>{muted_confirmation}<p class="settings-section-help">Muted accounts stay hidden from your views.</p>{}</section></div><section class="panel settings-card compact-panel settings-list-panel" id="muted-words" data-testid="settings-card"><h2>Muted words</h2>{word_confirmation}<p class="settings-section-help">Hide posts containing specific words or phrases.</p><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel settings-security-panel" id="password" data-testid="settings-card"><h2>Change password</h2>{password_confirmation}<p class="settings-section-help">Update the password used to sign in to this account.</p><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form></section>{username_panel}{account_data_panel}{delete_panel}"#,
+        r#"{notice_html}<section class="panel settings-card settings-profile-editor" data-testid="settings-card"><div class="settings-editor-bar"><div><h1>Account settings</h1><p class="muted">Profile, privacy, media, and account controls.</p></div></div>{jump_links}<form id="profile-settings-form" method="post" enctype="multipart/form-data" class="settings-profile-form"><input type="hidden" name="csrf" value="{}"><div class="settings-section settings-section-media"><div class="settings-section-heading"><h2>Profile media</h2><p class="settings-section-help">Avatar and banner images for your profile header.</p></div>{}</div><div class="settings-section settings-section-profile"><div class="settings-section-heading"><h2>Profile</h2><p class="settings-section-help">Your name, bio, location, and link as shown on your profile.</p></div>{}</div><div class="settings-section settings-section-preferences"><div class="settings-section-heading"><h2>Preferences and privacy</h2><p class="settings-section-help">Control NSFW media blur and profile activity visibility.</p></div><div class="settings-switch-list">{}</div></div><div id="profile-save">{profile_confirmation}<div class="settings-form-actions"><button class="primary" type="submit">Save profile settings</button></div></div></form></section><div class="settings-grid"><section class="panel settings-card compact-panel settings-list-panel" id="blocked-users" data-testid="settings-card"><h2>Blocked users</h2>{blocked_confirmation}<p class="settings-section-help">Blocked accounts cannot follow or interact with you.</p>{}</section><section class="panel settings-card compact-panel settings-list-panel" id="muted-users" data-testid="settings-card"><h2>Muted users</h2>{muted_confirmation}<p class="settings-section-help">Muted accounts stay hidden from your views.</p>{}</section></div><section class="panel settings-card compact-panel settings-list-panel" id="muted-words" data-testid="settings-card"><h2>Muted words</h2>{word_confirmation}<p class="settings-section-help">Hide posts containing specific words or phrases.</p><form method="post" action="/settings/muted-words" class="inline-settings-form"><input type="hidden" name="csrf" value="{}"><label class="sr-only" for="muted-word">Word or phrase to mute</label><input id="muted-word" name="term" placeholder="Word or phrase" required><button type="submit">Add muted word</button></form>{}</section><section class="panel settings-card compact-panel settings-security-panel" id="password" data-testid="settings-card"><h2>Change password</h2>{password_confirmation}<p class="settings-section-help">Update the password used to sign in to this account.</p><form method="post" action="/settings/password" class="settings-password-form"><input type="hidden" name="csrf" value="{}"><label for="current_password">Current password</label><div class="password-control"><input id="current_password" name="current_password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="current_password" aria-label="Show current password">Show</button></div><label for="new_password">New password</label><p class="field-help" id="new-password-requirement">{}</p><div class="password-control"><input id="new_password" name="new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="new_password" aria-label="Show new password">Show</button></div><label for="confirm_new_password">Confirm new password</label><p class="field-help" id="confirm-new-password-requirement">{}</p><div class="password-control"><input id="confirm_new_password" name="confirm_new_password" type="password" autocomplete="new-password"{}><button type="button" class="password-toggle" data-password-toggle="confirm_new_password" aria-label="Show new password confirmation">Show</button></div><div class="settings-form-actions"><button type="submit">Change password</button></div></form></section>{username_panel}{account_data_panel}{delete_panel}"#,
         html_escape::encode_double_quoted_attribute(&csrf),
         profile_media,
         profile_fields,
@@ -593,7 +586,6 @@ pub(super) async fn apply_profile_update(
     let bio = form.bio.trim().to_owned();
     let location = form.location.trim().to_owned();
     let website = form.website.trim().to_owned();
-    let theme = form.theme.as_str().to_owned();
     let nsfw_blur_enabled = i64::from(form.nsfw_blur_enabled);
     let liked_posts_public = i64::from(form.liked_posts_public);
     let follow_approval_required = i64::from(form.follow_approval_required);
@@ -617,13 +609,12 @@ pub(super) async fn apply_profile_update(
         .call(move |conn| {
             let tx = conn.transaction()?;
             let changed = tx.execute(
-                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, theme = ?, nsfw_blur_enabled = ?, liked_posts_public = ?, follow_approval_required = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
+                "UPDATE users SET display_name = ?, bio = ?, location = ?, website = ?, nsfw_blur_enabled = ?, liked_posts_public = ?, follow_approval_required = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
                 params![
                     display_name,
                     bio,
                     location,
                     website,
-                    theme,
                     nsfw_blur_enabled,
                     liked_posts_public,
                     follow_approval_required,

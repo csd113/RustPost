@@ -19,7 +19,7 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::auth::{self, CurrentUser, Theme};
+use crate::auth::{self, CurrentUser};
 use crate::config::Settings;
 use crate::db::SqlitePool;
 use crate::errors::{AppError, AppResult, ComposerField};
@@ -609,7 +609,6 @@ struct ParsedProfileUpdate {
     bio: String,
     location: String,
     website: String,
-    theme: Theme,
     delete_profile_picture: bool,
     delete_banner: bool,
     nsfw_blur_enabled: bool,
@@ -908,7 +907,6 @@ struct SettingsProfile {
     bio: String,
     location: String,
     website: String,
-    theme: String,
     nsfw_blur_enabled: bool,
     liked_posts_public: bool,
     follow_approval_required: bool,

@@ -78,6 +78,7 @@ pub fn layout_with_context(
     let brand_mark = site_name.chars().next().unwrap_or('R');
     let left_rail = left_rail(user, &auth_nav);
     let side_panel = dashboard_panel(user, context);
+    // Retain previously saved account themes as a fallback for browsers without a choice.
     let theme = user.map_or(Theme::Light, |user| user.theme).as_str();
     let header_tor = tor_header_indicator(context.tor_onion_address.as_deref());
     let announcement = announcement_banner(context.announcement.as_deref());
@@ -99,7 +100,7 @@ pub fn layout_with_context(
 <script src="/assets/rustpost.js" defer></script>
 </head>
 <body>
-<header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}{}</div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
+<header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}{}<div class="browser-theme" hidden><label for="browser-theme">Theme</label><select id="browser-theme"><option value="">Default</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
 {maintenance}{account_notice}
 <noscript><section class="noscript-banner" role="status"><strong>JavaScript is disabled.</strong> RustPost will use standard links and forms.</section></noscript>
 <main><div class="app-shell" data-testid="app-shell">{}<section class="primary-column" data-testid="primary-column">{} </section>{}</div></main>

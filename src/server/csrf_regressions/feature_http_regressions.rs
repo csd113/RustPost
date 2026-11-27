@@ -1,6 +1,7 @@
 //! Exercise the production router and multipart ownership boundaries.
 
 use super::*;
+use anyhow::Context as _;
 use base64::Engine as _;
 
 fn png() -> anyhow::Result<Vec<u8>> {
@@ -70,6 +71,47 @@ async fn raw(
         .ok_or_else(|| anyhow::anyhow!("missing status"))?
         .parse()?;
     Ok((status, response))
+}
+
+#[tokio::test]
+async fn browser_theme_has_a_legacy_default_without_saving_through_profile_settings()
+-> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let user_id = f.user_id;
+    let (status, light) = f.request("GET", "/home", &[], "").await?;
+    assert_eq!(status, 200);
+    assert!(light.contains(r#"<html lang="en" data-theme="light">"#));
+    let (before_style, _) = light.split_once("<style>").context("missing page styles")?;
+    assert!(before_style.contains(r#"<script src="/assets/rustpost-boot.js"></script>"#));
+
+    f.state
+        .pool
+        .call(move |conn| {
+            conn.execute("UPDATE users SET theme = 'dark' WHERE id = ?", [user_id])?;
+            Ok(())
+        })
+        .await?;
+    let (status, settings) = f.request("GET", "/settings", &[], "").await?;
+    assert_eq!(status, 200);
+    assert!(settings.contains(r#"<html lang="en" data-theme="dark">"#));
+    assert!(settings.contains(r#"<label for="browser-theme">Theme</label>"#));
+    assert!(settings.contains(r#"<select id="browser-theme">"#));
+    assert!(!settings.contains(r#"name="dark_mode""#));
+
+    let body = multipart(
+        &[
+            ("csrf", f.session.csrf_token.clone()),
+            ("display_name", "Theme regression account".into()),
+        ],
+        None,
+    );
+    assert_eq!(
+        f.request("POST", "/settings", &body, MULTIPART).await?.0,
+        303
+    );
+    let (_, after) = f.request("GET", "/home", &[], "").await?;
+    assert!(after.contains(r#"<html lang="en" data-theme="dark">"#));
+    Ok(())
 }
 
 #[tokio::test]

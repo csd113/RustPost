@@ -90,7 +90,7 @@ A gzip-compressed tar archive (`.tar.gz`) containing:
 | Entry | Contents |
 | --- | --- |
 | `manifest.json` | format version, app name, creation timestamp, random archive id, archive handle |
-| `profile.json` | display name, bio, location, website, theme, NSFW blur, liked-posts visibility, follow-approval preference |
+| `profile.json` | display name, bio, location, website, legacy account theme (not the browser choice), NSFW blur, liked-posts visibility, follow-approval preference |
 | `posts.json` | the account's posts, replies, and quotes with archive-local ids and remapped parent/root/quote references |
 | `media.json` | media metadata (kind, MIME type, filename, byte length, alt text, NSFW flag, SHA-256) |
 | `media/...` | media bytes for every entry in `media.json` (yes, bytes are included) |

@@ -76,7 +76,7 @@ See [Using RustPost](docs/account-and-instance-features.md) for everyday actions
 
 Read posts from the community and share an update from the same page.
 
-![RustPost home feed with a post composer, community posts, and social actions](docs/screenshots/home-feed.png)
+![Light-mode home feed with the post composer, feed filters, and a community post](docs/screenshots/home-feed.png)
 
 ### Profiles and conversations
 
@@ -84,7 +84,7 @@ Profiles bring a person's bio, follows, and posts together. Replies stay with th
 
 | Profile | Conversation |
 | --- | --- |
-| ![Profile with a banner, avatar, bio, and post tabs](docs/screenshots/profile.png) | ![Post thread with replies from several people](docs/screenshots/post-thread.png) |
+| ![Dark-mode profile with a banner, bio, follow controls, and post tabs](docs/screenshots/profile.png) | ![Dark-mode conversation with the original post and replies from several people](docs/screenshots/post-thread.png) |
 
 ### Media and mobile
 
@@ -92,7 +92,9 @@ Images appear within posts, and the layout adapts to smaller screens.
 
 | Image post | Phone layout |
 | --- | --- |
-| ![Image attachment and replies in a RustPost post](docs/screenshots/media-posts.png) | <img src="docs/screenshots/mobile.png" alt="RustPost home feed on a phone-sized screen" width="300"> |
+| ![Light-mode image post with a sample illustration, a reply, and a reply composer](docs/screenshots/media-posts.png) | <img src="docs/screenshots/mobile.png" alt="Dark-mode home feed on a phone-sized screen with the More menu and post composer" width="300"> |
+
+Use **Theme** in the site header to switch between light and dark. RustPost remembers your choice in this browser.
 
 These screenshots use fictional accounts and locally generated sample media. You can [run the same demo](docs/demo-preview.md) without using real account data.
 

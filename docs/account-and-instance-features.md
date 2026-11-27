@@ -18,7 +18,9 @@ See [community tools](community-tools.md) for drafts, UTC scheduling, per-image 
 
 ## Set up your profile
 
-Open **Settings** to change your display name, bio, location, website, picture, banner, theme, and media-blur preferences. A username is your account handle; a display name is the name shown beside your posts.
+Open **Settings** to change your display name, bio, location, website, picture, banner, and media-blur preferences. A username is your account handle; a display name is the name shown beside your posts.
+
+Use **Theme** in the site header to choose **Light** or **Dark**. This choice is saved only in this browser profile for this RustPost site, even when signed out. **Default** clears the browser choice and uses light mode, or an older account theme if you previously saved one.
 
 To change your username, use the **Username** panel and confirm your current password. Your posts, follows, and account identity stay with you. Previous usernames remain reserved while the account exists, and old profile URLs show history rather than silently becoming another person's profile. See [Username history](account-reference.md#username-changes-and-history-34).
 

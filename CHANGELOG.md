@@ -4,6 +4,11 @@ For installation, start with [Getting started](docs/getting-started.md). Entries
 
 ## v1.2.0 - Community tools and reliable operations (unreleased)
 
+- Keep the most-used links visible on smaller screens and put the rest in **More**. Keep your place when removing a bookmark with the keyboard.
+- See who you’re replying to and what needs fixing without losing what you typed. Get a confirmation when your post goes through, and avoid sending it twice.
+- See what was saved next to the account setting you changed. When you block someone, review what will happen before confirming.
+- Switch between light and dark in the site header. Your browser remembers your choice, even when you sign out.
+
 - Correct native draft edits that remove attachments while submitting their description fields; retain ownership/revision validation and shared-file safety. Recover interrupted backup capture markers under exclusive native ownership and report capture/recovery failures through readiness. Clarify that physical free-space checks are admission probes; atomic logical upload quotas remain separate.
 
 - Add private server-saved drafts, attachment descriptions, optimistic edits, UTC schedules, cancellation, and transactional restart-safe publication. Add optional browser-local description reminders and image previews.

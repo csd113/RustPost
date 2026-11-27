@@ -366,7 +366,6 @@ pub(super) async fn parse_profile_update(
         bio: String::new(),
         location: String::new(),
         website: String::new(),
-        theme: Theme::Light,
         delete_profile_picture: false,
         delete_banner: false,
         nsfw_blur_enabled: false,
@@ -411,7 +410,6 @@ pub(super) async fn fill_profile_update_form(
                     validate_csrf(&state.pool, headers, &form.csrf_token).await?;
                 }
             }
-            "dark_mode" => form.theme = Theme::Dark,
             "nsfw_blur_enabled" => form.nsfw_blur_enabled = true,
             "liked_posts_public" => form.liked_posts_public = true,
             "follow_approval_required" => form.follow_approval_required = true,
