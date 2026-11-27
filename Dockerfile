@@ -1,5 +1,7 @@
-# Use the same pinned Rust compiler on the supported Debian 12 base.
+# Bootstrap from the published Debian 12 image and install the pinned compiler.
 FROM rust:1.100.0-bookworm AS build
+RUN rustup toolchain install 1.100.1 --profile minimal \
+    && rustup default 1.100.1
 
 WORKDIR /usr/src/rustpost
 COPY Cargo.toml Cargo.lock ./
