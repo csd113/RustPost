@@ -2,28 +2,32 @@
 
 For installation, start with [Getting started](docs/getting-started.md). Entries below record changes for their own versions; use the [current guides](docs/README.md) for current behavior.
 
-## v1.2.0 - Community tools and reliable operations (unreleased)
+## v1.2.0 - Community tools and reliable operations
 
-- Keep the most-used links visible on smaller screens and put the rest in **More**. Keep your place when removing a bookmark with the keyboard.
-- See who you’re replying to and what needs fixing without losing what you typed. Get a confirmation when your post goes through, and avoid sending it twice.
-- See what was saved next to the account setting you changed. When you block someone, review what will happen before confirming.
-- Switch between light and dark in the site header. Your browser remembers your choice, even when you sign out.
+### Posting and conversations
+
+- Save private drafts from any device you’re signed in to. Schedule them in UTC, cancel a schedule, or publish immediately. A saved schedule survives an app restart.
+- Add image descriptions and preview attachments before posting. You can turn on a reminder for missing descriptions. Keep or remove attachments when editing a draft.
+- Run a poll with one or several allowed choices and an optional closing time. Readers see totals and their own selection. The site operator can still access vote records.
+- Switch between **Everyone** and **Following**. Browse older posts, bookmarks, and long conversations, or search by author, date, attachment type, and bookmarks.
+- Undo your own post deletion during the site’s recovery window. Administrator removals are final.
+- Get a confirmation when publishing succeeds. Retrying a submission does not create a duplicate post. Reply forms show who you are replying to and keep your text when you need to correct a field.
+- Continue using an original attachment while the app processes it in the background. Check its progress or retry processing. YouTube previews no longer fail for the missing-referrer error addressed in this release.
+
+### On phones and in account settings
+
+- Find the most-used links on smaller screens and the rest under **More**. Removing a bookmark with the keyboard keeps your place.
+- Switch between light and dark in the header. Your browser remembers the choice across pages and after sign-out, and can reuse the stylesheet as you move around the site.
 - Retry sign-in or correct mismatched registration passwords without retyping your username. Existing passwords still work if an administrator raises the minimum for new passwords.
-- Your browser can reuse the site’s stylesheet as you move between pages instead of downloading the same styles every time.
+- See what was saved next to the account setting you changed. Review what blocking an account will do before confirming.
 
-- Correct native draft edits that remove attachments while submitting their description fields; retain ownership/revision validation and shared-file safety. Recover interrupted backup capture markers under exclusive native ownership and report capture/recovery failures through readiness. Clarify that physical free-space checks are admission probes; atomic logical upload quotas remain separate.
+### Running and updating your site
 
-- Add private server-saved drafts, attachment descriptions, optimistic edits, UTC schedules, cancellation, and transactional restart-safe publication. Add optional browser-local description reminders and image previews.
-- Deduplicate posting retries with submission keys and atomically charge posting rates. Preserve committed attachments if response rendering fails.
-- Add single/multiple-choice polls with optional closing times, account-bound votes, and aggregate results. Votes remain visible to the database operator.
-- Add Everyone/Following feed controls, stable older/newer navigation for feeds/profiles/bookmarks/search, and paginated long conversations/deep reply links. Add author/date/media/bookmark search filters using SQLite.
-- Process post media through a durable single-worker queue with bounded admission, automatic/manual retries, restart recovery, safe shared-file handling, and usable originals. Keep FFmpeg optional and profile upload behavior intact.
-- Add logical instance/account upload quotas, atomic reservations, native filesystem headroom checks, and storage usage pages. Apply guardrails to uploads, imports, backup and verification staging.
-- Add owner-only deletion undo (default 30 seconds, configurable 0–300) and retained-media privacy/cleanup. Administrative removals revoke recovery and remain final.
-- Freeze consistent backup snapshots/files before resuming requests for bulk archive work. Add full non-destructive backup verification and disposable migration/path-rewrite rehearsal in Admin and CLI.
-- Add minimal uncached liveness/readiness endpoints, and fix YouTube error 153 with origin-only iframe referrers while preserving page-wide privacy policy.
-- Bump package/container/current guide versions to **1.2.0** and migrate supported databases transactionally to **schema 5**. Backup/account archive formats remain **1**; personal account archives do not include the new drafts, polls/votes, or recovery state. See [usage, limits, and upgrade notes](docs/community-tools.md).
-- Retain a single binary, embedded SQLite/Arti, native Windows/Unix support, and no mandatory external service. No moderator role or notification-control changes are included.
+- Create consistent full-site backups with a shorter pause for requests. Verify an archive and rehearse its database upgrade without replacing live data. Restore still runs with the server stopped.
+- See upload usage and set limits by site or account. Free-space checks are separate from quotas and do not reserve disk space.
+- Check whether RustPost is running and ready to serve through separate health endpoints. Bundled SQLite includes the fix for RUSTSEC-2026-0459.
+- The dependency audit still reports two advisories in the Tor dependency tree. The [deployment guide](docs/deployment.md#security-and-dependency-review) explains what remains and where to find the current report.
+- Before upgrading from v1.1.0, save a full-site backup. RustPost upgrades the database to schema 5 and keeps the full-site and personal account archive formats unchanged. Personal exports do not include drafts, polls or votes, or recently deleted posts. See [what to keep before upgrading](docs/community-tools.md#operator-controls-and-upgrade).
 
 ## v1.1.0 - Operations, safety, and easier setup
 

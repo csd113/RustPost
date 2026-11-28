@@ -7,6 +7,7 @@ WORKDIR /usr/src/rustpost
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY assets ./assets
+COPY vendor ./vendor
 RUN cargo build --release --locked --bin rustpost-cli
 
 FROM debian:bookworm-slim

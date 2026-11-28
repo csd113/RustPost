@@ -11,7 +11,7 @@ RustPost runs a small social website from one application. This guide takes you 
 3. Extract the archive into a folder you can write to. Open the extracted folder until you see `rustpost-cli` (Linux/macOS) or `rustpost-cli.exe` (Windows).
 4. Open a terminal there. On Windows, use **Open in Terminal** from that folder and select PowerShell. In a terminal, `cd` changes folders; quote paths that contain spaces.
 
-The v1.2.0 ZIPs contain a folder named for their version and platform, such as `rustpost-cli-v1.2.0-macos-apple-silicon`. Use them when v1.2.0 is published; older v1.0.0 archives contain a `rustpost` folder and use different archive/checksum names. Always work beside the executable. See [Release packaging](development.md#release-packaging) for the older names.
+The v1.2.0 ZIPs contain a folder named for their version and platform, such as `rustpost-cli-v1.2.0-macos-apple-silicon`. The published v1.1.0 ZIPs use the same pattern with their own version number. Older v1.0.0 archives contain a `rustpost` folder and use different archive/checksum names. Always work beside the executable. See [Release packaging](development.md#release-packaging) for the older names.
 
 ## Start the app
 

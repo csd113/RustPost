@@ -49,8 +49,8 @@ ring = "0.17.14"
 sha2 = "0.11.2"
 # Already used by the Tor stack; constant-time CSRF digest comparison.
 subtle = "2.6.1"
-# Arti 0.48 requires rusqlite >=0.36,<0.41; SQLite can only be linked once.
-rusqlite = { version = "0.40.2", features = ["bundled", "functions", "backup", "hooks"] }
+# Keep one bundled SQLite linkage for RustPost and Arti. See the patch below.
+rusqlite = { version = "0.41.1", features = ["bundled", "functions", "backup", "hooks"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 tar = "0.4.46"
 tempfile = "3.27.0"
@@ -87,6 +87,10 @@ path = "tests/terminal_regressions.rs"
 [[test]]
 name = "backup_interruptions"
 path = "tests/backup_interruptions.rs"
+
+[patch.crates-io]
+# Backport Arti's released-family SQLite compatibility change. See the provenance note.
+tor-dirmgr = { path = "vendor/tor-dirmgr" }
 
 [profile.release]
 lto = true

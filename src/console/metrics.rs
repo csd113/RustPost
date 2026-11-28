@@ -153,7 +153,7 @@ pub fn spawn(
 }
 
 fn collect_counts(path: &Path) -> Result<Counts, &'static str> {
-    let conn = Connection::open_with_flags(
+    let mut conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )

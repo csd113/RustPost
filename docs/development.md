@@ -98,6 +98,6 @@ The container workflow builds Linux amd64/arm64 images from a source tag and pub
 
 Update `rust-toolchain.toml`, `Cargo.toml`'s supported-version requirement when appropriate, workflow pins, and Dockerfile compiler selection together. Resolve dependencies deliberately, retain `Cargo.lock`, and pass the checks on the intended platforms before using a new build for release. Do not rewrite published migration history.
 
-Arti/Tor dependencies are currently pinned to 0.48.0, with `rusqlite` 0.40.2 to keep SQLite linkage compatible. `cargo tree --locked -i libsqlite3-sys` should show one resolved SQLite sys crate. Re-evaluate upstream advisories when updating the Tor stack.
+Arti/Tor dependencies are pinned to 0.48.0. A [small upstream compatibility backport](../vendor/tor-dirmgr/RUSTPOST-PATCH.md) lets RustPost and Arti share the patched SQLite bundled by `rusqlite` 0.41.1. `cargo tree --locked -i libsqlite3-sys` should show one resolved SQLite sys crate. Re-evaluate upstream advisories when updating the Tor stack.
 
 For provenance of the earlier compiler migration, read [Compiler upgrade history](rust-1.99-upgrade.md). That historical report is not the current build checklist.

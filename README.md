@@ -18,7 +18,7 @@ The app includes its own database. You do not need a separate database server, a
 
 Open the [latest published release](https://github.com/csd113/RustPost/releases/latest), expand **Assets**, and download the archive for your computer. Choose the app archive, not GitHub's **Source code** download.
 
-The **v1.2.0** release workflow prepares these downloads. Use them when v1.2.0 is published; if the latest release is still v1.0.0, follow its asset names and checksums instead. [Release packaging](docs/development.md#release-packaging) lists the older names.
+The **v1.2.0** release workflow prepares these downloads. Use the filenames and checksum from the same published release. v1.1.0 uses this naming pattern with its own version number. [Release packaging](docs/development.md#release-packaging) lists the older names.
 
 | Your computer | v1.2.0 download |
 | --- | --- |
@@ -98,7 +98,7 @@ Use **Theme** in the site header to switch between light and dark. RustPost reme
 
 These screenshots use fictional accounts and locally generated sample media. You can [run the same demo](docs/demo-preview.md) without using real account data.
 
-The prepared **1.2.0** development build adds drafts/scheduling, image descriptions, polls, complete history/search, background media processing, deletion undo, and safer storage/backups. Read [how to use these features and upgrade](docs/community-tools.md). No release is published by preparing this branch.
+RustPost **1.2.0** adds drafts and scheduling, image descriptions, polls, better history and search, background media processing, deletion undo, and backup verification. Read [how to use these features and upgrade](docs/community-tools.md).
 
 ## Manage your site
 
