@@ -74,6 +74,96 @@ async fn raw(
 }
 
 #[tokio::test]
+async fn auth_errors_keep_the_username_but_not_the_submitted_passwords() -> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let origin = format!("{FORM}Origin: http://{}\r\n", f.address);
+    let (status, response) = raw(
+        &f,
+        "POST",
+        "/login",
+        None,
+        b"username=csrfuser&password=incorrect-local-password",
+        &origin,
+    )
+    .await?;
+    let response = String::from_utf8(response)?;
+    assert_eq!(status, 401);
+    assert!(response.contains(r#"value="csrfuser""#));
+    assert!(response.contains("The password is incorrect."));
+    assert!(!response.contains("incorrect-local-password"));
+    assert!(!response.contains("minlength"));
+
+    let (status, response) = raw(
+        &f,
+        "POST",
+        "/register",
+        None,
+        b"username=localretry&password=local-password-first&confirm_password=local-password-second",
+        &origin,
+    )
+    .await?;
+    let response = String::from_utf8(response)?;
+    assert_eq!(status, 400);
+    assert!(response.contains("The passwords do not match."));
+    assert!(response.contains(r#"value="localretry""#));
+    assert!(response.contains(r#"id="confirm_password""#));
+    assert!(response.contains(r#"minlength="10""#));
+    assert!(!response.contains("local-password-first"));
+    assert!(!response.contains("local-password-second"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_stylesheet_can_be_cached_without_caching_other_revisions() -> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let (status, page) = f.request("GET", "/home", &[], "").await?;
+    assert_eq!(status, 200);
+    assert!(page.contains("cache-control: no-store"));
+    let (_, stylesheet_link) = page
+        .split_once(r#"<link rel="stylesheet" href=""#)
+        .context("missing stylesheet link")?;
+    let (path, _) = stylesheet_link
+        .split_once('"')
+        .context("missing stylesheet URL")?;
+    assert!(path.starts_with("/assets/rustpost.css?v="));
+    assert!(!page.contains("<style>"));
+
+    let (status, identity) = f.request("GET", path, &[], "").await?;
+    assert_eq!(status, 200);
+    let (headers, css) = identity
+        .split_once("\r\n\r\n")
+        .context("missing response body")?;
+    assert!(headers.contains("content-type: text/css; charset=utf-8"));
+    assert!(headers.contains("cache-control: public, max-age=31536000, immutable"));
+    assert!(headers.contains("vary: Accept-Encoding"));
+    assert_eq!(css, render::CSS);
+
+    let (status, encoded) = raw(&f, "GET", path, None, &[], "Accept-Encoding: gzip\r\n").await?;
+    assert_eq!(status, 200);
+    let split = encoded
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .context("missing compressed response body")?;
+    let headers = std::str::from_utf8(&encoded[..split])?;
+    assert!(headers.contains("content-encoding: gzip"));
+    assert!(headers.contains("vary: Accept-Encoding"));
+    let mut decoded = String::new();
+    std::io::Read::read_to_string(
+        &mut flate2::read::GzDecoder::new(&encoded[split + 4..]),
+        &mut decoded,
+    )?;
+    assert_eq!(decoded, css);
+
+    let (status, stale) = f
+        .request("GET", "/assets/rustpost.css?v=old", &[], "")
+        .await?;
+    assert_eq!(status, 200);
+    assert!(stale.contains("cache-control: no-store"));
+    assert!(stale.ends_with(css));
+    Ok(())
+}
+
+#[tokio::test]
 async fn browser_theme_has_a_legacy_default_without_saving_through_profile_settings()
 -> anyhow::Result<()> {
     let f = Fixture::new(30, 10).await?;
@@ -81,7 +171,9 @@ async fn browser_theme_has_a_legacy_default_without_saving_through_profile_setti
     let (status, light) = f.request("GET", "/home", &[], "").await?;
     assert_eq!(status, 200);
     assert!(light.contains(r#"<html lang="en" data-theme="light">"#));
-    let (before_style, _) = light.split_once("<style>").context("missing page styles")?;
+    let (before_style, _) = light
+        .split_once(r#"<link rel="stylesheet""#)
+        .context("missing page styles")?;
     assert!(before_style.contains(r#"<script src="/assets/rustpost-boot.js"></script>"#));
 
     f.state

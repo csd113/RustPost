@@ -62,6 +62,8 @@ RustPost hashes passwords with Argon2id, uses HttpOnly/SameSite=Lax session cook
 
 Dependency review is separate from successful compilation and tests. The v1.1.0 changelog records open upstream **RUSTSEC-2023-0071** and **RUSTSEC-2026-0387** findings. Do not treat an old advisory list as a fresh audit: inspect the latest [Dependency Audit workflow](https://github.com/csd113/RustPost/actions/workflows/audit.yml) report and run `cargo audit --file Cargo.lock` when evaluating a source build or release. The workflow is report-only; a successful workflow status can still include vulnerability findings.
 
+The v1.2.0 candidate also reports [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459) in bundled SQLite. The current Arti directory manager does not accept the first patched rusqlite release, and both use the same SQLite library. Keep runtime and restore staging directories private, restore only trusted full-site archives, and revisit the advisory when a compatible Arti release is available.
+
 For historical context, v1.0.0 recorded the transitive `rsa 0.9.10` / RUSTSEC-2023-0071 exception and maintenance warnings for `bincode 2.0.1` and `paste 1.0.15`. Those notes are evidence about that release, not a claim that the current dependency graph is clean or identical. Keep the [changelog](../CHANGELOG.md) and the current audit report with your deployment review.
 
 ## Practical limits

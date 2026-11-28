@@ -236,6 +236,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(home))
         .route("/assets/rustpost-boot.js", get(client_boot_script))
         .route("/assets/rustpost.js", get(client_script))
+        .route(render::SITE_STYLESHEET_PATH, get(site_stylesheet))
         .route("/favicon.ico", get(site_favicon))
         .route("/local", get(local_redirect))
         .route("/home", get(home))
@@ -440,6 +441,30 @@ fn attachment_bytes(count: usize, max_size: u64) -> u64 {
     u64::try_from(count)
         .unwrap_or(u64::MAX)
         .saturating_mul(max_size)
+}
+
+#[derive(Deserialize)]
+struct StylesheetQuery {
+    v: Option<String>,
+}
+
+async fn site_stylesheet(Query(query): Query<StylesheetQuery>) -> Response {
+    // A page already in flight during a restart can still load the stylesheet,
+    // but an outdated URL must not cache different bytes under the old revision.
+    let cache = if query.v.as_deref() == Some(render::stylesheet_revision()) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, cache),
+            (header::VARY, "Accept-Encoding"),
+        ],
+        render::CSS,
+    )
+        .into_response()
 }
 
 async fn client_script() -> Response {

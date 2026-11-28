@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) async fn login_form(State(state): State<Arc<AppState>>) -> Html<String> {
-    let body = render::login_form(None, state.settings.accounts.min_password_length);
+    let body = render::login_form("", None);
     let context = layout_context(&state, None).await.unwrap_or_default();
     Html(render::layout_with_context(
         None,
@@ -48,7 +48,7 @@ pub(super) async fn login(
                 auth::LoginFailure::UnavailableAccount => "This account cannot log in.",
             };
             rate_limit::record(&state.pool, rate_limit::Scope::FailedLogin, &actor).await?;
-            return auth_form_response(&state, StatusCode::UNAUTHORIZED, message).await;
+            return auth_form_response(&state, &form.username, message).await;
         }
     };
     let mut response = Redirect::to("/home").into_response();
@@ -76,7 +76,7 @@ pub(super) async fn register_form(State(state): State<Arc<AppState>>) -> AppResu
             )
         )
     } else {
-        register_form_body(&state, None).await?
+        register_form_body(&state, "", None).await?
     };
     Ok(Html(
         page_layout(&state, None, None, "Register", &body).await?,
@@ -103,15 +103,15 @@ pub(super) async fn register(
         )
             .into_response());
     }
-    let Some(confirm_password) = form.confirm_password.as_deref() else {
-        return Err(AppError::BadRequest(
-            "please confirm your password".to_owned(),
-        ));
+    let confirmation_error = match form.confirm_password.as_deref() {
+        None => Some("Enter your password again to confirm it."),
+        Some(confirmation) if form.password != confirmation => {
+            Some("The passwords do not match. Enter the same password in both fields.")
+        }
+        Some(_) => None,
     };
-    if form.password != confirm_password {
-        return Err(AppError::BadRequest(
-            "passwords do not match; please enter the same password twice".to_owned(),
-        ));
+    if let Some(message) = confirmation_error {
+        return register_form_response(&state, &form.username, message).await;
     }
     rate_limit::check_and_record(
         &state.pool,
@@ -131,7 +131,7 @@ pub(super) async fn register(
             )
             .await
     {
-        return register_form_response(&state, StatusCode::BAD_REQUEST, err.message()).await;
+        return register_form_response(&state, &form.username, err.message()).await;
     }
     let user_id = match auth::register_user(
         &state.pool,
@@ -148,15 +148,15 @@ pub(super) async fn register(
             if message == auth::USERNAME_TAKEN_MESSAGE {
                 return register_form_response(
                     &state,
-                    StatusCode::BAD_REQUEST,
-                    "That username is already taken.",
+                    &form.username,
+                    "That username is already taken. Choose a different username.",
                 )
                 .await;
             }
             if message == "password is too short"
                 || message == "password contains control characters"
             {
-                return register_form_response(&state, StatusCode::BAD_REQUEST, &message).await;
+                return register_form_response(&state, &form.username, &message).await;
             }
             return Err(AppError::BadRequest(message));
         }
@@ -171,34 +171,35 @@ pub(super) async fn register(
     Ok(response)
 }
 
-pub(super) async fn auth_form_response(
+async fn auth_form_response(
     state: &AppState,
-    status: StatusCode,
+    username: &str,
     message: &str,
 ) -> AppResult<Response> {
-    let body = render::login_form(Some(message), state.settings.accounts.min_password_length);
+    let body = render::login_form(username, Some(message));
     Ok((
-        status,
+        StatusCode::UNAUTHORIZED,
         Html(page_layout(state, None, None, "Login", &body).await?),
     )
         .into_response())
 }
 
-pub(super) async fn register_form_response(
+async fn register_form_response(
     state: &AppState,
-    status: StatusCode,
+    username: &str,
     message: &str,
 ) -> AppResult<Response> {
-    let body = register_form_body(state, Some(message)).await?;
+    let body = register_form_body(state, username, Some(message)).await?;
     Ok((
-        status,
+        StatusCode::BAD_REQUEST,
         Html(page_layout(state, None, None, "Register", &body).await?),
     )
         .into_response())
 }
 
-pub(super) async fn register_form_body(
+async fn register_form_body(
     state: &AppState,
+    username: &str,
     message: Option<&str>,
 ) -> AppResult<String> {
     let captcha = if state.settings.accounts.registration_captcha_enabled {
@@ -207,6 +208,7 @@ pub(super) async fn register_form_body(
         None
     };
     Ok(render::register_form(
+        username,
         message,
         state.settings.accounts.min_password_length,
         captcha.as_ref(),

@@ -8,6 +8,8 @@ For installation, start with [Getting started](docs/getting-started.md). Entries
 - See who you’re replying to and what needs fixing without losing what you typed. Get a confirmation when your post goes through, and avoid sending it twice.
 - See what was saved next to the account setting you changed. When you block someone, review what will happen before confirming.
 - Switch between light and dark in the site header. Your browser remembers your choice, even when you sign out.
+- Retry sign-in or correct mismatched registration passwords without retyping your username. Existing passwords still work if an administrator raises the minimum for new passwords.
+- Your browser can reuse the site’s stylesheet as you move between pages instead of downloading the same styles every time.
 
 - Correct native draft edits that remove attachments while submitting their description fields; retain ownership/revision validation and shared-file safety. Recover interrupted backup capture markers under exclusive native ownership and report capture/recovery failures through readiness. Clarify that physical free-space checks are admission probes; atomic logical upload quotas remain separate.
 

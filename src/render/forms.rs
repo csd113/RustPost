@@ -6,16 +6,17 @@ use super::{
     icon_svg, notice, posts_with_options, quote_preview_card,
 };
 
-pub fn login_form(message: Option<&str>, min_password_length: usize) -> String {
+pub fn login_form(username: &str, message: Option<&str>) -> String {
+    let username = html_escape::encode_double_quoted_attribute(username);
     let notice = message.map_or_else(String::new, |message| notice("error", message));
-    let hint = password_requirement_hint(min_password_length);
-    let attrs = password_length_attrs(min_password_length, "password-requirement");
+    // The configured minimum applies to new passwords, not existing credentials.
     format!(
-        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Log in</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="current-password"{attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><button class="auth-submit" type="submit">Log in</button></form></section>"#
+        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Log in</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" value="{username}" required><label for="password">Password</label><div class="password-control"><input id="password" name="password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><button class="auth-submit" type="submit">Log in</button></form></section>"#
     )
 }
 
 pub fn register_form(
+    username: &str,
     message: Option<&str>,
     min_password_length: usize,
     captcha: Option<&crate::registration_captcha::RegistrationCaptchaChallenge>,
@@ -25,8 +26,9 @@ pub fn register_form(
     let password_attrs = password_length_attrs(min_password_length, "password-requirement");
     let confirm_attrs = password_length_attrs(min_password_length, "confirm-password-requirement");
     let captcha_html = captcha.map_or_else(String::new, register_captcha_fields);
+    let username = html_escape::encode_double_quoted_attribute(username);
     format!(
-        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="new-password"{password_attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><p class="field-help" id="confirm-password-requirement">{hint}</p><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"{confirm_attrs}><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div>{captcha_html}<button class="auth-submit" type="submit">Create account</button></form></section>"#
+        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" value="{username}" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="new-password"{password_attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><p class="field-help" id="confirm-password-requirement">{hint}</p><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"{confirm_attrs}><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div>{captcha_html}<button class="auth-submit" type="submit">Create account</button></form></section>"#
     )
 }
 

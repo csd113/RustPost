@@ -1,6 +1,8 @@
 //! Layout for the render subsystem.
 
-use super::{CSS, CurrentUser, LayoutContext, Theme, icon_svg};
+use super::{
+    CurrentUser, LayoutContext, SITE_STYLESHEET_PATH, Theme, icon_svg, stylesheet_revision,
+};
 
 pub fn layout(user: Option<&CurrentUser>, title: &str, body: &str, site_name: &str) -> String {
     layout_with_csrf(user, None, title, body, site_name)
@@ -96,7 +98,7 @@ pub fn layout_with_context(
 <link rel="icon" href="/favicon.ico" type="{}">
 <title>{} - {}</title>
 <script src="/assets/rustpost-boot.js"></script>
-<style>{}</style>
+<link rel="stylesheet" href="{SITE_STYLESHEET_PATH}?v={}">
 <script src="/assets/rustpost.js" defer></script>
 </head>
 <body>
@@ -111,7 +113,7 @@ pub fn layout_with_context(
         html_escape::encode_double_quoted_attribute(context.favicon_content_type),
         html_escape::encode_text(title),
         html_escape::encode_text(site_name),
-        CSS,
+        stylesheet_revision(),
         html_escape::encode_text(&brand_mark.to_string()),
         html_escape::encode_text(site_name),
         announcement,
