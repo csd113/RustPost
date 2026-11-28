@@ -1,6 +1,6 @@
 # Compiler upgrade history
 
-For a current build, follow [Development](development.md): both the compiler pin and minimum supported version are now **Rust 1.100.0**. You do not need this historical report to run RustPost.
+For the current compiler pin and minimum supported version, see [Development](development.md). You do not need this historical report to run RustPost.
 
 [All guides](README.md) · [Current checks](development.md#checks) · [Changelog](../CHANGELOG.md)
 

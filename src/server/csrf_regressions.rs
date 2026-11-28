@@ -80,8 +80,11 @@ impl Fixture {
             self.session.token,
             body.len(),
         );
-        socket.write_all(head.as_bytes()).await?;
-        socket.write_all(body).await?;
+        // Keep short requests in one write so an early HTTP rejection cannot
+        // race a separately written body on a connection about to close.
+        let mut request = head.into_bytes();
+        request.extend_from_slice(body);
+        socket.write_all(&request).await?;
         let mut response = Vec::new();
         tokio::time::timeout(
             std::time::Duration::from_secs(20),

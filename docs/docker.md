@@ -98,7 +98,7 @@ docker cp rustpost:/data/backups/ARCHIVE_NAME.tar ./ARCHIVE_NAME.tar
 
 Tor private keys are excluded by default. Include them only when needed, and protect any archive containing them.
 
-Restore with the server stopped. Version 1.2.0 disables browser restore; use the offline procedure below, which also avoids replacing a live database on older releases. First copy the backup into the volume while the original container is running:
+Restore with the server stopped. Version 1.1.0 and later disable browser restore; use the offline procedure below, which also avoids replacing a live database on older releases. First copy the backup into the volume while the original container is running:
 
 ```sh
 docker cp ./ARCHIVE_NAME.tar rustpost:/data/backups/restore-input.tar

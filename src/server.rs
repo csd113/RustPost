@@ -19,10 +19,10 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::auth::{self, CurrentUser, Theme};
+use crate::auth::{self, CurrentUser};
 use crate::config::Settings;
 use crate::db::SqlitePool;
-use crate::errors::{AppError, AppResult};
+use crate::errors::{AppError, AppResult, ComposerField};
 use crate::ffmpeg::FfmpegStatus;
 use crate::registration_captcha::RegistrationCaptchaStore;
 use crate::runtime::RuntimePaths;
@@ -236,6 +236,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(home))
         .route("/assets/rustpost-boot.js", get(client_boot_script))
         .route("/assets/rustpost.js", get(client_script))
+        .route(render::SITE_STYLESHEET_PATH, get(site_stylesheet))
         .route("/favicon.ico", get(site_favicon))
         .route("/local", get(local_redirect))
         .route("/home", get(home))
@@ -275,7 +276,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/users/{id}/follow/cancel", post(cancel_follow_request))
         .route("/users/{id}/unfollow", post(unfollow))
         .route("/follow-requests", get(follow_requests))
-        .route("/users/{id}/block", post(block))
+        .route("/users/{id}/block", get(block_confirm).post(block))
         .route("/users/{id}/unblock", post(unblock))
         .route("/users/{id}/mute", post(mute))
         .route("/users/{id}/unmute", post(unmute))
@@ -440,6 +441,30 @@ fn attachment_bytes(count: usize, max_size: u64) -> u64 {
     u64::try_from(count)
         .unwrap_or(u64::MAX)
         .saturating_mul(max_size)
+}
+
+#[derive(Deserialize)]
+struct StylesheetQuery {
+    v: Option<String>,
+}
+
+async fn site_stylesheet(Query(query): Query<StylesheetQuery>) -> Response {
+    // A page already in flight during a restart can still load the stylesheet,
+    // but an outdated URL must not cache different bytes under the old revision.
+    let cache = if query.v.as_deref() == Some(render::stylesheet_revision()) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, cache),
+            (header::VARY, "Accept-Encoding"),
+        ],
+        render::CSS,
+    )
+        .into_response()
 }
 
 async fn client_script() -> Response {
@@ -609,7 +634,6 @@ struct ParsedProfileUpdate {
     bio: String,
     location: String,
     website: String,
-    theme: Theme,
     delete_profile_picture: bool,
     delete_banner: bool,
     nsfw_blur_enabled: bool,
@@ -908,7 +932,6 @@ struct SettingsProfile {
     bio: String,
     location: String,
     website: String,
-    theme: String,
     nsfw_blur_enabled: bool,
     liked_posts_public: bool,
     follow_approval_required: bool,
@@ -1038,9 +1061,9 @@ use posting::{
 };
 mod profiles;
 use profiles::{
-    account_list_next_link, approve_follow_request, block, cancel_follow_request, follow,
-    follow_requests, profile, profile_followers, profile_following, reject_follow_request, unblock,
-    unfollow,
+    account_list_next_link, approve_follow_request, block, block_confirm, cancel_follow_request,
+    follow, follow_requests, profile, profile_followers, profile_following, reject_follow_request,
+    unblock, unfollow,
 };
 mod settings;
 use settings::{

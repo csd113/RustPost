@@ -1,6 +1,7 @@
 //! Exercise the production router and multipart ownership boundaries.
 
 use super::*;
+use anyhow::Context as _;
 use base64::Engine as _;
 
 fn png() -> anyhow::Result<Vec<u8>> {
@@ -55,8 +56,11 @@ async fn raw(
         f.address,
         body.len()
     );
-    socket.write_all(request.as_bytes()).await?;
-    socket.write_all(body).await?;
+    // Keep short requests in one write so an early HTTP rejection cannot
+    // race a separately written body on a connection about to close.
+    let mut request = request.into_bytes();
+    request.extend_from_slice(body);
+    socket.write_all(&request).await?;
     let mut response = Vec::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -70,6 +74,139 @@ async fn raw(
         .ok_or_else(|| anyhow::anyhow!("missing status"))?
         .parse()?;
     Ok((status, response))
+}
+
+#[tokio::test]
+async fn auth_errors_keep_the_username_but_not_the_submitted_passwords() -> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let origin = format!("{FORM}Origin: http://{}\r\n", f.address);
+    let (status, response) = raw(
+        &f,
+        "POST",
+        "/login",
+        None,
+        b"username=csrfuser&password=incorrect-local-password",
+        &origin,
+    )
+    .await?;
+    let response = String::from_utf8(response)?;
+    assert_eq!(status, 401);
+    assert!(response.contains(r#"value="csrfuser""#));
+    assert!(response.contains("The password is incorrect."));
+    assert!(!response.contains("incorrect-local-password"));
+    assert!(!response.contains("minlength"));
+
+    let (status, response) = raw(
+        &f,
+        "POST",
+        "/register",
+        None,
+        b"username=localretry&password=local-password-first&confirm_password=local-password-second",
+        &origin,
+    )
+    .await?;
+    let response = String::from_utf8(response)?;
+    assert_eq!(status, 400);
+    assert!(response.contains("The passwords do not match."));
+    assert!(response.contains(r#"value="localretry""#));
+    assert!(response.contains(r#"id="confirm_password""#));
+    assert!(response.contains(r#"minlength="10""#));
+    assert!(!response.contains("local-password-first"));
+    assert!(!response.contains("local-password-second"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_stylesheet_can_be_cached_without_caching_other_revisions() -> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let (status, page) = f.request("GET", "/home", &[], "").await?;
+    assert_eq!(status, 200);
+    assert!(page.contains("cache-control: no-store"));
+    let (_, stylesheet_link) = page
+        .split_once(r#"<link rel="stylesheet" href=""#)
+        .context("missing stylesheet link")?;
+    let (path, _) = stylesheet_link
+        .split_once('"')
+        .context("missing stylesheet URL")?;
+    assert!(path.starts_with("/assets/rustpost.css?v="));
+    assert!(!page.contains("<style>"));
+
+    let (status, identity) = f.request("GET", path, &[], "").await?;
+    assert_eq!(status, 200);
+    let (headers, css) = identity
+        .split_once("\r\n\r\n")
+        .context("missing response body")?;
+    assert!(headers.contains("content-type: text/css; charset=utf-8"));
+    assert!(headers.contains("cache-control: public, max-age=31536000, immutable"));
+    assert!(headers.contains("vary: Accept-Encoding"));
+    assert_eq!(css, render::CSS);
+
+    let (status, encoded) = raw(&f, "GET", path, None, &[], "Accept-Encoding: gzip\r\n").await?;
+    assert_eq!(status, 200);
+    let split = encoded
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .context("missing compressed response body")?;
+    let headers = std::str::from_utf8(&encoded[..split])?;
+    assert!(headers.contains("content-encoding: gzip"));
+    assert!(headers.contains("vary: Accept-Encoding"));
+    let mut decoded = String::new();
+    std::io::Read::read_to_string(
+        &mut flate2::read::GzDecoder::new(&encoded[split + 4..]),
+        &mut decoded,
+    )?;
+    assert_eq!(decoded, css);
+
+    let (status, stale) = f
+        .request("GET", "/assets/rustpost.css?v=old", &[], "")
+        .await?;
+    assert_eq!(status, 200);
+    assert!(stale.contains("cache-control: no-store"));
+    assert!(stale.ends_with(css));
+    Ok(())
+}
+
+#[tokio::test]
+async fn browser_theme_has_a_legacy_default_without_saving_through_profile_settings()
+-> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let user_id = f.user_id;
+    let (status, light) = f.request("GET", "/home", &[], "").await?;
+    assert_eq!(status, 200);
+    assert!(light.contains(r#"<html lang="en" data-theme="light">"#));
+    let (before_style, _) = light
+        .split_once(r#"<link rel="stylesheet""#)
+        .context("missing page styles")?;
+    assert!(before_style.contains(r#"<script src="/assets/rustpost-boot.js"></script>"#));
+
+    f.state
+        .pool
+        .call(move |conn| {
+            conn.execute("UPDATE users SET theme = 'dark' WHERE id = ?", [user_id])?;
+            Ok(())
+        })
+        .await?;
+    let (status, settings) = f.request("GET", "/settings", &[], "").await?;
+    assert_eq!(status, 200);
+    assert!(settings.contains(r#"<html lang="en" data-theme="dark">"#));
+    assert!(settings.contains(r#"<label for="browser-theme">Theme</label>"#));
+    assert!(settings.contains(r#"<select id="browser-theme">"#));
+    assert!(!settings.contains(r#"name="dark_mode""#));
+
+    let body = multipart(
+        &[
+            ("csrf", f.session.csrf_token.clone()),
+            ("display_name", "Theme regression account".into()),
+        ],
+        None,
+    );
+    assert_eq!(
+        f.request("POST", "/settings", &body, MULTIPART).await?.0,
+        303
+    );
+    let (_, after) = f.request("GET", "/home", &[], "").await?;
+    assert!(after.contains(r#"<html lang="en" data-theme="dark">"#));
+    Ok(())
 }
 
 #[tokio::test]
@@ -732,5 +869,77 @@ async fn readiness_and_requests_recover_stale_capture_but_preserve_live_or_unexp
     assert_eq!(raw(&f, "GET", "/health/ready", None, &[], "").await?.0, 200);
     assert_eq!(raw(&f, "GET", "/home", None, &[], "").await?.0, 200);
     assert!(!marker.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn composer_rejections_identify_fields_and_preserve_native_input() -> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let parent = social::create_post(
+        &f.state.pool,
+        &f.state.settings,
+        Some(f.user_id),
+        "Thread opener",
+        None,
+        &[],
+    )
+    .await?;
+    let fields = [
+        ("csrf", f.session.csrf_token.clone()),
+        ("parent_post_id", parent.to_string()),
+        ("text", "Keep <this> reply".into()),
+        ("poll_options", "Only one choice".into()),
+        ("poll_multiple", "1".into()),
+    ];
+    let enhanced = format!("{MULTIPART}Accept: application/json\r\nX-RustPost-Enhance: 1\r\n");
+    let (status, response) = f
+        .request("POST", "/posts", &multipart(&fields, None), &enhanced)
+        .await?;
+    assert_eq!(status, 400);
+    assert!(response.contains(r#""field":"poll_options""#));
+    assert!(response.contains("a poll needs 2 to 6 choices"));
+
+    let mut schedule = fields.to_vec();
+    schedule.push(("intent", "schedule".into()));
+    let (status, response) = f
+        .request("POST", "/posts", &multipart(&schedule, None), &enhanced)
+        .await?;
+    assert_eq!(status, 400);
+    assert!(response.contains(r#""field":"scheduled_at""#));
+
+    let (status, response) = f
+        .request("POST", "/posts", &multipart(&fields, None), MULTIPART)
+        .await?;
+    assert_eq!(status, 400);
+    assert!(response.contains("Keep &lt;this&gt; reply"));
+    assert!(response.contains("Only one choice"));
+    assert!(response.contains(r#"name="poll_multiple" value="1" checked"#));
+    assert!(response.contains("Replying to"));
+    assert!(response.contains(&format!(r#"name="parent_post_id" value="{parent}""#)));
+    assert_eq!(f.count("posts").await?, 1);
+    assert_eq!(f.count("drafts").await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn composer_publish_links_to_post_and_keeps_native_redirect() -> anyhow::Result<()> {
+    let f = Fixture::new(30, 10).await?;
+    let csrf = ("csrf", f.session.csrf_token.clone());
+    let enhanced = format!("{MULTIPART}Accept: application/json\r\nX-RustPost-Enhance: 1\r\n");
+    let first = multipart(&[csrf.clone(), ("text", "Enhanced post".into())], None);
+    let (status, response) = f.request("POST", "/posts", &first, &enhanced).await?;
+    assert_eq!(status, 200);
+    assert!(response.contains(r#""redirect":"/posts/1""#));
+    let second_line = "界".repeat(f.state.settings.posts.max_text_chars - 2);
+    let second = multipart(&[csrf, ("text", format!("🌿\r\n{second_line}"))], None);
+    let (status, response) = f.request("POST", "/posts", &second, MULTIPART).await?;
+    assert_eq!(status, 303);
+    assert!(response.contains("location: /home#post-2"));
+    let saved_text: String = f
+        .state
+        .pool
+        .call(|conn| Ok(conn.query_row("SELECT text FROM posts WHERE id=2", [], |r| r.get(0))?))
+        .await?;
+    assert_eq!(saved_text, format!("🌿\n{second_line}"));
     Ok(())
 }

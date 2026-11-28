@@ -6,16 +6,17 @@ use super::{
     icon_svg, notice, posts_with_options, quote_preview_card,
 };
 
-pub fn login_form(message: Option<&str>, min_password_length: usize) -> String {
+pub fn login_form(username: &str, message: Option<&str>) -> String {
+    let username = html_escape::encode_double_quoted_attribute(username);
     let notice = message.map_or_else(String::new, |message| notice("error", message));
-    let hint = password_requirement_hint(min_password_length);
-    let attrs = password_length_attrs(min_password_length, "password-requirement");
+    // The configured minimum applies to new passwords, not existing credentials.
     format!(
-        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Log in</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="current-password"{attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><button class="auth-submit" type="submit">Log in</button></form></section>"#
+        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Log in</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" value="{username}" required><label for="password">Password</label><div class="password-control"><input id="password" name="password" type="password" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><button class="auth-submit" type="submit">Log in</button></form></section>"#
     )
 }
 
 pub fn register_form(
+    username: &str,
     message: Option<&str>,
     min_password_length: usize,
     captcha: Option<&crate::registration_captcha::RegistrationCaptchaChallenge>,
@@ -25,8 +26,9 @@ pub fn register_form(
     let password_attrs = password_length_attrs(min_password_length, "password-requirement");
     let confirm_attrs = password_length_attrs(min_password_length, "confirm-password-requirement");
     let captcha_html = captcha.map_or_else(String::new, register_captcha_fields);
+    let username = html_escape::encode_double_quoted_attribute(username);
     format!(
-        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="new-password"{password_attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><p class="field-help" id="confirm-password-requirement">{hint}</p><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"{confirm_attrs}><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div>{captcha_html}<button class="auth-submit" type="submit">Create account</button></form></section>"#
+        r#"<section class="panel form-card auth-panel" data-testid="form-card"><h1>Create account</h1>{notice}<form method="post" class="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" value="{username}" required><label for="password">Password</label><p class="field-help" id="password-requirement">{hint}</p><div class="password-control"><input id="password" name="password" type="password" autocomplete="new-password"{password_attrs}><button type="button" class="password-toggle" data-password-toggle="password" aria-label="Show password">Show</button></div><label for="confirm_password">Confirm password</label><p class="field-help" id="confirm-password-requirement">{hint}</p><div class="password-control"><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"{confirm_attrs}><button type="button" class="password-toggle" data-password-toggle="confirm_password" aria-label="Show password confirmation">Show</button></div>{captcha_html}<button class="auth-submit" type="submit">Create account</button></form></section>"#
     )
 }
 
@@ -69,55 +71,139 @@ pub fn client_boot_script() -> &'static str {
 }
 
 pub fn composer(csrf: Option<&str>, parent: Option<i64>, max_text_chars: usize) -> String {
+    composer_with_values(csrf, parent, max_text_chars, &ComposerValues::default())
+}
+
+#[derive(Default)]
+pub struct ComposerValues<'a> {
+    pub target: Option<&'a PostView>,
+    pub text: &'a str,
+    pub scheduled_at: &'a str,
+    pub poll_options: &'a str,
+    pub poll_multiple: bool,
+    pub poll_closes_at: &'a str,
+    pub alt_lines: &'a str,
+    pub nsfw: bool,
+    pub reselect_media: bool,
+    pub error: Option<(Option<crate::errors::ComposerField>, &'a str)>,
+}
+
+pub fn composer_with_values(
+    csrf: Option<&str>,
+    parent: Option<i64>,
+    max_text_chars: usize,
+    values: &ComposerValues<'_>,
+) -> String {
+    use html_escape::{encode_double_quoted_attribute as attr, encode_text as text};
+
     let request_key = uuid::Uuid::new_v4().to_string();
     let parent_input = parent.map_or_else(String::new, |id| {
         format!(r#"<input type="hidden" name="parent_post_id" value="{id}">"#)
     });
-    let csrf = csrf.unwrap_or_default();
+    let target = values.target.map_or_else(String::new, |post| {
+        let author = post.username.as_deref().map_or_else(
+            || {
+                post.anonymous_label
+                    .as_deref()
+                    .unwrap_or("this post")
+                    .to_owned()
+            },
+            |name| format!("@{name}"),
+        );
+        format!(
+            r#"<p class="reply-target">Replying to <a href="/posts/{}">{}</a></p>"#,
+            post.id,
+            text(&author),
+        )
+    });
+    let csrf = attr(csrf.unwrap_or_default());
     let input_id = parent.map_or_else(|| "post-text".to_owned(), |id| format!("reply-text-{id}"));
     let mention_menu_id = format!("{input_id}-mention-menu");
     let media_id = parent.map_or_else(|| "post-media".to_owned(), |id| format!("reply-media-{id}"));
     let nsfw_id = parent.map_or_else(|| "post-nsfw".to_owned(), |id| format!("reply-nsfw-{id}"));
-    let placeholder = if parent.is_some() {
-        "Write a reply..."
+    let (heading, label, placeholder, submit) = if parent.is_some() {
+        ("Reply", "Write a reply", "Write a reply...", "Reply")
     } else {
-        "What's happening?"
+        (
+            "New post",
+            "What is happening?",
+            "What's happening?",
+            "Post",
+        )
     };
-    format!(
-        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{}</h1><span class="muted character-counter character-counter-normal" data-character-counter="{}" aria-live="polite">{} remaining</span></div><form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
-<input type="hidden" name="csrf" value="{}">{}<input type="hidden" name="post_key" value="{request_key}">
-<label class="sr-only" for="{}">What is happening?</label>
-<div class="composer-surface">
-<textarea id="{}" name="text" rows="4" data-character-limit="{}" data-mention-autocomplete aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-controls="{}" placeholder="{}"></textarea>
-<div id="{}" class="mention-menu" role="listbox" data-mention-menu hidden></div>
-<div class="composer-footer"><label class="composer-file-control" for="{}"><input class="composer-file-input" id="{}" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime" aria-label="Attach media" data-composer-media><span class="composer-file-button" aria-hidden="true">{}<span>Attach media</span></span></label></div>
-<div class="composer-media-selection" data-composer-media-selection hidden><span class="composer-media-summary" data-composer-media-summary></span><label class="check-row composer-nsfw" for="{}"><input id="{}" name="nsfw" type="checkbox" value="true" data-composer-nsfw> Mark media as NSFW</label><button class="composer-clear-media" type="button" data-composer-clear-media>Clear</button></div>
-</div>
-<div data-image-descriptions></div><noscript><label>Attachment descriptions, one per line in selection order (leave a blank line for videos)<textarea name="alt_lines" rows="3"></textarea></label></noscript>
-<label class="check-row"><input type="checkbox" data-alt-reminder> Remind me if an image has no description</label>
-<details><summary>Drafts, scheduling and polls</summary><p><a href="/drafts">Your saved drafts and scheduled posts</a> (account required)</p><label>Publish at (UTC)<input type="datetime-local" name="scheduled_at"></label><label>Poll choices (2–6, one per line)<textarea name="poll_options" rows="3" maxlength="606"></textarea></label><label class="check-row"><input type="checkbox" name="poll_multiple" value="1"> Allow multiple choices</label><label>Poll closes at (UTC, optional)<input type="datetime-local" name="poll_closes_at"></label></details>
-<div class="composer-tools"><span><button type="submit" name="intent" value="draft">Save draft</button> <button type="submit" name="intent" value="schedule">Schedule</button></span><button class="primary" type="submit" name="intent" value="publish">Post</button></div>
-</form></section>"#,
-        if parent.is_some() {
-            "Reply"
+    let (invalid_field, message) = values.error.unwrap_or((None, ""));
+    let error_attrs = |name: &str| {
+        if invalid_field.is_some_and(|field| field.name() == name) {
+            format!(r#" aria-invalid="true" aria-describedby="{name}-error""#)
         } else {
-            "New post"
-        },
-        html_escape::encode_double_quoted_attribute(&input_id),
-        max_text_chars,
-        html_escape::encode_double_quoted_attribute(csrf),
-        parent_input,
-        html_escape::encode_double_quoted_attribute(&input_id),
-        html_escape::encode_double_quoted_attribute(&input_id),
-        max_text_chars,
-        html_escape::encode_double_quoted_attribute(&mention_menu_id),
-        html_escape::encode_double_quoted_attribute(placeholder),
-        html_escape::encode_double_quoted_attribute(&mention_menu_id),
-        html_escape::encode_double_quoted_attribute(&media_id),
-        html_escape::encode_double_quoted_attribute(&media_id),
-        icon_svg("paperclip"),
-        html_escape::encode_double_quoted_attribute(&nsfw_id),
-        html_escape::encode_double_quoted_attribute(&nsfw_id),
+            String::new()
+        }
+    };
+    let field_error = |name: &str| {
+        let invalid = invalid_field.is_some_and(|field| field.name() == name);
+        let (hidden, message) = if invalid {
+            ("", message)
+        } else {
+            (" hidden", "")
+        };
+        format!(
+            r#"<p class="composer-field-error" id="{name}-error" data-field-error="{name}" role="alert"{hidden}>{}</p>"#,
+            text(message),
+        )
+    };
+    let form_error = if invalid_field.is_none() && !message.is_empty() {
+        notice("error", message)
+    } else {
+        String::new()
+    };
+    let reselect = if values.reselect_media {
+        notice("error", "Select your attachments again before submitting.")
+    } else {
+        String::new()
+    };
+    let open = if invalid_field.is_some() { " open" } else { "" };
+    let nsfw_checked = if values.nsfw { " checked" } else { "" };
+    let multiple_checked = if values.poll_multiple { " checked" } else { "" };
+
+    format!(
+        r#"<section class="composer" id="reply" aria-labelledby="composer-title"><div class="section-heading"><h1 id="composer-title">{heading}</h1><span class="muted character-counter character-counter-normal" data-character-counter="{input_id}" aria-live="polite">{remaining} remaining</span></div>{target}<form method="post" action="/posts" enctype="multipart/form-data" data-enhance="post-create">
+<input type="hidden" name="csrf" value="{csrf}">{parent_input}<input type="hidden" name="post_key" value="{request_key}">
+{form_error}{reselect}
+<label class="sr-only" for="{input_id}">{label}</label>
+<div class="composer-surface">
+<textarea id="{input_id}" name="text" rows="4" data-character-limit="{max_text_chars}" data-mention-autocomplete aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-controls="{mention_menu_id}" placeholder="{placeholder}">
+{post_text}</textarea>
+<div id="{mention_menu_id}" class="mention-menu" role="listbox" data-mention-menu hidden></div>
+<div class="composer-footer"><label class="composer-file-control" for="{media_id}"><input class="composer-file-input" id="{media_id}" name="media" type="file" multiple accept="image/*,video/mp4,video/webm,video/quicktime" aria-label="Attach media" data-composer-media><span class="composer-file-button" aria-hidden="true">{attachment_icon}<span>Attach media</span></span></label></div>
+<div class="composer-media-selection" data-composer-media-selection hidden><span class="composer-media-summary" data-composer-media-summary></span><label class="check-row composer-nsfw" for="{nsfw_id}"><input id="{nsfw_id}" name="nsfw" type="checkbox" value="true" data-composer-nsfw{nsfw_checked}> Mark media as NSFW</label><button class="composer-clear-media" type="button" data-composer-clear-media>Clear</button></div>
+</div>
+{text_error}
+<div data-image-descriptions></div><noscript><label>Attachment descriptions, one per line in selection order (leave a blank line for videos)<textarea name="alt_lines" rows="3">
+{alt_lines}</textarea></label></noscript>
+<label class="check-row"><input type="checkbox" data-alt-reminder> Remind me if an image has no description</label>
+<details{open}><summary>Drafts, scheduling and polls</summary><p><a href="/drafts">Your saved drafts and scheduled posts</a> (account required)</p>
+<label>Publish at (UTC)<input type="datetime-local" name="scheduled_at" value="{scheduled_at}"{schedule_attrs}></label>{schedule_error}
+<label>Poll choices (2–6, one per line)<textarea name="poll_options" rows="3" maxlength="606"{poll_attrs}>
+{poll_options}</textarea></label>{poll_error}
+<label class="check-row"><input type="checkbox" name="poll_multiple" value="1"{multiple_checked}> Allow multiple choices</label>
+<label>Poll closes at (UTC, optional)<input type="datetime-local" name="poll_closes_at" value="{poll_closes_at}"{close_attrs}></label>{close_error}</details>
+<p class="notice success composer-success" data-post-success role="status" hidden></p>
+<div class="composer-tools"><span><button type="submit" name="intent" value="draft">Save draft</button> <button type="submit" name="intent" value="schedule">Schedule</button></span><button class="primary" type="submit" name="intent" value="publish">{submit}</button></div>
+</form></section>"#,
+        remaining = max_text_chars.saturating_sub(values.text.chars().count()),
+        post_text = text(values.text),
+        text_error = field_error("text"),
+        alt_lines = text(values.alt_lines),
+        attachment_icon = icon_svg("paperclip"),
+        scheduled_at = attr(values.scheduled_at),
+        poll_options = text(values.poll_options),
+        poll_closes_at = attr(values.poll_closes_at),
+        schedule_attrs = error_attrs("scheduled_at"),
+        schedule_error = field_error("scheduled_at"),
+        poll_attrs = error_attrs("poll_options"),
+        poll_error = field_error("poll_options"),
+        close_attrs = error_attrs("poll_closes_at"),
+        close_error = field_error("poll_closes_at"),
     )
 }
 

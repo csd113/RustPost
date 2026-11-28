@@ -1,6 +1,8 @@
 //! Layout for the render subsystem.
 
-use super::{CSS, CurrentUser, LayoutContext, Theme, icon_svg};
+use super::{
+    CurrentUser, LayoutContext, SITE_STYLESHEET_PATH, Theme, icon_svg, stylesheet_revision,
+};
 
 pub fn layout(user: Option<&CurrentUser>, title: &str, body: &str, site_name: &str) -> String {
     layout_with_csrf(user, None, title, body, site_name)
@@ -31,7 +33,7 @@ pub fn layout_with_context(
     site_name: &str,
     context: &LayoutContext,
 ) -> String {
-    let auth_nav = if let Some(user) = user {
+    let (auth_nav, mobile_nav) = if let Some(user) = user {
         let admin = if user.is_admin {
             nav_link("/admin", "Admin", "admin")
         } else {
@@ -53,26 +55,32 @@ pub fn layout_with_context(
             nav_link("/settings/deleted-posts", "Recently deleted", "trash")
         );
         let profile = nav_link(&format!("/users/{}", user.username), "Profile", "profile");
-        format!(
-            "{}{}{}{notifications}{requests}{}{}{saved}{admin}{logout}",
+        let primary = format!(
+            "{}{}{}{notifications}{requests}{}{}",
             nav_link("/home", "Home Feed", "home"),
             nav_link("/following", "Following", "users"),
             nav_link("/search", "Search", "search"),
             nav_link("/bookmarks", "Bookmarks", "bookmark"),
             profile,
-        )
+        );
+        let mobile = format!(
+            r#"{primary}<details class="mobile-nav-more"><summary>More</summary><div class="mobile-nav-options"><a href="/settings">Settings</a>{saved}{admin}{logout}</div></details>"#,
+        );
+        (format!("{primary}{saved}{admin}{logout}"), mobile)
     } else {
-        format!(
+        let guest = format!(
             "{}{}{}{}",
             nav_link("/home", "Home Feed", "home"),
             nav_link("/search", "Search", "search"),
             nav_link("/login", "Log in", "log-in"),
             nav_link("/register", "Register", "user-plus")
-        )
+        );
+        (guest.clone(), guest)
     };
     let brand_mark = site_name.chars().next().unwrap_or('R');
     let left_rail = left_rail(user, &auth_nav);
     let side_panel = dashboard_panel(user, context);
+    // Retain previously saved account themes as a fallback for browsers without a choice.
     let theme = user.map_or(Theme::Light, |user| user.theme).as_str();
     let header_tor = tor_header_indicator(context.tor_onion_address.as_deref());
     let announcement = announcement_banner(context.announcement.as_deref());
@@ -90,11 +98,11 @@ pub fn layout_with_context(
 <link rel="icon" href="/favicon.ico" type="{}">
 <title>{} - {}</title>
 <script src="/assets/rustpost-boot.js"></script>
-<style>{}</style>
+<link rel="stylesheet" href="{SITE_STYLESHEET_PATH}?v={}">
 <script src="/assets/rustpost.js" defer></script>
 </head>
 <body>
-<header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}{}</div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
+<header class="site-header"><div class="header-inner"><div class="header-brand-row"><a class="brand" href="/home"><span class="brand-mark">{}</span><span>{}</span></a>{}{}<div class="browser-theme" hidden><label for="browser-theme">Theme</label><select id="browser-theme"><option value="">Default</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div><nav class="mobile-nav" aria-label="Primary">{}</nav></div></header>
 {maintenance}{account_notice}
 <noscript><section class="noscript-banner" role="status"><strong>JavaScript is disabled.</strong> RustPost will use standard links and forms.</section></noscript>
 <main><div class="app-shell" data-testid="app-shell">{}<section class="primary-column" data-testid="primary-column">{} </section>{}</div></main>
@@ -105,12 +113,12 @@ pub fn layout_with_context(
         html_escape::encode_double_quoted_attribute(context.favicon_content_type),
         html_escape::encode_text(title),
         html_escape::encode_text(site_name),
-        CSS,
+        stylesheet_revision(),
         html_escape::encode_text(&brand_mark.to_string()),
         html_escape::encode_text(site_name),
         announcement,
         header_tor,
-        auth_nav,
+        mobile_nav,
         left_rail,
         body,
         side_panel,

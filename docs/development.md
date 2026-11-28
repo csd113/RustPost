@@ -6,7 +6,7 @@ You only need the Rust toolchain if you want to build or change the app. To run 
 
 ## Build and run
 
-Install Git and [rustup](https://rustup.rs/), plus the native compiler/linker tools for your operating system. The repository pins **Rust 1.100.0** in `rust-toolchain.toml`; `Cargo.toml` also declares 1.100.0 as the minimum supported version. Rustup selects the pin inside the repository without changing your global default.
+Install Git and [rustup](https://rustup.rs/), plus the native compiler/linker tools for your operating system. The repository pins **Rust 1.100.1** in `rust-toolchain.toml`. `Cargo.toml` also declares 1.100.1 as the minimum supported version. Rustup selects the pin inside the repository without changing your global default.
 
 ```sh
 git clone --branch dev https://github.com/csd113/RustPost.git
@@ -92,12 +92,12 @@ Each ZIP contains a matching version/platform folder with the executable, README
 
 The release workflow checks that the tag matches the package version, validates code quality/rustdoc, verifies the native executable version and Mac architecture, and prepares a **draft** GitHub release. It refuses to modify an already-published release. Publishing a draft is a separate maintainer action.
 
-The container workflow builds Linux amd64/arm64 images from a source tag and publishes version tags, plus `latest` for stable versions. The image uses an unprivileged UID/GID 10001, persistent `/data`, and bundled `ffmpeg`. Its Dockerfile starts with `rust:1.98.1-bookworm` and installs the exact 1.100.0 compiler; that base-image tag is not the final build compiler version.
+The container workflow builds Linux amd64/arm64 images from a source tag and publishes version tags, plus `latest` for stable versions. The image uses an unprivileged UID/GID 10001, persistent `/data`, and bundled `ffmpeg`. The Dockerfile starts with `rust:1.100.0-bookworm` and installs the same exact Rust 1.100.1 compiler used by the repository and CI.
 
 ## Change the compiler or dependencies
 
 Update `rust-toolchain.toml`, `Cargo.toml`'s supported-version requirement when appropriate, workflow pins, and Dockerfile compiler selection together. Resolve dependencies deliberately, retain `Cargo.lock`, and pass the checks on the intended platforms before using a new build for release. Do not rewrite published migration history.
 
-Arti/Tor dependencies are currently pinned to 0.48.0, with `rusqlite` 0.40.2 to keep SQLite linkage compatible. `cargo tree --locked -i libsqlite3-sys` should show one resolved SQLite sys crate. Re-evaluate upstream advisories when updating the Tor stack.
+Arti/Tor dependencies are pinned to 0.48.0. A [small upstream compatibility backport](../vendor/tor-dirmgr/RUSTPOST-PATCH.md) lets RustPost and Arti share the patched SQLite bundled by `rusqlite` 0.41.1. `cargo tree --locked -i libsqlite3-sys` should show one resolved SQLite sys crate. Re-evaluate upstream advisories when updating the Tor stack.
 
 For provenance of the earlier compiler migration, read [Compiler upgrade history](rust-1.99-upgrade.md). That historical report is not the current build checklist.

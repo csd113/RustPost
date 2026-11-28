@@ -12,12 +12,28 @@ pub struct PollSpec {
     pub closes_at: Option<i64>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PollInputError {
+    #[error("{0}")]
+    Choices(&'static str),
+    #[error("poll close time must be within the next year")]
+    CloseTime,
+}
+
 impl PollSpec {
     pub fn parse(
         options: &str,
         multiple: bool,
         closes_at: Option<i64>,
     ) -> anyhow::Result<Option<Self>> {
+        Self::parse_input(options, multiple, closes_at).map_err(Into::into)
+    }
+
+    pub(crate) fn parse_input(
+        options: &str,
+        multiple: bool,
+        closes_at: Option<i64>,
+    ) -> Result<Option<Self>, PollInputError> {
         let options = options
             .lines()
             .map(str::trim)
@@ -27,27 +43,25 @@ impl PollSpec {
         if options.is_empty() {
             return Ok(None);
         }
-        anyhow::ensure!(
-            (2..=6).contains(&options.len()),
-            "a poll needs 2 to 6 choices"
-        );
+        if !(2..=6).contains(&options.len()) {
+            return Err(PollInputError::Choices("a poll needs 2 to 6 choices"));
+        }
         let mut unique = BTreeSet::new();
         for option in &options {
-            anyhow::ensure!(
-                option.chars().count() <= 100,
-                "poll choices must be at most 100 characters"
-            );
-            anyhow::ensure!(
-                unique.insert(option.to_lowercase()),
-                "poll choices must be different"
-            );
+            if option.chars().count() > 100 {
+                return Err(PollInputError::Choices(
+                    "poll choices must be at most 100 characters",
+                ));
+            }
+            if !unique.insert(option.to_lowercase()) {
+                return Err(PollInputError::Choices("poll choices must be different"));
+            }
         }
         if let Some(close) = closes_at {
             let now = chrono::Utc::now().timestamp();
-            anyhow::ensure!(
-                close > now && close <= now + 366 * 86_400,
-                "poll close time must be within the next year"
-            );
+            if !(now + 1..=now + 366 * 86_400).contains(&close) {
+                return Err(PollInputError::CloseTime);
+            }
         }
         Ok(Some(Self {
             options,

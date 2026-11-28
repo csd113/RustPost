@@ -233,12 +233,22 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
     )
 }
 
-const CSS: &str = include_str!("../assets/site.css");
+pub(crate) const SITE_STYLESHEET_PATH: &str = "/assets/rustpost.css";
+pub(crate) const CSS: &str = include_str!("../assets/site.css");
+
+pub(crate) fn stylesheet_revision() -> &'static str {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest as _, Sha256};
+    static REVISION: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| URL_SAFE_NO_PAD.encode(Sha256::digest(CSS.as_bytes())));
+    REVISION.as_str()
+}
 
 mod layout;
 use layout::plural;
 pub use layout::{layout, layout_with_context, layout_with_csrf};
 mod forms;
+pub(crate) use forms::{ComposerValues, composer_with_values};
 pub use forms::{
     account_links, account_links_with_empty_state, accounts, client_boot_script, client_script,
     composer, edit_post_form, follow_form, login_form, onboarding_page, password_length_attrs,

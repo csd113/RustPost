@@ -4,11 +4,11 @@
 
 The README screenshots show a local demo with fictional accounts, generated illustrations, and short sample videos. No real account data or internet media is used.
 
-The screenshot refresh for v1.0.0 was captured on September 29, 2026. Desktop images use a 1440 × 1200 browser viewport; the mobile image uses a 390 × 844 viewport.
+The v1.2.0 development screenshots were captured on November 27, 2026. Desktop images use a 1440 × 1200 browser viewport; the mobile image uses a 390 × 844 viewport.
 
 ## What you need
 
-- Git and rustup, using the repository’s pinned Rust 1.100.0 compiler. Start from a current `dev` checkout; see [Build from source](development.md#build-and-run).
+- Git and rustup, using the repository’s pinned Rust compiler. Start from a current `dev` checkout; see [Build from source](development.md#build-and-run).
 - `ffmpeg` with the `drawtext` filter and the `libvpx-vp9` encoder to generate the sample videos. These are needed for this demo even though `ffmpeg` is optional for normal RustPost use. Check your build with `ffmpeg -filters` and `ffmpeg -encoders`.
 
 ## 1. Build
@@ -56,14 +56,14 @@ The generated database, uploads, temporary files, logs, and backups stay under t
 
 ## Reproduce the screenshots
 
-Log in as `ada`, then open these pages. Capture the visible browser viewport, rather than the full scrolling page, so text stays readable in the README.
+Log in as `ada`, then use **Theme** in the site header to select the theme listed for each page. Capture the visible browser viewport, rather than the full scrolling page, so text stays readable in the README.
 
-| Screenshot | Page | Viewport |
-| --- | --- | --- |
-| Home feed | `/home` | 1440 × 1200 |
-| Profile | `/users/nova` | 1440 × 1200 |
-| Conversation | `/posts/13` | 1440 × 1200 |
-| Image post | `/posts/2` | 1440 × 1200 |
-| Mobile | `/home` | 390 × 844 |
+| Screenshot | Page | Theme | Viewport |
+| --- | --- | --- | --- |
+| Home feed | `/home` | Light | 1440 × 1200 |
+| Profile | `/users/nova` | Dark | 1440 × 1200 |
+| Conversation | `/posts/13` | Dark | 1440 × 1200 |
+| Image post | `/posts/2` | Light | 1440 × 1200 |
+| Mobile | `/home` | Dark | 390 × 844 |
 
-These post IDs come from a freshly seeded database. Screenshots are saved in `docs/screenshots/`; browser logs and other temporary capture files should stay in the ignored `output/playwright/` directory.
+These post IDs come from a freshly seeded database. Screenshots are saved in `docs/screenshots/`. Keep temporary screenshots, logs, and browser profiles outside the checkout.

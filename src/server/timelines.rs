@@ -20,19 +20,32 @@ pub(super) async fn bookmarks(
     let posts = &history.posts;
     let navigation = history_navigation("/bookmarks", &history);
     let csrf = form_csrf(&state, &headers).await?;
-    let body = format!(
-        "{}{}",
-        render::page_header("Bookmarks", "Posts you saved for later."),
-        render::posts_with_controls_empty_state(
-            posts,
-            Some(&user),
-            csrf.as_deref(),
-            blur_nsfw_media(&state, Some(&user)),
-            state.settings.posts.post_edit_window_seconds,
-            render::EmptyState::new("No bookmarks yet.", "Saved posts will appear here."),
+    let header = render::page_header("Bookmarks", "Posts you saved for later.");
+    let empty = if history.older.is_none() && history.newer.is_none() {
+        render::EmptyState::new("No bookmarks yet.", "Saved posts will appear here.")
+    } else {
+        render::EmptyState::new(
+            "No bookmarks on this page.",
+            "Use the history links to see other saved posts.",
         )
+    };
+    let list = render::posts_with_controls_empty_state(
+        posts,
+        Some(&user),
+        csrf.as_deref(),
+        blur_nsfw_media(&state, Some(&user)),
+        state.settings.posts.post_edit_window_seconds,
+        empty,
     );
-    let body = format!("{body}{navigation}");
+    let template = if posts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<template data-bookmarks-empty>{}</template>"#,
+            render::empty_state(empty.title, empty.message),
+        )
+    };
+    let body = format!(r#"{header}<div data-bookmarks>{list}{template}</div>{navigation}"#);
     Ok(Html(
         page_layout(&state, Some(&user), csrf.as_deref(), "Bookmarks", &body).await?,
     ))
